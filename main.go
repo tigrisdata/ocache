@@ -9,15 +9,14 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 var (
 	diskPath  = flag.String("disk", "/var/cache", "Directory for disk cache")
 	threshold = flag.Int("threshold", 128*1024, "Small obj threshold")
 	ttl       = flag.Int("ttl", 900, "Default TTL in seconds")
-	port      = flag.Int("port", 8080, "Listen port")
+	port      = flag.Int("port", 9000, "Listen port")
+	httpPort  = flag.Int("http-port", 9001, "HTTP port")
 	verbose   = flag.Bool("v", false, "Enable debug logging")
 )
 
@@ -84,17 +83,9 @@ func main() {
 
 	initStorage(GetDiskPath(), GetTTL())
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/put", handlePut)
-	mux.HandleFunc("/get", handleGet)
-	mux.HandleFunc("/delete", handleDelete)
-	mux.HandleFunc("/list", handleList)
+	grpcAddr := fmt.Sprintf(":%d", *port)
+	go startGRPCServer()                           // Start gRPC server in goroutine
+	go startGRPCGatewayServer(grpcAddr, *httpPort) // Start grpc-gateway on different port
 
-	// Wrap mux with logging middleware and h2c (HTTP/2 cleartext)
-	handler := loggingMiddleware(mux)
-	h2cHandler := h2c.NewHandler(handler, &http2.Server{})
-	err := http.ListenAndServe(fmt.Sprintf(":%d", GetPort()), h2cHandler)
-	if err != nil {
-		zlog.Fatal().Err(err).Msg("server failed to start")
-	}
+	select {} // Block forever
 }

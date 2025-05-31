@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package cache;
+
+option go_package = "github.com/tigrisdata/cache_service/proto;proto";
+
+import "google/api/annotations.proto";
+
+service CacheService {
+  rpc Put (stream PutRequest) returns (PutResponse);
+  rpc PutObject (PutRequest) returns (PutResponse) {
+    option (google.api.http) = {
+      post: "/v1/cache/{key}"
+      body: "*"
+    };
+  }
+  rpc Get (GetRequest) returns (stream GetResponse) {
+    option (google.api.http) = {
+      get: "/v1/cache/{key}"
+    };
+  }
+  rpc Delete (DeleteRequest) returns (DeleteResponse) {
+    option (google.api.http) = {
+      delete: "/v1/cache/{key}"
+    };
+  }
+  rpc List (ListRequest) returns (stream ListResponse) {
+    option (google.api.http) = {
+      get: "/v1/cache"
+    };
+  }
+}
+
+message PutRequest {
+  string key = 1; // the cache key; only required in the first message
+  int64 ttl_seconds = 2; // optional TTL; only used in the first message
+  bytes data = 3; // raw chunk of the object
+}
+
+message PutResponse {
+  bool success = 1;
+  string error  = 2; // nonempty if something went wrong
+}
+
+message GetRequest {
+  string key = 1;
+  int64 start = 2; // inclusive byte offset in the object (0-based)
+  int64 end = 3;   // exclusive byte offset (if 0 or omitted, read to EOF)
+}
+
+message GetResponse {
+  bytes data = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string error  = 2;
+}
+
+message ListRequest {}
+
+message ListResponse {
+  repeated string keys = 1;
+}

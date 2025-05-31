@@ -1,0 +1,6 @@
+.vscode/
+
+# Generated files
+*.pb.go
+*.pb.gw.go
+cache_service

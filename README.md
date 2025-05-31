@@ -42,19 +42,54 @@ Run the service:
 - `-disk` : Path for disk spill (default: `/var/cache`)
 - `-threshold`: Small object threshold in bytes (default: 131072)
 - `-ttl`: Time-to-live for items in seconds (default: 900)
-- `-port` : HTTP listen port (default: 8080)
+- `-port` : gRPC listen port (default: 9000)
+- `-http-port` : HTTP listen port (default: 9001)
+- `-v` : Enable debug logging (default: no)
 
 Example:
 
 ```bash
-./cache_service -db mydb -disk /tmp/mydisk -threshold 2097152 -port 9090
+./cache_service -disk /tmp/mydisk -threshold 2097152 -port 9090 -http-port 9091 -ttl 3600 -v
 ```
 
-## Endpoints
+## HTTP Endpoints
 
-- `PUT   /put` : Store an item
-- `GET   /get` : Retrieve an item
-- `POST  /delete` : Delete an item
-- `GET   /list` : List items
+- `POST  /v1/cache/{key}` : Store an item (body: JSON with `data` as base64, or use a tool that sends binary data)
+- `GET   /v1/cache/{key}` : Retrieve an item
+- `DELETE /v1/cache/{key}` : Delete an item
+- `GET   /v1/cache` : List items
 
-Refer to the code for request/response formats.
+### Examples
+
+**Store an item (base64-encoded data):**
+
+```bash
+curl -X POST "http://localhost:9001/v1/cache/mykey" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"mykey","ttl_seconds":3600,"data":"aGVsbG8gd29ybGQ="}'
+```
+
+**Store an item (raw binary data, if supported):**
+
+```bash
+curl -X POST "http://localhost:9001/v1/cache/mykey" \
+  --data-binary @myfile.bin
+```
+
+**Retrieve an item:**
+
+```bash
+curl "http://localhost:9001/v1/cache/mykey"
+```
+
+**Delete an item:**
+
+```bash
+curl -X DELETE "http://localhost:9001/v1/cache/mykey"
+```
+
+**List all items:**
+
+```bash
+curl "http://localhost:9001/v1/cache"
+```
