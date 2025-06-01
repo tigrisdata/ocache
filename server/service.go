@@ -10,7 +10,7 @@ import (
 	"time"
 
 	pb "github.com/tigrisdata/cache_service/proto"
-	stor "github.com/tigrisdata/cache_service/storage"
+	stor "github.com/tigrisdata/cache_service/server/storage"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/rs/zerolog"

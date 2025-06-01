@@ -5,16 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
-	stor "github.com/tigrisdata/cache_service/storage"
+	stor "github.com/tigrisdata/cache_service/server/storage"
 )
 
 var (
 	diskPath  = flag.String("disk", "/var/cache", "Directory for disk cache")
-	threshold = flag.Int("threshold", 128*1024, "Small obj threshold")
+	threshold = flag.Int("threshold", 256*1024, "Small obj threshold")
 	ttl       = flag.Int("ttl", 900, "Default TTL in seconds")
 	port      = flag.Int("port", 9000, "Listen port")
 	httpPort  = flag.Int("http-port", 9001, "HTTP port")
@@ -47,37 +46,17 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return rw.ResponseWriter.Write(b)
 }
 
-// loggingMiddleware logs each HTTP request using zerolog
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		rw := &responseWriter{ResponseWriter: w}
-		next.ServeHTTP(rw, r)
-		duration := time.Since(start)
-
-		zlog.Info().
-			Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Str("remote", r.RemoteAddr).
-			Int("status", rw.Status()).
-			Dur("duration", duration).
-			Msg("request completed")
-	})
-}
-
-func main() {
+func configureLogger() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-
-	flag.Parse()
-
 	if *verbose {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	} else {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	}
-
 	zlog.Logger = zlog.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+}
 
+func RunServer() {
 	if err := os.MkdirAll(GetDiskPath(), 0o755); err != nil {
 		zlog.Fatal().Err(err).Msg("failed to create disk path")
 	}
@@ -89,4 +68,11 @@ func main() {
 	go startGRPCGatewayServer(grpcAddr, *httpPort) // Start grpc-gateway on different port
 
 	select {} // Block forever
+}
+
+func main() {
+	flag.Parse()
+	configureLogger()
+
+	RunServer() // Initialize and run the server
 }

@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	pb "github.com/tigrisdata/cache_service/proto"
-	stor "github.com/tigrisdata/cache_service/storage"
+	stor "github.com/tigrisdata/cache_service/server/storage"
 )
 
 func setupTestStorage(t *testing.T) {

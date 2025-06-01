@@ -1,4 +1,4 @@
-module github.com/tigrisdata/cache_service
+module github.com/tigrisdata/cache_service/server
 
 go 1.24.2
 
@@ -7,9 +7,8 @@ require (
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
-	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb
+	github.com/tigrisdata/cache_service/proto v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
-	google.golang.org/protobuf v1.36.5
 )
 
 require (
@@ -22,6 +21,12 @@ require (
 	golang.org/x/net v0.40.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.25.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
+	google.golang.org/protobuf v1.36.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// We want to import the local `proto/` module
+// We want to import the local `proto/` module
+replace github.com/tigrisdata/cache_service/proto => ../proto

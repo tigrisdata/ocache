@@ -25,6 +25,17 @@ cd cache_service
 
 ### Build the service
 
+Generate the Go code for gRPC, at the root of the repo:
+
+```bash
+protoc -I ./proto \
+  --go_out=paths=source_relative:./proto \
+  --go-grpc_out=paths=source_relative:./proto \
+  proto/cache.proto
+```
+
+Then build the service:
+
 ```bash
 CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib" go build -o cache_service .
 ```
@@ -40,7 +51,7 @@ Run the service:
 ### Command-line Flags
 
 - `-disk` : Path for disk spill (default: `/var/cache`)
-- `-threshold`: Small object threshold in bytes (default: 131072)
+- `-threshold`: Small object threshold in bytes (default: 262144)
 - `-ttl`: Time-to-live for items in seconds (default: 900)
 - `-port` : gRPC listen port (default: 9000)
 - `-http-port` : HTTP listen port (default: 9001)
