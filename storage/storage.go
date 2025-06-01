@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -42,30 +41,6 @@ var storage *Storage
 // GetStorage returns the singleton Storage instance
 func GetStorage() *Storage {
 	return storage
-}
-
-// bufferPool is used to reduce allocations
-var (
-	defaultBufferSize = 64 * 1024 // 64KB default buffer size
-	bufferPool        = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, defaultBufferSize)
-		},
-	}
-)
-
-// GetBuffer returns a buffer of defaultBufferSize length from the pool, or allocates a new one if needed
-func GetBuffer() []byte {
-	buf := bufferPool.Get().([]byte)
-	if cap(buf) < defaultBufferSize {
-		return make([]byte, defaultBufferSize)
-	}
-	return buf[:defaultBufferSize]
-}
-
-// PutBuffer returns a buffer to the pool
-func PutBuffer(buf []byte) {
-	bufferPool.Put(buf)
 }
 
 // InitStorage initializes storage at dbPath
@@ -189,7 +164,7 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to open file")
 				return nil, false, err
 			}
-			return &pooledFileReader{f: f}, true, nil
+			return f, true, nil
 		}
 	}
 	zlog.Debug().Str("key", key).Msg("storage.Get: value format did not match expected encoding")
@@ -209,27 +184,21 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	}
 	// For small objects, do NOT call sw.Close() yet
 
-	// Store expiry as part of the value if TTL is set
+	// Store expiry as part of the value, always encode expiryBytes (0 if no TTL)
 	var val []byte
+	expiryBytes := make([]byte, 8)
 	if ttl > 0 {
 		expiry := time.Now().Add(time.Duration(ttl) * time.Second).Unix()
-		expiryBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(expiryBytes, uint64(expiry))
-		if sw.UsedFile() {
-			val = append([]byte("L|"), expiryBytes...)
-			val = append(val, '|')
-			val = append(val, []byte(sw.FilePath())...)
-		} else {
-			val = append([]byte("S|"), expiryBytes...)
-			val = append(val, '|')
-			val = append(val, sw.Buffer()...)
-		}
+	}
+	if sw.UsedFile() {
+		val = append([]byte("L|"), expiryBytes...)
+		val = append(val, '|')
+		val = append(val, []byte(sw.FilePath())...)
 	} else {
-		if sw.UsedFile() {
-			val = []byte("L|" + sw.FilePath())
-		} else {
-			val = append([]byte("S|"), sw.Buffer()...)
-		}
+		val = append([]byte("S|"), expiryBytes...)
+		val = append(val, '|')
+		val = append(val, sw.Buffer()...)
 	}
 
 	ts := generateTimestamp()
