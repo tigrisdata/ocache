@@ -8,6 +8,7 @@ import (
 	"strconv"
 
 	zlog "github.com/rs/zerolog/log"
+	stor "github.com/tigrisdata/cache_service/storage"
 )
 
 // handlePut streams the body into spillWriter and stores metadata in RocksDB
@@ -24,7 +25,7 @@ func handlePut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := storage.Put(key, r.Body, ttl); err != nil {
+	if err := stor.GetStorage().Put(key, r.Body, ttl); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -53,7 +54,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 
 	zlog.Debug().Str("key", key).Int64("start", start).Int64("end", end).Msg("handleGet: start")
 
-	reader, exists, err := storage.Get(key)
+	reader, exists, err := stor.GetStorage().Get(key)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("handleGet: storage.Get error")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -78,8 +79,8 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	buf := getBuffer()
-	defer bufferPool.Put(buf[:0])
+	buf := stor.GetBuffer()
+	defer stor.PutBuffer(buf[:0])
 
 	if end >= 0 && end > start {
 		toRead := end - start
@@ -115,13 +116,13 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing key", http.StatusBadRequest)
 		return
 	}
-	storage.DeleteKey(key)
+	stor.GetStorage().DeleteKey(key)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
 func handleList(w http.ResponseWriter, r *http.Request) {
-	keys, err := storage.ListKeys()
+	keys, err := stor.GetStorage().ListKeys()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -1,4 +1,4 @@
-package main
+package storage
 
 import (
 	"bytes"
@@ -32,10 +32,17 @@ import (
 //
 // On read, expiry is checked (if present) and expired keys are deleted and not returned.
 type Storage struct {
-	db *grocksdb.DB
+	db        *grocksdb.DB
+	diskPath  string // Path to the disk cache directory
+	threshold int    // Threshold for small vs large objects
 }
 
 var storage *Storage
+
+// GetStorage returns the singleton Storage instance
+func GetStorage() *Storage {
+	return storage
+}
 
 // bufferPool is used to reduce allocations
 var (
@@ -47,8 +54,8 @@ var (
 	}
 )
 
-// getBuffer returns a buffer of defaultBufferSize length from the pool, or allocates a new one if needed
-func getBuffer() []byte {
+// GetBuffer returns a buffer of defaultBufferSize length from the pool, or allocates a new one if needed
+func GetBuffer() []byte {
 	buf := bufferPool.Get().([]byte)
 	if cap(buf) < defaultBufferSize {
 		return make([]byte, defaultBufferSize)
@@ -56,17 +63,22 @@ func getBuffer() []byte {
 	return buf[:defaultBufferSize]
 }
 
-// initStorage initializes storage at dbPath
-func initStorage(diskPath string, ttl int) {
-	s, err := NewStorage(diskPath, ttl)
+// PutBuffer returns a buffer to the pool
+func PutBuffer(buf []byte) {
+	bufferPool.Put(buf)
+}
+
+// InitStorage initializes storage at dbPath
+func InitStorage(diskPath string, ttl int, threshold int) {
+	s, err := newStorage(diskPath, ttl, threshold)
 	if err != nil {
 		panic("failed to open RocksDB: " + err.Error())
 	}
 	storage = s
 }
 
-// NewStorage initializes RocksDB inside diskPath and returns a Storage instance
-func NewStorage(diskPath string, ttl int) (*Storage, error) {
+// newStorage initializes RocksDB inside diskPath and returns a Storage instance
+func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
 	dbPath := diskPath + "/rocksdb"
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
@@ -74,7 +86,7 @@ func NewStorage(diskPath string, ttl int) (*Storage, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{db: db}, nil
+	return &Storage{db: db, diskPath: diskPath, threshold: threshold}, nil
 }
 
 // ListKeys returns all keys in the RocksDB instance
@@ -186,11 +198,8 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 
 // Put streams the body into spillWriter, stores metadata, and handles TTL
 func (s *Storage) Put(key string, body io.Reader, ttl int) error {
-	threshold := GetThreshold()
-	diskPath := GetDiskPath()
-
-	sw := newSpillWriter(threshold, diskPath, key)
-	buf := getBuffer()
+	sw := newSpillWriter(s.threshold, s.diskPath, key)
+	buf := GetBuffer()
 	if _, err := io.CopyBuffer(sw, body, buf); err != nil {
 		return err
 	}

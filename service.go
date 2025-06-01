@@ -10,6 +10,7 @@ import (
 	"time"
 
 	pb "github.com/tigrisdata/cache_service/proto"
+	stor "github.com/tigrisdata/cache_service/storage"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/rs/zerolog"
@@ -36,7 +37,7 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 
 	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
 	go func() {
-		errCh <- storage.Put(key, pr, ttl)
+		errCh <- stor.GetStorage().Put(key, pr, ttl)
 	}()
 
 	// Read chunks from the stream and write to the pipe
@@ -78,7 +79,7 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
 	}
 	// Use the same logic as the streaming Put, but for a single chunk
-	if err := storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds)); err != nil {
+	if err := stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds)); err != nil {
 		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
 	}
 	return &pb.PutResponse{Success: true}, nil
@@ -91,7 +92,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	start := req.Start
 	end := req.End
 
-	r, found, err := storage.Get(key)
+	r, found, err := stor.GetStorage().Get(key)
 	if err != nil {
 		return err
 	}
@@ -101,8 +102,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 
 	// Seek to start if possible
 	if start > 0 {
-		buf := getBuffer()
-		defer bufferPool.Put(buf[:0])
+		buf := stor.GetBuffer()
+		defer stor.PutBuffer(buf[:0])
 		if seeker, ok := r.(io.Seeker); ok {
 			_, err := seeker.Seek(start, io.SeekStart)
 			if err != nil {
@@ -127,8 +128,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		}
 	}
 
-	buf := getBuffer()
-	defer bufferPool.Put(buf[:0])
+	buf := stor.GetBuffer()
+	defer stor.PutBuffer(buf[:0])
 	var toRead int64 = -1
 	if end > 0 && end > start {
 		toRead = end - start
@@ -167,14 +168,14 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	if req.Key == "" {
 		return &pb.DeleteResponse{Success: false, Error: "missing key"}, nil
 	}
-	storage.DeleteKey(req.Key)
+	stor.GetStorage().DeleteKey(req.Key)
 	return &pb.DeleteResponse{Success: true}, nil
 }
 
 // Streaming List implementation
 func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
 	zlog.Debug().Msg("gRPC List called")
-	keys, err := storage.ListKeys()
+	keys, err := stor.GetStorage().ListKeys()
 	if err != nil {
 		return err
 	}

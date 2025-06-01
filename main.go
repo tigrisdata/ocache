@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
+	stor "github.com/tigrisdata/cache_service/storage"
 )
 
 var (
@@ -81,7 +82,7 @@ func main() {
 		zlog.Fatal().Err(err).Msg("failed to create disk path")
 	}
 
-	initStorage(GetDiskPath(), GetTTL())
+	stor.InitStorage(GetDiskPath(), GetTTL(), GetThreshold())
 
 	grpcAddr := fmt.Sprintf(":%d", *port)
 	go startGRPCServer()                           // Start gRPC server in goroutine
