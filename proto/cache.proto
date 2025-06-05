@@ -66,3 +66,10 @@ message ListRequest {}
 message ListResponse {
   repeated string keys = 1;
 }
+
+// ValueMessage is a proto-encoded value for storage
+message ValueMessage {
+  bytes data = 1; // The actual value bytes
+  int64 expiry = 2; // Expiry timestamp (unix seconds), 0 if no expiry
+  string file_path = 3; // Optional: file path for large objects (if used)
+}

@@ -9,6 +9,9 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+
+	pb "github.com/tigrisdata/cache_service/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // Storage wraps all RocksDB access and related logic
@@ -128,6 +131,30 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 	}
 	v := slice.Data()
 
+	// Try to decode as proto ValueMessage
+	valueMsg := &pb.ValueMessage{}
+	if err := proto.Unmarshal(v, valueMsg); err == nil {
+		zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
+		if valueMsg.Expiry > 0 && time.Now().Unix() > valueMsg.Expiry {
+			zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
+			s.DeleteKey(key)
+			return nil, false, nil
+		}
+		if valueMsg.FilePath != "" {
+			f, err := os.Open(valueMsg.FilePath)
+			if err != nil {
+				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to open file from proto")
+				return nil, false, err
+			}
+			return f, true, nil
+		}
+		if len(valueMsg.Data) > 0 {
+			return bytes.NewReader(valueMsg.Data), true, nil
+		}
+		return nil, false, nil
+	}
+
+	// Fallback: legacy encoding (for backward compatibility)
 	// Log up to first 32 bytes of the raw value for debugging
 	zlog.Debug().Str("key", key).Int("raw_len", len(v)).Msg("storage.Get: raw value bytes")
 	if len(v) > 0 {
@@ -186,19 +213,21 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 
 	// Store expiry as part of the value, always encode expiryBytes (0 if no TTL)
 	var val []byte
-	expiryBytes := make([]byte, 8)
+	var expiry int64
 	if ttl > 0 {
-		expiry := time.Now().Add(time.Duration(ttl) * time.Second).Unix()
-		binary.BigEndian.PutUint64(expiryBytes, uint64(expiry))
+		expiry = time.Now().Add(time.Duration(ttl) * time.Second).Unix()
 	}
+	// Use proto ValueMessage for encoding
+	valueMsg := &pb.ValueMessage{}
 	if sw.UsedFile() {
-		val = append([]byte("L|"), expiryBytes...)
-		val = append(val, '|')
-		val = append(val, []byte(sw.FilePath())...)
+		valueMsg.FilePath = sw.FilePath()
 	} else {
-		val = append([]byte("S|"), expiryBytes...)
-		val = append(val, '|')
-		val = append(val, sw.Buffer()...)
+		valueMsg.Data = sw.Buffer()
+	}
+	valueMsg.Expiry = expiry
+	val, err := proto.Marshal(valueMsg)
+	if err != nil {
+		return err
 	}
 
 	ts := generateTimestamp()

@@ -14,7 +14,7 @@ A cache service that supports both in-memory and disk-based storage, with gRPC a
 
 ```bash
 git clone <repo-url>
-cd cache_service/server
+cd cache_service
 ```
 
 ### Build the service (macOS)
@@ -37,7 +37,7 @@ protoc -I ./proto \
 Then build the service:
 
 ```bash
-CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib" go build -o cache_service .
+CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib" go build -o cache_service ./server/
 ```
 
 ## Usage
@@ -112,9 +112,7 @@ A command-line client is available for interacting with the cache service via gR
 ### Build the CLI
 
 ```bash
-cd client/cmd
-# Build the CLI binary
-go build -o cachecli .
+go build -o cachecli ./client/cmd/
 ```
 
 ### CLI Commands
@@ -123,6 +121,7 @@ go build -o cachecli .
 - `get <key>`: Retrieve a value from the cache
 - `del <key>`: Delete a key from the cache
 - `list`: List all keys in the cache
+- `bench`: Run a benchmark test
 
 You can specify the server address with `--addr` (default: `localhost:9000`).
 
@@ -157,3 +156,21 @@ For more help, run:
 ```bash
 ./cachecli --help
 ```
+
+### Benchmarks
+
+To run benchmarks, use the `bench` command in the CLI:
+
+```bash
+./cachecli --addr localhost:9000 bench
+```
+
+This will run a YCSB style benchmark against the cache service, simulating a workload with configurable parameters.
+
+#### Benchmark Options
+
+- `--concurrency`: Number of concurrent workers (default 8)
+- `--num-keys`: Number of unique keys (default 1000)
+- `--num-ops`: Total number of operations (default 10000)
+- `--value-size`: Value size in bytes (default 100)
+- `--workload`: Workload type or custom mix (e.g. A, B, read=70,update=30) (default "A")
