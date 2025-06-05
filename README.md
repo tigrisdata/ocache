@@ -1,29 +1,29 @@
-# cache_service
+# Cache Service
 
-A simple HTTP cache service using RocksDB for storage.
+A cache service that supports both in-memory and disk-based storage, with gRPC and HTTP interfaces. It uses a combination of RocksDB and local storage to manage cache items efficiently, and provides fast access to both small and large objects. The service is designed to handle high throughput and low latency, making it suitable for various caching scenarios.
 
 ## Prerequisites
 
 - Go (1.18 or newer recommended)
-- [Homebrew](https://brew.sh/) (for installing dependencies)
+- [Homebrew](https://brew.sh/) (for installing dependencies on macOS)
 - [RocksDB](https://github.com/facebook/rocksdb)
 
-## Installation (macOS)
-
-## Install RocksDB
-
-```bash
-brew install rocksdb
-```
+## Installation
 
 ### Clone the repository
 
 ```bash
-git clone <your-repo-url>
-cd cache_service
+git clone <repo-url>
+cd cache_service/server
 ```
 
-### Build the service
+### Build the service (macOS)
+
+Install RocksDB:
+
+```bash
+brew install rocksdb
+```
 
 Generate the Go code for gRPC, at the root of the repo:
 
@@ -103,4 +103,57 @@ curl -X DELETE "http://localhost:9001/v1/cache/mykey"
 
 ```bash
 curl "http://localhost:9001/v1/cache"
+```
+
+## CLI Usage
+
+A command-line client is available for interacting with the cache service via gRPC.
+
+### Build the CLI
+
+```bash
+cd client/cmd
+# Build the CLI binary
+go build -o cachecli .
+```
+
+### CLI Commands
+
+- `put <key> <value>`: Store a value in the cache
+- `get <key>`: Retrieve a value from the cache
+- `del <key>`: Delete a key from the cache
+- `list`: List all keys in the cache
+
+You can specify the server address with `--addr` (default: `localhost:9000`).
+
+### Examples
+
+**Store a value:**
+
+```bash
+./cachecli --addr localhost:9000 put mykey "hello world"
+```
+
+**Retrieve a value:**
+
+```bash
+./cachecli --addr localhost:9000 get mykey
+```
+
+**Delete a key:**
+
+```bash
+./cachecli --addr localhost:9000 del mykey
+```
+
+**List all keys:**
+
+```bash
+./cachecli --addr localhost:9000 list
+```
+
+For more help, run:
+
+```bash
+./cachecli --help
 ```

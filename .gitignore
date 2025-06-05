@@ -3,4 +3,7 @@
 # Generated files
 *.pb.go
 *.pb.gw.go
-cache_service
+
+# Go build artifacts
+**/cache_service
+**/cachecli
