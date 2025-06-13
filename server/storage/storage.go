@@ -34,9 +34,10 @@ import (
 //
 // On read, expiry is checked (if present) and expired keys are deleted and not returned.
 type Storage struct {
-	db        *grocksdb.DB
-	diskPath  string // Path to the disk cache directory
-	threshold int    // Threshold for small vs large objects
+	db             *grocksdb.DB
+	diskPath       string          // Path to the disk cache directory
+	threshold      int             // Threshold for small vs large objects
+	segmentManager *SegmentManager // Segment manager for large objects on disk
 }
 
 var storage *Storage
@@ -57,14 +58,21 @@ func InitStorage(diskPath string, ttl int, threshold int) {
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
 func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
-	dbPath := diskPath + "/rocksdb"
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
+
+	dbPath := diskPath + "/rocksdb"
 	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)
 	if err != nil {
 		return nil, err
 	}
-	return &Storage{db: db, diskPath: diskPath, threshold: threshold}, nil
+
+	segmentManager, err := NewSegmentManager(diskPath, DefaultSegmentSize)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Storage{db: db, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager}, nil
 }
 
 // ListKeys returns all keys in the RocksDB instance
@@ -133,125 +141,99 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 
 	// Try to decode as proto ValueMessage
 	valueMsg := &pb.ValueMessage{}
-	if err := proto.Unmarshal(v, valueMsg); err == nil {
-		zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
-		if valueMsg.Expiry > 0 && time.Now().Unix() > valueMsg.Expiry {
-			zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
-			s.DeleteKey(key)
-			return nil, false, nil
-		}
-		if valueMsg.FilePath != "" {
-			f, err := os.Open(valueMsg.FilePath)
-			if err != nil {
-				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to open file from proto")
-				return nil, false, err
-			}
-			return f, true, nil
-		}
-		if len(valueMsg.Data) > 0 {
-			return bytes.NewReader(valueMsg.Data), true, nil
-		}
+	err = proto.Unmarshal(v, valueMsg)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage")
+		return nil, false, err
+	}
+
+	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
+	if valueMsg.Expiry > 0 && time.Now().Unix() > valueMsg.Expiry {
+		zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
+		s.DeleteKey(key)
 		return nil, false, nil
 	}
-
-	// Fallback: legacy encoding (for backward compatibility)
-	// Log up to first 32 bytes of the raw value for debugging
-	zlog.Debug().Str("key", key).Int("raw_len", len(v)).Msg("storage.Get: raw value bytes")
-	if len(v) > 0 {
-		max := len(v)
-		if max > 32 {
-			max = 32
+	if valueMsg.FilePath != "" {
+		f, err := os.Open(valueMsg.FilePath)
+		if err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to open file from proto")
+			return nil, false, err
 		}
-		zlog.Debug().Str("key", key).Msgf("storage.Get: first bytes: %v", string(v[:max]))
+		return f, true, nil
 	}
-
-	// Expect the separator after expiry bytes
-	if len(v) >= 11 && (v[0] == 'S' || v[0] == 'L') && v[1] == '|' && v[10] == '|' {
-		expiry := int64(binary.BigEndian.Uint64(v[2:10]))
-		zlog.Debug().Str("key", key).Int64("expiry", expiry).Int64("now", time.Now().Unix()).Msg("storage.Get: parsed expiry")
-		if expiry > 0 && time.Now().Unix() > expiry {
-			zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
-			s.DeleteKey(key)
-			return nil, false, nil
-		}
-		valStart := 11
-
-		// Check if the value is small or large
-		if v[0] == 'S' {
-			zlog.Debug().Str("key", key).Int("data_len", len(v[valStart:])).Msg("storage.Get: returning small object")
-			// Defensive: copy the value to a new slice to avoid referencing mmap'd memory that may be freed
-			data := make([]byte, len(v[valStart:]))
-			copy(data, v[valStart:])
-			return bytes.NewReader(data), true, nil
-		}
-		if v[0] == 'L' {
-			zlog.Debug().Str("key", key).Str("path", string(v[valStart:])).Msg("storage.Get: returning large object")
-			f, err := os.Open(string(v[valStart:]))
-			if err != nil {
-				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to open file")
-				return nil, false, err
-			}
-			return f, true, nil
-		}
+	if len(valueMsg.Data) > 0 {
+		return bytes.NewReader(valueMsg.Data), true, nil
 	}
-	zlog.Debug().Str("key", key).Msg("storage.Get: value format did not match expected encoding")
 	return nil, false, nil
 }
 
 // Put streams the body into spillWriter, stores metadata, and handles TTL
 func (s *Storage) Put(key string, body io.Reader, ttl int) error {
-	sw := newSpillWriter(s.threshold, s.diskPath, key)
-	buf := GetBuffer()
-	if _, err := io.CopyBuffer(sw, body, buf); err != nil {
+	// We need to read at most threshold+1 bytes to decide if the value is "large".
+	// Allocate a buffer exactly that size to avoid the short-buffer error.
+	firstReadSize := s.threshold + 1
+	if firstReadSize <= 0 {
+		firstReadSize = 1 // ensure at least 1
+	}
+	firstChunk := GetSizedBuffer(firstReadSize)
+	defer PutSizedBuffer(firstChunk)
+
+	// Read up to firstReadSize bytes. io.ReadFull returns ErrUnexpectedEOF when the
+	// value is smaller than firstReadSize – that is fine, we still get the bytes read.
+	n, err := io.ReadFull(body, firstChunk)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
 		return err
 	}
-	if sw.UsedFile() {
-		sw.file.Close()
-		bufferPool.Put(buf[:0]) // only return to pool if file was used
-	}
-	// For small objects, do NOT call sw.Close() yet
 
-	// Store expiry as part of the value, always encode expiryBytes (0 if no TTL)
-	var val []byte
+	// Determine expiry timestamp if TTL is specified
 	var expiry int64
 	if ttl > 0 {
 		expiry = time.Now().Add(time.Duration(ttl) * time.Second).Unix()
 	}
-	// Use proto ValueMessage for encoding
-	valueMsg := &pb.ValueMessage{}
-	if sw.UsedFile() {
-		valueMsg.FilePath = sw.FilePath()
-	} else {
-		valueMsg.Data = sw.Buffer()
+
+	// Large value path: we managed to read more than threshold bytes, which means
+	// the value length exceeds the small-value threshold.
+	if n > s.threshold {
+		// Combine the bytes we already read with the remaining reader and write via the segment manager
+		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
+		filePath, err := s.segmentManager.Write(key, multiReader)
+		if err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
+			return err
+		}
+
+		valueMsg := &pb.ValueMessage{
+			FilePath: filePath,
+			Expiry:   expiry,
+		}
+		val, err := proto.Marshal(valueMsg)
+		if err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
+			return err
+		}
+		return s.putLow(key, val)
 	}
-	valueMsg.Expiry = expiry
+
+	// Small value: we have read the entire value into firstChunk[:n]
+	smallValue := firstChunk[:n]
+
+	valueMsg := &pb.ValueMessage{
+		Data:   smallValue,
+		Expiry: expiry,
+	}
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 		return err
 	}
-
-	ts := generateTimestamp()
-	if err := s.putLow(key, val, ts); err != nil {
-		return err
-	}
-
-	if !sw.UsedFile() {
-		sw.Close() // only now return buffer to pool for small objects
-	}
-
-	return nil
+	return s.putLow(key, val)
 }
 
 // putLow stores the key-value pair in the database
-func (s *Storage) putLow(key string, val []byte, ts []byte) error {
-	wo := grocksdb.NewDefaultWriteOptions()
-	return s.db.Put(wo, []byte(key), val) // Use standard Put, ignore ts
-}
+func (s *Storage) putLow(key string, val []byte) error {
+	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
-func generateTimestamp() []byte {
-	// Use 8-byte big-endian encoding for optimal RocksDB timestamp compatibility
-	ts := time.Now().UnixNano()
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(ts))
-	return buf
+	wo := grocksdb.NewDefaultWriteOptions()
+	return s.db.Put(wo, []byte(key), val)
 }
