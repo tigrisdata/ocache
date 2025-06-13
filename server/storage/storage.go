@@ -67,7 +67,7 @@ func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
 		return nil, err
 	}
 
-	segmentManager, err := NewSegmentManager(diskPath, DefaultSegmentSize)
+	segmentManager, err := NewSegmentManager(diskPath, DefaultSegmentSize, db)
 	if err != nil {
 		return nil, err
 	}

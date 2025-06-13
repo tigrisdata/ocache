@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	grocksdb "github.com/linxGnu/grocksdb"
 	"golang.org/x/sys/unix"
 )
 
@@ -57,7 +58,7 @@ type SegmentManager struct {
 }
 
 // NewSegmentManager creates a new segment manager
-func NewSegmentManager(basePath string, segmentSize int64) (*SegmentManager, error) {
+func NewSegmentManager(basePath string, segmentSize int64, db *grocksdb.DB) (*SegmentManager, error) {
 	segmentsPath := filepath.Join(basePath, "segments")
 	rawFilesPath := filepath.Join(basePath, "raw_files")
 
@@ -65,7 +66,7 @@ func NewSegmentManager(basePath string, segmentSize int64) (*SegmentManager, err
 		return nil, fmt.Errorf("failed to create segment directory: %w", err)
 	}
 
-	rawWriter, err := NewRawWriter(rawFilesPath)
+	rawWriter, err := NewRawWriter(rawFilesPath, db)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create raw writer: %w", err)
 	}

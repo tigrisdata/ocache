@@ -6,6 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+
+	grocksdb "github.com/linxGnu/grocksdb"
+	zlog "github.com/rs/zerolog/log"
 )
 
 // RawWriter manages all raw files in the raw directory
@@ -15,10 +19,11 @@ type RawWriter struct {
 	fileLocks sync.Map
 	// Global mutex only for directory operations
 	dirMu sync.RWMutex
+	db    *grocksdb.DB // RocksDB handle for raw-index entries
 }
 
 // NewRawWriter creates a new RawWriter for managing raw files
-func NewRawWriter(rawFilesPath string) (*RawWriter, error) {
+func NewRawWriter(rawFilesPath string, db *grocksdb.DB) (*RawWriter, error) {
 	// Create the raw files directory if it doesn't exist
 	if err := os.MkdirAll(rawFilesPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create raw files directory: %w", err)
@@ -26,6 +31,7 @@ func NewRawWriter(rawFilesPath string) (*RawWriter, error) {
 
 	return &RawWriter{
 		rawFilesPath: rawFilesPath,
+		db:           db,
 	}, nil
 }
 
@@ -55,6 +61,22 @@ func (rw *RawWriter) Write(key string, reader io.Reader) (string, error) {
 		// Clean up the file if write fails
 		os.Remove(filePath)
 		return "", fmt.Errorf("failed to write value to raw file: %w", err)
+	}
+
+	// Record entry in RocksDB raw index for future compaction
+	if rw.db != nil {
+		ts := time.Now().UnixNano()
+		idxKey := fmt.Sprintf("!raw/%020d|%s", ts, key)
+		var size int64
+		if fi, err := file.Stat(); err == nil {
+			size = fi.Size()
+		}
+		idxVal := fmt.Sprintf("%s|%d", filePath, size)
+		wo := grocksdb.NewDefaultWriteOptions()
+		if err := rw.db.Put(wo, []byte(idxKey), []byte(idxVal)); err != nil {
+			// Failure to index should not make the write fail
+			zlog.Error().Err(err).Str("key", key).Msg("rawWriter: failed to put raw index")
+		}
 	}
 
 	return filePath, nil
