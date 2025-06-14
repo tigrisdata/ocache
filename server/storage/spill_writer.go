@@ -24,7 +24,8 @@ func newSpillWriter(threshold int, diskPath string, key string) *spillWriter {
 	// Create a sharded directory structure based on the key
 	shardDir := shardPath(diskPath, key)
 
-	buf := GetBuffer()
+	buf, release := AcquireBuffer(1 << 20) // 1 MiB
+	defer release()
 	return &spillWriter{threshold: threshold, diskPath: shardDir, buffer: buf[:0]}
 }
 

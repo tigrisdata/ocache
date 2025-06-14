@@ -11,8 +11,11 @@ import (
 	"sync"
 	"time"
 
+	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/cache_service/proto"
 	"golang.org/x/sys/unix"
+
+	sf "github.com/tigrisdata/cache_service/server/storage/segmentfile"
 )
 
 const (
@@ -21,19 +24,11 @@ const (
 	LargeSegmentSize   = 1 << 32 // 4GB
 	DefaultSegmentSize = LargeSegmentSize
 
-	// Header format:
-	// - 4 bytes: value length (uint32)
-	// - 8 bytes: timestamp (int64)
-	// - 4 bytes: key length (uint32)
-	// - N bytes: key
-	HeaderSize = 16 // Minimum header size without key
-
-	// Footer V1 layout (20 bytes total):
-	//   0..7   : ASCII magic "SEGEOF01"
-	//   8..11  : uint32 number of entries in segment
-	//   12..19 : uint64 total value bytes
-	SegmentFooterMagic = "SEGEOF01" // 8-byte ASCII marker + version
-	SegmentFooterSize  = 8 + 4 + 8  // 20 bytes fixed size
+	// Re-export constants from segmentfile so callers of storage package don't
+	// need to import segmentfile directly.
+	HeaderSize         = sf.HeaderSize
+	SegmentFooterMagic = sf.SegmentFooterMagic
+	SegmentFooterSize  = sf.SegmentFooterSize
 
 	// Default compaction thresholds
 	DefaultCompactionMaxFiles               = 100
@@ -68,39 +63,15 @@ type SegmentManager struct {
 	rawManager   *RawFileManager
 }
 
-// streamReader implements io.ReadCloser over a fixed range of a file using
-// position-independent ReadAt so that concurrent reads on the same *os.File
-// don't contend on the descriptor offset.
-type streamReader struct {
-	f    *os.File
-	off  int64 // current read offset in the file
-	left int64 // bytes left to serve
+// RegisterSegment implements segmentfile.Registry allowing helper code to add
+// new segments without poking into internal maps externally.
+func (sm *SegmentManager) RegisterSegment(path string, entries uint32, bytes int64) {
+	seg := &Segment{path: path, entries: entries, dataBytes: int64(bytes), position: int64(bytes)}
+	sm.mu.Lock()
+	sm.segments = append(sm.segments, seg)
+	sm.segMap[path] = seg
+	sm.mu.Unlock()
 }
-
-// Read implements io.Reader. It is position-independent and can be used concurrently
-// on the same *os.File.
-func (sr *streamReader) Read(p []byte) (int, error) {
-	if sr.left == 0 {
-		return 0, io.EOF
-	}
-	if int64(len(p)) > sr.left {
-		p = p[:sr.left]
-	}
-	n, err := sr.f.ReadAt(p, sr.off)
-	sr.off += int64(n)
-	sr.left -= int64(n)
-	if err == io.EOF && sr.left > 0 {
-		// unexpected EOF – treat as error
-		return n, err
-	}
-	if sr.left == 0 {
-		return n, io.EOF
-	}
-	return n, err
-}
-
-// Close implements io.Closer. It is a no-op.
-func (sr *streamReader) Close() error { return nil }
 
 // NewSegmentManager creates a new segment manager
 func NewSegmentManager(basePath string, segmentSize int64) (*SegmentManager, error) {
@@ -108,12 +79,14 @@ func NewSegmentManager(basePath string, segmentSize int64) (*SegmentManager, err
 	rawFilesPath := filepath.Join(basePath, "raw_files")
 
 	if err := os.MkdirAll(segmentsPath, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create segment directory: %w", err)
+		zlog.Error().Err(err).Str("path", segmentsPath).Msg("failed to create segment directory")
+		return nil, wrap("failed to create segment directory", segmentsPath, err)
 	}
 
-	rawWriter, err := NewRawFileManager(rawFilesPath)
+	rawWriter, err := NewRawFileManager(rawFilesPath, segmentSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create raw writer: %w", err)
+		zlog.Error().Err(err).Str("path", rawFilesPath).Msg("failed to create raw writer")
+		return nil, wrap("failed to create raw writer", rawFilesPath, err)
 	}
 
 	sm := &SegmentManager{
@@ -126,6 +99,7 @@ func NewSegmentManager(basePath string, segmentSize int64) (*SegmentManager, err
 
 	// Load existing segments
 	if err := sm.loadSegments(); err != nil {
+		zlog.Error().Err(err).Str("path", sm.segmentsPath).Msg("failed to load segments")
 		return nil, err
 	}
 
@@ -145,7 +119,7 @@ func (sm *SegmentManager) WriteValue(key string, reader io.Reader) (string, erro
 // external data is referenced.
 func (sm *SegmentManager) ReadValue(vm *pb.ValueMessage) (io.ReadCloser, error) {
 	if vm == nil {
-		return nil, fmt.Errorf("nil ValueMessage")
+		return nil, wrap("nil ValueMessage", "", nil)
 	}
 
 	// If the value is stored in a segment, return a reader for the segment slice
@@ -166,16 +140,16 @@ func (sm *SegmentManager) ReadValue(vm *pb.ValueMessage) (io.ReadCloser, error) 
 func (sm *SegmentManager) readSlice(segPath string, offset, length int64) (io.ReadCloser, error) {
 	seg := sm.segMap[segPath]
 	if seg == nil {
-		return nil, fmt.Errorf("segment not found: %s", segPath)
+		return nil, wrap("segment not found", segPath, nil)
 	}
 
-	// Fast path: if mmap present we can serve directly without syscalls
+	// Fast path: mmap slice
 	if seg.mmap != nil && offset+length <= int64(len(seg.mmap)) {
 		slice := seg.mmap[offset : offset+length]
 		return io.NopCloser(bytes.NewReader(slice)), nil
 	}
 
-	// Otherwise fall back to ReadAt via streamReader
+	// Ensure file handle ready
 	seg.mu.Lock()
 	if seg.file == nil {
 		ro, err := os.Open(seg.path)
@@ -188,14 +162,14 @@ func (sm *SegmentManager) readSlice(segPath string, offset, length int64) (io.Re
 	f := seg.file
 	seg.mu.Unlock()
 
-	return &streamReader{f: f, off: offset, left: length}, nil
+	return io.NopCloser(io.NewSectionReader(f, offset, length)), nil
 }
 
 // loadSegments loads existing segments from disk
 func (sm *SegmentManager) loadSegments() error {
 	entries, err := os.ReadDir(sm.segmentsPath)
 	if err != nil {
-		return fmt.Errorf("failed to read segment directory: %w", err)
+		return wrap("failed to read segment directory", sm.segmentsPath, err)
 	}
 
 	var openSegs []*Segment
@@ -208,13 +182,13 @@ func (sm *SegmentManager) loadSegments() error {
 		path := filepath.Join(sm.segmentsPath, entry.Name())
 		file, err := os.OpenFile(path, os.O_RDWR, 0o644)
 		if err != nil {
-			return fmt.Errorf("failed to open segment %s: %w", entry.Name(), err)
+			return wrap("failed to open segment", entry.Name(), err)
 		}
 
 		stat, err := file.Stat()
 		if err != nil {
 			file.Close()
-			return fmt.Errorf("failed to stat segment %s: %w", entry.Name(), err)
+			return wrap("failed to stat segment", entry.Name(), err)
 		}
 
 		segment := &Segment{
@@ -251,7 +225,7 @@ func (sm *SegmentManager) loadSegments() error {
 		// Open segment – needs validation/truncation
 		if err := sm.validateOpenSegment(segment); err != nil {
 			file.Close()
-			return fmt.Errorf("failed to validate open segment %s: %w", entry.Name(), err)
+			return wrap("failed to validate open segment", entry.Name(), err)
 		}
 		openSegs = append(openSegs, segment)
 		sm.segments = append(sm.segments, segment)
@@ -295,12 +269,12 @@ func (sm *SegmentManager) validateOpenSegment(seg *Segment) error {
 			break
 		}
 		if err != nil && err != io.EOF {
-			return fmt.Errorf("read header: %w", err)
+			return wrap("read header", seg.path, err)
 		}
 		if n < headerFixed {
 			// incomplete header – truncate
 			if err := seg.file.Truncate(pos); err != nil {
-				return fmt.Errorf("truncate incomplete header: %w", err)
+				return wrap("truncate incomplete header", seg.path, err)
 			}
 			break
 		}
@@ -311,7 +285,7 @@ func (sm *SegmentManager) validateOpenSegment(seg *Segment) error {
 		// Check that header values are reasonable
 		if valLen < 0 || keyLen < 0 || keyLen > 1<<20 { // arbitrary 1MB key limit
 			if err := seg.file.Truncate(pos); err != nil {
-				return fmt.Errorf("truncate invalid header: %w", err)
+				return wrap("truncate invalid header", seg.path, err)
 			}
 			break
 		}
@@ -322,7 +296,7 @@ func (sm *SegmentManager) validateOpenSegment(seg *Segment) error {
 		// Ensure we have full entry in file
 		if nextPos > seg.size {
 			if err := seg.file.Truncate(pos); err != nil {
-				return fmt.Errorf("truncate partial entry: %w", err)
+				return wrap("truncate partial entry", seg.path, err)
 			}
 			break
 		}
@@ -352,12 +326,16 @@ func (sm *SegmentManager) WriteToSegment(key string, filePath string) (string, i
 	// Determine value length first (stat the raw file)
 	info, err := os.Stat(filePath)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("stat raw file: %w", err)
+		return "", 0, 0, wrap("stat raw file", filePath, err)
 	}
 	valueLen := info.Size()
 
-	// Total bytes we will add = header + value
-	needed := int64(HeaderSize+len(key)) + valueLen
+	// Build header via helper so format defined in one place
+	header := sf.BuildHeader(key, valueLen)
+	headerSize := int64(len(header))
+
+	// Total bytes to add
+	needed := headerSize + valueLen
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -368,16 +346,6 @@ func (sm *SegmentManager) WriteToSegment(key string, filePath string) (string, i
 		return "", 0, 0, err
 	}
 
-	// Prepare header
-	header := make([]byte, HeaderSize+len(key))
-	binary.BigEndian.PutUint32(header[0:4], uint32(valueLen))
-	binary.BigEndian.PutUint64(header[4:12], uint64(time.Now().UnixNano()))
-	binary.BigEndian.PutUint32(header[12:16], uint32(len(key)))
-	copy(header[16:], []byte(key))
-
-	segment.mu.Lock()
-	defer segment.mu.Unlock()
-
 	// Offset where this value will be written inside the segment
 	startOffset := segment.position
 
@@ -385,28 +353,28 @@ func (sm *SegmentManager) WriteToSegment(key string, filePath string) (string, i
 		// Fast path: copy into mmap
 		copy(segment.mmap[segment.position:], header)
 
-		dst := segment.mmap[segment.position+int64(len(header)) : segment.position+needed]
+		dst := segment.mmap[segment.position+headerSize : segment.position+needed]
 		src, err := os.Open(filePath)
 		if err != nil {
-			return "", 0, 0, fmt.Errorf("open raw file: %w", err)
+			return "", 0, 0, wrap("open raw file", filePath, err)
 		}
 		defer src.Close()
 
 		if _, err := io.ReadFull(src, dst); err != nil {
-			return "", 0, 0, fmt.Errorf("read raw into mmap: %w", err)
+			return "", 0, 0, wrap("read raw into mmap", filePath, err)
 		}
 	} else {
 		// Fallback to normal write
 		if _, err := segment.file.Write(header); err != nil {
-			return "", 0, 0, fmt.Errorf("failed to write header: %w", err)
+			return "", 0, 0, wrap("failed to write header", filePath, err)
 		}
 		src, err := os.Open(filePath)
 		if err != nil {
-			return "", 0, 0, fmt.Errorf("open raw file: %w", err)
+			return "", 0, 0, wrap("open raw file", filePath, err)
 		}
 		defer src.Close()
 		if _, err := io.Copy(segment.file, src); err != nil {
-			return "", 0, 0, fmt.Errorf("copy value to segment: %w", err)
+			return "", 0, 0, wrap("copy value to segment", filePath, err)
 		}
 	}
 
@@ -453,10 +421,7 @@ func (sm *SegmentManager) finalizeSegment(seg *Segment) error {
 	}
 
 	// Build footer [magic|entries|bytes]
-	footer := make([]byte, SegmentFooterSize)
-	copy(footer[0:8], []byte(SegmentFooterMagic))
-	binary.BigEndian.PutUint32(footer[8:12], seg.entries)
-	binary.BigEndian.PutUint64(footer[12:20], uint64(seg.dataBytes))
+	footer := sf.BuildFooter(seg.entries, seg.dataBytes)
 
 	if seg.mmap != nil {
 		copy(seg.mmap[seg.position:], footer)
@@ -470,17 +435,17 @@ func (sm *SegmentManager) finalizeSegment(seg *Segment) error {
 		_ = seg.file.Truncate(seg.position)
 	} else {
 		if _, err := seg.file.Write(footer); err != nil {
-			return fmt.Errorf("failed to write segment footer: %w", err)
+			return wrap("failed to write segment footer", seg.path, err)
 		}
 		seg.position += int64(len(footer))
 	}
 
 	// Flush and close the R/W file descriptor
 	if err := seg.file.Sync(); err != nil {
-		return fmt.Errorf("failed to sync segment: %w", err)
+		return wrap("failed to sync segment", seg.path, err)
 	}
 	if err := seg.file.Close(); err != nil {
-		return fmt.Errorf("failed to close segment: %w", err)
+		return wrap("failed to close segment", seg.path, err)
 	}
 
 	// Reopen read-only cached descriptor
@@ -497,7 +462,7 @@ func (sm *SegmentManager) createNewSegment() (*Segment, error) {
 	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create segment file: %w", err)
+		return nil, wrap("failed to create segment file", path, err)
 	}
 
 	segment := &Segment{
@@ -509,7 +474,7 @@ func (sm *SegmentManager) createNewSegment() (*Segment, error) {
 	// Ensure mmap ready for fast writes
 	if err := segment.initMmap(sm.segmentSize); err != nil {
 		segment.file.Close()
-		return nil, fmt.Errorf("mmap segment: %w", err)
+		return nil, wrap("mmap segment", path, err)
 	}
 
 	sm.segments = append(sm.segments, segment)
@@ -525,15 +490,15 @@ func (seg *Segment) initMmap(segmentSize int64) error {
 		return nil
 	}
 	if seg.file == nil {
-		return fmt.Errorf("segment file is nil while attempting mmap")
+		return wrap("segment file is nil while attempting mmap", seg.path, nil)
 	}
 	// Enlarge file to full segment size so mapping length is fixed.
 	if err := seg.file.Truncate(segmentSize); err != nil {
-		return fmt.Errorf("truncate for mmap: %w", err)
+		return wrap("truncate for mmap", seg.path, err)
 	}
 	buf, err := unix.Mmap(int(seg.file.Fd()), 0, int(segmentSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {
-		return fmt.Errorf("mmap: %w", err)
+		return wrap("mmap", seg.path, err)
 	}
 	seg.mmap = buf
 	return nil
@@ -583,7 +548,9 @@ func (sm *SegmentManager) Close() error {
 
 	for _, segment := range sm.segments {
 		if err := segment.file.Close(); err != nil {
-			return fmt.Errorf("failed to close segment %s: %w", segment.path, err)
+			// Ignore errors when closing segments.
+			zlog.Error().Err(err).Str("path", segment.path).Msg("failed to close segment")
+			continue
 		}
 	}
 	return nil

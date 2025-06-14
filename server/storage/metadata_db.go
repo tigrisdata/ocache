@@ -22,6 +22,10 @@ func initMetaDB(diskPath string, ttl int) (*grocksdb.DB, error) {
 		return nil, err
 	}
 
+	// Cache the instance globally so future callers (e.g., RawFileManager) get a
+	// valid handle instead of nil and won't crash when they attempt to use it.
+	metaDB = db
+
 	return db, nil
 }
 

@@ -137,6 +137,7 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 	err = proto.Unmarshal(v, valueMsg)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage")
+		s.DeleteKey(key)
 		return nil, false, err
 	}
 
@@ -147,17 +148,18 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		return nil, false, nil
 	}
 
-	// Try to read from segment or raw file
+	// Try to read from small value
+	if len(valueMsg.Data) > 0 {
+		return bytes.NewReader(valueMsg.Data), true, nil
+	}
+
+	// Try to read from segment or raw file (large value)
 	if r, err := s.segmentManager.ReadValue(valueMsg); err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read large value")
+		s.DeleteKey(key)
 		return nil, false, err
 	} else if r != nil {
 		return r, true, nil
-	}
-
-	// If we are here, we have a small value in the ValueMessage
-	if len(valueMsg.Data) > 0 {
-		return bytes.NewReader(valueMsg.Data), true, nil
 	}
 
 	return nil, false, nil
@@ -171,8 +173,8 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	if firstReadSize <= 0 {
 		firstReadSize = 1 // ensure at least 1
 	}
-	firstChunk := GetSizedBuffer(firstReadSize)
-	defer PutSizedBuffer(firstChunk)
+	firstChunk, release := AcquireBuffer(firstReadSize)
+	defer release()
 
 	// Read up to firstReadSize bytes. io.ReadFull returns ErrUnexpectedEOF when the
 	// value is smaller than firstReadSize – that is fine, we still get the bytes read.

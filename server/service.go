@@ -102,8 +102,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 
 	// Seek to start if possible
 	if start > 0 {
-		buf := stor.GetBuffer()
-		defer stor.PutBuffer(buf[:0])
+		buf, release := stor.AcquireBuffer(1 << 20) // 1 MiB
+		defer release()
 		if seeker, ok := r.(io.Seeker); ok {
 			_, err := seeker.Seek(start, io.SeekStart)
 			if err != nil {
@@ -128,8 +128,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		}
 	}
 
-	buf := stor.GetBuffer()
-	defer stor.PutBuffer(buf[:0])
+	buf, release := stor.AcquireBuffer(1 << 20) // 1 MiB
+	defer release()
 	var toRead int64 = -1
 	if end > 0 && end > start {
 		toRead = end - start
