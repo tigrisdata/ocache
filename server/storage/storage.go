@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -58,16 +59,19 @@ func InitStorage(diskPath string, ttl int, threshold int) {
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
 func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetCreateIfMissing(true)
+	// Create the metadata DB directory if it doesn't exist
+	if err := os.MkdirAll(diskPath, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
 
-	dbPath := diskPath + "/rocksdb"
-	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)
+	// Initialize the metadata DB
+	db, err := initMetaDB(diskPath, ttl)
 	if err != nil {
 		return nil, err
 	}
 
-	segmentManager, err := NewSegmentManager(diskPath, DefaultSegmentSize, db)
+	// Initialize the segment manager
+	segmentManager, err := NewSegmentManager(diskPath, DefaultSegmentSize)
 	if err != nil {
 		return nil, err
 	}
@@ -109,17 +113,6 @@ func (s *Storage) ListKeys() ([]string, error) {
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) {
 	wo := grocksdb.NewDefaultWriteOptions()
-	ro := grocksdb.NewDefaultReadOptions()
-	slice, err := s.db.Get(ro, []byte(key))
-	if err != nil || !slice.Exists() {
-		return
-	}
-	v := slice.Data()
-	slice.Free()
-	if len(v) > 2 && v[1] == '|' && v[0] == 'L' {
-		// large object on disk
-		os.Remove(string(v[2:]))
-	}
 	s.db.Delete(wo, []byte(key))
 }
 
@@ -153,17 +146,20 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		s.DeleteKey(key)
 		return nil, false, nil
 	}
-	if valueMsg.FilePath != "" {
-		f, err := os.Open(valueMsg.FilePath)
-		if err != nil {
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to open file from proto")
-			return nil, false, err
-		}
-		return f, true, nil
+
+	// Try to read from segment or raw file
+	if r, err := s.segmentManager.ReadValue(valueMsg); err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read large value")
+		return nil, false, err
+	} else if r != nil {
+		return r, true, nil
 	}
+
+	// If we are here, we have a small value in the ValueMessage
 	if len(valueMsg.Data) > 0 {
 		return bytes.NewReader(valueMsg.Data), true, nil
 	}
+
 	return nil, false, nil
 }
 
@@ -197,15 +193,15 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	if n > s.threshold {
 		// Combine the bytes we already read with the remaining reader and write via the segment manager
 		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
-		filePath, err := s.segmentManager.Write(key, multiReader)
+		filePath, err := s.segmentManager.WriteValue(key, multiReader)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
 			return err
 		}
 
 		valueMsg := &pb.ValueMessage{
-			FilePath: filePath,
-			Expiry:   expiry,
+			RawFilePath: filePath,
+			Expiry:      expiry,
 		}
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {

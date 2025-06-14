@@ -71,5 +71,8 @@ message ListResponse {
 message ValueMessage {
   bytes data = 1; // The actual value bytes
   int64 expiry = 2; // Expiry timestamp (unix seconds), 0 if no expiry
-  string file_path = 3; // Optional: file path for large objects (if used)
+  string raw_file_path = 3; // Optional: raw file path for large objects (if used)
+  string segment_path = 4; // Optional: segment file storing the value for large objects (if used)
+  int64 segment_offset = 5; // Byte offset within the segment where the value starts
+  int64 value_length = 6; // Length of the value in bytes within the segment
 }
