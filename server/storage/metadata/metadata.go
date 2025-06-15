@@ -4,11 +4,20 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 )
 
-var metaDB *grocksdb.DB
+type MetaDB struct {
+	handle *grocksdb.DB
+}
 
-// InitMetaDB initializes the global metadata DB. It should be called exactly
+// Handle returns the underlying RocksDB handle.
+func (m *MetaDB) Handle() *grocksdb.DB {
+	return m.handle
+}
+
+var metaDB *MetaDB
+
+// NewMetaDB initializes the global metadata DB. It should be called exactly
 // once during Storage initialization.
-func InitMetaDB(diskPath string, ttl int) (*grocksdb.DB, error) {
+func NewMetaDB(diskPath string, ttl int) (*MetaDB, error) {
 	if metaDB != nil {
 		return metaDB, nil
 	}
@@ -22,12 +31,10 @@ func InitMetaDB(diskPath string, ttl int) (*grocksdb.DB, error) {
 		return nil, err
 	}
 
-	// Cache the instance globally so future callers (e.g., RawFileManager) get a
-	// valid handle instead of nil and won't crash when they attempt to use it.
-	metaDB = db
+	metaDB = &MetaDB{handle: db}
 
-	return db, nil
+	return metaDB, nil
 }
 
 // GetMetaDB returns the global RocksDB instance used for metadata operations.
-func GetMetaDB() *grocksdb.DB { return metaDB }
+func GetMetaDB() *MetaDB { return metaDB }

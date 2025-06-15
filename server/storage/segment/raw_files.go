@@ -1,32 +1,24 @@
 package segment
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
-	"time"
 
-	pb "github.com/tigrisdata/cache_service/proto"
 	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
-	"github.com/tigrisdata/cache_service/server/storage/metadata"
 	"github.com/tigrisdata/cache_service/server/utils"
 
-	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
-	"google.golang.org/protobuf/proto"
 )
 
 // RawFileManager manages all raw files in the raw directory
 type RawFileManager struct {
-	rawFilesPath string       // path to the raw files directory
-	fileLocks    sync.Map     // map of mutexes for individual files
-	db           *grocksdb.DB // RocksDB handle for raw-index entries
-	segmentSize  int64        // configured segment size used for promotion heuristics
+	rawFilesPath string   // path to the raw files directory
+	fileLocks    sync.Map // map of mutexes for individual files
+	segmentSize  int64    // configured segment size used for promotion heuristics
 }
 
 // rawFileReadCloser wraps a Reader and closes the underlying file while
@@ -53,7 +45,6 @@ func NewRawFileManager(rawFilesPath string, segmentSize int64) (*RawFileManager,
 
 	return &RawFileManager{
 		rawFilesPath: rawFilesPath,
-		db:           metadata.GetMetaDB(),
 		segmentSize:  segmentSize,
 	}, nil
 }
@@ -122,22 +113,9 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 	_ = file.Sync()
 
 	// --------------------------------------------------------------------
-	// 4. Record entry in RocksDB raw index for future compaction
+	// 4. Record entry in Compactor for future compaction
 	// --------------------------------------------------------------------
-	ts := time.Now().UnixNano()
-	idxKey := fmt.Sprintf("!raw/%020d|%s", ts, key)
-	var size int64
-	if fi, err := file.Stat(); err == nil {
-		size = fi.Size()
-	}
-	idxVal := fmt.Sprintf("%s|%d", filePath, size)
-	wo := grocksdb.NewDefaultWriteOptions()
-	if err := rw.db.Put(wo, []byte(idxKey), []byte(idxVal)); err != nil {
-		// Failure to index should not make the write fail
-		zlog.Error().Err(err).Str("key", key).Msg("rawWriter: failed to put raw index")
-	} else {
-		zlog.Debug().Str("key", key).Msg("rawWriter: indexed raw file in RocksDB")
-	}
+	RecordEntryForCompaction(key, filePath, bytesWritten)
 
 	zlog.Debug().Str("key", key).Str("path", filePath).Int64("bytes", bytesWritten).Msg("rawWriter: completed write")
 	return filePath, nil
@@ -201,174 +179,4 @@ func (rw *RawFileManager) Remove(filePath string) error {
 	rw.fileLocks.Delete(filePath)
 	zlog.Debug().Str("path", filePath).Msg("rawWriter: deleted raw file")
 	return nil
-}
-
-// CompactToSegments scans the RocksDB raw index and moves raw files into the
-// provided SegmentManager. It deletes index rows after successful copy and
-// removes the raw files. The compaction in a single run stops when
-// maxBytes bytes have been migrated.
-func (rw *RawFileManager) CompactToSegments(sm *Manager, maxBytes int64, flushBytes int64) {
-	zlog.Info().Int64("maxBytes", maxBytes).Int64("flushBytes", flushBytes).Msg("rawWriter: starting compaction")
-
-	ro := grocksdb.NewDefaultReadOptions()
-	ro.SetPrefixSameAsStart(true)
-	it := rw.db.NewIterator(ro)
-	defer it.Close()
-
-	wo := grocksdb.NewDefaultWriteOptions()
-	batch := grocksdb.NewWriteBatch()
-	processed := 0
-	var bytesMigrated, bytesToFlush int64
-
-	rawPrefix := []byte("!raw/")
-	for it.Seek(rawPrefix); it.ValidForPrefix(rawPrefix); it.Next() {
-		k := it.Key().Data()
-		v := it.Value().Data()
-
-		userKey, filePath, fileSize, ok := parseRawIndexRow(k, v)
-		if !ok {
-			continue
-		}
-
-		// Load current metadata for the user key
-		slice, err := rw.db.Get(ro, []byte(userKey))
-		if err != nil {
-			zlog.Error().Err(err).Str("key", userKey).Msg("rawWriter compaction: db.Get error")
-			continue
-		}
-
-		metadataFound := slice.Exists()
-		vm := &pb.ValueMessage{}
-		if metadataFound {
-			if err := proto.Unmarshal(slice.Data(), vm); err != nil {
-				metadataFound = false
-			}
-		}
-
-		var (
-			bytesMoved int64
-			promoted   bool
-			promErr    error
-		)
-		if metadataFound {
-			// Attempt zero-copy promotion first; fall back to copy otherwise.
-			promoted, bytesMoved, promErr = rw.promoteLargeRaw(sm, userKey, filePath, fileSize, vm)
-			if promErr != nil {
-				zlog.Error().Err(promErr).Str("key", userKey).Msg("rawWriter compaction: promotion failed, falling back to copy")
-				promoted = false
-			}
-
-			if !promoted {
-				bytesMoved, promErr = rw.copyRawIntoSegment(sm, userKey, filePath, vm)
-				if promErr != nil {
-					zlog.Error().Err(promErr).Str("key", userKey).Msg("rawWriter compaction: copy failed")
-					slice.Free()
-					continue
-				}
-			}
-
-			// Update metadata if present.
-			if data, err := proto.Marshal(vm); err == nil {
-				batch.Put([]byte(userKey), data)
-			}
-
-		}
-
-		// Regardless of metadata presence, remove the raw file as it is no longer needed.
-		rw.Remove(filePath)
-
-		// Release slice as early as possible.
-		slice.Free()
-
-		// Remove the index row.
-		batch.Delete(k)
-
-		processed++
-		bytesMigrated += bytesMoved
-		bytesToFlush += bytesMoved
-
-		// Flush intermediate batch when threshold reached
-		if bytesToFlush >= flushBytes {
-			_ = rw.db.Write(wo, batch)
-			batch.Clear()
-			bytesToFlush = 0
-
-			zlog.Debug().Int("processed", processed).Int64("bytes", bytesMigrated).Msg("rawWriter compaction: batch flushed")
-			if bytesMigrated >= maxBytes {
-				break
-			}
-		}
-	}
-
-	// flush any remaining data
-	if batch.Count() > 0 {
-		_ = rw.db.Write(wo, batch)
-	}
-
-	zlog.Info().Int("migrated", processed).Int64("bytes", bytesMigrated).Dur("duration", time.Since(time.Now())).Msg("rawWriter: compaction finished")
-}
-
-// parseRawIndexRow extracts the userKey, filePath and size from RocksDB raw index
-// key/value pairs. It returns ok=false when the row does not follow the expected
-// format so that the caller can skip it quietly.
-func parseRawIndexRow(k, v []byte) (userKey, filePath string, fileSize int64, ok bool) {
-	// Key format: !raw/<ts>|<userKey>
-	pipeIdx := bytes.IndexByte(k, '|')
-	if pipeIdx <= 0 {
-		return
-	}
-	userKey = string(k[pipeIdx+1:])
-
-	// Value format: <filePath>|<size>
-	parts := bytes.SplitN(v, []byte("|"), 2)
-	if len(parts) < 1 {
-		return
-	}
-	filePath = string(parts[0])
-	if len(parts) == 2 {
-		if sz, err := strconv.ParseInt(string(parts[1]), 10, 64); err == nil {
-			fileSize = sz
-		}
-	}
-	ok = true
-	return
-}
-
-// promoteLargeRaw attempts to convert the raw file into a one-entry segment by
-// appending the footer and renaming it. It returns promoted=true on success.
-func (rw *RawFileManager) promoteLargeRaw(sm *Manager, userKey, filePath string, fileSize int64, vm *pb.ValueMessage) (promoted bool, valueBytes int64, err error) {
-	// Require the file to be sufficiently big to justify promotion.
-	if fileSize < rw.segmentSize*9/10 {
-		return false, 0, nil // too small – fall back
-	}
-
-	// Use helper from segmentfile which also registers the segment.
-	newPath, headerSize, valueLen, err := PromoteRawFile(filePath, sm.segmentsPath, userKey, fileSize, sm)
-	if err != nil {
-		return false, 0, err
-	}
-
-	// ValueMessage update.
-	vm.RawFilePath = ""
-	vm.SegmentPath = newPath
-	vm.SegmentOffset = headerSize
-	vm.ValueLength = valueLen
-
-	return true, valueLen, nil
-}
-
-// copyRawIntoSegment copies the raw file into an open segment using the
-// existing segment pipeline and updates the ValueMessage.
-func (rw *RawFileManager) copyRawIntoSegment(sm *Manager, userKey, filePath string, vm *pb.ValueMessage) (copiedBytes int64, err error) {
-	segPath, segOff, segLen, err := sm.WriteToSegment(userKey, filePath)
-	if err != nil {
-		return 0, err
-	}
-
-	vm.RawFilePath = ""
-	vm.SegmentPath = segPath
-	vm.SegmentOffset = segOff
-	vm.ValueLength = segLen
-
-	return segLen, nil
 }

@@ -53,7 +53,6 @@ type Manager struct {
 	segments     []*Segment          // ordered list (oldest→newest)
 	segMap       map[string]*Segment // path → *Segment for O(1) lookup
 	mu           sync.RWMutex
-	compactionCh chan struct{}
 	rawManager   *RawFileManager
 }
 
@@ -86,7 +85,6 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 	sm := &Manager{
 		segmentsPath: segmentsPath,
 		segmentSize:  segmentSize,
-		compactionCh: make(chan struct{}, 1),
 		rawManager:   rawWriter,
 		segMap:       make(map[string]*Segment),
 	}
@@ -512,9 +510,6 @@ func (sm *Manager) compactionLoop() {
 			sm.compactRawFiles()
 		case <-segmentTicker.C:
 			sm.compactSegments()
-		case <-sm.compactionCh:
-			sm.compactRawFiles()
-			sm.compactSegments()
 		}
 	}
 }
@@ -529,10 +524,8 @@ func (sm *Manager) compactSegments() {
 // is removed. The raw file itself is **not** deleted yet – we keep it until the
 // reader path understands segment offsets.
 func (sm *Manager) compactRawFiles() {
-	if sm.rawManager == nil {
-		return
-	}
-	sm.rawManager.CompactToSegments(sm, DefaultCompactionMaxBytes, DefaultCompactionIntermediateFlushBytes)
+	compactor := NewCompactor(sm.rawManager, sm)
+	compactor.CompactRawFiles(DefaultCompactionMaxBytes, DefaultCompactionIntermediateFlushBytes)
 }
 
 // Close closes all segment files

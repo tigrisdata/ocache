@@ -38,7 +38,7 @@ import (
 //
 // On read, expiry is checked (if present) and expired keys are deleted and not returned.
 type Storage struct {
-	db             *grocksdb.DB
+	meta           *metadata.MetaDB
 	diskPath       string           // Path to the disk cache directory
 	threshold      int              // Threshold for small vs large objects
 	segmentManager *segment.Manager // Segment manager for large objects on disk
@@ -68,7 +68,7 @@ func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
 	}
 
 	// Initialize the metadata DB
-	db, err := metadata.InitMetaDB(diskPath, ttl)
+	meta, err := metadata.NewMetaDB(diskPath, ttl)
 	if err != nil {
 		return nil, err
 	}
@@ -79,13 +79,13 @@ func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
 		return nil, err
 	}
 
-	return &Storage{db: db, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager}, nil
+	return &Storage{meta: meta, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager}, nil
 }
 
 // ListKeys returns all keys in the RocksDB instance
 func (s *Storage) ListKeys() ([]string, error) {
 	ro := grocksdb.NewDefaultReadOptions()
-	it := s.db.NewIterator(ro)
+	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
 	var keys []string
@@ -116,14 +116,14 @@ func (s *Storage) ListKeys() ([]string, error) {
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) {
 	wo := grocksdb.NewDefaultWriteOptions()
-	s.db.Delete(wo, []byte(key))
+	s.meta.Handle().Delete(wo, []byte(key))
 }
 
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
 func (s *Storage) Get(key string) (io.Reader, bool, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 
-	slice, err := s.db.Get(ro, []byte(key))
+	slice, err := s.meta.Handle().Get(ro, []byte(key))
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
 		return nil, false, err
@@ -236,5 +236,5 @@ func (s *Storage) putLow(key string, val []byte) error {
 	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
 	wo := grocksdb.NewDefaultWriteOptions()
-	return s.db.Put(wo, []byte(key), val)
+	return s.meta.Handle().Put(wo, []byte(key), val)
 }
