@@ -2,7 +2,6 @@ package segment
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +24,7 @@ const (
 	DefaultSegmentSize = LargeSegmentSize
 
 	// Default compaction thresholds
+	DefaultRawToSegmentPromotionThreshold   = 1 << 30 // 1GB
 	DefaultCompactionMaxFiles               = 100
 	DefaultCompactionMaxBytes               = 1 << 30  // 1GB
 	DefaultCompactionIntermediateFlushBytes = 64 << 20 // 64 MiB
@@ -44,6 +44,9 @@ type Segment struct {
 	// Statistics
 	entries   uint32 // number of key/value pairs stored in this segment
 	dataBytes int64  // total number of bytes occupied by value payloads (not counting headers)
+
+	// Format version of this segment (derived from footer when closed or set when created).
+	version int
 }
 
 // Manager manages the segments on disk.
@@ -56,10 +59,16 @@ type Manager struct {
 	rawManager   *RawFileManager
 }
 
+// Registry is implemented by segment managers that need to be informed when a
+// new segment file is created (e.g. after promotion from a raw file).
+type Registry interface {
+	RegisterSegment(path string, entries uint32, bytes int64)
+}
+
 // RegisterSegment implements segmentfile.Registry allowing helper code to add
 // new segments without poking into internal maps externally.
 func (sm *Manager) RegisterSegment(path string, entries uint32, bytes int64) {
-	seg := &Segment{path: path, entries: entries, dataBytes: int64(bytes), position: int64(bytes)}
+	seg := &Segment{path: path, entries: entries, dataBytes: int64(bytes), position: int64(bytes), version: CurrentSegmentVersion}
 	sm.mu.Lock()
 	sm.segments = append(sm.segments, seg)
 	sm.segMap[path] = seg
@@ -67,7 +76,7 @@ func (sm *Manager) RegisterSegment(path string, entries uint32, bytes int64) {
 }
 
 // NewManager creates a new segment manager
-func NewManager(basePath string, segmentSize int64) (*Manager, error) {
+func NewManager(basePath string) (*Manager, error) {
 	segmentsPath := filepath.Join(basePath, "segments")
 	rawFilesPath := filepath.Join(basePath, "raw_files")
 
@@ -76,7 +85,7 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 		return nil, utils.WrapError("failed to create segment directory", segmentsPath, err)
 	}
 
-	rawWriter, err := NewRawFileManager(rawFilesPath, segmentSize)
+	rawWriter, err := NewRawFileManager(rawFilesPath)
 	if err != nil {
 		zlog.Error().Err(err).Str("path", rawFilesPath).Msg("failed to create raw writer")
 		return nil, utils.WrapError("failed to create raw writer", rawFilesPath, err)
@@ -84,7 +93,7 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 
 	sm := &Manager{
 		segmentsPath: segmentsPath,
-		segmentSize:  segmentSize,
+		segmentSize:  DefaultSegmentSize,
 		rawManager:   rawWriter,
 		segMap:       make(map[string]*Segment),
 	}
@@ -188,16 +197,18 @@ func (sm *Manager) loadSegments() error {
 			size:     stat.Size(),
 			file:     file,
 			position: stat.Size(),
+			version:  CurrentSegmentVersion,
 		}
 
 		// Determine if file has footer
 		if stat.Size() >= int64(SegmentFooterSize) {
 			footer := make([]byte, SegmentFooterSize)
 			if _, err := file.ReadAt(footer, stat.Size()-int64(SegmentFooterSize)); err == nil {
-				if string(footer[0:8]) == SegmentFooterMagic {
+				if ver, ent, bytes, ok := ParseSegmentFooter(footer); ok {
 					// Closed / finalized segment
-					segment.entries = binary.BigEndian.Uint32(footer[8:12])
-					segment.dataBytes = int64(binary.BigEndian.Uint64(footer[12:20]))
+					segment.version = ver
+					segment.entries = ent
+					segment.dataBytes = bytes
 
 					// Close current R/W handle and reopen read-only to cache descriptor
 					file.Close()
@@ -246,43 +257,26 @@ func (sm *Manager) loadSegments() error {
 // validateOpenSegment scans the segment, counts entries, truncates invalid tail, and
 // updates position/statistics. The segment file remains open for further writes.
 func (sm *Manager) validateOpenSegment(seg *Segment) error {
-	const headerFixed = HeaderSize // 16 bytes
-
 	pos := int64(0)
 	entries := uint32(0)
 	dataBytes := int64(0)
-	buf := make([]byte, headerFixed)
 
 	for {
-		// Read fixed part of header
-		n, err := seg.file.ReadAt(buf, pos)
-		if err == io.EOF && n == 0 {
-			// clean EOF
-			break
-		}
-		if err != nil && err != io.EOF {
+		// Read header
+		valLen, headerSize, keyLen, err := ReadValueHeader(seg.file)
+		if err != nil {
 			return utils.WrapError("read header", seg.path, err)
 		}
-		if n < headerFixed {
-			// incomplete header – truncate
-			if err := seg.file.Truncate(pos); err != nil {
-				return utils.WrapError("truncate incomplete header", seg.path, err)
-			}
-			break
-		}
-
-		valLen := int64(binary.BigEndian.Uint32(buf[0:4]))
-		keyLen := int64(binary.BigEndian.Uint32(buf[12:16]))
 
 		// Check that header values are reasonable
-		if valLen < 0 || keyLen < 0 || keyLen > 1<<20 { // arbitrary 1MB key limit
+		if valLen < 0 || keyLen < 0 {
 			if err := seg.file.Truncate(pos); err != nil {
 				return utils.WrapError("truncate invalid header", seg.path, err)
 			}
 			break
 		}
 
-		entryTotal := headerFixed + keyLen + valLen
+		entryTotal := headerSize + valLen
 		nextPos := pos + entryTotal
 
 		// Ensure we have full entry in file
@@ -323,7 +317,7 @@ func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, i
 	valueLen := info.Size()
 
 	// Build header via helper so format defined in one place
-	header := BuildHeader(key, valueLen)
+	header := BuildValueHeader(key, valueLen)
 	headerSize := int64(len(header))
 
 	// Total bytes to add
@@ -413,7 +407,7 @@ func (sm *Manager) finalizeSegment(seg *Segment) error {
 	}
 
 	// Build footer [magic|entries|bytes]
-	footer := BuildFooter(seg.entries, seg.dataBytes)
+	footer := BuildSegmentFooterWithVersion(seg.version, seg.entries, seg.dataBytes)
 
 	if seg.mmap != nil {
 		copy(seg.mmap[seg.position:], footer)
@@ -461,6 +455,7 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 		path:     path,
 		file:     file,
 		position: 0,
+		version:  CurrentSegmentVersion,
 	}
 
 	// Ensure mmap ready for fast writes

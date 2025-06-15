@@ -3,6 +3,8 @@ package segment
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -193,12 +195,12 @@ func parseRawIndexRow(k, v []byte) (userKey, filePath string, fileSize int64, ok
 // by appending a footer and renaming the file. Returns promoted=true on success.
 func (c *Compactor) promoteLargeRaw(userKey, filePath string, fileSize int64, vm *pb.ValueMessage) (promoted bool, valueBytes int64, err error) {
 	// Require the file to be sufficiently big to justify promotion.
-	if fileSize < c.rw.segmentSize*9/10 {
+	if fileSize < DefaultRawToSegmentPromotionThreshold {
 		return false, 0, nil // Too small – fall back.
 	}
 
 	// Use helper from segmentfile which also registers the segment.
-	newPath, headerSize, valueLen, err := PromoteRawFile(filePath, c.sm.segmentsPath, userKey, fileSize, c.sm)
+	newPath, headerSize, valueLen, err := c.promoteRawFileLow(filePath, c.sm.segmentsPath, userKey, fileSize)
 	if err != nil {
 		return false, 0, err
 	}
@@ -226,4 +228,39 @@ func (c *Compactor) copyRawIntoSegment(userKey, filePath string, vm *pb.ValueMes
 	vm.ValueLength = segLen
 
 	return segLen, nil
+}
+
+// promoteRawFileLow converts an existing raw file that already contains
+// [header|payload] into a fully-fledged single-entry segment by appending the
+// footer and atomically renaming the file into destDir. It returns the new
+// segment path, header size (offset of payload) and payload length.
+func (c *Compactor) promoteRawFileLow(rawPath, destDir, userKey string, fileSize int64) (string, int64, int64, error) {
+	valueHeaderSize := CalculateValueHeaderSize(userKey)
+	valueLen := fileSize - valueHeaderSize
+	if valueLen <= 0 {
+		return "", 0, 0, fmt.Errorf("computed negative value length")
+	}
+
+	// Append footer.
+	f, err := os.OpenFile(rawPath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	footer := BuildSegmentFooterWithVersion(CurrentSegmentVersion, 1, valueLen)
+	if _, err := f.Write(footer); err != nil {
+		f.Close()
+		return "", 0, 0, err
+	}
+	_ = f.Sync()
+	_ = f.Close()
+
+	// Generate final path.
+	newPath := filepath.Join(destDir, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
+	if err := os.Rename(rawPath, newPath); err != nil {
+		return "", 0, 0, err
+	}
+
+	c.sm.RegisterSegment(newPath, 1, valueLen)
+
+	return newPath, valueHeaderSize, valueLen, nil
 }

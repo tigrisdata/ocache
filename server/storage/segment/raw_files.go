@@ -1,12 +1,12 @@
 package segment
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
 	"github.com/tigrisdata/cache_service/server/utils"
@@ -14,30 +14,54 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
-// RawFileManager manages all raw files in the raw directory
-type RawFileManager struct {
-	rawFilesPath string   // path to the raw files directory
-	fileLocks    sync.Map // map of mutexes for individual files
-	segmentSize  int64    // configured segment size used for promotion heuristics
-}
+// Default maximum number of open file descriptors kept in fdCache before new
+// acquisitions stop being cached. Chosen conservatively; can be overridden by
+// updating RawFileManager.maxFdCache after construction if needed.
+const defaultFdCacheCapacity = 1024
 
 // rawFileReadCloser wraps a Reader and closes the underlying file while
 // releasing the per-file read lock when Close is invoked.
 type rawFileReadCloser struct {
 	io.Reader
-	f  *os.File
-	mu *sync.RWMutex
+	onClose func()
 }
 
 func (rc *rawFileReadCloser) Close() error {
-	rc.mu.RUnlock()
-	return rc.f.Close()
+	if rc.onClose != nil {
+		rc.onClose()
+	}
+	return nil
 }
 
-// NewRawFileManager creates a new RawFileManager for managing raw files. The
-// segmentSize parameter (borrowed from SegmentManager) is used later to decide
-// whether a raw file can be promoted to a standalone segment without copying.
-func NewRawFileManager(rawFilesPath string, segmentSize int64) (*RawFileManager, error) {
+// headerMeta caches parsed header information so we don't have to read the
+// first 20 bytes on every call.
+type headerMeta struct {
+	valLen     int64
+	headerSize int64
+}
+
+// fileEntry is a wrapper around a file and a lock. It is used to cache file
+// entries and reuse them.
+type fileEntry struct {
+	f    *os.File
+	mu   *sync.RWMutex // existing per–file lock
+	refs int32         // accessed atomically
+}
+
+// RawFileManager manages all raw files in the raw directory
+type RawFileManager struct {
+	rawFilesPath string   // path to the raw files directory
+	fileLocks    sync.Map // map of mutexes for individual files
+
+	fdCache     sync.Map // path -> *fileEntry for FD reuse
+	fdCacheSize int32    // current number of cached entries (atomic)
+	maxFdCache  int      // capacity limit
+
+	headerCache sync.Map // path -> headerMeta
+}
+
+// NewRawFileManager creates a new RawFileManager for managing raw files.
+func NewRawFileManager(rawFilesPath string) (*RawFileManager, error) {
 	// Create the raw files directory if it doesn't exist
 	if err := os.MkdirAll(rawFilesPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create raw files directory: %w", err)
@@ -45,7 +69,7 @@ func NewRawFileManager(rawFilesPath string, segmentSize int64) (*RawFileManager,
 
 	return &RawFileManager{
 		rawFilesPath: rawFilesPath,
-		segmentSize:  segmentSize,
+		maxFdCache:   defaultFdCacheCapacity,
 	}, nil
 }
 
@@ -56,6 +80,54 @@ func NewRawFileManager(rawFilesPath string, segmentSize int64) (*RawFileManager,
 func (rw *RawFileManager) getFileLock(key string) *sync.RWMutex {
 	lock, _ := rw.fileLocks.LoadOrStore(key, &sync.RWMutex{})
 	return lock.(*sync.RWMutex)
+}
+
+// acquire returns a fileEntry for the given path, incrementing the reference count
+func (rw *RawFileManager) acquire(path string) (*fileEntry, error) {
+	v, ok := rw.fdCache.Load(path)
+	if ok {
+		e := v.(*fileEntry)
+		atomic.AddInt32(&e.refs, 1)
+		return e, nil
+	}
+
+	// slow-path: open file once
+	file, err := os.OpenFile(path, os.O_RDONLY, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			zlog.Warn().Str("path", path).Msg("rawWriter: raw file not found")
+			return nil, utils.WrapError("raw file not found", path, nil)
+		}
+		return nil, utils.WrapError("failed to open raw file", path, err)
+	}
+	e := &fileEntry{f: file, mu: rw.getFileLock(path), refs: 1}
+
+	// If we are above capacity, fall back to non-cached open which will be
+	// closed on release. This avoids unbounded FD accumulation.
+	if atomic.LoadInt32(&rw.fdCacheSize) >= int32(rw.maxFdCache) {
+		return e, nil
+	}
+
+	// Try to add to cache.
+	actual, _ := rw.fdCache.LoadOrStore(path, e)
+	if actual != e { // somebody won the race
+		file.Close()
+		return actual.(*fileEntry), nil
+	}
+
+	// Successfully added new cached entry; increment size counter.
+	atomic.AddInt32(&rw.fdCacheSize, 1)
+	return e, nil
+}
+
+// release decrements the reference count for the given fileEntry and closes the file if the count reaches zero
+func (rw *RawFileManager) release(path string, e *fileEntry) {
+	if atomic.AddInt32(&e.refs, -1) == 0 {
+		_ = e.f.Close()
+		if _, loaded := rw.fdCache.LoadAndDelete(path); loaded {
+			atomic.AddInt32(&rw.fdCacheSize, -1)
+		}
+	}
 }
 
 // Write writes a value to a raw file for the given key
@@ -78,7 +150,7 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 	// --------------------------------------------------------------------
 	// 1. Write provisional header (valueLen = 0 for now)
 	// --------------------------------------------------------------------
-	header := BuildHeader(key, 0) // valueLen unknown yet
+	header := BuildValueHeader(key, 0) // valueLen unknown yet
 	if _, err := file.Write(header); err != nil {
 		os.Remove(filePath)
 		return "", utils.WrapError("write header", key, err)
@@ -99,12 +171,8 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 	// --------------------------------------------------------------------
 	// 3. Patch header with actual value length
 	// --------------------------------------------------------------------
-	var lenBuf [4]byte
-	if bytesWritten > (1<<32)-1 {
-		zlog.Warn().Int64("bytes", bytesWritten).Msg("value exceeds 4GiB, truncating length for header")
-	}
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(bytesWritten))
-	if _, err := file.WriteAt(lenBuf[:], 0); err != nil {
+	header = UpdateValueHeaderValueLen(header, bytesWritten)
+	if _, err := file.WriteAt(header, 0); err != nil {
 		os.Remove(filePath)
 		return "", utils.WrapError("patch header", key, err)
 	}
@@ -123,40 +191,45 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 
 // Read reads a value from a raw file for the given key
 func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
-	// Get file-specific lock (shared for readers)
-	fileLock := rw.getFileLock(filePath)
-	fileLock.RLock()
-	// We will release the lock in the returned reader's Close implementation
-
-	file, err := os.OpenFile(filePath, os.O_RDONLY, 0o644)
+	e, err := rw.acquire(filePath)
 	if err != nil {
-		fileLock.RUnlock()
-		if os.IsNotExist(err) {
-			zlog.Warn().Str("path", filePath).Msg("rawWriter: raw file not found")
-			return nil, utils.WrapError("raw file not found", filePath, nil)
+		return nil, err
+	}
+
+	// Acquire shared read lock to protect against concurrent writers.
+	e.mu.RLock()
+
+	// Attempt fast-path: header already cached.
+	var (
+		valLen     int64
+		headerSize int64
+	)
+
+	if v, ok := rw.headerCache.Load(filePath); ok {
+		hm := v.(headerMeta)
+		valLen = hm.valLen
+		headerSize = hm.headerSize
+	} else {
+		// Slow path: parse header and cache it.
+		valLen, headerSize, _, err = ReadValueHeader(e.f)
+		if err != nil {
+			e.mu.RUnlock()
+			rw.release(filePath, e)
+			return nil, err
 		}
-		return nil, utils.WrapError("failed to open raw file", filePath, err)
+		rw.headerCache.Store(filePath, headerMeta{valLen: valLen, headerSize: headerSize})
 	}
 
-	// Read header to skip it so callers receive only the value bytes.
-	valueLen, _, keyLen, err := ReadHeader(file)
-	if err != nil {
-		fileLock.RUnlock()
-		zlog.Debug().Err(err).Str("path", filePath).Msg("rawWriter: returning full raw file (ReadHeader failed)")
-		return file, nil
-	}
+	reader := io.NewSectionReader(e.f, headerSize, valLen)
 
-	// If the value length is 0, the file is empty and we can return the whole file.
-	if valueLen <= 0 {
-		fileLock.RUnlock()
-		return file, nil
-	}
-
-	headerSize := int64(HeaderSize) + keyLen
-	section := io.NewSectionReader(file, headerSize, valueLen)
-
-	// Wrap SectionReader so Close unlocks & closes.
-	return &rawFileReadCloser{Reader: section, f: file, mu: fileLock}, nil
+	return &rawFileReadCloser{
+		Reader: reader,
+		onClose: func() {
+			// Release lock & cached FD when caller is done.
+			e.mu.RUnlock()
+			rw.release(filePath, e)
+		},
+	}, nil
 }
 
 // Delete removes a raw file for the given key
@@ -175,8 +248,19 @@ func (rw *RawFileManager) Remove(filePath string) error {
 		return utils.WrapError("failed to delete raw file", filePath, err)
 	}
 
+	// Release the file entry and the header cache.
+	if v, ok := rw.fdCache.Load(filePath); ok {
+		if e, ok2 := v.(*fileEntry); ok2 {
+			_ = e.f.Close()
+		}
+		rw.fdCache.Delete(filePath)
+		atomic.AddInt32(&rw.fdCacheSize, -1)
+	}
+	rw.headerCache.Delete(filePath)
+
 	// Remove the lock from the map
 	rw.fileLocks.Delete(filePath)
+
 	zlog.Debug().Str("path", filePath).Msg("rawWriter: deleted raw file")
 	return nil
 }
