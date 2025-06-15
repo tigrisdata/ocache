@@ -255,11 +255,11 @@ func startGRPCServer() {
 	)
 	pb.RegisterCacheServiceServer(grpcServer, &cacheService{})
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", GetPort()))
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", AppConfig.Port))
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to listen for gRPC")
 	}
-	zlog.Info().Msgf("gRPC server listening on :%d", GetPort())
+	zlog.Info().Msgf("gRPC server listening on :%d", AppConfig.Port)
 	if err := grpcServer.Serve(lis); err != nil {
 		zlog.Fatal().Err(err).Msg("gRPC server failed")
 	}

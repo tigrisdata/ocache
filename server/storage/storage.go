@@ -55,14 +55,14 @@ func GetStorage() *Storage {
 func InitStorage(diskPath string, ttl int, threshold int) {
 	s, err := newStorage(diskPath, ttl, threshold)
 	if err != nil {
-		panic("failed to open RocksDB: " + err.Error())
+		zlog.Fatal().Err(err).Msg("failed to open RocksDB")
 	}
 	storage = s
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
 func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
-	// Create the metadata DB directory if it doesn't exist
+	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(diskPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}

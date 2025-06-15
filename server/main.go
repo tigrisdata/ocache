@@ -20,11 +20,6 @@ var (
 	verbose   = flag.Bool("v", false, "Enable debug logging")
 )
 
-func GetDiskPath() string { return *diskPath }
-func GetThreshold() int   { return *threshold }
-func GetTTL() int         { return *ttl }
-func GetPort() int        { return *port }
-
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -48,7 +43,7 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 
 func configureLogger() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	if *verbose {
+	if AppConfig.Verbose {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	} else {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
@@ -57,11 +52,7 @@ func configureLogger() {
 }
 
 func RunServer() {
-	if err := os.MkdirAll(GetDiskPath(), 0o755); err != nil {
-		zlog.Fatal().Err(err).Msg("failed to create disk path")
-	}
-
-	stor.InitStorage(GetDiskPath(), GetTTL(), GetThreshold())
+	stor.InitStorage(AppConfig.DiskPath, AppConfig.TTL, AppConfig.Threshold)
 
 	grpcAddr := fmt.Sprintf(":%d", *port)
 	go startGRPCServer()                           // Start gRPC server in goroutine
@@ -72,6 +63,7 @@ func RunServer() {
 
 func main() {
 	flag.Parse()
+	LoadConfig()
 	configureLogger()
 
 	RunServer() // Initialize and run the server
