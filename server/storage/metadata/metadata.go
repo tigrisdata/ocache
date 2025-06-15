@@ -1,4 +1,4 @@
-package storage
+package metadata
 
 import (
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -6,9 +6,9 @@ import (
 
 var metaDB *grocksdb.DB
 
-// initMetaDB initializes the global metadata DB. It should be called exactly
+// InitMetaDB initializes the global metadata DB. It should be called exactly
 // once during Storage initialization.
-func initMetaDB(diskPath string, ttl int) (*grocksdb.DB, error) {
+func InitMetaDB(diskPath string, ttl int) (*grocksdb.DB, error) {
 	if metaDB != nil {
 		return metaDB, nil
 	}
@@ -29,5 +29,5 @@ func initMetaDB(diskPath string, ttl int) (*grocksdb.DB, error) {
 	return db, nil
 }
 
-// getMetaDB returns the global RocksDB instance used for metadata operations.
-func getMetaDB() *grocksdb.DB { return metaDB }
+// GetMetaDB returns the global RocksDB instance used for metadata operations.
+func GetMetaDB() *grocksdb.DB { return metaDB }

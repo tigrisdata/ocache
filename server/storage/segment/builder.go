@@ -1,4 +1,4 @@
-package segmentfile
+package segment
 
 import (
 	"encoding/binary"
@@ -8,8 +8,7 @@ import (
 	"time"
 )
 
-// Constants defining the on-disk segment format.  They used to live in
-// segment.go but are moved here so the layout is defined in exactly one place.
+// Constants defining the on-disk segment format.
 const (
 	// Header layout (fixed 16 bytes + key)
 	//  0..3  : uint32 value length

@@ -1,4 +1,4 @@
-package storage
+package segment
 
 import (
 	"bytes"
@@ -11,10 +11,13 @@ import (
 	"sync"
 	"time"
 
+	pb "github.com/tigrisdata/cache_service/proto"
+	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
+	"github.com/tigrisdata/cache_service/server/storage/metadata"
+	"github.com/tigrisdata/cache_service/server/utils"
+
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
-	pb "github.com/tigrisdata/cache_service/proto"
-	segmentfile "github.com/tigrisdata/cache_service/server/storage/segmentfile"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -50,7 +53,7 @@ func NewRawFileManager(rawFilesPath string, segmentSize int64) (*RawFileManager,
 
 	return &RawFileManager{
 		rawFilesPath: rawFilesPath,
-		db:           getMetaDB(),
+		db:           metadata.GetMetaDB(),
 		segmentSize:  segmentSize,
 	}, nil
 }
@@ -77,29 +80,29 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
-		return "", wrap("failed to create raw file for key", key, err)
+		return "", utils.WrapError("failed to create raw file for key", key, err)
 	}
 	defer file.Close()
 
 	// --------------------------------------------------------------------
 	// 1. Write provisional header (valueLen = 0 for now)
 	// --------------------------------------------------------------------
-	header := segmentfile.BuildHeader(key, 0) // valueLen unknown yet
+	header := BuildHeader(key, 0) // valueLen unknown yet
 	if _, err := file.Write(header); err != nil {
 		os.Remove(filePath)
-		return "", wrap("write header", key, err)
+		return "", utils.WrapError("write header", key, err)
 	}
 
 	// --------------------------------------------------------------------
 	// 2. Stream payload directly from reader → file with pooled buffer
 	// --------------------------------------------------------------------
-	buf, release := AcquireBuffer(1 << 20) // 1 MiB
+	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
 	defer release()
 
 	bytesWritten, err := io.CopyBuffer(file, reader, buf)
 	if err != nil {
 		os.Remove(filePath)
-		return "", wrap("copy payload", key, err)
+		return "", utils.WrapError("copy payload", key, err)
 	}
 
 	// --------------------------------------------------------------------
@@ -112,7 +115,7 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(bytesWritten))
 	if _, err := file.WriteAt(lenBuf[:], 0); err != nil {
 		os.Remove(filePath)
-		return "", wrap("patch header", key, err)
+		return "", utils.WrapError("patch header", key, err)
 	}
 
 	// Sync to ensure durability of header + data
@@ -152,13 +155,13 @@ func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
 		fileLock.RUnlock()
 		if os.IsNotExist(err) {
 			zlog.Warn().Str("path", filePath).Msg("rawWriter: raw file not found")
-			return nil, wrap("raw file not found", filePath, nil)
+			return nil, utils.WrapError("raw file not found", filePath, nil)
 		}
-		return nil, wrap("failed to open raw file", filePath, err)
+		return nil, utils.WrapError("failed to open raw file", filePath, err)
 	}
 
 	// Read header to skip it so callers receive only the value bytes.
-	valueLen, _, keyLen, err := segmentfile.ReadHeader(file)
+	valueLen, _, keyLen, err := ReadHeader(file)
 	if err != nil {
 		fileLock.RUnlock()
 		zlog.Debug().Err(err).Str("path", filePath).Msg("rawWriter: returning full raw file (ReadHeader failed)")
@@ -171,7 +174,7 @@ func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
 		return file, nil
 	}
 
-	headerSize := int64(segmentfile.HeaderSize) + keyLen
+	headerSize := int64(HeaderSize) + keyLen
 	section := io.NewSectionReader(file, headerSize, valueLen)
 
 	// Wrap SectionReader so Close unlocks & closes.
@@ -191,7 +194,7 @@ func (rw *RawFileManager) Remove(filePath string) error {
 			return nil
 		}
 		zlog.Error().Err(err).Str("path", filePath).Msg("rawWriter: failed to delete raw file")
-		return wrap("failed to delete raw file", filePath, err)
+		return utils.WrapError("failed to delete raw file", filePath, err)
 	}
 
 	// Remove the lock from the map
@@ -204,7 +207,7 @@ func (rw *RawFileManager) Remove(filePath string) error {
 // provided SegmentManager. It deletes index rows after successful copy and
 // removes the raw files. The compaction in a single run stops when
 // maxBytes bytes have been migrated.
-func (rw *RawFileManager) CompactToSegments(sm *SegmentManager, maxBytes int64, flushBytes int64) {
+func (rw *RawFileManager) CompactToSegments(sm *Manager, maxBytes int64, flushBytes int64) {
 	zlog.Info().Int64("maxBytes", maxBytes).Int64("flushBytes", flushBytes).Msg("rawWriter: starting compaction")
 
 	ro := grocksdb.NewDefaultReadOptions()
@@ -333,14 +336,14 @@ func parseRawIndexRow(k, v []byte) (userKey, filePath string, fileSize int64, ok
 
 // promoteLargeRaw attempts to convert the raw file into a one-entry segment by
 // appending the footer and renaming it. It returns promoted=true on success.
-func (rw *RawFileManager) promoteLargeRaw(sm *SegmentManager, userKey, filePath string, fileSize int64, vm *pb.ValueMessage) (promoted bool, valueBytes int64, err error) {
+func (rw *RawFileManager) promoteLargeRaw(sm *Manager, userKey, filePath string, fileSize int64, vm *pb.ValueMessage) (promoted bool, valueBytes int64, err error) {
 	// Require the file to be sufficiently big to justify promotion.
 	if fileSize < rw.segmentSize*9/10 {
 		return false, 0, nil // too small – fall back
 	}
 
 	// Use helper from segmentfile which also registers the segment.
-	newPath, headerSize, valueLen, err := segmentfile.PromoteRawFile(filePath, sm.segmentsPath, userKey, fileSize, sm)
+	newPath, headerSize, valueLen, err := PromoteRawFile(filePath, sm.segmentsPath, userKey, fileSize, sm)
 	if err != nil {
 		return false, 0, err
 	}
@@ -356,7 +359,7 @@ func (rw *RawFileManager) promoteLargeRaw(sm *SegmentManager, userKey, filePath 
 
 // copyRawIntoSegment copies the raw file into an open segment using the
 // existing segment pipeline and updates the ValueMessage.
-func (rw *RawFileManager) copyRawIntoSegment(sm *SegmentManager, userKey, filePath string, vm *pb.ValueMessage) (copiedBytes int64, err error) {
+func (rw *RawFileManager) copyRawIntoSegment(sm *Manager, userKey, filePath string, vm *pb.ValueMessage) (copiedBytes int64, err error) {
 	segPath, segOff, segLen, err := sm.WriteToSegment(userKey, filePath)
 	if err != nil {
 		return 0, err

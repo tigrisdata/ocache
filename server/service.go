@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/tigrisdata/cache_service/proto"
 	stor "github.com/tigrisdata/cache_service/server/storage"
+	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/rs/zerolog"
@@ -102,7 +103,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 
 	// Seek to start if possible
 	if start > 0 {
-		buf, release := stor.AcquireBuffer(1 << 20) // 1 MiB
+		buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
 		defer release()
 		if seeker, ok := r.(io.Seeker); ok {
 			_, err := seeker.Seek(start, io.SeekStart)
@@ -128,7 +129,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		}
 	}
 
-	buf, release := stor.AcquireBuffer(1 << 20) // 1 MiB
+	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
 	defer release()
 	var toRead int64 = -1
 	if end > 0 && end > start {

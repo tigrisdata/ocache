@@ -8,10 +8,13 @@ import (
 	"os"
 	"time"
 
+	pb "github.com/tigrisdata/cache_service/proto"
+	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
+	"github.com/tigrisdata/cache_service/server/storage/metadata"
+	"github.com/tigrisdata/cache_service/server/storage/segment"
+
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
-
-	pb "github.com/tigrisdata/cache_service/proto"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -36,9 +39,9 @@ import (
 // On read, expiry is checked (if present) and expired keys are deleted and not returned.
 type Storage struct {
 	db             *grocksdb.DB
-	diskPath       string          // Path to the disk cache directory
-	threshold      int             // Threshold for small vs large objects
-	segmentManager *SegmentManager // Segment manager for large objects on disk
+	diskPath       string           // Path to the disk cache directory
+	threshold      int              // Threshold for small vs large objects
+	segmentManager *segment.Manager // Segment manager for large objects on disk
 }
 
 var storage *Storage
@@ -65,13 +68,13 @@ func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
 	}
 
 	// Initialize the metadata DB
-	db, err := initMetaDB(diskPath, ttl)
+	db, err := metadata.InitMetaDB(diskPath, ttl)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initialize the segment manager
-	segmentManager, err := NewSegmentManager(diskPath, DefaultSegmentSize)
+	segmentManager, err := segment.NewManager(diskPath, segment.DefaultSegmentSize)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +176,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	if firstReadSize <= 0 {
 		firstReadSize = 1 // ensure at least 1
 	}
-	firstChunk, release := AcquireBuffer(firstReadSize)
+	firstChunk, release := bufferpool.AcquireBuffer(firstReadSize)
 	defer release()
 
 	// Read up to firstReadSize bytes. io.ReadFull returns ErrUnexpectedEOF when the
