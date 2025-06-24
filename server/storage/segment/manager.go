@@ -40,7 +40,7 @@ type Segment struct {
 	size     int64
 	file     *os.File
 	mmap     []byte // writable mmap for the open segment (nil for closed)
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	position int64
 
 	// Statistics
@@ -152,18 +152,26 @@ func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadClose
 		return io.NopCloser(bytes.NewReader(slice)), nil
 	}
 
-	// Ensure file handle ready
-	seg.mu.Lock()
-	if seg.file == nil {
-		ro, err := os.Open(seg.path)
-		if err != nil {
-			seg.mu.Unlock()
-			return nil, err
-		}
-		seg.file = ro
-	}
+	// First take read lock to see if file already open.
+	seg.mu.RLock()
 	f := seg.file
-	seg.mu.Unlock()
+	seg.mu.RUnlock()
+
+	if f == nil {
+		// Need to open file – take exclusive lock.
+		seg.mu.Lock()
+		// Double-check after acquiring write lock.
+		if seg.file == nil {
+			ro, err := os.Open(seg.path)
+			if err != nil {
+				seg.mu.Unlock()
+				return nil, err
+			}
+			seg.file = ro
+		}
+		f = seg.file
+		seg.mu.Unlock()
+	}
 
 	return io.NopCloser(io.NewSectionReader(f, offset, length)), nil
 }
