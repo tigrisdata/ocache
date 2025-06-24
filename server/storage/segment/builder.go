@@ -3,7 +3,6 @@ package segment
 import (
 	"encoding/binary"
 	"os"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -12,10 +11,10 @@ import (
 const (
 	// Header layout (fixed 16 bytes + key)
 	//  0..7  : uint64 value length
-	//  8..15 : int64  nano timestamp
-	// 16..19 : uint32 key length
-	// 20..N  : key bytes
-	ValueHeaderSize = 20
+	//  8..11 : uint32 key length
+	// 12..15 : uint32 CRC32 checksum of value bytes
+	// 16..N  : key bytes
+	ValueHeaderSize = 16
 
 	// Footer layout (20 bytes)
 	//  0..5  : ASCII magic "SEGEOF"
@@ -31,26 +30,27 @@ const (
 
 // BuildValueHeader returns a header buffer for the given key and value length.  The
 // caller owns the returned slice.
-func BuildValueHeader(key string, valueLen int64) []byte {
+func BuildValueHeader(key string, valueLen int64, checksum uint32) []byte {
 	hdr := make([]byte, ValueHeaderSize+len(key))
 	binary.BigEndian.PutUint64(hdr[0:8], uint64(valueLen))
-	binary.BigEndian.PutUint64(hdr[8:16], uint64(time.Now().UnixNano()))
-	binary.BigEndian.PutUint32(hdr[16:20], uint32(len(key)))
-	copy(hdr[20:], []byte(key))
+	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(key)))
+	binary.BigEndian.PutUint32(hdr[12:16], checksum)
+	copy(hdr[16:], []byte(key))
 	return hdr
 }
 
 // ReadValueHeader parses the header at the beginning of a segment/raw file and
 // returns the value length, total header size and key length.
 // It expects the file cursor to be at the beginning of the file or supports
-// random access via ReadAt.
-func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64, err error) {
+// random access via Pread.
+func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64, checksum uint32, err error) {
 	var fixed [ValueHeaderSize]byte
 	if _, err = unix.Pread(int(f.Fd()), fixed[:], 0); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	valueLen = int64(binary.BigEndian.Uint64(fixed[0:8]))
-	keyLen = int64(binary.BigEndian.Uint32(fixed[16:20]))
+	keyLen = int64(binary.BigEndian.Uint32(fixed[8:12]))
+	checksum = binary.BigEndian.Uint32(fixed[12:16])
 	headerSize = int64(ValueHeaderSize) + keyLen
 	return
 }
@@ -60,10 +60,11 @@ func CalculateValueHeaderSize(key string) int64 {
 	return int64(ValueHeaderSize + len(key))
 }
 
-// UpdateValueHeaderValueLen updates the value length in the header of a segment/raw
-// file.
-func UpdateValueHeaderValueLen(header []byte, valueLen int64) []byte {
+// UpdateValueHeader updates both value length and checksum in the supplied
+// header slice.
+func UpdateValueHeader(header []byte, valueLen int64, checksum uint32) []byte {
 	binary.BigEndian.PutUint64(header[0:8], uint64(valueLen))
+	binary.BigEndian.PutUint32(header[12:16], checksum)
 	return header
 }
 

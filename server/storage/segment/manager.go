@@ -3,6 +3,7 @@ package segment
 import (
 	"bytes"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/tigrisdata/cache_service/proto"
+	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
 	"github.com/tigrisdata/cache_service/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
@@ -263,7 +265,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 
 	for {
 		// Read header
-		valLen, headerSize, keyLen, err := ReadValueHeader(seg.file)
+		valLen, headerSize, keyLen, checksum, err := ReadValueHeader(seg.file)
 		if err != nil {
 			return utils.WrapError("read header", seg.path, err)
 		}
@@ -285,6 +287,26 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 				return utils.WrapError("truncate partial entry", seg.path, err)
 			}
 			break
+		}
+
+		// Checksum validation when header contains non-zero checksum.
+		if checksum != 0 {
+			valueOffset := pos + headerSize // pos is entry start offset
+			h := crc32.NewIEEE()
+			section := io.NewSectionReader(seg.file, valueOffset, valLen)
+			buf, releaseBuf := bufferpool.AcquireBuffer(64 * 1024)
+			if _, err := io.CopyBuffer(h, section, buf); err != nil {
+				releaseBuf()
+				return utils.WrapError("checksum read", seg.path, err)
+			}
+			releaseBuf()
+			if h.Sum32() != checksum {
+				zlog.Warn().Str("segment", seg.path).Int64("offset", pos).Msg("checksum mismatch – truncating segment")
+				if err := seg.file.Truncate(pos); err != nil {
+					return utils.WrapError("truncate after checksum mismatch", seg.path, err)
+				}
+				break
+			}
 		}
 
 		// Entry seems valid – advance
@@ -309,20 +331,24 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 
 // WriteToSegment writes a value from a raw file into the current segment, creating a new one if needed
 func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, int64, error) {
-	// Determine value length first (stat the raw file)
-	info, err := os.Stat(filePath)
+	src, err := os.Open(filePath)
 	if err != nil {
-		return "", 0, 0, utils.WrapError("stat raw file", filePath, err)
+		return "", 0, 0, utils.WrapError("open raw file", filePath, err)
 	}
-	valueLen := info.Size()
+	defer src.Close()
 
-	// Build header via helper so format defined in one place
-	header := BuildValueHeader(key, valueLen)
-	headerSize := int64(len(header))
+	valueLen, headerSize, _, checksum, err := ReadValueHeader(src)
+	if err != nil {
+		return "", 0, 0, utils.WrapError("read value header", filePath, err)
+	}
+
+	// Build header
+	header := BuildValueHeader(key, valueLen, checksum)
 
 	// Total bytes to add
 	needed := headerSize + valueLen
 
+	// Acquire lock to ensure only one writer at a time.
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -335,17 +361,16 @@ func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, i
 	// Offset where this value will be written inside the segment
 	startOffset := segment.position
 
+	// Reset file cursor to start of value.
+	if _, err := src.Seek(headerSize, io.SeekStart); err != nil {
+		return "", 0, 0, utils.WrapError("seek to start", filePath, err)
+	}
+
 	if segment.mmap != nil {
 		// Fast path: copy into mmap
 		copy(segment.mmap[segment.position:], header)
 
 		dst := segment.mmap[segment.position+headerSize : segment.position+needed]
-		src, err := os.Open(filePath)
-		if err != nil {
-			return "", 0, 0, utils.WrapError("open raw file", filePath, err)
-		}
-		defer src.Close()
-
 		if _, err := io.ReadFull(src, dst); err != nil {
 			return "", 0, 0, utils.WrapError("read raw into mmap", filePath, err)
 		}
@@ -354,11 +379,6 @@ func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, i
 		if _, err := segment.file.Write(header); err != nil {
 			return "", 0, 0, utils.WrapError("failed to write header", filePath, err)
 		}
-		src, err := os.Open(filePath)
-		if err != nil {
-			return "", 0, 0, utils.WrapError("open raw file", filePath, err)
-		}
-		defer src.Close()
 		if _, err := io.Copy(segment.file, src); err != nil {
 			return "", 0, 0, utils.WrapError("copy value to segment", filePath, err)
 		}

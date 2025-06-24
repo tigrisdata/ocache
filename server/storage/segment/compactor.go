@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -47,10 +46,10 @@ func NewCompactor(rw *RawFileManager, sm *Manager) *Compactor {
 }
 
 // RecordEntry records an entry in the RocksDB raw-index.
-func RecordEntryForCompaction(key, filePath string, fileSize int64) error {
+func RecordEntryForCompaction(key, filePath string) error {
 	ts := time.Now().UnixNano()
 	idxKey := fmt.Sprintf("!raw/%020d|%s", ts, key)
-	idxVal := fmt.Sprintf("%s|%d", filePath, fileSize)
+	idxVal := fmt.Sprintf("%s", filePath)
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	if err := metadata.GetMetaDB().Handle().Put(wo, []byte(idxKey), []byte(idxVal)); err != nil {
@@ -82,8 +81,16 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 		k := it.Key().Data()
 		v := it.Value().Data()
 
-		userKey, filePath, fileSize, ok := parseRawIndexRow(k, v)
+		userKey, filePath, ok := parseRawIndexRow(k, v)
 		if !ok {
+			continue
+		}
+
+		// If the raw file does not exist, remove the index row.
+		fInfo, err := os.Stat(filePath)
+		if os.IsNotExist(err) {
+			zlog.Warn().Str("key", userKey).Str("path", filePath).Msg("compactor: raw file does not exist")
+			batch.Delete(k)
 			continue
 		}
 
@@ -110,7 +117,7 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 
 		if metadataFound {
 			// Attempt zero-copy promotion first; fall back to copy otherwise.
-			promoted, bytesMoved, promErr = c.promoteLargeRaw(userKey, filePath, fileSize, vm)
+			promoted, bytesMoved, promErr = c.promoteLargeRaw(userKey, filePath, fInfo.Size(), vm)
 			if promErr != nil {
 				zlog.Error().Err(promErr).Str("key", userKey).Msg("compactor: promotion failed, falling back to copy")
 				promoted = false
@@ -131,11 +138,11 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 			}
 		}
 
-		// Regardless of metadata presence, remove the raw file as it is no longer needed.
-		c.rw.Remove(filePath)
-
 		// Release slice as early as possible.
 		slice.Free()
+
+		// Regardless of metadata presence, remove the raw file as it is no longer needed.
+		c.rw.Remove(filePath)
 
 		// Remove the index row.
 		batch.Delete(k)
@@ -168,7 +175,7 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 // parseRawIndexRow extracts userKey, filePath and size from RocksDB raw-index
 // key/value pairs. Returns ok=false when the row does not follow the expected
 // format.
-func parseRawIndexRow(k, v []byte) (userKey, filePath string, fileSize int64, ok bool) {
+func parseRawIndexRow(k, v []byte) (userKey, filePath string, ok bool) {
 	// Key format: !raw/<ts>|<userKey>
 	pipeIdx := bytes.IndexByte(k, '|')
 	if pipeIdx <= 0 {
@@ -176,17 +183,8 @@ func parseRawIndexRow(k, v []byte) (userKey, filePath string, fileSize int64, ok
 	}
 	userKey = string(k[pipeIdx+1:])
 
-	// Value format: <filePath>|<size>
-	parts := bytes.SplitN(v, []byte("|"), 2)
-	if len(parts) < 1 {
-		return
-	}
-	filePath = string(parts[0])
-	if len(parts) == 2 {
-		if sz, err := strconv.ParseInt(string(parts[1]), 10, 64); err == nil {
-			fileSize = sz
-		}
-	}
+	// Value format: <filePath>
+	filePath = string(v)
 	ok = true
 	return
 }
@@ -240,6 +238,11 @@ func (c *Compactor) promoteRawFileLow(rawPath, destDir, userKey string, fileSize
 	if valueLen <= 0 {
 		return "", 0, 0, fmt.Errorf("computed negative value length")
 	}
+
+	// Get file lock.
+	lock := c.rw.GetFileLock(rawPath)
+	lock.Lock()
+	defer lock.Unlock()
 
 	// Append footer.
 	f, err := os.OpenFile(rawPath, os.O_WRONLY|os.O_APPEND, 0)

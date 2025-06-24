@@ -3,6 +3,7 @@ module github.com/tigrisdata/cache_service/server
 go 1.24.2
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/rs/zerolog v1.34.0
