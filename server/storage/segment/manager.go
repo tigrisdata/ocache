@@ -23,7 +23,7 @@ const (
 	// Segment sizes
 	SmallSegmentSize   = 1 << 30 // 1GB
 	LargeSegmentSize   = 1 << 32 // 4GB
-	DefaultSegmentSize = LargeSegmentSize
+	DefaultSegmentSize = SmallSegmentSize
 
 	// Default compaction thresholds
 	DefaultRawToSegmentPromotionThreshold   = 1 << 30 // 1GB
@@ -59,6 +59,7 @@ type Manager struct {
 	segMap       map[string]*Segment // path → *Segment for O(1) lookup
 	mu           sync.RWMutex
 	rawManager   *RawFileManager
+	fdCache      *FdCache // descriptor cache for closed segments
 }
 
 // Registry is implemented by segment managers that need to be informed when a
@@ -99,6 +100,9 @@ func NewManager(basePath string) (*Manager, error) {
 		rawManager:   rawWriter,
 		segMap:       make(map[string]*Segment),
 	}
+
+	// Instantiate descriptor cache for closed segments
+	sm.fdCache = NewFdCache(defaultFdCacheCapacity, sm.getSegmentLock)
 
 	// Load existing segments
 	if err := sm.loadSegments(); err != nil {
@@ -152,28 +156,29 @@ func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadClose
 		return io.NopCloser(bytes.NewReader(slice)), nil
 	}
 
-	// First take read lock to see if file already open.
+	// If the segment is still open for writes, reuse its R/W descriptor under lock.
 	seg.mu.RLock()
 	f := seg.file
 	seg.mu.RUnlock()
 
-	if f == nil {
-		// Need to open file – take exclusive lock.
-		seg.mu.Lock()
-		// Double-check after acquiring write lock.
-		if seg.file == nil {
-			ro, err := os.Open(seg.path)
-			if err != nil {
-				seg.mu.Unlock()
-				return nil, err
-			}
-			seg.file = ro
-		}
-		f = seg.file
-		seg.mu.Unlock()
+	if f != nil {
+		// Use existing open descriptor; caller doesn't need to manage lifecycle.
+		return io.NopCloser(io.NewSectionReader(f, offset, length)), nil
 	}
 
-	return io.NopCloser(io.NewSectionReader(f, offset, length)), nil
+	// Closed segment – acquire cached read-only descriptor via FdCache.
+	entry, err := sm.fdCache.Acquire(segPath)
+	if err != nil {
+		return nil, err
+	}
+
+	reader := io.NewSectionReader(entry.f, offset, length)
+	return &readCloserWithOnClose{
+		Reader: reader,
+		onClose: func() {
+			sm.fdCache.Release(segPath, entry)
+		},
+	}, nil
 }
 
 // loadSegments loads existing segments from disk
@@ -220,14 +225,9 @@ func (sm *Manager) loadSegments() error {
 					segment.entries = ent
 					segment.dataBytes = bytes
 
-					// Close current R/W handle and reopen read-only to cache descriptor
+					// Closed segment – we don't keep a cached descriptor; rely on fdCache.
 					file.Close()
-					ro, err := os.Open(segment.path)
-					if err == nil {
-						segment.file = ro // cached read-only handle
-					} else {
-						segment.file = nil // Fallback: no handle cached
-					}
+					segment.file = nil
 					sm.segments = append(sm.segments, segment)
 					sm.segMap[path] = segment
 					continue
@@ -462,12 +462,8 @@ func (sm *Manager) finalizeSegment(seg *Segment) error {
 		return utils.WrapError("failed to close segment", seg.path, err)
 	}
 
-	// Reopen read-only cached descriptor
-	if ro, err := os.Open(seg.path); err == nil {
-		seg.file = ro
-	} else {
-		seg.file = nil
-	}
+	// Clear pointer – closed segments will use fdCache for reads.
+	seg.file = nil
 	return nil
 }
 
@@ -557,11 +553,39 @@ func (sm *Manager) Close() error {
 	defer sm.mu.Unlock()
 
 	for _, segment := range sm.segments {
+		if segment.file == nil {
+			continue
+		}
 		if err := segment.file.Close(); err != nil {
 			// Ignore errors when closing segments.
 			zlog.Error().Err(err).Str("path", segment.path).Msg("failed to close segment")
 			continue
 		}
+	}
+	return nil
+}
+
+// getSegmentLock returns the RWMutex guarding a segment at the provided path, or a
+// fresh mutex if the segment is unknown (should not normally happen).
+func (sm *Manager) getSegmentLock(path string) *sync.RWMutex {
+	sm.mu.RLock()
+	seg := sm.segMap[path]
+	sm.mu.RUnlock()
+	if seg != nil {
+		return &seg.mu
+	}
+	return &sync.RWMutex{}
+}
+
+// readCloserWithOnClose wraps a reader and calls the provided function when closed.
+type readCloserWithOnClose struct {
+	io.Reader
+	onClose func()
+}
+
+func (rc *readCloserWithOnClose) Close() error {
+	if rc.onClose != nil {
+		rc.onClose()
 	}
 	return nil
 }

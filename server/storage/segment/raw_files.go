@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 
 	"github.com/google/uuid"
 	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
@@ -43,22 +42,12 @@ type headerMeta struct {
 	headerSize int64
 }
 
-// fileEntry is a wrapper around a file and a lock. It is used to cache file
-// entries and reuse them.
-type fileEntry struct {
-	f    *os.File
-	mu   *sync.RWMutex // existing per–file lock
-	refs int32         // accessed atomically
-}
-
 // RawFileManager manages all raw files in the raw directory
 type RawFileManager struct {
 	rawFilesPath string   // path to the raw files directory
 	fileLocks    sync.Map // map of mutexes for individual files
 
-	fdCache     sync.Map // path -> *fileEntry for FD reuse
-	fdCacheSize int32    // current number of cached entries (atomic)
-	maxFdCache  int      // capacity limit
+	fdCache *FdCache // descriptor cache shared across readers
 
 	headerCache sync.Map // path -> headerMeta
 }
@@ -70,10 +59,14 @@ func NewRawFileManager(rawFilesPath string) (*RawFileManager, error) {
 		return nil, fmt.Errorf("failed to create raw files directory: %w", err)
 	}
 
-	return &RawFileManager{
+	rwm := &RawFileManager{
 		rawFilesPath: rawFilesPath,
-		maxFdCache:   defaultFdCacheCapacity,
-	}, nil
+	}
+
+	// Instantiate a bounded descriptor cache that reuses RawFileManager's lock provider
+	rwm.fdCache = NewFdCache(defaultFdCacheCapacity, rwm.GetFileLock)
+
+	return rwm, nil
 }
 
 // GetFileLock returns an RWMutex for the given path, creating it if it doesn't exist.
@@ -87,50 +80,12 @@ func (rw *RawFileManager) GetFileLock(path string) *sync.RWMutex {
 
 // acquire returns a fileEntry for the given path, incrementing the reference count
 func (rw *RawFileManager) acquire(path string) (*fileEntry, error) {
-	v, ok := rw.fdCache.Load(path)
-	if ok {
-		e := v.(*fileEntry)
-		atomic.AddInt32(&e.refs, 1)
-		return e, nil
-	}
-
-	// slow-path: open file once
-	file, err := os.OpenFile(path, os.O_RDONLY, 0o644)
-	if err != nil {
-		if os.IsNotExist(err) {
-			zlog.Warn().Str("path", path).Msg("rawWriter: raw file not found")
-			return nil, utils.WrapError("raw file not found", path, nil)
-		}
-		return nil, utils.WrapError("failed to open raw file", path, err)
-	}
-	e := &fileEntry{f: file, mu: rw.GetFileLock(path), refs: 1}
-
-	// If we are above capacity, fall back to non-cached open which will be
-	// closed on release. This avoids unbounded FD accumulation.
-	if atomic.LoadInt32(&rw.fdCacheSize) >= int32(rw.maxFdCache) {
-		return e, nil
-	}
-
-	// Try to add to cache.
-	actual, _ := rw.fdCache.LoadOrStore(path, e)
-	if actual != e { // somebody won the race
-		file.Close()
-		return actual.(*fileEntry), nil
-	}
-
-	// Successfully added new cached entry; increment size counter.
-	atomic.AddInt32(&rw.fdCacheSize, 1)
-	return e, nil
+	return rw.fdCache.Acquire(path)
 }
 
 // release decrements the reference count for the given fileEntry and closes the file if the count reaches zero
 func (rw *RawFileManager) release(path string, e *fileEntry) {
-	if atomic.AddInt32(&e.refs, -1) == 0 {
-		_ = e.f.Close()
-		if _, loaded := rw.fdCache.LoadAndDelete(path); loaded {
-			atomic.AddInt32(&rw.fdCacheSize, -1)
-		}
-	}
+	rw.fdCache.Release(path, e)
 }
 
 // Write writes a value to a raw file for the given key
@@ -259,14 +214,8 @@ func (rw *RawFileManager) Remove(filePath string) error {
 		return utils.WrapError("failed to delete raw file", filePath, err)
 	}
 
-	// Release the file entry and the header cache.
-	if v, ok := rw.fdCache.Load(filePath); ok {
-		if e, ok2 := v.(*fileEntry); ok2 {
-			_ = e.f.Close()
-		}
-		rw.fdCache.Delete(filePath)
-		atomic.AddInt32(&rw.fdCacheSize, -1)
-	}
+	// Evict any cached file descriptor for this path.
+	rw.fdCache.Remove(filePath)
 	rw.headerCache.Delete(filePath)
 
 	// Remove the lock from the map
