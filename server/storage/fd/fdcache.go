@@ -1,4 +1,4 @@
-package segment
+package fd
 
 import (
 	"os"
@@ -9,7 +9,7 @@ import (
 	"github.com/tigrisdata/cache_service/server/utils"
 )
 
-// fileEntry wraps a cached os.File descriptor along with a per-file RWMutex and reference count.
+// FileEntry wraps a cached os.File descriptor along with a per-file RWMutex and reference count.
 // The lock protects concurrent readers/writers on the underlying file while refs ensures that the
 // file descriptor stays open while in-use across goroutines.
 //
@@ -19,10 +19,35 @@ import (
 //
 // Callers interact with it exclusively through the FdCache APIs.
 
-type fileEntry struct {
+type FileEntry struct {
 	refs int32 // accessed atomically – keep first
 	f    *os.File
 	mu   *sync.RWMutex // per-file lock shared with RawFileManager
+}
+
+// File returns the underlying os.File descriptor.
+func (e *FileEntry) File() *os.File {
+	return e.f
+}
+
+// Lock acquires an exclusive lock.
+func (e *FileEntry) Lock() {
+	e.mu.Lock()
+}
+
+// Unlock releases the exclusive lock.
+func (e *FileEntry) Unlock() {
+	e.mu.Unlock()
+}
+
+// RLock acquires a shared read lock.
+func (e *FileEntry) RLock() {
+	e.mu.RLock()
+}
+
+// RUnlock releases the read lock.
+func (e *FileEntry) RUnlock() {
+	e.mu.RUnlock()
 }
 
 // FdCache implements a capacity-bounded cache for open file descriptors. It allows multiple
@@ -32,29 +57,42 @@ type fileEntry struct {
 // All public APIs (`Acquire`, `Release`, `Remove`) are safe for concurrent use.
 
 type FdCache struct {
-	capacity     int                        // maximum number of cached entries (0 = unlimited)
-	size         int32                      // current size, accessed atomically
-	entries      sync.Map                   // path -> *fileEntry
-	lockProvider func(string) *sync.RWMutex // returns (and memoises) a per-file lock
+	capacity  int      // maximum number of cached entries (0 = unlimited)
+	size      int32    // current size, accessed atomically
+	entries   sync.Map // path -> *FileEntry
+	fileLocks sync.Map // path -> *sync.RWMutex
+}
+
+// fdCache is a singleton instance of FdCache.
+var fdCache *FdCache
+
+// GetFdCache returns the singleton instance of FdCache.
+func GetFdCache() *FdCache {
+	return fdCache
 }
 
 // NewFdCache returns an initialised FdCache that will hold at most `capacity` file descriptors.
-// The `lockProvider` callback is used to obtain the RWMutex that guards access to a given file
-// path; typically this will be RawFileManager.GetFileLock.
-func NewFdCache(capacity int, lockProvider func(string) *sync.RWMutex) *FdCache {
-	return &FdCache{
-		capacity:     capacity,
-		lockProvider: lockProvider,
+func NewFdCache(capacity int) *FdCache {
+	if fdCache != nil {
+		return fdCache
 	}
+
+	fdCache = &FdCache{
+		capacity:  capacity,
+		fileLocks: sync.Map{},
+	}
+
+	return fdCache
 }
 
 // Acquire returns a cached *fileEntry for the given path, opening the file in read-only mode if
-// necessary. The entry's reference count is incremented; callers MUST invoke Release when they are
-// done so the underlying descriptor can be closed (and the cache pruned) when no longer needed.
-func (fc *FdCache) Acquire(path string) (*fileEntry, error) {
+// necessary. The lockProvider is used to obtain the RWMutex that guards access to a given file
+// path. The entry's reference count is incremented; callers MUST invoke Release when they are done
+// so the underlying descriptor can be closed (and the cache pruned) when no longer needed.
+func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	// Fast-path: entry already in cache.
 	if v, ok := fc.entries.Load(path); ok {
-		e := v.(*fileEntry)
+		e := v.(*FileEntry)
 		atomic.AddInt32(&e.refs, 1)
 		return e, nil
 	}
@@ -69,10 +107,10 @@ func (fc *FdCache) Acquire(path string) (*fileEntry, error) {
 		return nil, utils.WrapError("failed to open raw file", path, err)
 	}
 
-	entry := &fileEntry{
+	entry := &FileEntry{
 		refs: 1,
 		f:    f,
-		mu:   fc.lockProvider(path),
+		mu:   fc.GetFileLock(path),
 	}
 
 	// If we are above capacity, skip caching this descriptor – it will be closed on Release.
@@ -85,7 +123,7 @@ func (fc *FdCache) Acquire(path string) (*fileEntry, error) {
 	if actual != entry { // a concurrent goroutine won the race
 		// We did not get our entry into the cache – close ours and use theirs.
 		f.Close()
-		entry = actual.(*fileEntry)
+		entry = actual.(*FileEntry)
 		atomic.AddInt32(&entry.refs, 1)
 		return entry, nil
 	}
@@ -97,7 +135,7 @@ func (fc *FdCache) Acquire(path string) (*fileEntry, error) {
 
 // Release decrements the reference count for the given entry and, when it reaches zero, removes
 // the entry from the cache and closes the underlying file.
-func (fc *FdCache) Release(path string, e *fileEntry) {
+func (fc *FdCache) Release(path string, e *FileEntry) {
 	if atomic.AddInt32(&e.refs, -1) == 0 {
 		_ = e.f.Close()
 		if _, loaded := fc.entries.LoadAndDelete(path); loaded {
@@ -110,9 +148,25 @@ func (fc *FdCache) Release(path string, e *fileEntry) {
 // This is primarily used when the file itself has been deleted from disk.
 func (fc *FdCache) Remove(path string) {
 	if v, ok := fc.entries.LoadAndDelete(path); ok {
-		if e, ok2 := v.(*fileEntry); ok2 {
+		if e, ok2 := v.(*FileEntry); ok2 {
 			_ = e.f.Close()
 			atomic.AddInt32(&fc.size, -1)
 		}
 	}
+}
+
+// GetFileLock returns an RWMutex for the given path, creating it if it doesn't exist.
+// An RWMutex allows multiple concurrent readers while still giving exclusive
+// access to writers (Write/Delete), which is exactly the behaviour we need for
+// raw files.
+func (fc *FdCache) GetFileLock(path string) *sync.RWMutex {
+	lock, _ := fc.fileLocks.LoadOrStore(path, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
+}
+
+// CleanUp removes the entry for `path` from the cache and closes the file.
+// This is primarily used when the file itself has been deleted from disk.
+func (fc *FdCache) CleanUp(path string) {
+	fc.Remove(path)
+	fc.fileLocks.Delete(path)
 }

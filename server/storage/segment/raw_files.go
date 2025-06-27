@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
+	"github.com/tigrisdata/cache_service/server/storage/fd"
 	"github.com/tigrisdata/cache_service/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
@@ -47,7 +48,7 @@ type RawFileManager struct {
 	rawFilesPath string   // path to the raw files directory
 	fileLocks    sync.Map // map of mutexes for individual files
 
-	fdCache *FdCache // descriptor cache shared across readers
+	fdCache *fd.FdCache // descriptor cache shared across readers
 
 	headerCache sync.Map // path -> headerMeta
 }
@@ -64,28 +65,9 @@ func NewRawFileManager(rawFilesPath string) (*RawFileManager, error) {
 	}
 
 	// Instantiate a bounded descriptor cache that reuses RawFileManager's lock provider
-	rwm.fdCache = NewFdCache(defaultFdCacheCapacity, rwm.GetFileLock)
+	rwm.fdCache = fd.GetFdCache()
 
 	return rwm, nil
-}
-
-// GetFileLock returns an RWMutex for the given path, creating it if it doesn't exist.
-// An RWMutex allows multiple concurrent readers while still giving exclusive
-// access to writers (Write/Delete), which is exactly the behaviour we need for
-// raw files.
-func (rw *RawFileManager) GetFileLock(path string) *sync.RWMutex {
-	lock, _ := rw.fileLocks.LoadOrStore(path, &sync.RWMutex{})
-	return lock.(*sync.RWMutex)
-}
-
-// acquire returns a fileEntry for the given path, incrementing the reference count
-func (rw *RawFileManager) acquire(path string) (*fileEntry, error) {
-	return rw.fdCache.Acquire(path)
-}
-
-// release decrements the reference count for the given fileEntry and closes the file if the count reaches zero
-func (rw *RawFileManager) release(path string, e *fileEntry) {
-	rw.fdCache.Release(path, e)
 }
 
 // Write writes a value to a raw file for the given key
@@ -95,8 +77,9 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 	random := uuid.New().String()
 	filePath := filepath.Join(rw.rawFilesPath, random)
 
-	// Get file-specific lock (exclusive for writers)
-	fileLock := rw.GetFileLock(filePath)
+	// Get file-specific lock (exclusive for writers). As the file does not exist yet, we need to
+	// take the lock bypassing the fdCache.
+	fileLock := rw.fdCache.GetFileLock(filePath)
 	fileLock.Lock()
 	defer fileLock.Unlock()
 
@@ -156,13 +139,13 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 
 // Read reads a value from a raw file for the given key
 func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
-	e, err := rw.acquire(filePath)
+	e, err := rw.fdCache.Acquire(filePath)
 	if err != nil {
 		return nil, err
 	}
 
 	// Acquire shared read lock to protect against concurrent writers.
-	e.mu.RLock()
+	e.RLock()
 
 	// Attempt fast-path: header already cached.
 	var (
@@ -177,23 +160,23 @@ func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
 		headerSize = hm.headerSize
 	} else {
 		// Slow path: parse header and cache it.
-		valLen, headerSize, _, checksum, err = ReadValueHeader(e.f)
+		valLen, headerSize, _, checksum, err = ReadValueHeader(e.File())
 		if err != nil {
-			e.mu.RUnlock()
-			rw.release(filePath, e)
+			e.RUnlock()
+			rw.fdCache.Release(filePath, e)
 			return nil, err
 		}
 		rw.headerCache.Store(filePath, headerMeta{valLen: valLen, checksum: checksum, headerSize: headerSize})
 	}
 
-	reader := io.NewSectionReader(e.f, headerSize, valLen)
+	reader := io.NewSectionReader(e.File(), headerSize, valLen)
 
 	return &rawFileReadCloser{
 		Reader: reader,
 		onClose: func() {
 			// Release lock & cached FD when caller is done.
-			e.mu.RUnlock()
-			rw.release(filePath, e)
+			e.RUnlock()
+			rw.fdCache.Release(filePath, e)
 		},
 	}, nil
 }
@@ -201,26 +184,36 @@ func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
 // Delete removes a raw file for the given key
 func (rw *RawFileManager) Remove(filePath string) error {
 	// Get file-specific lock
-	fileLock := rw.GetFileLock(filePath)
-	fileLock.Lock()
-	defer fileLock.Unlock()
+	e, err := rw.fdCache.Acquire(filePath)
+	if err != nil {
+		return err
+	}
+
+	// Take exclusive lock to prevent concurrent writes.
+	e.Lock()
+	defer e.Unlock()
 
 	if err := os.Remove(filePath); err != nil {
-		if os.IsNotExist(err) {
-			zlog.Debug().Str("path", filePath).Msg("rawWriter: file already deleted")
-			return nil
+		if !os.IsNotExist(err) {
+			zlog.Error().Err(err).Str("path", filePath).Msg("rawWriter: failed to delete raw file")
+			return utils.WrapError("failed to delete raw file", filePath, err)
 		}
-		zlog.Error().Err(err).Str("path", filePath).Msg("rawWriter: failed to delete raw file")
-		return utils.WrapError("failed to delete raw file", filePath, err)
+
+		zlog.Debug().Str("path", filePath).Msg("rawWriter: file already deleted")
 	}
 
 	// Evict any cached file descriptor for this path.
-	rw.fdCache.Remove(filePath)
-	rw.headerCache.Delete(filePath)
+	rw.fdCache.CleanUp(filePath)
 
-	// Remove the lock from the map
-	rw.fileLocks.Delete(filePath)
+	// Clean up any cached header metadata for this path.
+	rw.CleanUp(filePath)
 
 	zlog.Debug().Str("path", filePath).Msg("rawWriter: deleted raw file")
 	return nil
+}
+
+// CleanUp removes any cached header metadata for the given path.
+func (rw *RawFileManager) CleanUp(filePath string) {
+	// Remove any cached header metadata for this path.
+	rw.headerCache.Delete(filePath)
 }

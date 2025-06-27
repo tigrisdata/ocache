@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/tigrisdata/cache_service/proto"
 	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
+	"github.com/tigrisdata/cache_service/server/storage/fd"
 	"github.com/tigrisdata/cache_service/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
@@ -59,7 +60,7 @@ type Manager struct {
 	segMap       map[string]*Segment // path → *Segment for O(1) lookup
 	mu           sync.RWMutex
 	rawManager   *RawFileManager
-	fdCache      *FdCache // descriptor cache for closed segments
+	fdCache      *fd.FdCache // descriptor cache for closed segments
 }
 
 // Registry is implemented by segment managers that need to be informed when a
@@ -102,7 +103,7 @@ func NewManager(basePath string) (*Manager, error) {
 	}
 
 	// Instantiate descriptor cache for closed segments
-	sm.fdCache = NewFdCache(defaultFdCacheCapacity, sm.getSegmentLock)
+	sm.fdCache = fd.GetFdCache()
 
 	// Load existing segments
 	if err := sm.loadSegments(); err != nil {
@@ -145,7 +146,10 @@ func (sm *Manager) ReadValue(vm *pb.ValueMessage) (io.ReadCloser, error) {
 
 // readSlice returns an io.ReadCloser over a slice of a segment file.
 func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadCloser, error) {
+	sm.mu.RLock()
 	seg := sm.segMap[segPath]
+	sm.mu.RUnlock()
+
 	if seg == nil {
 		return nil, utils.WrapError("segment not found", segPath, nil)
 	}
@@ -156,26 +160,21 @@ func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadClose
 		return io.NopCloser(bytes.NewReader(slice)), nil
 	}
 
-	// If the segment is still open for writes, reuse its R/W descriptor under lock.
-	seg.mu.RLock()
-	f := seg.file
-	seg.mu.RUnlock()
-
-	if f != nil {
-		// Use existing open descriptor; caller doesn't need to manage lifecycle.
-		return io.NopCloser(io.NewSectionReader(f, offset, length)), nil
-	}
-
-	// Closed segment – acquire cached read-only descriptor via FdCache.
+	// Acquire cached read-only descriptor via FdCache.
 	entry, err := sm.fdCache.Acquire(segPath)
 	if err != nil {
 		return nil, err
 	}
 
-	reader := io.NewSectionReader(entry.f, offset, length)
+	// Take shared read lock to protect against concurrent writers.
+	entry.RLock()
+
+	reader := io.NewSectionReader(entry.File(), offset, length)
 	return &readCloserWithOnClose{
 		Reader: reader,
 		onClose: func() {
+			// Release lock & cached FD when caller is done.
+			entry.RUnlock()
 			sm.fdCache.Release(segPath, entry)
 		},
 	}, nil
@@ -183,6 +182,8 @@ func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadClose
 
 // loadSegments loads existing segments from disk
 func (sm *Manager) loadSegments() error {
+	zlog.Info().Str("path", sm.segmentsPath).Msg("loading segments")
+
 	entries, err := os.ReadDir(sm.segmentsPath)
 	if err != nil {
 		return utils.WrapError("failed to read segment directory", sm.segmentsPath, err)
@@ -245,8 +246,12 @@ func (sm *Manager) loadSegments() error {
 		sm.segMap[path] = segment
 	}
 
+	zlog.Info().Str("path", sm.segmentsPath).Msg("finished loading segments")
+
 	// If more than one open segment, finalize all but the newest (by mod time)
 	if len(openSegs) > 1 {
+		zlog.Info().Str("path", sm.segmentsPath).Msg("finalizing open segments")
+
 		// Sort openSegs by modification time ascending
 		sort.Slice(openSegs, func(i, j int) bool {
 			infoI, _ := os.Stat(openSegs[i].path)
@@ -261,12 +266,16 @@ func (sm *Manager) loadSegments() error {
 		}
 	}
 
+	zlog.Info().Str("path", sm.segmentsPath).Msg("finished finalizing open segments")
+
 	return nil
 }
 
 // validateOpenSegment scans the segment, counts entries, truncates invalid tail, and
 // updates position/statistics. The segment file remains open for further writes.
 func (sm *Manager) validateOpenSegment(seg *Segment) error {
+	zlog.Info().Str("path", seg.path).Msg("validating open segment")
+
 	pos := int64(0)
 	entries := uint32(0)
 	dataBytes := int64(0)
@@ -323,6 +332,8 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		pos = nextPos
 	}
 
+	zlog.Info().Str("path", seg.path).Msg("finished validating open segment")
+
 	// Update segment struct
 	seg.entries = entries
 	seg.dataBytes = dataBytes
@@ -331,7 +342,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 
 	// Seek file to end for further writes
 	if _, err := seg.file.Seek(pos, io.SeekStart); err != nil {
-		return err
+		return utils.WrapError("seek to end", seg.path, err)
 	}
 
 	return nil
@@ -427,6 +438,8 @@ func (sm *Manager) getWritableSegment(needed int64) (*Segment, error) {
 // finalizeSegment writes a footer to the segment file and closes it so that no
 // further writes are possible. Callers must hold sm.mu when invoking this.
 func (sm *Manager) finalizeSegment(seg *Segment) error {
+	zlog.Info().Str("path", seg.path).Msg("finalizing segment")
+
 	seg.mu.Lock()
 	defer seg.mu.Unlock()
 
@@ -464,12 +477,18 @@ func (sm *Manager) finalizeSegment(seg *Segment) error {
 
 	// Clear pointer – closed segments will use fdCache for reads.
 	seg.file = nil
+
+	zlog.Info().Str("path", seg.path).Msg("finished finalizing segment")
+
 	return nil
 }
 
 // createNewSegment creates a new segment file
 func (sm *Manager) createNewSegment() (*Segment, error) {
 	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
+
+	zlog.Info().Str("path", path).Msg("creating new segment")
+
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, utils.WrapError("failed to create segment file", path, err)
@@ -488,6 +507,8 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 		return nil, utils.WrapError("mmap segment", path, err)
 	}
 
+	zlog.Info().Str("path", path).Msg("finished creating new segment")
+
 	sm.segments = append(sm.segments, segment)
 	sm.segMap[path] = segment
 	return segment, nil
@@ -500,6 +521,9 @@ func (seg *Segment) initMmap(segmentSize int64) error {
 	if seg.mmap != nil {
 		return nil
 	}
+
+	zlog.Info().Str("path", seg.path).Msg("initializing mmap")
+
 	if seg.file == nil {
 		return utils.WrapError("segment file is nil while attempting mmap", seg.path, nil)
 	}
@@ -512,6 +536,9 @@ func (seg *Segment) initMmap(segmentSize int64) error {
 		return utils.WrapError("mmap", seg.path, err)
 	}
 	seg.mmap = buf
+
+	zlog.Info().Str("path", seg.path).Msg("finished initializing mmap")
+
 	return nil
 }
 
@@ -563,18 +590,6 @@ func (sm *Manager) Close() error {
 		}
 	}
 	return nil
-}
-
-// getSegmentLock returns the RWMutex guarding a segment at the provided path, or a
-// fresh mutex if the segment is unknown (should not normally happen).
-func (sm *Manager) getSegmentLock(path string) *sync.RWMutex {
-	sm.mu.RLock()
-	seg := sm.segMap[path]
-	sm.mu.RUnlock()
-	if seg != nil {
-		return &seg.mu
-	}
-	return &sync.RWMutex{}
 }
 
 // readCloserWithOnClose wraps a reader and calls the provided function when closed.

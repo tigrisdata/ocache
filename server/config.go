@@ -6,12 +6,13 @@ package main
 //
 
 type Config struct {
-	DiskPath  string // Directory for on-disk cache data
-	Threshold int    // Threshold for small objects (bytes)
-	TTL       int    // Default TTL (seconds)
-	Port      int    // gRPC listen port
-	HTTPPort  int    // HTTP (grpc-gateway) port
-	Verbose   bool   // Enable verbose/debug logging
+	DiskPath    string // Directory for on-disk cache data
+	Threshold   int    // Threshold for small objects (bytes)
+	TTL         int    // Default TTL (seconds)
+	Port        int    // gRPC listen port
+	HTTPPort    int    // HTTP (grpc-gateway) port
+	Verbose     bool   // Enable verbose/debug logging
+	FdCacheSize int    // Size of the file descriptor cache
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -22,11 +23,12 @@ var AppConfig Config
 // flag variables into the global AppConfig variable.
 func LoadConfig() {
 	AppConfig = Config{
-		DiskPath:  *diskPath,
-		Threshold: *threshold,
-		TTL:       *ttl,
-		Port:      *port,
-		HTTPPort:  *httpPort,
-		Verbose:   *verbose,
+		DiskPath:    *diskPath,
+		Threshold:   *threshold,
+		TTL:         *ttl,
+		Port:        *port,
+		HTTPPort:    *httpPort,
+		Verbose:     *verbose,
+		FdCacheSize: *fdCacheSize,
 	}
 }

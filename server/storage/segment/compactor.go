@@ -10,6 +10,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/cache_service/proto"
+	"github.com/tigrisdata/cache_service/server/storage/fd"
 	"github.com/tigrisdata/cache_service/server/storage/metadata"
 
 	"google.golang.org/protobuf/proto"
@@ -34,15 +35,16 @@ import (
 // compaction (merging/deleting) lives in Manager.compactSegments().
 
 type Compactor struct {
-	rw   *RawFileManager
-	sm   *Manager
-	meta *metadata.MetaDB
+	rw      *RawFileManager
+	sm      *Manager
+	meta    *metadata.MetaDB
+	fdCache *fd.FdCache
 }
 
 // NewCompactor creates a new Compactor bound to the provided RawFileManager and
 // Segment Manager.
 func NewCompactor(rw *RawFileManager, sm *Manager) *Compactor {
-	return &Compactor{rw: rw, sm: sm, meta: metadata.GetMetaDB()}
+	return &Compactor{rw: rw, sm: sm, meta: metadata.GetMetaDB(), fdCache: fd.GetFdCache()}
 }
 
 // RecordEntry records an entry in the RocksDB raw-index.
@@ -240,9 +242,14 @@ func (c *Compactor) promoteRawFileLow(rawPath, destDir, userKey string, fileSize
 	}
 
 	// Get file lock.
-	lock := c.rw.GetFileLock(rawPath)
-	lock.Lock()
-	defer lock.Unlock()
+	e, err := c.fdCache.Acquire(rawPath)
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	// Take exclusive lock to prevent concurrent writes.
+	e.Lock()
+	defer e.Unlock()
 
 	// Append footer.
 	f, err := os.OpenFile(rawPath, os.O_WRONLY|os.O_APPEND, 0)
@@ -263,6 +270,13 @@ func (c *Compactor) promoteRawFileLow(rawPath, destDir, userKey string, fileSize
 		return "", 0, 0, err
 	}
 
+	// Evict any cached file descriptor for this path.
+	c.fdCache.CleanUp(rawPath)
+
+	// Perform cleanup on the raw file manager.
+	c.rw.CleanUp(rawPath)
+
+	// Register the new segment with a single entry.
 	c.sm.RegisterSegment(newPath, 1, valueLen)
 
 	return newPath, valueHeaderSize, valueLen, nil

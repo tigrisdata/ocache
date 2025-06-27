@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/tigrisdata/cache_service/proto"
 	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
+	"github.com/tigrisdata/cache_service/server/storage/fd"
 	"github.com/tigrisdata/cache_service/server/storage/metadata"
 	"github.com/tigrisdata/cache_service/server/storage/segment"
 
@@ -42,6 +43,7 @@ type Storage struct {
 	diskPath       string           // Path to the disk cache directory
 	threshold      int              // Threshold for small vs large objects
 	segmentManager *segment.Manager // Segment manager for large objects on disk
+	fdCache        *fd.FdCache      // File descriptor cache for open files
 }
 
 var storage *Storage
@@ -52,8 +54,8 @@ func GetStorage() *Storage {
 }
 
 // InitStorage initializes storage at dbPath
-func InitStorage(diskPath string, ttl int, threshold int) {
-	s, err := newStorage(diskPath, ttl, threshold)
+func InitStorage(diskPath string, ttl int, threshold int, fdCacheSize int) {
+	s, err := newStorage(diskPath, ttl, threshold, fdCacheSize)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to open RocksDB")
 	}
@@ -61,7 +63,7 @@ func InitStorage(diskPath string, ttl int, threshold int) {
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
-func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
+func newStorage(diskPath string, ttl int, threshold int, fdCacheSize int) (*Storage, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(diskPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
@@ -73,13 +75,16 @@ func newStorage(diskPath string, ttl int, threshold int) (*Storage, error) {
 		return nil, err
 	}
 
+	// Initialize the fdCache
+	fdCache := fd.NewFdCache(fdCacheSize)
+
 	// Initialize the segment manager
 	segmentManager, err := segment.NewManager(diskPath)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Storage{meta: meta, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager}, nil
+	return &Storage{meta: meta, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager, fdCache: fdCache}, nil
 }
 
 // ListKeys returns all keys in the RocksDB instance
