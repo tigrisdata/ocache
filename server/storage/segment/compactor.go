@@ -85,6 +85,7 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 
 		userKey, filePath, ok := parseRawIndexRow(k, v)
 		if !ok {
+			zlog.Error().Str("key", string(k)).Msg("compactor: failed to parse raw index row")
 			continue
 		}
 
@@ -107,9 +108,13 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 		vm := &pb.ValueMessage{}
 		if metadataFound {
 			if err := proto.Unmarshal(slice.Data(), vm); err != nil {
+				zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to unmarshal metadata")
 				metadataFound = false
 			}
 		}
+
+		// Release slice as early as possible.
+		slice.Free()
 
 		var (
 			bytesMoved int64
@@ -125,23 +130,23 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 				promoted = false
 			}
 
+			// If promotion failed, fall back to copy the raw file into a segment.
 			if !promoted {
 				bytesMoved, promErr = c.copyRawIntoSegment(userKey, filePath, vm)
 				if promErr != nil {
 					zlog.Error().Err(promErr).Str("key", userKey).Msg("compactor: copy failed")
-					slice.Free()
 					continue
 				}
 			}
 
 			// Update metadata if present.
-			if data, err := proto.Marshal(vm); err == nil {
-				batch.Put([]byte(userKey), data)
+			var data []byte
+			if data, err = proto.Marshal(vm); err != nil {
+				zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to marshal metadata")
+				continue
 			}
+			batch.Put([]byte(userKey), data)
 		}
-
-		// Release slice as early as possible.
-		slice.Free()
 
 		// Regardless of metadata presence, remove the raw file as it is no longer needed.
 		c.rw.Remove(filePath)
@@ -155,7 +160,24 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 
 		// Flush intermediate batch when threshold reached.
 		if bytesToFlush >= flushBytes {
-			_ = c.meta.Handle().Write(wo, batch)
+			// Ensure data written to the segment is durable on disk.
+			if err := c.sm.SyncCurrentSegment(); err != nil {
+				zlog.Error().Err(err).Msg("compactor: failed to sync current segment")
+				// We can't write to RocksDB if the segment is not durable.
+				// We need to retry the compaction.
+				batch.Clear()
+				return
+			}
+
+			// Only after segment is made durable, we can write to RocksDB.
+			if err := c.meta.Handle().Write(wo, batch); err != nil {
+				zlog.Error().Err(err).Msg("compactor: failed to write to RocksDB")
+				// We can't write to RocksDB if the segment is not durable.
+				// We need to retry the compaction.
+				batch.Clear()
+				return
+			}
+
 			batch.Clear()
 			bytesToFlush = 0
 
@@ -168,7 +190,19 @@ func (c *Compactor) CompactRawFiles(maxBytes int64, flushBytes int64) {
 
 	// Flush any remaining data.
 	if batch.Count() > 0 {
-		_ = c.meta.Handle().Write(wo, batch)
+		// Ensure data written to the segment is durable on disk.
+		if err := c.sm.SyncCurrentSegment(); err != nil {
+			zlog.Error().Err(err).Msg("compactor: failed to sync current segment")
+			// We can't write to RocksDB if the segment is not durable.
+			// We need to retry the compaction.
+			batch.Clear()
+			return
+		}
+
+		// Only after segment is made durable, we can write to RocksDB.
+		if err := c.meta.Handle().Write(wo, batch); err != nil {
+			zlog.Error().Err(err).Msg("compactor: failed to write to RocksDB")
+		}
 	}
 
 	zlog.Info().Int("migrated", processed).Int64("bytes", bytesMigrated).Dur("duration", time.Since(time.Now())).Msg("compactor: finished raw-file compaction")

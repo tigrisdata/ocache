@@ -41,6 +41,7 @@ type headerMeta struct {
 	valLen     int64
 	checksum   uint32
 	headerSize int64
+	version    uint16
 }
 
 // RawFileManager manages all raw files in the raw directory
@@ -98,7 +99,7 @@ func (rw *RawFileManager) Write(key string, reader io.Reader) (string, error) {
 	// --------------------------------------------------------------------
 	// 2. Write provisional header (valueLen = 0 for now)
 	// --------------------------------------------------------------------
-	header := BuildValueHeader(key, 0, 0) // valueLen unknown yet
+	header := BuildValueHeader(key, 0, 0, CurrentValueHeaderVersion) // valueLen unknown yet
 	if _, err := file.Write(header); err != nil {
 		os.Remove(filePath)
 		return "", utils.WrapError("write header", key, err)
@@ -151,6 +152,7 @@ func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
 	var (
 		valLen     int64
 		headerSize int64
+		version    uint16
 		checksum   uint32
 	)
 
@@ -160,13 +162,13 @@ func (rw *RawFileManager) Read(filePath string) (io.ReadCloser, error) {
 		headerSize = hm.headerSize
 	} else {
 		// Slow path: parse header and cache it.
-		valLen, headerSize, _, checksum, err = ReadValueHeader(e.File())
+		valLen, headerSize, _, version, checksum, err = ReadValueHeader(e.File())
 		if err != nil {
 			e.RUnlock()
 			rw.fdCache.Release(filePath, e)
 			return nil, err
 		}
-		rw.headerCache.Store(filePath, headerMeta{valLen: valLen, checksum: checksum, headerSize: headerSize})
+		rw.headerCache.Store(filePath, headerMeta{valLen: valLen, checksum: checksum, headerSize: headerSize, version: version})
 	}
 
 	reader := io.NewSectionReader(e.File(), headerSize, valLen)

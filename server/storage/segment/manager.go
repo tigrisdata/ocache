@@ -27,8 +27,7 @@ const (
 	DefaultSegmentSize = SmallSegmentSize
 
 	// Default compaction thresholds
-	DefaultRawToSegmentPromotionThreshold   = 1 << 30 // 1GB
-	DefaultCompactionMaxFiles               = 100
+	DefaultRawToSegmentPromotionThreshold   = 1 << 30  // 1GB
 	DefaultCompactionMaxBytes               = 1 << 30  // 1GB
 	DefaultCompactionIntermediateFlushBytes = 64 << 20 // 64 MiB
 	DefaultRawCompactionInterval            = 5 * time.Minute
@@ -61,6 +60,10 @@ type Manager struct {
 	mu           sync.RWMutex
 	rawManager   *RawFileManager
 	fdCache      *fd.FdCache // descriptor cache for closed segments
+
+	// shutdown handling for background compaction goroutine
+	closeCh chan struct{}
+	wg      sync.WaitGroup
 }
 
 // Registry is implemented by segment managers that need to be informed when a
@@ -84,6 +87,8 @@ func NewManager(basePath string) (*Manager, error) {
 	segmentsPath := filepath.Join(basePath, "segments")
 	rawFilesPath := filepath.Join(basePath, "raw_files")
 
+	zlog.Info().Str("segmentsPath", segmentsPath).Str("rawFilesPath", rawFilesPath).Msg("creating segment manager")
+
 	if err := os.MkdirAll(segmentsPath, 0o755); err != nil {
 		zlog.Error().Err(err).Str("path", segmentsPath).Msg("failed to create segment directory")
 		return nil, utils.WrapError("failed to create segment directory", segmentsPath, err)
@@ -100,6 +105,7 @@ func NewManager(basePath string) (*Manager, error) {
 		segmentSize:  DefaultSegmentSize,
 		rawManager:   rawWriter,
 		segMap:       make(map[string]*Segment),
+		closeCh:      make(chan struct{}),
 	}
 
 	// Instantiate descriptor cache for closed segments
@@ -112,7 +118,10 @@ func NewManager(basePath string) (*Manager, error) {
 	}
 
 	// Start compaction goroutine
+	sm.wg.Add(1)
 	go sm.compactionLoop()
+
+	zlog.Info().Msg("segment manager created")
 
 	return sm, nil
 }
@@ -282,7 +291,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 
 	for {
 		// Read header
-		valLen, headerSize, keyLen, checksum, err := ReadValueHeader(seg.file)
+		valLen, headerSize, keyLen, _, checksum, err := ReadValueHeader(seg.file)
 		if err != nil {
 			return utils.WrapError("read header", seg.path, err)
 		}
@@ -356,13 +365,13 @@ func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, i
 	}
 	defer src.Close()
 
-	valueLen, headerSize, _, checksum, err := ReadValueHeader(src)
+	valueLen, headerSize, _, version, checksum, err := ReadValueHeader(src)
 	if err != nil {
 		return "", 0, 0, utils.WrapError("read value header", filePath, err)
 	}
 
 	// Build header
-	header := BuildValueHeader(key, valueLen, checksum)
+	header := BuildValueHeader(key, valueLen, checksum, version)
 
 	// Total bytes to add
 	needed := headerSize + valueLen
@@ -407,6 +416,39 @@ func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, i
 	segment.entries++
 	segment.dataBytes += valueLen
 	return segment.path, startOffset, valueLen, nil
+}
+
+// SyncCurrentSegment syncs the current segment.
+func (sm *Manager) SyncCurrentSegment() error {
+	// Fast path: no segments yet
+	sm.mu.RLock()
+	if len(sm.segments) == 0 {
+		sm.mu.RUnlock()
+		return nil
+	}
+	// Get the newest (currently writable) segment
+	seg := sm.segments[len(sm.segments)-1]
+	sm.mu.RUnlock()
+
+	// If the segment is already finalized (file == nil) nothing to sync
+	seg.mu.RLock()
+	if seg.file == nil {
+		seg.mu.RUnlock()
+		return nil
+	}
+
+	// Flush mmap or file contents
+	var err error
+	if seg.mmap != nil {
+		err = unix.Msync(seg.mmap[:seg.position], unix.MS_SYNC)
+	} else {
+		err = seg.file.Sync()
+	}
+	seg.mu.RUnlock()
+	if err != nil {
+		return utils.WrapError("failed to sync current segment", seg.path, err)
+	}
+	return nil
 }
 
 // getWritableSegment returns a segment that can be written to ensuring that
@@ -544,6 +586,10 @@ func (seg *Segment) initMmap(segmentSize int64) error {
 
 // compactionLoop periodically compacts segments
 func (sm *Manager) compactionLoop() {
+	defer sm.wg.Done()
+
+	zlog.Info().Msg("starting compaction loop")
+
 	rawTicker := time.NewTicker(DefaultRawCompactionInterval)
 	defer rawTicker.Stop()
 
@@ -556,6 +602,9 @@ func (sm *Manager) compactionLoop() {
 			sm.compactRawFiles()
 		case <-segmentTicker.C:
 			sm.compactSegments()
+		case <-sm.closeCh:
+			zlog.Info().Msg("segment manager: compaction loop stopping")
+			return
 		}
 	}
 }
@@ -575,21 +624,31 @@ func (sm *Manager) compactRawFiles() {
 }
 
 // Close closes all segment files
-func (sm *Manager) Close() error {
+func (sm *Manager) Close() {
+	zlog.Info().Msg("closing segment manager")
+
+	// Signal background goroutine to exit and wait for it
+	close(sm.closeCh)
+	sm.wg.Wait()
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	for _, segment := range sm.segments {
-		if segment.file == nil {
-			continue
+		if segment.mmap != nil {
+			if err := unix.Munmap(segment.mmap); err != nil {
+				zlog.Error().Err(err).Str("path", segment.path).Msg("failed to unmap segment")
+			}
+			segment.mmap = nil
 		}
-		if err := segment.file.Close(); err != nil {
-			// Ignore errors when closing segments.
-			zlog.Error().Err(err).Str("path", segment.path).Msg("failed to close segment")
-			continue
+		if segment.file != nil {
+			if err := segment.file.Close(); err != nil {
+				zlog.Error().Err(err).Str("path", segment.path).Msg("failed to close segment")
+			}
 		}
 	}
-	return nil
+
+	zlog.Info().Msg("segment manager closed")
 }
 
 // readCloserWithOnClose wraps a reader and calls the provided function when closed.

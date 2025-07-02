@@ -87,6 +87,19 @@ func newStorage(diskPath string, ttl int, threshold int, fdCacheSize int) (*Stor
 	return &Storage{meta: meta, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager, fdCache: fdCache}, nil
 }
 
+// Close closes the storage
+func CloseStorage() {
+	if storage == nil {
+		return
+	}
+
+	// Close the segment manager
+	storage.segmentManager.Close()
+
+	// Close the metadata DB
+	metadata.CloseMetaDB()
+}
+
 // ListKeys returns all keys in the RocksDB instance
 func (s *Storage) ListKeys() ([]string, error) {
 	ro := grocksdb.NewDefaultReadOptions()

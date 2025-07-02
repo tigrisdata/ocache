@@ -9,12 +9,13 @@ import (
 
 // Constants defining the on-disk segment format.
 const (
-	// Header layout (fixed 16 bytes + key)
+	// Header layout (fixed 18 bytes + key)
 	//  0..7  : uint64 value length
 	//  8..11 : uint32 key length
 	// 12..15 : uint32 CRC32 checksum of value bytes
-	// 16..N  : key bytes
-	ValueHeaderSize = 16
+	// 16..17 : uint16 header format version
+	// 18..N  : key bytes
+	ValueHeaderSize = 18
 
 	// Footer layout (20 bytes)
 	//  0..5  : ASCII magic "SEGEOF"
@@ -26,16 +27,20 @@ const (
 
 	// Segment versioning constants.
 	CurrentSegmentVersion = 1 // Increment when format changes
+
+	// Current header version – increment when ValueHeader layout changes.
+	CurrentValueHeaderVersion = 1
 )
 
 // BuildValueHeader returns a header buffer for the given key and value length.  The
 // caller owns the returned slice.
-func BuildValueHeader(key string, valueLen int64, checksum uint32) []byte {
+func BuildValueHeader(key string, valueLen int64, checksum uint32, version uint16) []byte {
 	hdr := make([]byte, ValueHeaderSize+len(key))
 	binary.BigEndian.PutUint64(hdr[0:8], uint64(valueLen))
 	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(key)))
 	binary.BigEndian.PutUint32(hdr[12:16], checksum)
-	copy(hdr[16:], []byte(key))
+	binary.BigEndian.PutUint16(hdr[16:18], version)
+	copy(hdr[18:], []byte(key))
 	return hdr
 }
 
@@ -43,14 +48,15 @@ func BuildValueHeader(key string, valueLen int64, checksum uint32) []byte {
 // returns the value length, total header size and key length.
 // It expects the file cursor to be at the beginning of the file or supports
 // random access via Pread.
-func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64, checksum uint32, err error) {
+func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64, version uint16, checksum uint32, err error) {
 	var fixed [ValueHeaderSize]byte
 	if _, err = unix.Pread(int(f.Fd()), fixed[:], 0); err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	valueLen = int64(binary.BigEndian.Uint64(fixed[0:8]))
 	keyLen = int64(binary.BigEndian.Uint32(fixed[8:12]))
 	checksum = binary.BigEndian.Uint32(fixed[12:16])
+	version = binary.BigEndian.Uint16(fixed[16:18])
 	headerSize = int64(ValueHeaderSize) + keyLen
 	return
 }

@@ -2,6 +2,7 @@ package metadata
 
 import (
 	grocksdb "github.com/linxGnu/grocksdb"
+	zlog "github.com/rs/zerolog/log"
 )
 
 type MetaDB struct {
@@ -22,6 +23,8 @@ func NewMetaDB(diskPath string, ttl int) (*MetaDB, error) {
 		return metaDB, nil
 	}
 
+	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB")
+
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
 
@@ -33,8 +36,24 @@ func NewMetaDB(diskPath string, ttl int) (*MetaDB, error) {
 
 	metaDB = &MetaDB{handle: db}
 
+	zlog.Info().Msg("metadata DB created")
+
 	return metaDB, nil
 }
 
 // GetMetaDB returns the global RocksDB instance used for metadata operations.
 func GetMetaDB() *MetaDB { return metaDB }
+
+// CloseMetaDB closes the global RocksDB instance used for metadata operations.
+func CloseMetaDB() {
+	if metaDB == nil {
+		return
+	}
+	zlog.Info().Msg("closing metadata DB")
+
+	metaDB.handle.Close()
+
+	zlog.Info().Msg("metadata DB closed")
+
+	metaDB = nil
+}

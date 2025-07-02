@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
@@ -37,7 +39,16 @@ func RunServer() {
 	go startGRPCServer()                           // Start gRPC server in goroutine
 	go startGRPCGatewayServer(grpcAddr, *httpPort) // Start grpc-gateway on different port
 
-	select {} // Block forever
+	// Handle graceful shutdown on SIGINT/SIGTERM.
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigChan
+	zlog.Info().Str("signal", sig.String()).Msg("Received shutdown signal, shutting down...")
+
+	// Close storage (flush segments, close RocksDB, etc.)
+	stor.CloseStorage()
+
+	zlog.Info().Msg("Shutdown complete")
 }
 
 func main() {
