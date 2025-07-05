@@ -9,9 +9,9 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
-	"github.com/tigrisdata/cache_service/server/storage/fd"
-	"github.com/tigrisdata/cache_service/server/utils"
+	"github.com/tigrisdata/ocache/server/storage/bufferpool"
+	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
 )

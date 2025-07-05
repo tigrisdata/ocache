@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	pb "github.com/tigrisdata/cache_service/proto"
+	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 )
 

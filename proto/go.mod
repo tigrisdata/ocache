@@ -1,4 +1,4 @@
-module github.com/tigrisdata/cache_service/proto
+module github.com/tigrisdata/ocache/proto
 
 go 1.23.0
 

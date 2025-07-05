@@ -14,7 +14,7 @@ A cache service that supports both in-memory and disk-based storage, with gRPC a
 
 ```bash
 git clone <repo-url>
-cd cache_service
+cd ocache
 ```
 
 ### Build the service (macOS)
@@ -37,7 +37,7 @@ protoc -I ./proto \
 Then build the service:
 
 ```bash
-CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib" go build -o cache_service ./server/
+CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib" go build -o ocache ./server/
 ```
 
 ## Usage
@@ -45,7 +45,7 @@ CGO_CFLAGS="-I$(brew --prefix)/include" CGO_LDFLAGS="-L$(brew --prefix)/lib" go 
 Run the service:
 
 ```bash
-./cache_service
+./ocache
 ```
 
 ### Command-line Flags
@@ -60,7 +60,7 @@ Run the service:
 Example:
 
 ```bash
-./cache_service -disk /tmp/mydisk -threshold 2097152 -port 9090 -http-port 9091 -ttl 3600 -v
+./ocache -disk /tmp/mydisk -threshold 2097152 -port 9090 -http-port 9091 -ttl 3600 -v
 ```
 
 ## HTTP Endpoints
@@ -112,7 +112,7 @@ A command-line client is available for interacting with the cache service via gR
 ### Build the CLI
 
 ```bash
-go build -o cachecli ./client/cmd/
+go build -o ocachecli ./client/cmd/
 ```
 
 ### CLI Commands
@@ -130,31 +130,31 @@ You can specify the server address with `--addr` (default: `localhost:9000`).
 **Store a value:**
 
 ```bash
-./cachecli --addr localhost:9000 put mykey "hello world"
+./ocachecli --addr localhost:9000 put mykey "hello world"
 ```
 
 **Retrieve a value:**
 
 ```bash
-./cachecli --addr localhost:9000 get mykey
+./ocachecli --addr localhost:9000 get mykey
 ```
 
 **Delete a key:**
 
 ```bash
-./cachecli --addr localhost:9000 del mykey
+./ocachecli --addr localhost:9000 del mykey
 ```
 
 **List all keys:**
 
 ```bash
-./cachecli --addr localhost:9000 list
+./ocachecli --addr localhost:9000 list
 ```
 
 For more help, run:
 
 ```bash
-./cachecli --help
+./ocachecli --help
 ```
 
 ### Benchmarks
@@ -162,7 +162,7 @@ For more help, run:
 To run benchmarks, use the `bench` command in the CLI:
 
 ```bash
-./cachecli --addr localhost:9000 bench
+./ocachecli --addr localhost:9000 bench
 ```
 
 This will run a YCSB style benchmark against the cache service, simulating a workload with configurable parameters.

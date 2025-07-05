@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	cacheclient "github.com/tigrisdata/cache_service/client"
-	ycsb "github.com/tigrisdata/cache_service/client/cmd/ycsb"
+	cacheclient "github.com/tigrisdata/ocache/client"
+	ycsb "github.com/tigrisdata/ocache/client/cmd/ycsb"
 )
 
 var rootCmd = &cobra.Command{

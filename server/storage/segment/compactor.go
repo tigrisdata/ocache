@@ -9,9 +9,9 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
-	pb "github.com/tigrisdata/cache_service/proto"
-	"github.com/tigrisdata/cache_service/server/storage/fd"
-	"github.com/tigrisdata/cache_service/server/storage/metadata"
+	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/server/storage/metadata"
 
 	"google.golang.org/protobuf/proto"
 )

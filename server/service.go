@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"time"
 
-	pb "github.com/tigrisdata/cache_service/proto"
-	stor "github.com/tigrisdata/cache_service/server/storage"
-	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
+	pb "github.com/tigrisdata/ocache/proto"
+	stor "github.com/tigrisdata/ocache/server/storage"
+	"github.com/tigrisdata/ocache/server/storage/bufferpool"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/rs/zerolog"

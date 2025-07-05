@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/tigrisdata/cache_service/proto"
-	"github.com/tigrisdata/cache_service/server/storage/bufferpool"
-	"github.com/tigrisdata/cache_service/server/storage/fd"
-	"github.com/tigrisdata/cache_service/server/utils"
+	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/bufferpool"
+	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
 )

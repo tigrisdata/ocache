@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package cache;
 
-option go_package = "github.com/tigrisdata/cache_service/proto;proto";
+option go_package = "github.com/tigrisdata/ocache/proto;proto";
 
 import "google/api/annotations.proto";
 

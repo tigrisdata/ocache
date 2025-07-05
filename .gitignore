@@ -5,5 +5,5 @@
 *.pb.gw.go
 
 # Go build artifacts
-**/cache_service
-**/cachecli
+**/ocache
+**/ocachecli

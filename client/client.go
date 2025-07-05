@@ -4,7 +4,7 @@ import (
 	"context"
 	"io"
 
-	pb "github.com/tigrisdata/cache_service/proto"
+	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 )
 

@@ -1,4 +1,4 @@
-module github.com/tigrisdata/cache_service/server
+module github.com/tigrisdata/ocache/server
 
 go 1.24.2
 
@@ -8,7 +8,7 @@ require (
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
-	github.com/tigrisdata/cache_service/proto v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
 )
 
@@ -30,4 +30,4 @@ require (
 
 // We want to import the local `proto/` module
 // We want to import the local `proto/` module
-replace github.com/tigrisdata/cache_service/proto => ../proto
+replace github.com/tigrisdata/ocache/proto => ../proto

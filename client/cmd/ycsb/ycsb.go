@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	cacheclient "github.com/tigrisdata/cache_service/client"
+	cacheclient "github.com/tigrisdata/ocache/client"
 )
 
 type OpType int
