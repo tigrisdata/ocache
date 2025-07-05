@@ -83,17 +83,15 @@ func BuildSegmentFooterWithVersion(version int, entries uint32, dataBytes int64)
 	// 0..5 – static prefix "SEGEOF"
 	copy(ftr[0:6], []byte(SegmentFooterMagicPrefix))
 
-	// 6..7 – version encoded as zero-padded decimal ("01", "02", ...)
-	if version < 10 { // 1 digit
-		ver := []byte{byte('0' + version)}
-		copy(ftr[6:8], ver)
+	// 6..7 – version encoded as zero-padded decimal ("01", "02", ... up to 99)
+	if version < 0 || version > 99 {
+		// fall back to 00 for unsupported values (should not happen)
+		copy(ftr[6:8], []byte{'0', '0'})
 	} else {
-		// 2 digits
-		ver := []byte{
-			byte('0' + (version/10)%10),
-			byte('0' + version%10),
-		}
-		copy(ftr[6:8], ver)
+		tens := byte('0' + (version/10)%10)
+		ones := byte('0' + version%10)
+		ftr[6] = tens
+		ftr[7] = ones
 	}
 
 	// 8..11 – entry count (uint32)
