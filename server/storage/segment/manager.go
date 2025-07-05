@@ -1,7 +1,6 @@
 package segment
 
 import (
-	"bytes"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -17,7 +16,6 @@ import (
 	"github.com/tigrisdata/cache_service/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -39,7 +37,6 @@ type Segment struct {
 	path     string
 	size     int64
 	file     *os.File
-	mmap     []byte // writable mmap for the open segment (nil for closed)
 	mu       sync.RWMutex
 	position int64
 
@@ -161,12 +158,6 @@ func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadClose
 
 	if seg == nil {
 		return nil, utils.WrapError("segment not found", segPath, nil)
-	}
-
-	// Fast path: mmap slice
-	if seg.mmap != nil && offset+length <= int64(len(seg.mmap)) {
-		slice := seg.mmap[offset : offset+length]
-		return io.NopCloser(bytes.NewReader(slice)), nil
 	}
 
 	// Acquire cached read-only descriptor via FdCache.
@@ -318,14 +309,17 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		// Checksum validation when header contains non-zero checksum.
 		if checksum != 0 {
 			valueOffset := pos + headerSize // pos is entry start offset
+
 			h := crc32.NewIEEE()
 			section := io.NewSectionReader(seg.file, valueOffset, valLen)
+
 			buf, releaseBuf := bufferpool.AcquireBuffer(64 * 1024)
 			if _, err := io.CopyBuffer(h, section, buf); err != nil {
 				releaseBuf()
 				return utils.WrapError("checksum read", seg.path, err)
 			}
 			releaseBuf()
+
 			if h.Sum32() != checksum {
 				zlog.Warn().Str("segment", seg.path).Int64("offset", pos).Msg("checksum mismatch – truncating segment")
 				if err := seg.file.Truncate(pos); err != nil {
@@ -394,22 +388,12 @@ func (sm *Manager) WriteToSegment(key string, filePath string) (string, int64, i
 		return "", 0, 0, utils.WrapError("seek to start", filePath, err)
 	}
 
-	if segment.mmap != nil {
-		// Fast path: copy into mmap
-		copy(segment.mmap[segment.position:], header)
-
-		dst := segment.mmap[segment.position+headerSize : segment.position+needed]
-		if _, err := io.ReadFull(src, dst); err != nil {
-			return "", 0, 0, utils.WrapError("read raw into mmap", filePath, err)
-		}
-	} else {
-		// Fallback to normal write
-		if _, err := segment.file.Write(header); err != nil {
-			return "", 0, 0, utils.WrapError("failed to write header", filePath, err)
-		}
-		if _, err := io.Copy(segment.file, src); err != nil {
-			return "", 0, 0, utils.WrapError("copy value to segment", filePath, err)
-		}
+	// Sequential write: header then payload
+	if _, err := segment.file.Write(header); err != nil {
+		return "", 0, 0, utils.WrapError("failed to write header", filePath, err)
+	}
+	if _, err := io.Copy(segment.file, src); err != nil {
+		return "", 0, 0, utils.WrapError("copy value to segment", filePath, err)
 	}
 
 	segment.position += needed
@@ -437,13 +421,8 @@ func (sm *Manager) SyncCurrentSegment() error {
 		return nil
 	}
 
-	// Flush mmap or file contents
-	var err error
-	if seg.mmap != nil {
-		err = unix.Msync(seg.mmap[:seg.position], unix.MS_SYNC)
-	} else {
-		err = seg.file.Sync()
-	}
+	// Flush file contents to disk
+	err := seg.file.Sync()
 	seg.mu.RUnlock()
 	if err != nil {
 		return utils.WrapError("failed to sync current segment", seg.path, err)
@@ -469,11 +448,6 @@ func (sm *Manager) getWritableSegment(needed int64) (*Segment, error) {
 		return sm.createNewSegment()
 	}
 
-	// Ensure mmap ready for fast writes
-	if err := lastSeg.initMmap(sm.segmentSize); err != nil {
-		return nil, err
-	}
-
 	return lastSeg, nil
 }
 
@@ -492,21 +466,13 @@ func (sm *Manager) finalizeSegment(seg *Segment) error {
 	// Build footer [magic|entries|bytes]
 	footer := BuildSegmentFooterWithVersion(seg.version, seg.entries, seg.dataBytes)
 
-	if seg.mmap != nil {
-		copy(seg.mmap[seg.position:], footer)
-		seg.position += int64(len(footer))
-		// msync to flush footer & previous writes
-		_ = unix.Msync(seg.mmap[:seg.position], unix.MS_SYNC)
-		// Unmap now that the segment is closed
-		_ = unix.Munmap(seg.mmap)
-		seg.mmap = nil
-		// Shrink file to actual size
-		_ = seg.file.Truncate(seg.position)
-	} else {
-		if _, err := seg.file.Write(footer); err != nil {
-			return utils.WrapError("failed to write segment footer", seg.path, err)
-		}
-		seg.position += int64(len(footer))
+	if _, err := seg.file.Write(footer); err != nil {
+		return utils.WrapError("failed to write segment footer", seg.path, err)
+	}
+	seg.position += int64(len(footer))
+	// Shrink pre-allocated file to actual used size
+	if err := seg.file.Truncate(seg.position); err != nil {
+		return utils.WrapError("truncate segment", seg.path, err)
 	}
 
 	// Flush and close the R/W file descriptor
@@ -536,6 +502,12 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 		return nil, utils.WrapError("failed to create segment file", path, err)
 	}
 
+	// Pre-allocate file to configured segment size
+	if err := file.Truncate(sm.segmentSize); err != nil {
+		file.Close()
+		return nil, utils.WrapError("truncate segment file", path, err)
+	}
+
 	segment := &Segment{
 		path:     path,
 		file:     file,
@@ -543,45 +515,9 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 		version:  CurrentSegmentVersion,
 	}
 
-	// Ensure mmap ready for fast writes
-	if err := segment.initMmap(sm.segmentSize); err != nil {
-		segment.file.Close()
-		return nil, utils.WrapError("mmap segment", path, err)
-	}
-
-	zlog.Info().Str("path", path).Msg("finished creating new segment")
-
 	sm.segments = append(sm.segments, segment)
 	sm.segMap[path] = segment
 	return segment, nil
-}
-
-// initMmap ensures seg.mmap is initialized for writable use. It truncates the file
-// to segmentSize (if needed) and maps the whole region as read-write shared. Safe
-// to call multiple times; it is a no-op when seg.mmap already exists.
-func (seg *Segment) initMmap(segmentSize int64) error {
-	if seg.mmap != nil {
-		return nil
-	}
-
-	zlog.Info().Str("path", seg.path).Msg("initializing mmap")
-
-	if seg.file == nil {
-		return utils.WrapError("segment file is nil while attempting mmap", seg.path, nil)
-	}
-	// Enlarge file to full segment size so mapping length is fixed.
-	if err := seg.file.Truncate(segmentSize); err != nil {
-		return utils.WrapError("truncate for mmap", seg.path, err)
-	}
-	buf, err := unix.Mmap(int(seg.file.Fd()), 0, int(segmentSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		return utils.WrapError("mmap", seg.path, err)
-	}
-	seg.mmap = buf
-
-	zlog.Info().Str("path", seg.path).Msg("finished initializing mmap")
-
-	return nil
 }
 
 // compactionLoop periodically compacts segments
@@ -635,12 +571,6 @@ func (sm *Manager) Close() {
 	defer sm.mu.Unlock()
 
 	for _, segment := range sm.segments {
-		if segment.mmap != nil {
-			if err := unix.Munmap(segment.mmap); err != nil {
-				zlog.Error().Err(err).Str("path", segment.path).Msg("failed to unmap segment")
-			}
-			segment.mmap = nil
-		}
 		if segment.file != nil {
 			if err := segment.file.Close(); err != nil {
 				zlog.Error().Err(err).Str("path", segment.path).Msg("failed to close segment")
