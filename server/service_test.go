@@ -12,7 +12,7 @@ import (
 
 func setupTestStorage(t *testing.T) {
 	dir := t.TempDir()
-	stor.InitStorage(dir, 3600, 1024, 1000)
+	stor.InitStorage(dir, 3600, 1024, 4096, 16*1024*1024, 1000)
 }
 
 func TestCacheService_PutObjectAndGet(t *testing.T) {

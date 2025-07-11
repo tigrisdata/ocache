@@ -8,15 +8,23 @@ import (
 	"os"
 	"time"
 
-	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/bufferpool"
-	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
-	"github.com/tigrisdata/ocache/server/storage/segment"
-
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/tigrisdata/ocache/server/compaction"
+	"github.com/tigrisdata/ocache/server/storage/bufferpool"
+	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/server/storage/files"
+	"github.com/tigrisdata/ocache/server/storage/metadata"
+	"github.com/tigrisdata/ocache/server/storage/segment"
+)
+
+const (
+	// Default compaction thresholds
+	DefaultCompactionMaxBytes     = 1 << 30 // 1GB
+	DefaultFileCompactionInterval = 5 * time.Minute
 )
 
 // Storage wraps all RocksDB access and related logic
@@ -39,11 +47,14 @@ import (
 //
 // On read, expiry is checked (if present) and expired keys are deleted and not returned.
 type Storage struct {
-	meta           *metadata.MetaDB
-	diskPath       string           // Path to the disk cache directory
-	threshold      int              // Threshold for small vs large objects
-	segmentManager *segment.Manager // Segment manager for large objects on disk
-	fdCache        *fd.FdCache      // File descriptor cache for open files
+	meta             *metadata.MetaDB
+	diskPath         string                // Path to the disk cache directory
+	inlineThreshold  int                   // Threshold for small vs large objects
+	compactThreshold int64                 // Objects less than this size are compacted to segments (bytes)
+	segmentManager   *segment.Manager      // Segment manager for large objects on disk
+	fileManager      *files.FileManager    // File manager for large objects on disk
+	fdCache          *fd.FdCache           // File descriptor cache for open files
+	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 }
 
 var storage *Storage
@@ -54,8 +65,8 @@ func GetStorage() *Storage {
 }
 
 // InitStorage initializes storage at dbPath
-func InitStorage(diskPath string, ttl int, threshold int, fdCacheSize int) {
-	s, err := newStorage(diskPath, ttl, threshold, fdCacheSize)
+func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int) {
+	s, err := newStorage(diskPath, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to open RocksDB")
 	}
@@ -63,7 +74,7 @@ func InitStorage(diskPath string, ttl int, threshold int, fdCacheSize int) {
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
-func newStorage(diskPath string, ttl int, threshold int, fdCacheSize int) (*Storage, error) {
+func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int) (*Storage, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(diskPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
@@ -79,18 +90,33 @@ func newStorage(diskPath string, ttl int, threshold int, fdCacheSize int) (*Stor
 	fdCache := fd.NewFdCache(fdCacheSize)
 
 	// Initialize the segment manager
-	segmentManager, err := segment.NewManager(diskPath)
+	segmentManager, err := segment.NewManager(diskPath, segmentSize)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Storage{meta: meta, diskPath: diskPath, threshold: threshold, segmentManager: segmentManager, fdCache: fdCache}, nil
+	// Initialize the file manager
+	fileManager, err := files.NewFileManager(diskPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize and start background compactor that migrates raw files into segments.
+	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, DefaultFileCompactionInterval)
+	compactor.Start()
+
+	return &Storage{meta: meta, diskPath: diskPath, inlineThreshold: inlineThreshold, segmentManager: segmentManager, fileManager: fileManager, fdCache: fdCache, compactor: compactor}, nil
 }
 
 // Close closes the storage
 func CloseStorage() {
 	if storage == nil {
 		return
+	}
+
+	// Stop background compactor first so it does not race with segment manager shutdown
+	if storage.compactor != nil {
+		storage.compactor.Close()
 	}
 
 	// Close the segment manager
@@ -174,13 +200,26 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		return bytes.NewReader(valueMsg.Data), true, nil
 	}
 
-	// Try to read from segment or raw file (large value)
-	if r, err := s.segmentManager.ReadValue(valueMsg); err != nil {
-		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read large value")
-		s.DeleteKey(key)
-		return nil, false, err
-	} else if r != nil {
-		return r, true, nil
+	// If the value is stored in a segment, return a reader for the segment slice
+	if valueMsg.SegmentPath != "" && valueMsg.ValueLength > 0 {
+		if r, err := s.segmentManager.ReadValue(valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
+			s.DeleteKey(key)
+			return nil, false, err
+		} else if r != nil {
+			return r, true, nil
+		}
+	}
+
+	// If the value is stored in a file, return a reader for the file
+	if valueMsg.RawFilePath != "" {
+		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
+			s.DeleteKey(key)
+			return nil, false, err
+		} else if r != nil {
+			return r, true, nil
+		}
 	}
 
 	return nil, false, nil
@@ -190,7 +229,7 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	// We need to read at most threshold+1 bytes to decide if the value is "large".
 	// Allocate a buffer exactly that size to avoid the short-buffer error.
-	firstReadSize := s.threshold + 1
+	firstReadSize := s.inlineThreshold + 1
 	if firstReadSize <= 0 {
 		firstReadSize = 1 // ensure at least 1
 	}
@@ -213,10 +252,10 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 
 	// Large value path: we managed to read more than threshold bytes, which means
 	// the value length exceeds the small-value threshold.
-	if n > s.threshold {
+	if n > s.inlineThreshold {
 		// Combine the bytes we already read with the remaining reader and write via the segment manager
 		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
-		filePath, err := s.segmentManager.WriteValue(key, multiReader)
+		filePath, _, bytesWritten, err := s.fileManager.Write(key, multiReader)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
 			return err
@@ -225,34 +264,47 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		valueMsg := &pb.ValueMessage{
 			RawFilePath: filePath,
 			Expiry:      expiry,
+			ValueLength: bytesWritten,
 		}
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 			return err
 		}
-		return s.putLow(key, val)
+		return s.putLow(key, val, filePath, bytesWritten)
 	}
 
 	// Small value: we have read the entire value into firstChunk[:n]
 	smallValue := firstChunk[:n]
 
 	valueMsg := &pb.ValueMessage{
-		Data:   smallValue,
-		Expiry: expiry,
+		Data:        smallValue,
+		Expiry:      expiry,
+		ValueLength: int64(n),
 	}
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 		return err
 	}
-	return s.putLow(key, val)
+	return s.putLow(key, val, "", int64(n))
 }
 
 // putLow stores the key-value pair in the database
-func (s *Storage) putLow(key string, val []byte) error {
+// If the value is larger than the compact threshold, record it for compaction.
+func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten int64) error {
 	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
 	wo := grocksdb.NewDefaultWriteOptions()
-	return s.meta.Handle().Put(wo, []byte(key), val)
+	batch := grocksdb.NewWriteBatch()
+
+	if bytesWritten > s.compactThreshold {
+		cIdxKey, cIdxVal := compaction.PrepareEntryForCompaction(key, filePath)
+		batch.Put(cIdxKey, cIdxVal)
+	}
+
+	// Store the metadata in the database
+	batch.Put([]byte(key), val)
+
+	return s.meta.Handle().Write(wo, batch)
 }

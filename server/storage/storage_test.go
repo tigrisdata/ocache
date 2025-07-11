@@ -11,7 +11,7 @@ import (
 
 func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newStorage(dir, 3600, 1024, 1000)
+	s, err := newStorage(dir, 3600, 1024, 4096, 16*1024*1024, 1000)
 	assert.NoError(t, err, "failed to create storage")
 	key := "testkey"
 	value := []byte("hello world")
@@ -33,7 +33,7 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 
 func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newStorage(dir, 3600, 8, 1000) // very low threshold to force spill
+	s, err := newStorage(dir, 3600, 8, 4096, 16*1024*1024, 1000) // very low threshold to force spill
 	assert.NoError(t, err, "failed to create storage")
 	key := "largekey"
 	value := []byte("this is a large value that should spill to disk")
@@ -55,7 +55,7 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 
 func TestStorage_ListKeys(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newStorage(dir, 3600, 1024, 1000)
+	s, err := newStorage(dir, 3600, 1024, 4096, 16*1024*1024, 1000)
 	assert.NoError(t, err, "failed to create storage")
 	keys := []string{"k1", "k2", "k3"}
 	for _, k := range keys {
@@ -71,7 +71,7 @@ func TestStorage_ListKeys(t *testing.T) {
 
 func TestStorage_PutGet_TTL(t *testing.T) {
 	dir := t.TempDir()
-	s, err := newStorage(dir, 3600, 1024, 1000)
+	s, err := newStorage(dir, 3600, 1024, 4096, 16*1024*1024, 1000)
 	assert.NoError(t, err, "failed to create storage")
 	key := "ttlkey"
 	value := []byte("with ttl")

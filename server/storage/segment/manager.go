@@ -10,26 +10,11 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/bufferpool"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/utils"
 
 	zlog "github.com/rs/zerolog/log"
-)
-
-const (
-	// Segment sizes
-	SmallSegmentSize   = 1 << 30 // 1GB
-	LargeSegmentSize   = 1 << 32 // 4GB
-	DefaultSegmentSize = SmallSegmentSize
-
-	// Default compaction thresholds
-	DefaultRawToSegmentPromotionThreshold   = 1 << 30  // 1GB
-	DefaultCompactionMaxBytes               = 1 << 30  // 1GB
-	DefaultCompactionIntermediateFlushBytes = 64 << 20 // 64 MiB
-	DefaultRawCompactionInterval            = 5 * time.Minute
-	DefaultSegmentCompactionInterval        = 1 * time.Hour
 )
 
 // Segment is a file on disk that contains key/value pairs.
@@ -55,7 +40,6 @@ type Manager struct {
 	segments     []*Segment          // ordered list (oldest→newest)
 	segMap       map[string]*Segment // path → *Segment for O(1) lookup
 	mu           sync.RWMutex
-	rawManager   *RawFileManager
 	fdCache      *fd.FdCache // descriptor cache for closed segments
 
 	// shutdown handling for background compaction goroutine
@@ -80,27 +64,19 @@ func (sm *Manager) RegisterSegment(path string, entries uint32, bytes int64) {
 }
 
 // NewManager creates a new segment manager
-func NewManager(basePath string) (*Manager, error) {
+func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 	segmentsPath := filepath.Join(basePath, "segments")
-	rawFilesPath := filepath.Join(basePath, "raw_files")
 
-	zlog.Info().Str("segmentsPath", segmentsPath).Str("rawFilesPath", rawFilesPath).Msg("creating segment manager")
+	zlog.Info().Str("segmentsPath", segmentsPath).Msg("creating segment manager")
 
 	if err := os.MkdirAll(segmentsPath, 0o755); err != nil {
 		zlog.Error().Err(err).Str("path", segmentsPath).Msg("failed to create segment directory")
 		return nil, utils.WrapError("failed to create segment directory", segmentsPath, err)
 	}
 
-	rawWriter, err := NewRawFileManager(rawFilesPath)
-	if err != nil {
-		zlog.Error().Err(err).Str("path", rawFilesPath).Msg("failed to create raw writer")
-		return nil, utils.WrapError("failed to create raw writer", rawFilesPath, err)
-	}
-
 	sm := &Manager{
 		segmentsPath: segmentsPath,
-		segmentSize:  DefaultSegmentSize,
-		rawManager:   rawWriter,
+		segmentSize:  segmentSize,
 		segMap:       make(map[string]*Segment),
 		closeCh:      make(chan struct{}),
 	}
@@ -114,44 +90,13 @@ func NewManager(basePath string) (*Manager, error) {
 		return nil, err
 	}
 
-	// Start compaction goroutine
-	sm.wg.Add(1)
-	go sm.compactionLoop()
-
 	zlog.Info().Msg("segment manager created")
 
 	return sm, nil
 }
 
-// WriteValue writes a value to a raw file
-func (sm *Manager) WriteValue(key string, reader io.Reader) (string, error) {
-	return sm.rawManager.Write(key, reader)
-}
-
-// ReadValue returns a reader for a ValueMessage that references a raw file or a
-// segment slice. Caller must ensure vm is non-nil. Returns (nil, nil) if no
-// external data is referenced.
-func (sm *Manager) ReadValue(vm *pb.ValueMessage) (io.ReadCloser, error) {
-	if vm == nil {
-		return nil, utils.WrapError("nil ValueMessage", "", nil)
-	}
-
-	// If the value is stored in a segment, return a reader for the segment slice
-	if vm.SegmentPath != "" && vm.ValueLength > 0 {
-		return sm.readSlice(vm.SegmentPath, vm.SegmentOffset, vm.ValueLength)
-	}
-
-	// If the value is stored in a raw file, return a reader for the raw file
-	if vm.RawFilePath != "" {
-		return sm.rawManager.Read(vm.RawFilePath)
-	}
-
-	// Return nil if no data is referenced in segment or raw file
-	return nil, nil
-}
-
-// readSlice returns an io.ReadCloser over a slice of a segment file.
-func (sm *Manager) readSlice(segPath string, offset, length int64) (io.ReadCloser, error) {
+// ReadValue returns an io.ReadCloser over a slice of a segment file.
+func (sm *Manager) ReadValue(segPath string, offset, length int64) (io.ReadCloser, error) {
 	sm.mu.RLock()
 	seg := sm.segMap[segPath]
 	sm.mu.RUnlock()
@@ -518,45 +463,6 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 	sm.segments = append(sm.segments, segment)
 	sm.segMap[path] = segment
 	return segment, nil
-}
-
-// compactionLoop periodically compacts segments
-func (sm *Manager) compactionLoop() {
-	defer sm.wg.Done()
-
-	zlog.Info().Msg("starting compaction loop")
-
-	rawTicker := time.NewTicker(DefaultRawCompactionInterval)
-	defer rawTicker.Stop()
-
-	segmentTicker := time.NewTicker(DefaultSegmentCompactionInterval)
-	defer segmentTicker.Stop()
-
-	for {
-		select {
-		case <-rawTicker.C:
-			sm.compactRawFiles()
-		case <-segmentTicker.C:
-			sm.compactSegments()
-		case <-sm.closeCh:
-			zlog.Info().Msg("segment manager: compaction loop stopping")
-			return
-		}
-	}
-}
-
-// compactSegments is a placeholder for future segment-merging compaction logic.
-func (sm *Manager) compactSegments() {
-	// TODO: implement segment-level compaction (merge small closed segments, drop deleted keys, etc.)
-}
-
-// compactRawFiles moves data from the raw-files directory into segments using the
-// RocksDB raw index (key prefix "!raw/"). After a successful copy the index row
-// is removed. The raw file itself is **not** deleted yet – we keep it until the
-// reader path understands segment offsets.
-func (sm *Manager) compactRawFiles() {
-	compactor := NewCompactor(sm.rawManager, sm)
-	compactor.CompactRawFiles(DefaultCompactionMaxBytes, DefaultCompactionIntermediateFlushBytes)
 }
 
 // Close closes all segment files
