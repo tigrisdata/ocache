@@ -195,13 +195,10 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		return nil, false, nil
 	}
 
-	// Try to read from small value
-	if len(valueMsg.Data) > 0 {
+	switch valueMsg.ValueType {
+	case pb.ValueType_INLINE:
 		return bytes.NewReader(valueMsg.Data), true, nil
-	}
-
-	// If the value is stored in a segment, return a reader for the segment slice
-	if valueMsg.SegmentPath != "" && valueMsg.ValueLength > 0 {
+	case pb.ValueType_SEGMENT:
 		if r, err := s.segmentManager.ReadValue(valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
@@ -209,10 +206,7 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		} else if r != nil {
 			return r, true, nil
 		}
-	}
-
-	// If the value is stored in a file, return a reader for the file
-	if valueMsg.RawFilePath != "" {
+	case pb.ValueType_RAW_FILE:
 		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
 			s.DeleteKey(key)
@@ -220,6 +214,10 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		} else if r != nil {
 			return r, true, nil
 		}
+	default:
+		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type")
+		s.DeleteKey(key)
+		return nil, false, nil
 	}
 
 	return nil, false, nil
@@ -255,7 +253,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	if n > s.inlineThreshold {
 		// Combine the bytes we already read with the remaining reader and write via the segment manager
 		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
-		filePath, _, bytesWritten, err := s.fileManager.Write(key, multiReader)
+		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, multiReader)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
 			return err
@@ -265,6 +263,8 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			RawFilePath: filePath,
 			Expiry:      expiry,
 			ValueLength: bytesWritten,
+			Checksum:    checksum,
+			ValueType:   pb.ValueType_RAW_FILE,
 		}
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
@@ -277,10 +277,13 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	// Small value: we have read the entire value into firstChunk[:n]
 	smallValue := firstChunk[:n]
 
+	// We don't need to store the checksum for small values because
+	// we are relying on RocksDB to verify the integrity of the data.
 	valueMsg := &pb.ValueMessage{
 		Data:        smallValue,
 		Expiry:      expiry,
 		ValueLength: int64(n),
+		ValueType:   pb.ValueType_INLINE,
 	}
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {
@@ -298,7 +301,9 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
 
-	if bytesWritten > s.compactThreshold {
+	// If the value is larger than the inline threshold and smaller than the compact threshold,
+	// record it for compaction.
+	if bytesWritten > int64(s.inlineThreshold) && bytesWritten <= s.compactThreshold {
 		cIdxKey, cIdxVal := compaction.PrepareEntryForCompaction(key, filePath)
 		batch.Put(cIdxKey, cIdxVal)
 	}

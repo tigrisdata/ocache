@@ -101,6 +101,10 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 
 // Read reads a value from a file for the given key
 func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error) {
+	if filePath == "" || length <= 0 {
+		return nil, utils.WrapError("invalid file path or length", filePath, nil)
+	}
+
 	e, err := fm.fdCache.Acquire(filePath)
 	if err != nil {
 		return nil, err

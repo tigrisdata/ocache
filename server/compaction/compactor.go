@@ -249,6 +249,7 @@ func (c *Compactor) copyFileIntoSegment(userKey, filePath string, vm *pb.ValueMe
 	vm.SegmentPath = segPath
 	vm.SegmentOffset = segOff
 	vm.ValueLength = segLen
+	vm.ValueType = pb.ValueType_SEGMENT
 
 	return segLen, nil
 }

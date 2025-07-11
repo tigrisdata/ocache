@@ -97,6 +97,10 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 
 // ReadValue returns an io.ReadCloser over a slice of a segment file.
 func (sm *Manager) ReadValue(segPath string, offset, length int64) (io.ReadCloser, error) {
+	if segPath == "" || offset < 0 || length <= 0 {
+		return nil, utils.WrapError("invalid segment path, offset or length", segPath, nil)
+	}
+
 	sm.mu.RLock()
 	seg := sm.segMap[segPath]
 	sm.mu.RUnlock()
