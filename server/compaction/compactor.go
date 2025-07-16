@@ -112,16 +112,25 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 func (c *Compactor) CompactFiles(maxBytes int64) {
 	zlog.Info().Int64("maxBytes", maxBytes).Msg("compactor: starting file compaction")
 
+	// RocksDB iterator setup
 	ro := grocksdb.NewDefaultReadOptions()
 	ro.SetPrefixSameAsStart(true)
 	it := c.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	wo := grocksdb.NewDefaultWriteOptions()
-	batch := grocksdb.NewWriteBatch()
-	processed := 0
-	var bytesMigrated int64
-	var filesToRemove []string
+	wb := grocksdb.NewWriteBatch()
+	var (
+		processed   int
+		bytesCopied int64
+		filesToDel  []string
+	)
+
+	// Acquire the initial open segment.
+	seg, err := c.sm.AcquireOpenSegment(0)
+	if err != nil {
+		zlog.Error().Err(err).Msg("compactor: acquire open segment")
+		return
+	}
 
 	filePrefix := []byte("!compact/")
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
@@ -130,94 +139,87 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 
 		userKey, filePath, ok := parseFileIndexRow(k, v)
 		if !ok {
-			zlog.Error().Str("key", string(k)).Msg("compactor: failed to parse file index row")
+			zlog.Error().Str("row", string(k)).Msg("compactor: malformed index row")
+			wb.Delete(k)
 			continue
 		}
 
-		// If the file does not exist, remove the index row.
-		_, err := os.Stat(filePath)
-		if os.IsNotExist(err) {
-			zlog.Warn().Str("key", userKey).Str("path", filePath).Msg("compactor: file does not exist")
-			batch.Delete(k)
-			continue
-		}
-
-		// Load current metadata for the user key.
-		slice, err := c.meta.Handle().Get(ro, []byte(userKey))
+		// Stat first – cheap, and gives us size quickly.
+		fInfo, err := os.Stat(filePath)
 		if err != nil {
-			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: db.Get error")
+			if os.IsNotExist(err) {
+				wb.Delete(k) // stale index row
+				continue
+			}
+			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: stat failed")
 			continue
 		}
 
-		metadataFound := slice.Exists()
-		vm := &pb.ValueMessage{}
-		if metadataFound {
-			if err := proto.Unmarshal(slice.Data(), vm); err != nil {
-				zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to unmarshal metadata")
-				metadataFound = false
-			}
-		}
-
-		// Release slice as early as possible.
-		slice.Free()
-
-		var bytesMoved int64
-
-		if metadataFound {
-
-			if bytesMoved, err = c.copyFileIntoSegment(userKey, filePath, vm); err != nil {
-				zlog.Error().Err(err).Str("key", userKey).Msg("compactor: copy failed")
-				continue
-			}
-			zlog.Debug().Int64("bytesMoved", bytesMoved).Str("key", userKey).Msg("compactor: copied file into segment")
-
-			// Update metadata if present.
-			var data []byte
-			if data, err = proto.Marshal(vm); err != nil {
-				zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to marshal metadata")
-				continue
-			}
-			batch.Put([]byte(userKey), data)
-		}
-
-		// Regardless of metadata presence, remove the file as it is no longer needed.
-		filesToRemove = append(filesToRemove, filePath)
-
-		// Remove the index row.
-		batch.Delete(k)
-
-		processed++
-		bytesMigrated += bytesMoved
-
-		if bytesMigrated >= maxBytes {
+		// Advisory maxBytes check: if limit already reached and the next file
+		// would overflow the current segment, stop compaction.
+		if bytesCopied >= maxBytes && seg.Remaining() < fInfo.Size() {
 			break
 		}
-	}
 
-	// Flush any remaining data.
-	if batch.Count() > 0 {
-		// Ensure data written to the segment is durable on disk.
-		if err := c.sm.SyncCurrentSegment(); err != nil {
-			zlog.Error().Err(err).Msg("compactor: failed to sync current segment")
-			// We can't write to RocksDB if the segment is not durable.
-			// We need to retry the compaction.
-			batch.Clear()
+		// Fetch metadata for the user key.
+		slice, err := c.meta.Handle().Get(ro, []byte(userKey))
+		if err != nil {
+			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: db.Get")
+			continue
+		}
+
+		if !slice.Exists() {
+			// Key already gone – schedule raw file + index row for deletion.
+			slice.Free()
+			wb.Delete(k)
+			filesToDel = append(filesToDel, filePath)
+			continue
+		}
+
+		vm := &pb.ValueMessage{}
+		if err := proto.Unmarshal(slice.Data(), vm); err != nil {
+			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: bad metadata")
+			slice.Free()
+			continue
+		}
+		slice.Free()
+
+		// Ensure we have space in the current segment.
+		if err := c.ensureCapacity(&seg, vm.ValueLength); err != nil {
+			zlog.Error().Err(err).Msg("compactor: segment rotation failed")
 			return
 		}
 
-		// Only after segment is made durable, we can write to RocksDB.
-		if err := c.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("compactor: failed to write to RocksDB")
+		// Copy the raw file into the segment.
+		f, err := os.Open(filePath)
+		if err != nil {
+			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: open failed")
+			continue
 		}
+		if err := c.copyFileIntoSegment(seg, userKey, f, vm); err != nil {
+			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: copy failed")
+			f.Close()
+			continue
+		}
+		f.Close()
+
+		// Update metadata & housekeeping.
+		metaBytes, _ := proto.Marshal(vm)
+		wb.Put([]byte(userKey), metaBytes)
+		wb.Delete(k) // remove index row
+		filesToDel = append(filesToDel, filePath)
+
+		processed++
+		bytesCopied += fInfo.Size()
 	}
 
-	// Remove files after the segment is made durable.
-	for _, filePath := range filesToRemove {
-		c.fm.Remove(filePath)
-		zlog.Debug().Str("path", filePath).Msg("compactor: removed file")
+	// Final commit.
+	if err := c.commit(seg, wb, filesToDel); err != nil {
+		zlog.Error().Err(err).Msg("compactor: commit failed")
+		return
 	}
 
-	zlog.Info().Int("migrated", processed).Int64("bytes", bytesMigrated).Dur("duration", time.Since(time.Now())).Msg("compactor: finished file compaction")
+	zlog.Info().Int("migrated", processed).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
 }
 
 // parseFileIndexRow extracts userKey, filePath and size from RocksDB file-index
@@ -239,17 +241,55 @@ func parseFileIndexRow(k, v []byte) (userKey, filePath string, ok bool) {
 
 // copyFileIntoSegment copies the file into an open segment using the
 // existing segment pipeline and updates the ValueMessage.
-func (c *Compactor) copyFileIntoSegment(userKey, filePath string, vm *pb.ValueMessage) (copiedBytes int64, err error) {
-	segPath, segOff, segLen, err := c.sm.WriteToSegment(userKey, filePath)
+func (c *Compactor) copyFileIntoSegment(seg *segment.Segment, userKey string, f *os.File, vm *pb.ValueMessage) (err error) {
+	segOff, err := c.sm.WriteEntry(seg, userKey, f, vm)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	vm.RawFilePath = ""
-	vm.SegmentPath = segPath
+	vm.SegmentPath = seg.Path()
 	vm.SegmentOffset = segOff
-	vm.ValueLength = segLen
 	vm.ValueType = pb.ValueType_SEGMENT
 
-	return segLen, nil
+	return nil
+}
+
+// commit commits pending RocksDB mutations and deletes migrated files.
+func (c *Compactor) commit(seg *segment.Segment, wb *grocksdb.WriteBatch, toDelete []string) error {
+	if wb.Count() == 0 {
+		return nil // nothing to do
+	}
+
+	// Persist segment first so that metadata can safely reference it.
+	if err := c.sm.SyncSegment(seg); err != nil {
+		return err
+	}
+
+	if err := c.meta.Handle().Write(grocksdb.NewDefaultWriteOptions(), wb); err != nil {
+		return err
+	}
+
+	// Remove obsolete raw files on best-effort basis
+	for _, p := range toDelete {
+		c.fm.Remove(p)
+	}
+	return nil
+}
+
+// ensureCapacity ensures that the segment has at least the needed bytes
+// available, finalising and acquiring a fresh segment when necessary.
+func (c *Compactor) ensureCapacity(seg **segment.Segment, needed int64) error {
+	if (*seg).Remaining() >= needed {
+		return nil
+	}
+	if err := c.sm.FinalizeSegment(*seg); err != nil {
+		return err
+	}
+	newSeg, err := c.sm.AcquireOpenSegment(0)
+	if err != nil {
+		return err
+	}
+	*seg = newSeg
+	return nil
 }

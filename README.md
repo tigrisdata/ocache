@@ -1,4 +1,4 @@
-# Cache Service
+# OCache
 
 A cache service that supports both in-memory and disk-based storage, with gRPC and HTTP interfaces. It uses a combination of RocksDB and local storage to manage cache items efficiently, and provides fast access to both small and large objects. The service is designed to handle high throughput and low latency, making it suitable for various caching scenarios.
 
