@@ -25,7 +25,127 @@ const (
 	// Default compaction thresholds
 	DefaultCompactionMaxBytes     = 1 << 30 // 1GB
 	DefaultFileCompactionInterval = 5 * time.Minute
+	// Default TTL cleanup interval
+	DefaultTTLCleanupInterval = 1 * time.Minute
+	// Default access update buffer size and batch interval
+	DefaultAccessUpdateBufferSize = 10000
+	DefaultAccessUpdateInterval   = 100 * time.Millisecond
 )
+
+// getCleanupInterval returns the cleanup interval, allowing tests to override via env var
+func getCleanupInterval() time.Duration {
+	if testInterval := os.Getenv("OCACHE_TEST_CLEANUP_INTERVAL"); testInterval != "" {
+		if d, err := time.ParseDuration(testInterval); err == nil {
+			return d
+		}
+	}
+	return DefaultTTLCleanupInterval
+}
+
+// accessUpdate represents a single access time update request
+type accessUpdate struct {
+	key  string
+	time int64
+}
+
+// accessUpdater handles asynchronous batched updates of access times for LRU tracking
+type accessUpdater struct {
+	updates  chan accessUpdate
+	done     chan struct{}
+	storage  *Storage
+	interval time.Duration
+}
+
+// newAccessUpdater creates a new access updater
+func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration) *accessUpdater {
+	return &accessUpdater{
+		updates:  make(chan accessUpdate, bufferSize),
+		done:     make(chan struct{}),
+		storage:  s,
+		interval: interval,
+	}
+}
+
+// Start begins the background goroutine for processing access updates
+func (a *accessUpdater) Start() {
+	go a.run()
+}
+
+// Stop stops the access updater
+func (a *accessUpdater) Stop() {
+	close(a.done)
+}
+
+// Update queues an access time update (non-blocking)
+func (a *accessUpdater) Update(key string, accessTime int64) {
+	select {
+	case a.updates <- accessUpdate{key: key, time: accessTime}:
+		// Update queued successfully
+	default:
+		// Buffer full, drop the update (LRU tracking is best-effort)
+	}
+}
+
+// run is the main loop that processes batched updates
+func (a *accessUpdater) run() {
+	ticker := time.NewTicker(a.interval)
+	defer ticker.Stop()
+
+	batch := make(map[string]int64)
+
+	for {
+		select {
+		case <-a.done:
+			// Flush remaining updates before exiting
+			a.collectUpdates(batch)
+			if len(batch) > 0 {
+				a.flushBatch(batch)
+			}
+			return
+
+		case update := <-a.updates:
+			// Only keep the latest access time for each key
+			batch[update.key] = update.time
+
+		case <-ticker.C:
+			if len(batch) > 0 {
+				a.flushBatch(batch)
+				// Clear the batch
+				batch = make(map[string]int64)
+			}
+		}
+	}
+}
+
+// collectUpdates drains all pending updates from the channel
+func (a *accessUpdater) collectUpdates(batch map[string]int64) {
+	for {
+		select {
+		case update := <-a.updates:
+			batch[update.key] = update.time
+		default:
+			return
+		}
+	}
+}
+
+// flushBatch writes a batch of access updates to RocksDB
+func (a *accessUpdater) flushBatch(batch map[string]int64) {
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+
+	writeBatch := grocksdb.NewWriteBatch()
+	defer writeBatch.Destroy()
+
+	for key, accessTime := range batch {
+		accessKey, accessVal := PrepareAccessEntry(key, accessTime)
+		writeBatch.Put(accessKey, accessVal)
+	}
+
+	if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
+		zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
+	}
+}
 
 // Storage wraps all RocksDB access and related logic
 // It provides methods to store, retrieve, delete, and list keys
@@ -55,6 +175,8 @@ type Storage struct {
 	fileManager      *files.FileManager    // File manager for large objects on disk
 	fdCache          *fd.FdCache           // File descriptor cache for open files
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
+	cleaner          *Cleaner              // Background TTL cleanup and eviction
+	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
 }
 
 var storage *Storage
@@ -65,16 +187,16 @@ func GetStorage() *Storage {
 }
 
 // InitStorage initializes storage at dbPath
-func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int) {
-	s, err := newStorage(diskPath, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize)
+func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) {
+	s, err := newStorage(diskPath, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize, maxDiskUsage)
 	if err != nil {
-		zlog.Fatal().Err(err).Msg("failed to open RocksDB")
+		zlog.Fatal().Err(err).Msg("failed to open storage")
 	}
 	storage = s
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
-func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int) (*Storage, error) {
+func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) (*Storage, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(diskPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
@@ -105,7 +227,35 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, DefaultFileCompactionInterval)
 	compactor.Start()
 
-	return &Storage{meta: meta, diskPath: diskPath, inlineThreshold: inlineThreshold, segmentManager: segmentManager, fileManager: fileManager, fdCache: fdCache, compactor: compactor}, nil
+	s := &Storage{
+		meta:             meta,
+		diskPath:         diskPath,
+		inlineThreshold:  inlineThreshold,
+		compactThreshold: compactThreshold,
+		segmentManager:   segmentManager,
+		fileManager:      fileManager,
+		fdCache:          fdCache,
+		compactor:        compactor,
+	}
+
+	// Initialize and start the cleaner (always enabled for TTL cleanup)
+	cleanupInterval := getCleanupInterval()
+	s.cleaner = NewCleaner(s, cleanupInterval, maxDiskUsage)
+	s.cleaner.Start()
+	zlog.Info().
+		Dur("ttl_cleanup_interval", cleanupInterval).
+		Int64("max_disk_usage", maxDiskUsage).
+		Msg("storage: started background cleaner with TTL cleanup and LRU eviction")
+
+	// Initialize and start the access updater for async LRU tracking
+	s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval)
+	s.accessUpdater.Start()
+	zlog.Info().
+		Int("buffer_size", DefaultAccessUpdateBufferSize).
+		Dur("batch_interval", DefaultAccessUpdateInterval).
+		Msg("storage: started async access updater for LRU tracking")
+
+	return s, nil
 }
 
 // Close closes the storage
@@ -114,7 +264,9 @@ func CloseStorage() {
 		return
 	}
 
-	// Stop background compactor first so it does not race with segment manager shutdown
+	// Stop background services
+	storage.accessUpdater.Stop()
+	storage.cleaner.Close()
 	if storage.compactor != nil {
 		storage.compactor.Close()
 	}
@@ -159,8 +311,38 @@ func (s *Storage) ListKeys() ([]string, error) {
 
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) {
+	// Get the value to track size changes and file cleanup
+	ro := grocksdb.NewDefaultReadOptions()
+	slice, err := s.meta.Handle().Get(ro, []byte(key))
+	if err != nil || !slice.Exists() {
+		return // Key doesn't exist, nothing to delete
+	}
+	defer slice.Free()
+
+	// Parse value to get size and file info
+	valueMsg := &pb.ValueMessage{}
+	if err := proto.Unmarshal(slice.Data(), valueMsg); err == nil {
+		// Notify cleaner about size reduction
+		s.notifyDelete(valueMsg.ValueLength)
+
+		// Clean up files if necessary
+		switch valueMsg.ValueType {
+		case pb.ValueType_RAW_FILE:
+			if err := s.fileManager.Remove(valueMsg.RawFilePath); err != nil {
+				zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).
+					Msg("storage.DeleteKey: failed to remove raw file")
+			}
+		case pb.ValueType_SEGMENT:
+			// Segments are cleaned up by the compactor/segment manager
+		}
+	}
+
+	// Delete key and its access index in a single batch
 	wo := grocksdb.NewDefaultWriteOptions()
-	s.meta.Handle().Delete(wo, []byte(key))
+	batch := grocksdb.NewWriteBatch()
+	batch.Delete([]byte(key))
+	batch.Delete(MakeAccessIndexKey(key))
+	s.meta.Handle().Write(wo, batch)
 }
 
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
@@ -194,6 +376,9 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		s.DeleteKey(key)
 		return nil, false, nil
 	}
+
+	// Update access time asynchronously for LRU tracking
+	s.accessUpdater.Update(key, time.Now().Unix())
 
 	switch valueMsg.ValueType {
 	case pb.ValueType_INLINE:
@@ -271,7 +456,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 			return err
 		}
-		return s.putLow(key, val, filePath, bytesWritten)
+		err = s.putLow(key, val, filePath, bytesWritten)
+		if err == nil {
+			s.notifyPut(bytesWritten)
+		}
+		return err
 	}
 
 	// Small value: we have read the entire value into firstChunk[:n]
@@ -290,7 +479,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 		return err
 	}
-	return s.putLow(key, val, "", int64(n))
+	err = s.putLow(key, val, "", int64(n))
+	if err == nil {
+		s.notifyPut(int64(n))
+	}
+	return err
 }
 
 // putLow stores the key-value pair in the database
@@ -311,5 +504,24 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Store the metadata in the database
 	batch.Put([]byte(key), val)
 
+	// Add access time index entry for LRU tracking
+	accessKey, accessVal := PrepareAccessEntry(key, time.Now().Unix())
+	batch.Put(accessKey, accessVal)
+
 	return s.meta.Handle().Write(wo, batch)
+}
+
+// CleanerStats returns statistics from the background cleaner
+func (s *Storage) CleanerStats() (cleaned, evicted int64) {
+	return s.cleaner.Stats()
+}
+
+// notifyPut updates the cleaner's size tracking when a new key is added
+func (s *Storage) notifyPut(size int64) {
+	s.cleaner.UpdateSize(size)
+}
+
+// notifyDelete updates the cleaner's size tracking when a key is deleted
+func (s *Storage) notifyDelete(size int64) {
+	s.cleaner.UpdateSize(-size)
 }
