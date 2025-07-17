@@ -86,6 +86,11 @@ func (a *accessUpdater) Update(key string, accessTime int64) {
 	}
 }
 
+// UpdateNow queues an access time update with current time (non-blocking)
+func (a *accessUpdater) UpdateNow(key string) {
+	a.Update(key, time.Now().Unix())
+}
+
 // run is the main loop that processes batched updates
 func (a *accessUpdater) run() {
 	ticker := time.NewTicker(a.interval)
@@ -247,13 +252,15 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 		Int64("max_disk_usage", maxDiskUsage).
 		Msg("storage: started background cleaner with TTL cleanup and LRU eviction")
 
-	// Initialize and start the access updater for async LRU tracking
-	s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval)
-	s.accessUpdater.Start()
-	zlog.Info().
-		Int("buffer_size", DefaultAccessUpdateBufferSize).
-		Dur("batch_interval", DefaultAccessUpdateInterval).
-		Msg("storage: started async access updater for LRU tracking")
+	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
+	if maxDiskUsage > 0 {
+		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval)
+		s.accessUpdater.Start()
+		zlog.Info().
+			Int("buffer_size", DefaultAccessUpdateBufferSize).
+			Dur("batch_interval", DefaultAccessUpdateInterval).
+			Msg("storage: started async access updater for LRU tracking")
+	}
 
 	return s, nil
 }
@@ -265,7 +272,9 @@ func CloseStorage() {
 	}
 
 	// Stop background services
-	storage.accessUpdater.Stop()
+	if storage.accessUpdater != nil {
+		storage.accessUpdater.Stop()
+	}
 	storage.cleaner.Close()
 	if storage.compactor != nil {
 		storage.compactor.Close()
@@ -377,8 +386,10 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		return nil, false, nil
 	}
 
-	// Update access time asynchronously for LRU tracking
-	s.accessUpdater.Update(key, time.Now().Unix())
+	// Update access time asynchronously for LRU tracking only if max disk usage is set
+	if s.accessUpdater != nil {
+		s.accessUpdater.UpdateNow(key)
+	}
 
 	switch valueMsg.ValueType {
 	case pb.ValueType_INLINE:
@@ -504,9 +515,11 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Store the metadata in the database
 	batch.Put([]byte(key), val)
 
-	// Add access time index entry for LRU tracking
-	accessKey, accessVal := PrepareAccessEntry(key, time.Now().Unix())
-	batch.Put(accessKey, accessVal)
+	// Add access time index entry for LRU tracking only if max disk usage is set
+	if s.cleaner.maxDiskUsage > 0 {
+		accessKey, accessVal := PrepareAccessEntry(key, time.Now().Unix())
+		batch.Put(accessKey, accessVal)
+	}
 
 	return s.meta.Handle().Write(wo, batch)
 }
