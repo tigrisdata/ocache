@@ -105,6 +105,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 
 	for h.Len() > 0 && evicted < targetBytes {
 		entry := heap.Pop(h).(lruEntry)
+		zlog.Debug().Str("key", entry.key).Int64("lastAccess", entry.lastAccess).Int64("size", entry.size).Msg("LRU: considering for eviction")
 
 		// Get the full value to access file paths
 		slice, err := c.storage.meta.Handle().Get(ro, []byte(entry.key))
