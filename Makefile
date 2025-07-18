@@ -1,9 +1,29 @@
 # OCache Makefile
 
 # Variables
-BREW_PREFIX := $(shell brew --prefix)
-CGO_CFLAGS := -I$(BREW_PREFIX)/include
-CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Platform-specific settings
+ifeq ($(UNAME_S),Darwin)
+    # macOS (both Intel and Apple Silicon)
+    BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
+    CGO_CFLAGS := -I$(BREW_PREFIX)/include
+    CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
+else ifeq ($(UNAME_S),Linux)
+    # Linux - handle different architectures
+    CGO_CFLAGS := -I/usr/include
+    ifeq ($(UNAME_M),x86_64)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64
+    else ifeq ($(UNAME_M),aarch64)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64
+    else ifeq ($(UNAME_M),arm64)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64
+    else
+        # Generic Linux fallback
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64
+    endif
+endif
 
 # Build targets
 .PHONY: all
@@ -28,8 +48,59 @@ proto:
 
 # Installation
 .PHONY: install-deps
-install-deps: install-protoc-plugins
+install-deps: install-protoc install-protoc-plugins install-rocksdb
+
+.PHONY: install-rocksdb
+install-rocksdb:
+ifeq ($(UNAME_S),Darwin)
+	@echo "Installing RocksDB on macOS..."
+	@if ! command -v brew &> /dev/null; then \
+		echo "Homebrew is required but not installed. Please install it first."; \
+		exit 1; \
+	fi
 	brew install rocksdb
+else ifeq ($(UNAME_S),Linux)
+	@echo "Installing RocksDB on Linux..."
+	@if command -v apt-get &> /dev/null; then \
+		sudo apt-get update && sudo apt-get install -y librocksdb-dev; \
+	elif command -v yum &> /dev/null; then \
+		sudo yum install -y rocksdb-devel; \
+	elif command -v dnf &> /dev/null; then \
+		sudo dnf install -y rocksdb-devel; \
+	else \
+		echo "Unsupported Linux distribution. Please install RocksDB manually."; \
+		exit 1; \
+	fi
+else
+	@echo "Unsupported platform: $(UNAME_S)"
+	@exit 1
+endif
+
+.PHONY: install-protoc
+install-protoc:
+ifeq ($(UNAME_S),Darwin)
+	@echo "Installing protoc on macOS..."
+	@if ! command -v brew &> /dev/null; then \
+		echo "Homebrew is required but not installed. Please install it first."; \
+		exit 1; \
+	fi
+	brew install protobuf
+else ifeq ($(UNAME_S),Linux)
+	@echo "Installing protoc on Linux..."
+	@if command -v apt-get &> /dev/null; then \
+		sudo apt-get update && sudo apt-get install -y protobuf-compiler; \
+	elif command -v yum &> /dev/null; then \
+		sudo yum install -y protobuf-compiler; \
+	elif command -v dnf &> /dev/null; then \
+		sudo dnf install -y protobuf-compiler; \
+	else \
+		echo "Unsupported Linux distribution. Please install protoc manually."; \
+		exit 1; \
+	fi
+else
+	@echo "Unsupported platform: $(UNAME_S)"
+	@exit 1
+endif
 
 .PHONY: install-protoc-plugins
 install-protoc-plugins:
