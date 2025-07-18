@@ -129,15 +129,10 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 
 // Delete removes a file for the given key
 func (fm *FileManager) Remove(filePath string) error {
-	// Get file-specific lock
-	e, err := fm.fdCache.Acquire(filePath)
-	if err != nil {
-		return err
-	}
-
-	// Take exclusive lock to prevent concurrent writes.
-	e.Lock()
-	defer e.Unlock()
+	// Get file-specific lock (use GetFileLock, not Acquire, to avoid opening the file)
+	fileLock := fm.fdCache.GetFileLock(filePath)
+	fileLock.Lock()
+	defer fileLock.Unlock()
 
 	if err := os.Remove(filePath); err != nil {
 		if !os.IsNotExist(err) {
