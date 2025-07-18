@@ -67,10 +67,16 @@ stop:
 
 # Testing targets
 .PHONY: test
-test:
-	@echo "Running tests for server..."
+test: test-server test-client
+
+.PHONY: test-server
+test-server:
+	@echo "Running server tests..."
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 60s ./...
-	@echo "Running tests for client..."
+
+.PHONY: test-client
+test-client:
+	@echo "Running client tests..."
 	@cd client && go test -v -timeout 30s ./...
 
 .PHONY: test-short
@@ -100,11 +106,6 @@ test-coverage:
 	@rm -f coverage-*.out
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
-
-.PHONY: test-storage
-test-storage:
-	@echo "Running storage tests only..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 120s ./storage/...
 
 .PHONY: test-e2e
 test-e2e: build build-cli
@@ -174,10 +175,11 @@ help:
 	@echo ""
 	@echo "Test targets:"
 	@echo "  test          - Run all unit tests"
+	@echo "  test-server   - Run server tests only"
+	@echo "  test-client   - Run client tests only"
 	@echo "  test-short    - Run unit tests (short mode)"
 	@echo "  test-race     - Run tests with race detector"
 	@echo "  test-coverage - Run tests with coverage report"
-	@echo "  test-storage  - Run storage tests only (longer timeout)"
 	@echo "  test-e2e      - Run end-to-end tests"
 	@echo "  bench         - Run benchmarks"
 	@echo ""
