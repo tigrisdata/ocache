@@ -4,6 +4,12 @@
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
+# Check if pkg-config is available for RocksDB
+HAS_PKG_CONFIG := $(shell command -v pkg-config 2> /dev/null)
+ifdef HAS_PKG_CONFIG
+    ROCKSDB_EXISTS := $(shell pkg-config --exists rocksdb 2> /dev/null && echo yes)
+endif
+
 # Platform-specific settings
 ifeq ($(UNAME_S),Darwin)
     # macOS (both Intel and Apple Silicon)
@@ -12,16 +18,23 @@ ifeq ($(UNAME_S),Darwin)
     CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
 else ifeq ($(UNAME_S),Linux)
     # Linux - handle different architectures
-    CGO_CFLAGS := -I/usr/include
-    ifeq ($(UNAME_M),x86_64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64
-    else ifeq ($(UNAME_M),aarch64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64
-    else ifeq ($(UNAME_M),arm64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64
+    ifdef ROCKSDB_EXISTS
+        # Use pkg-config if available
+        CGO_CFLAGS := $(shell pkg-config --cflags rocksdb)
+        CGO_LDFLAGS := $(shell pkg-config --libs rocksdb)
     else
-        # Generic Linux fallback
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64
+        # Fallback to manual paths
+        CGO_CFLAGS := -I/usr/include -I/usr/local/include
+        ifeq ($(UNAME_M),x86_64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        else ifeq ($(UNAME_M),aarch64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        else ifeq ($(UNAME_M),arm64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        else
+            # Generic Linux fallback
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        endif
     endif
 endif
 
@@ -62,11 +75,11 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
 	@echo "Installing RocksDB on Linux..."
 	@if command -v apt-get &> /dev/null; then \
-		sudo apt-get update && sudo apt-get install -y librocksdb-dev; \
+		sudo apt-get update && sudo apt-get install -y librocksdb-dev pkg-config; \
 	elif command -v yum &> /dev/null; then \
-		sudo yum install -y rocksdb-devel; \
+		sudo yum install -y rocksdb-devel pkgconfig; \
 	elif command -v dnf &> /dev/null; then \
-		sudo dnf install -y rocksdb-devel; \
+		sudo dnf install -y rocksdb-devel pkgconfig; \
 	else \
 		echo "Unsupported Linux distribution. Please install RocksDB manually."; \
 		exit 1; \
