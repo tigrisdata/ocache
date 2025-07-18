@@ -2,7 +2,7 @@
 
 set -e
 
-ROCKSDB_VERSION="${ROCKSDB_VERSION:-9.6.1}"
+ROCKSDB_VERSION="${ROCKSDB_VERSION:-10.4.2}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 

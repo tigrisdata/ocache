@@ -8,7 +8,7 @@ on:
 
 env:
   GO_VERSION: "1.21"
-  ROCKSDB_VERSION: "9.6.1"
+  ROCKSDB_VERSION: "10.4.2"
 
 jobs:
   build:
@@ -47,7 +47,7 @@ jobs:
 
       - name: Install RocksDB from source
         if: steps.cache-rocksdb.outputs.cache-hit != 'true'
-        run: make install-rocksdb-from-source
+        run: ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} make install-rocksdb-from-source
 
       - name: Verify RocksDB installation
         run: |
