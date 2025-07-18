@@ -79,13 +79,6 @@ test-client:
 	@echo "Running client tests..."
 	@cd client && go test -v -timeout 30s ./...
 
-.PHONY: test-short
-test-short:
-	@echo "Running short tests for server..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -short -v -timeout 30s ./...
-	@echo "Running short tests for client..."
-	@cd client && go test -short -v -timeout 30s ./...
-
 .PHONY: test-race
 test-race:
 	@echo "Running race tests for server..."
@@ -151,7 +144,7 @@ fmt-check:
 	@gofmt -l $$(find . -name '*.go' -not -path './proto/*')
 
 .PHONY: check
-check: fmt-check vet test-short
+check: fmt-check vet test
 	@echo "All checks passed!"
 
 # Clean targets
@@ -177,7 +170,6 @@ help:
 	@echo "  test          - Run all unit tests"
 	@echo "  test-server   - Run server tests only"
 	@echo "  test-client   - Run client tests only"
-	@echo "  test-short    - Run unit tests (short mode)"
 	@echo "  test-race     - Run tests with race detector"
 	@echo "  test-coverage - Run tests with coverage report"
 	@echo "  test-e2e      - Run end-to-end tests"
@@ -189,7 +181,7 @@ help:
 	@echo "  vet           - Run go vet"
 	@echo "  fmt           - Format code with gofmt"
 	@echo "  fmt-check     - Check code formatting"
-	@echo "  check         - Run all quality checks (fmt, vet, test-short)"
+	@echo "  check         - Run all quality checks (fmt, vet, test)"
 	@echo ""
 	@echo "Run targets:"
 	@echo "  run           - Run the server with default options"
