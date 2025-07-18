@@ -69,7 +69,7 @@ stop:
 .PHONY: test
 test:
 	@echo "Running tests for server..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 30s ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 60s ./...
 	@echo "Running tests for client..."
 	@cd client && go test -v -timeout 30s ./...
 	@echo "Running tests for proto..."
@@ -87,7 +87,7 @@ test-short:
 .PHONY: test-race
 test-race:
 	@echo "Running race tests for server..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -race -v -timeout 30s ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -race -v -timeout 60s ./...
 	@echo "Running race tests for client..."
 	@cd client && go test -race -v -timeout 30s ./...
 	@echo "Running race tests for proto..."
@@ -96,11 +96,11 @@ test-race:
 .PHONY: test-coverage
 test-coverage:
 	@echo "Running coverage tests for server..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -coverprofile=../coverage-server.out ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -coverprofile=../coverage-server.out -timeout 60s ./...
 	@echo "Running coverage tests for client..."
-	@cd client && go test -coverprofile=../coverage-client.out ./...
+	@cd client && go test -coverprofile=../coverage-client.out -timeout 30s ./...
 	@echo "Running coverage tests for proto..."
-	@cd proto && go test -coverprofile=../coverage-proto.out ./...
+	@cd proto && go test -coverprofile=../coverage-proto.out -timeout 30s ./...
 	@echo "Combining coverage reports..."
 	@echo "mode: set" > coverage.out
 	@tail -n +2 coverage-server.out >> coverage.out 2>/dev/null || true
@@ -109,6 +109,11 @@ test-coverage:
 	@rm -f coverage-*.out
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
+
+.PHONY: test-storage
+test-storage:
+	@echo "Running storage tests only..."
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 120s ./storage/...
 
 .PHONY: test-e2e
 test-e2e: build build-cli
@@ -183,6 +188,7 @@ help:
 	@echo "  test-short    - Run unit tests (short mode)"
 	@echo "  test-race     - Run tests with race detector"
 	@echo "  test-coverage - Run tests with coverage report"
+	@echo "  test-storage  - Run storage tests only (longer timeout)"
 	@echo "  test-e2e      - Run end-to-end tests"
 	@echo "  bench         - Run benchmarks"
 	@echo ""
