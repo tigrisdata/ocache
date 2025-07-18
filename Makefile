@@ -4,24 +4,27 @@
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
+# RocksDB requires these additional libraries
+ROCKSDB_LIBS := -lrocksdb -lstdc++ -lm -lz -lsnappy -llz4 -lzstd -ldl -pthread
+
 # Platform-specific settings
 ifeq ($(UNAME_S),Darwin)
     # macOS (both Intel and Apple Silicon)
     BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
     CGO_CFLAGS := -I$(BREW_PREFIX)/include
-    CGO_LDFLAGS := -L$(BREW_PREFIX)/lib -lrocksdb
+    CGO_LDFLAGS := -L$(BREW_PREFIX)/lib $(ROCKSDB_LIBS)
 else ifeq ($(UNAME_S),Linux)
     # Linux - handle different architectures
     CGO_CFLAGS := -I/usr/include -I/usr/local/include
     ifeq ($(UNAME_M),x86_64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
     else ifeq ($(UNAME_M),aarch64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
     else ifeq ($(UNAME_M),arm64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
     else
         # Generic Linux fallback
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib -lrocksdb
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
     endif
 endif
 
@@ -31,7 +34,7 @@ all: build build-cli
 
 .PHONY: build
 build: proto
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ocache ./server/
+	CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ocache ./server/
 
 .PHONY: build-cli
 build-cli:
@@ -62,11 +65,11 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
 	@echo "Installing RocksDB on Linux..."
 	@if command -v apt-get &> /dev/null; then \
-		sudo apt-get update && sudo apt-get install -y librocksdb-dev; \
+		sudo apt-get update && sudo apt-get install -y librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev; \
 	elif command -v yum &> /dev/null; then \
-		sudo yum install -y rocksdb-devel; \
+		sudo yum install -y rocksdb-devel snappy-devel lz4-devel libzstd-devel zlib-devel; \
 	elif command -v dnf &> /dev/null; then \
-		sudo dnf install -y rocksdb-devel; \
+		sudo dnf install -y rocksdb-devel snappy-devel lz4-devel libzstd-devel zlib-devel; \
 	else \
 		echo "Unsupported Linux distribution. Please install RocksDB manually."; \
 		exit 1; \
