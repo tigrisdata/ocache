@@ -46,31 +46,6 @@ run: build
 run-verbose: build
 	./ocache -disk /tmp/ocache -v
 
-# Testing targets
-.PHONY: test
-test:
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v ./...
-
-.PHONY: test-short
-test-short:
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -short -v ./...
-
-.PHONY: test-race
-test-race:
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -race -v ./...
-
-.PHONY: test-coverage
-test-coverage:
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -coverprofile=coverage.out ./...
-	go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report generated at coverage.html"
-
-.PHONY: test-e2e
-test-e2e: build build-cli
-	@chmod +x e2e/*.sh
-	@echo "Running E2E tests..."
-	@cd e2e && ./ttl_lru_test.sh
-
 .PHONY: bench
 bench: build build-cli run-background
 	./ocachecli --addr localhost:9000 bench
@@ -89,6 +64,57 @@ stop:
 		rm -f ocache.pid; \
 		echo "Stopped ocache"; \
 	fi
+
+# Testing targets
+.PHONY: test
+test:
+	@echo "Running tests for server..."
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 30s ./...
+	@echo "Running tests for client..."
+	@cd client && go test -v -timeout 30s ./...
+	@echo "Running tests for proto..."
+	@cd proto && go test -v -timeout 30s ./...
+
+.PHONY: test-short
+test-short:
+	@echo "Running short tests for server..."
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -short -v -timeout 30s ./...
+	@echo "Running short tests for client..."
+	@cd client && go test -short -v -timeout 30s ./...
+	@echo "Running short tests for proto..."
+	@cd proto && go test -short -v -timeout 30s ./...
+
+.PHONY: test-race
+test-race:
+	@echo "Running race tests for server..."
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -race -v -timeout 30s ./...
+	@echo "Running race tests for client..."
+	@cd client && go test -race -v -timeout 30s ./...
+	@echo "Running race tests for proto..."
+	@cd proto && go test -race -v -timeout 30s ./...
+
+.PHONY: test-coverage
+test-coverage:
+	@echo "Running coverage tests for server..."
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -coverprofile=../coverage-server.out ./...
+	@echo "Running coverage tests for client..."
+	@cd client && go test -coverprofile=../coverage-client.out ./...
+	@echo "Running coverage tests for proto..."
+	@cd proto && go test -coverprofile=../coverage-proto.out ./...
+	@echo "Combining coverage reports..."
+	@echo "mode: set" > coverage.out
+	@tail -n +2 coverage-server.out >> coverage.out 2>/dev/null || true
+	@tail -n +2 coverage-client.out >> coverage.out 2>/dev/null || true
+	@tail -n +2 coverage-proto.out >> coverage.out 2>/dev/null || true
+	@rm -f coverage-*.out
+	@go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated at coverage.html"
+
+.PHONY: test-e2e
+test-e2e: build build-cli
+	@chmod +x e2e/*.sh
+	@echo "Running E2E tests..."
+	@cd e2e && ./ttl_lru_test.sh
 
 # Code quality targets
 .PHONY: lint
