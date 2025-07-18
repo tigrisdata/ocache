@@ -24,6 +24,9 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 	got, err := io.ReadAll(r)
 	assert.NoError(t, err, "ReadAll failed")
 	assert.Equal(t, value, got, "Get returned wrong value")
+	if closer, ok := r.(io.Closer); ok {
+		closer.Close() // Must close reader to release file lock before delete
+	}
 
 	s.DeleteKey(key)
 	_, found, err = s.Get(key)
@@ -46,6 +49,9 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 	got, err := io.ReadAll(r)
 	assert.NoError(t, err, "ReadAll failed")
 	assert.Equal(t, value, got, "Get returned wrong value")
+	if closer, ok := r.(io.Closer); ok {
+		closer.Close() // Must close reader to release file lock before delete
+	}
 
 	s.DeleteKey(key)
 	_, found, err = s.Get(key)
