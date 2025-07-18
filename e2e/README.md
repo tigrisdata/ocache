@@ -1,10 +1,10 @@
 # End-to-End Integration Tests
 
-This directory contains end-to-end integration tests and demo scripts for ocache.
+This directory contains end-to-end integration tests for ocache.
 
 ## Contents
 
-- `demo_ttl_lru.sh` - Demonstrates TTL expiration and LRU eviction functionality
+- `ttl_lru_test.sh` - E2E test for TTL expiration and LRU eviction functionality
 
 ## Running Tests
 
@@ -12,7 +12,7 @@ Make sure ocache server is built and available in your PATH:
 
 ```bash
 cd e2e
-./demo_ttl_lru.sh
+./ttl_lru_test.sh
 ```
 
 ## Adding New Tests

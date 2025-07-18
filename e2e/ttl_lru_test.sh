@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "=== OCache TTL and LRU Eviction Demo ==="
+echo "=== OCache TTL and LRU Eviction E2E Test ==="
 echo
 
 # Start the server with specific settings
@@ -21,8 +21,8 @@ sleep 2
 echo "Server started with PID: $SERVER_PID"
 echo
 
-# Demo 1: TTL Cleanup
-echo "=== Demo 1: TTL Cleanup ==="
+# Test 1: TTL Cleanup
+echo "=== Test 1: TTL Cleanup ==="
 echo "Adding 5 keys with 10-second TTL..."
 for i in {1..5}; do
   ./ocachecli put "ttl-key-$i" "This value will expire in 10 seconds" --ttl 10
@@ -45,9 +45,9 @@ echo
 echo "Listing keys after TTL cleanup (expired keys should be gone):"
 ./ocachecli list
 
-# Demo 2: LRU Eviction
+# Test 2: LRU Eviction
 echo
-echo "=== Demo 2: LRU Eviction ==="
+echo "=== Test 2: LRU Eviction ==="
 echo "Adding large values to trigger disk usage limit..."
 echo "Each value is about 1KB, disk usage limit is 10KB"
 echo
@@ -100,12 +100,58 @@ echo "Stopping server..."
 kill $SERVER_PID
 wait $SERVER_PID 2>/dev/null
 
-echo "Demo complete!"
+# Track test results
+TEST_PASSED=true
+
+# Verify TTL test results
 echo
-echo "Summary of new features:"
-echo "1. Background TTL cleanup runs periodically (configurable interval)"
-echo "2. LRU eviction automatically frees space when disk usage limit is reached"
-echo "3. Recently accessed keys are preserved during eviction"
+echo "=== Test Results ==="
+echo -n "Test 1 (TTL Cleanup): "
+if ./ocachecli list | grep -q "ttl-key"; then
+    echo "FAILED - TTL keys still exist"
+    TEST_PASSED=false
+else
+    echo "PASSED"
+fi
+
+# Verify LRU test results
+echo -n "Test 2 (LRU Eviction): "
+RECENT_EXISTS=true
+OLD_EVICTED=true
+
+# Check if recent keys exist
+for i in {18..20}; do
+    if ! ./ocachecli get "lru-key-$i" > /dev/null 2>&1; then
+        RECENT_EXISTS=false
+    fi
+done
+
+# Check if old keys were evicted
+for i in {1..5}; do
+    if ./ocachecli get "lru-key-$i" > /dev/null 2>&1; then
+        OLD_EVICTED=false
+    fi
+done
+
+if [ "$RECENT_EXISTS" = true ] && [ "$OLD_EVICTED" = true ]; then
+    echo "PASSED"
+else
+    echo "FAILED"
+    [ "$RECENT_EXISTS" = false ] && echo "  - Recent keys were incorrectly evicted"
+    [ "$OLD_EVICTED" = false ] && echo "  - Old keys were not evicted"
+    TEST_PASSED=false
+fi
 
 # Cleanup
 rm -rf /tmp/ocache-demo
+
+# Exit with appropriate code
+if [ "$TEST_PASSED" = true ]; then
+    echo
+    echo "All tests passed!"
+    exit 0
+else
+    echo
+    echo "Some tests failed!"
+    exit 1
+fi
