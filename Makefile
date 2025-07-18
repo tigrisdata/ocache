@@ -4,27 +4,24 @@
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-# RocksDB requires these additional libraries
-ROCKSDB_LIBS := -lrocksdb -lstdc++ -lm -lz -lsnappy -llz4 -lzstd -ldl -pthread
-
 # Platform-specific settings
 ifeq ($(UNAME_S),Darwin)
     # macOS (both Intel and Apple Silicon)
     BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
     CGO_CFLAGS := -I$(BREW_PREFIX)/include
-    CGO_LDFLAGS := -L$(BREW_PREFIX)/lib $(ROCKSDB_LIBS)
+    CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
 else ifeq ($(UNAME_S),Linux)
     # Linux - handle different architectures
     CGO_CFLAGS := -I/usr/include -I/usr/local/include
     ifeq ($(UNAME_M),x86_64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib
     else ifeq ($(UNAME_M),aarch64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
     else ifeq ($(UNAME_M),arm64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
     else
         # Generic Linux fallback
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib $(ROCKSDB_LIBS)
+        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib
     endif
 endif
 
