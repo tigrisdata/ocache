@@ -22,6 +22,7 @@ var (
 	httpPort         = flag.Int("http-port", 9001, "HTTP port")
 	verbose          = flag.Bool("v", false, "Enable debug logging")
 	fdCacheSize      = flag.Int("fd-cache-size", 1000, "Size of the file descriptor cache (entries)")
+	maxDiskUsage     = flag.Int64("max-disk-usage", 0, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 )
 
 func configureLogger() {
@@ -35,7 +36,15 @@ func configureLogger() {
 }
 
 func RunServer() {
-	stor.InitStorage(AppConfig.DiskPath, AppConfig.TTL, AppConfig.InlineThreshold, AppConfig.CompactThreshold, AppConfig.SegmentSize, AppConfig.FdCacheSize)
+	stor.InitStorage(
+		AppConfig.DiskPath,
+		AppConfig.TTL,
+		AppConfig.InlineThreshold,
+		AppConfig.CompactThreshold,
+		AppConfig.SegmentSize,
+		AppConfig.FdCacheSize,
+		AppConfig.MaxDiskUsage,
+	)
 
 	grpcAddr := fmt.Sprintf(":%d", *port)
 	go startGRPCServer()                           // Start gRPC server in goroutine
