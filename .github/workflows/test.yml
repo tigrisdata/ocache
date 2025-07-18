@@ -1,54 +1,69 @@
-name: Tests
+name: Test
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+env:
+  GO_VERSION: "1.21"
+  ROCKSDB_VERSION: "9.6.1"
 
 jobs:
-  test:
+  build:
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm64]
+        os: [ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
     runs-on: ${{ matrix.os }}
-    
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.24.2'
-    
-    - name: Add Go bin to PATH
-      run: echo "$HOME/go/bin" >> $GITHUB_PATH
-    
-    - name: Install dependencies
-      run: make install-deps
-    
-    - name: Generate proto files
-      run: make proto
-    
-    - name: Build binaries
-      run: make all
-    
-    - name: Run linting
-      run: make lint
-    
-    - name: Run tests with race detector
-      run: make test-race
-    
-    - name: Run coverage tests
-      run: make test-coverage
-    
-    - name: Upload coverage reports
-      uses: actions/upload-artifact@v4
-      with:
-        name: coverage-report-${{ matrix.os }}
-        path: |
-          coverage.out
-          coverage.html
-    
-    - name: Run end-to-end tests
-      run: make test-e2e
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache RocksDB build
+        uses: actions/cache@v4
+        id: cache-rocksdb
+        with:
+          path: /usr/local
+          key: ${{ runner.os }}-rocksdb-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}
+
+      - name: Install RocksDB from source
+        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
+        run: make install-rocksdb-from-source
+
+      - name: Install Dependencies
+        run: make install-deps
+
+      - name: Generate proto files
+        run: make proto
+
+      - name: Build
+        run: make all
+
+      - name: Run linting
+        run: make lint
+
+      - name: Run tests with race detector
+        run: make test-race
+
+      - name: Run coverage tests
+        run: make test-coverage
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ matrix.os }}
+          path: |
+            coverage.out
+            coverage.html
+
+      - name: Run end-to-end tests
+        run: make test-e2e

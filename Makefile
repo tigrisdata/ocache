@@ -4,24 +4,40 @@
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
+# Allow custom RocksDB installation path
+ROCKSDB_PREFIX ?= /usr/local
+
 # Platform-specific settings
 ifeq ($(UNAME_S),Darwin)
     # macOS (both Intel and Apple Silicon)
     BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
-    CGO_CFLAGS := -I$(BREW_PREFIX)/include
-    CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
-else ifeq ($(UNAME_S),Linux)
-    # Linux - handle different architectures
-    CGO_CFLAGS := -I/usr/include -I/usr/local/include
-    ifeq ($(UNAME_M),x86_64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib
-    else ifeq ($(UNAME_M),aarch64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
-    else ifeq ($(UNAME_M),arm64)
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+    # Check if custom RocksDB exists, otherwise use brew
+    ifeq ($(wildcard $(ROCKSDB_PREFIX)/include/rocksdb/c.h),)
+        CGO_CFLAGS := -I$(BREW_PREFIX)/include
+        CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
     else
-        # Generic Linux fallback
-        CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib
+        CGO_CFLAGS := -I$(ROCKSDB_PREFIX)/include
+        CGO_LDFLAGS := -L$(ROCKSDB_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd
+    endif
+else ifeq ($(UNAME_S),Linux)
+    # Linux - prioritize custom RocksDB if available
+    ifeq ($(wildcard $(ROCKSDB_PREFIX)/include/rocksdb/c.h),)
+        # Fallback to system paths
+        CGO_CFLAGS := -I/usr/include -I/usr/local/include
+        ifeq ($(UNAME_M),x86_64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+        else ifeq ($(UNAME_M),aarch64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+        else ifeq ($(UNAME_M),arm64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+        else
+            # Generic Linux fallback
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib
+        endif
+    else
+        # Use custom RocksDB installation
+        CGO_CFLAGS := -I$(ROCKSDB_PREFIX)/include
+        CGO_LDFLAGS := -L$(ROCKSDB_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd
     endif
 endif
 
@@ -48,7 +64,7 @@ proto:
 
 # Installation
 .PHONY: install-deps
-install-deps: install-protoc install-protoc-plugins install-rocksdb
+install-deps: install-protoc install-protoc-plugins
 
 .PHONY: install-rocksdb
 install-rocksdb:
@@ -75,6 +91,11 @@ else
 	@echo "Unsupported platform: $(UNAME_S)"
 	@exit 1
 endif
+
+.PHONY: install-rocksdb-from-source
+install-rocksdb-from-source:
+	@echo "Installing RocksDB from source..."
+	@./scripts/install-rocksdb.sh
 
 .PHONY: install-protoc
 install-protoc:
