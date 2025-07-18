@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -52,6 +51,7 @@ type accessUpdate struct {
 type accessUpdater struct {
 	updates  chan accessUpdate
 	done     chan struct{}
+	flush    chan chan struct{} // Channel to request flush with completion notification
 	storage  *Storage
 	interval time.Duration
 }
@@ -61,6 +61,7 @@ func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration) *acces
 	return &accessUpdater{
 		updates:  make(chan accessUpdate, bufferSize),
 		done:     make(chan struct{}),
+		flush:    make(chan chan struct{}),
 		storage:  s,
 		interval: interval,
 	}
@@ -91,6 +92,14 @@ func (a *accessUpdater) UpdateNow(key string) {
 	a.Update(key, time.Now().Unix())
 }
 
+// Flush forces all pending updates to be written to RocksDB immediately
+// This is mainly useful for testing to ensure deterministic behavior
+func (a *accessUpdater) Flush() {
+	done := make(chan struct{})
+	a.flush <- done
+	<-done // Wait for flush to complete
+}
+
 // run is the main loop that processes batched updates
 func (a *accessUpdater) run() {
 	ticker := time.NewTicker(a.interval)
@@ -111,6 +120,15 @@ func (a *accessUpdater) run() {
 		case update := <-a.updates:
 			// Only keep the latest access time for each key
 			batch[update.key] = update.time
+
+		case done := <-a.flush:
+			// Handle explicit flush request
+			a.collectUpdates(batch)
+			if len(batch) > 0 {
+				a.flushBatch(batch)
+				batch = make(map[string]int64)
+			}
+			close(done) // Signal completion
 
 		case <-ticker.C:
 			if len(batch) > 0 {
@@ -287,7 +305,8 @@ func CloseStorage() {
 	metadata.CloseMetaDB()
 }
 
-// ListKeys returns all keys in the RocksDB instance
+// ListKeys returns all non-expired keys in the RocksDB instance
+// Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
 func (s *Storage) ListKeys() ([]string, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	it := s.meta.Handle().NewIterator(ro)
@@ -296,18 +315,27 @@ func (s *Storage) ListKeys() ([]string, error) {
 	var keys []string
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		k := string(it.Key().Data())
+		
+		// Skip index entries
+		if len(k) > 0 && k[0] == '!' {
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+		
 		v := it.Value().Data()
-		// Check for expiry if value is in expected format
-		if len(v) >= 11 && (v[0] == 'S' || v[0] == 'L') && v[1] == '|' && v[10] == '|' {
-			expiry := int64(binary.BigEndian.Uint64(v[2:10]))
-			if expiry > 0 && time.Now().Unix() > expiry {
-				// Expired, skip and delete
+		
+		// Try to decode as proto ValueMessage to check expiry
+		valueMsg := &pb.ValueMessage{}
+		if err := proto.Unmarshal(v, valueMsg); err == nil {
+			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
+				// Expired, skip but don't delete - let the cleaner handle it
 				it.Key().Free()
 				it.Value().Free()
-				s.DeleteKey(k)
 				continue
 			}
 		}
+		
 		keys = append(keys, k)
 		it.Key().Free()
 		it.Value().Free()
@@ -380,7 +408,7 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 	}
 
 	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
-	if valueMsg.Expiry > 0 && time.Now().Unix() > valueMsg.Expiry {
+	if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
 		zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
 		s.DeleteKey(key)
 		return nil, false, nil
@@ -442,6 +470,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	var expiry int64
 	if ttl > 0 {
 		expiry = time.Now().Add(time.Duration(ttl) * time.Second).Unix()
+		zlog.Debug().Str("key", key).Int("ttl", ttl).Int64("expiry", expiry).Msg("storage.Put: setting TTL")
 	}
 
 	// Large value path: we managed to read more than threshold bytes, which means
@@ -527,6 +556,22 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 // CleanerStats returns statistics from the background cleaner
 func (s *Storage) CleanerStats() (cleaned, evicted int64) {
 	return s.cleaner.Stats()
+}
+
+// FlushAccessUpdates forces all pending access time updates to be written immediately
+// This is mainly useful for testing to ensure deterministic behavior
+func (s *Storage) FlushAccessUpdates() {
+	if s.accessUpdater != nil {
+		s.accessUpdater.Flush()
+	}
+}
+
+// SetAccessTime sets a specific access time for a key
+// This is mainly useful for testing to create predictable LRU scenarios
+func (s *Storage) SetAccessTime(key string, accessTime int64) {
+	if s.accessUpdater != nil {
+		s.accessUpdater.Update(key, accessTime)
+	}
 }
 
 // notifyPut updates the cleaner's size tracking when a new key is added

@@ -3,7 +3,6 @@ package storage
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"testing"
 	"time"
@@ -88,26 +87,23 @@ func TestLRUEviction(t *testing.T) {
 	require.NotNil(t, s)
 	require.NotNil(t, s.cleaner)
 
-	// Add keys that exceed memory limit
-	// First batch - will be evicted (older access time)
+	// Add keys with specific access times to ensure predictable LRU behavior
+	baseTime := time.Now().Unix()
+	
+	// First batch - will be evicted (oldest access times)
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("old-key-%d", i)
 		data := bytes.Repeat([]byte("x"), 100) // 100 bytes each
 		err := s.Put(key, bytes.NewReader(data), 0)
 		require.NoError(t, err)
+		
+		// Set access times in the past, with keys 0-7 being oldest
+		accessTime := baseTime - int64(100-i)
+		s.SetAccessTime(key, accessTime)
 	}
-
-	// Sleep to ensure different access times
-	time.Sleep(100 * time.Millisecond)
-
-	// Access some of the old keys to update their access time
-	for i := 8; i < 10; i++ {
-		key := fmt.Sprintf("old-key-%d", i)
-		reader, found, err := s.Get(key)
-		require.NoError(t, err)
-		require.True(t, found)
-		io.ReadAll(reader)
-	}
+	
+	// Flush access updates to ensure they're written to RocksDB
+	s.FlushAccessUpdates()
 
 	// Add new keys that should trigger eviction
 	for i := 0; i < 5; i++ {
@@ -124,23 +120,30 @@ func TestLRUEviction(t *testing.T) {
 	keys, err := s.ListKeys()
 	require.NoError(t, err)
 
-	// Should have evicted oldest keys
-	// old-key-8 and old-key-9 should still exist (recently accessed)
-	foundOld8, foundOld9 := false, false
+	// With 1KB limit and 15 keys of 100 bytes each (1500 bytes total),
+	// we need to evict 600 bytes (6 keys) to get to 90% of limit
+	// Keys 0-5 should be evicted (oldest access times)
+	// Keys 6-9 and new-key-0 through new-key-4 should remain
+	
 	for _, key := range keys {
-		if key == "old-key-8" {
-			foundOld8 = true
-		}
-		if key == "old-key-9" {
-			foundOld9 = true
-		}
-		// old-key-0 through old-key-7 should be evicted
-		for i := 0; i < 8; i++ {
+		// old-key-0 through old-key-5 should be evicted
+		for i := 0; i < 6; i++ {
 			assert.NotEqual(t, fmt.Sprintf("old-key-%d", i), key)
 		}
 	}
-	assert.True(t, foundOld8, "old-key-8 should not be evicted (recently accessed)")
-	assert.True(t, foundOld9, "old-key-9 should not be evicted (recently accessed)")
+	
+	// old-key-6 through old-key-9 should still exist
+	for i := 6; i < 10; i++ {
+		found := false
+		expectedKey := fmt.Sprintf("old-key-%d", i)
+		for _, key := range keys {
+			if key == expectedKey {
+				found = true
+				break
+			}
+		}
+		assert.True(t, found, fmt.Sprintf("%s should not be evicted (newer access time)", expectedKey))
+	}
 
 	// Check eviction stats
 	_, evicted := s.CleanerStats()

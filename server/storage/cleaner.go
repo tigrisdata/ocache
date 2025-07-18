@@ -121,12 +121,16 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 
 		// Check if expired
-		if valueMsg.Expiry > 0 && now > valueMsg.Expiry {
+		if valueMsg.Expiry > 0 {
+			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Bool("expired", now >= valueMsg.Expiry).Msg("cleaner: checking expiry")
+		}
+		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
 			// Also delete access index
 			accessKey := MakeAccessIndexKey(key)
 			batch.Delete(accessKey)
 			cleaned++
+			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
 			// Also delete associated files
 			switch valueMsg.ValueType {
@@ -158,12 +162,10 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 	c.cleanedKeys.Add(int64(cleaned))
 
-	if cleaned > 0 {
-		zlog.Info().
-			Int("cleaned", cleaned).
-			Dur("duration", time.Since(start)).
-			Msg("cleaner: TTL cleanup completed")
-	}
+	zlog.Info().
+		Int("cleaned", cleaned).
+		Dur("duration", time.Since(start)).
+		Msg("cleaner: TTL cleanup completed")
 }
 
 // calculateTotalSize calculates the total size of stored data
