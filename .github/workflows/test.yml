@@ -30,6 +30,9 @@ jobs:
     - name: Generate proto files
       run: make proto
     
+    - name: Build binaries
+      run: make all
+    
     - name: Run linting
       run: make lint
     
@@ -46,9 +49,6 @@ jobs:
         path: |
           coverage.out
           coverage.html
-    
-    - name: Build binaries
-      run: make all
     
     - name: Run end-to-end tests
       run: make test-e2e

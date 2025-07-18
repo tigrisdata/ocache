@@ -204,6 +204,17 @@ lint:
 	@cd client && go mod tidy
 	@cd proto && go mod tidy
 
+.PHONY: lint-ci
+lint-ci:
+	@echo "Running gofmt..."
+	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
+	@echo "Running go mod tidy check..."
+	@go work sync
+	@cd server && go mod tidy
+	@cd client && go mod tidy
+	@cd proto && go mod tidy
+	@git diff --exit-code go.mod go.sum || (echo "go.mod or go.sum is not tidy" && exit 1)
+
 .PHONY: lint-fix
 lint-fix:
 	@echo "Fixing formatting issues..."
