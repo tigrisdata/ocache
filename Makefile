@@ -47,6 +47,30 @@ run-verbose: build
 	./ocache -disk /tmp/ocache -v
 
 # Testing targets
+.PHONY: test
+test:
+	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v ./...
+
+.PHONY: test-short
+test-short:
+	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -short -v ./...
+
+.PHONY: test-race
+test-race:
+	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -race -v ./...
+
+.PHONY: test-coverage
+test-coverage:
+	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated at coverage.html"
+
+.PHONY: test-e2e
+test-e2e: build build-cli
+	@chmod +x e2e/*.sh
+	@echo "Running E2E tests..."
+	@cd e2e && ./ttl_lru_test.sh
+
 .PHONY: bench
 bench: build build-cli run-background
 	./ocachecli --addr localhost:9000 bench
@@ -66,25 +90,91 @@ stop:
 		echo "Stopped ocache"; \
 	fi
 
+# Code quality targets
+.PHONY: lint
+lint:
+	@echo "Running go vet..."
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet ./...
+	@cd client && go vet ./...
+	@cd proto && go vet ./...
+	@echo "Running gofmt..."
+	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
+	@echo "Running go mod tidy..."
+	@go work sync
+	@cd server && go mod tidy
+	@cd client && go mod tidy
+	@cd proto && go mod tidy
+
+.PHONY: lint-fix
+lint-fix:
+	@echo "Fixing formatting issues..."
+	@gofmt -w $$(find . -name '*.go' -not -path './proto/*')
+	@echo "Running go mod tidy..."
+	@go work sync
+	@cd server && go mod tidy
+	@cd client && go mod tidy
+	@cd proto && go mod tidy
+
+.PHONY: vet
+vet:
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet ./...
+	@cd client && go vet ./...
+	@cd proto && go vet ./...
+
+.PHONY: fmt
+fmt:
+	@gofmt -w $$(find . -name '*.go' -not -path './proto/*')
+
+.PHONY: fmt-check
+fmt-check:
+	@gofmt -l $$(find . -name '*.go' -not -path './proto/*')
+
+.PHONY: check
+check: fmt-check vet test-short
+	@echo "All checks passed!"
+
 # Clean targets
 .PHONY: clean
 clean:
 	rm -f ocache ocachecli ocache.log ocache.pid
 	rm -f proto/*.pb.go proto/*.pb.gw.go
+	rm -f coverage.out coverage.html
+	rm -rf /tmp/ocache /tmp/ocache-demo
 
 # Help target
 .PHONY: help
 help:
 	@echo "OCache Makefile targets:"
+	@echo ""
+	@echo "Build targets:"
 	@echo "  all           - Build both server and CLI"
 	@echo "  build         - Build the server"
 	@echo "  build-cli     - Build the CLI client"
 	@echo "  proto         - Generate Go code from protobuf"
-	@echo "  install-deps  - Install dependencies (RocksDB)"
-	@echo "  install-protoc-plugins - Install protoc Go plugins"
+	@echo ""
+	@echo "Test targets:"
+	@echo "  test          - Run all unit tests"
+	@echo "  test-short    - Run unit tests (short mode)"
+	@echo "  test-race     - Run tests with race detector"
+	@echo "  test-coverage - Run tests with coverage report"
+	@echo "  test-e2e      - Run end-to-end tests"
+	@echo "  bench         - Run benchmarks"
+	@echo ""
+	@echo "Code quality targets:"
+	@echo "  lint          - Run linters (vet, gofmt check, mod tidy)"
+	@echo "  lint-fix      - Fix linting issues"
+	@echo "  vet           - Run go vet"
+	@echo "  fmt           - Format code with gofmt"
+	@echo "  fmt-check     - Check code formatting"
+	@echo "  check         - Run all quality checks (fmt, vet, test-short)"
+	@echo ""
+	@echo "Run targets:"
 	@echo "  run           - Run the server with default options"
 	@echo "  run-verbose   - Run the server with verbose logging"
-	@echo "  bench         - Run benchmarks"
+	@echo ""
+	@echo "Other targets:"
+	@echo "  install-deps  - Install dependencies (RocksDB)"
+	@echo "  install-protoc-plugins - Install protoc Go plugins"
 	@echo "  clean         - Remove built binaries and generated files"
 	@echo "  help          - Show this help message"
 
