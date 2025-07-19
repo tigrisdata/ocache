@@ -1,9 +1,45 @@
 # OCache Makefile
 
 # Variables
-BREW_PREFIX := $(shell brew --prefix)
-CGO_CFLAGS := -I$(BREW_PREFIX)/include
-CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Allow custom RocksDB installation path
+ROCKSDB_PREFIX ?= /usr/local
+
+# Platform-specific settings
+ifeq ($(UNAME_S),Darwin)
+    # macOS (both Intel and Apple Silicon)
+    BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
+    # Check if custom RocksDB exists, otherwise use brew
+    ifeq ($(wildcard $(ROCKSDB_PREFIX)/include/rocksdb/c.h),)
+        CGO_CFLAGS := -I$(BREW_PREFIX)/include
+        CGO_LDFLAGS := -L$(BREW_PREFIX)/lib
+    else
+        CGO_CFLAGS := -I$(ROCKSDB_PREFIX)/include
+        CGO_LDFLAGS := -L$(ROCKSDB_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd
+    endif
+else ifeq ($(UNAME_S),Linux)
+    # Linux - prioritize custom RocksDB if available
+    ifeq ($(wildcard $(ROCKSDB_PREFIX)/include/rocksdb/c.h),)
+        # Fallback to system paths
+        CGO_CFLAGS := -I/usr/include -I/usr/local/include
+        ifeq ($(UNAME_M),x86_64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+        else ifeq ($(UNAME_M),aarch64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+        else ifeq ($(UNAME_M),arm64)
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib/aarch64-linux-gnu -L/usr/lib64 -L/usr/local/lib
+        else
+            # Generic Linux fallback
+            CGO_LDFLAGS := -L/usr/lib -L/usr/lib64 -L/usr/local/lib
+        endif
+    else
+        # Use custom RocksDB installation
+        CGO_CFLAGS := -I$(ROCKSDB_PREFIX)/include
+        CGO_LDFLAGS := -L$(ROCKSDB_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd
+    endif
+endif
 
 # Build targets
 .PHONY: all
@@ -11,7 +47,7 @@ all: build build-cli
 
 .PHONY: build
 build: proto
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ocache ./server/
+	CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ocache ./server/
 
 .PHONY: build-cli
 build-cli:
@@ -28,8 +64,64 @@ proto:
 
 # Installation
 .PHONY: install-deps
-install-deps: install-protoc-plugins
+install-deps: install-protoc install-protoc-plugins
+
+.PHONY: install-rocksdb
+install-rocksdb:
+ifeq ($(UNAME_S),Darwin)
+	@echo "Installing RocksDB on macOS..."
+	@if ! command -v brew &> /dev/null; then \
+		echo "Homebrew is required but not installed. Please install it first."; \
+		exit 1; \
+	fi
 	brew install rocksdb
+else ifeq ($(UNAME_S),Linux)
+	@echo "Installing RocksDB on Linux..."
+	@if command -v apt-get &> /dev/null; then \
+		sudo apt-get update && sudo apt-get install -y librocksdb-dev libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev; \
+	elif command -v yum &> /dev/null; then \
+		sudo yum install -y rocksdb-devel snappy-devel lz4-devel libzstd-devel zlib-devel; \
+	elif command -v dnf &> /dev/null; then \
+		sudo dnf install -y rocksdb-devel snappy-devel lz4-devel libzstd-devel zlib-devel; \
+	else \
+		echo "Unsupported Linux distribution. Please install RocksDB manually."; \
+		exit 1; \
+	fi
+else
+	@echo "Unsupported platform: $(UNAME_S)"
+	@exit 1
+endif
+
+.PHONY: install-rocksdb-from-source
+install-rocksdb-from-source:
+	@echo "Installing RocksDB from source..."
+	@./scripts/install-rocksdb.sh
+
+.PHONY: install-protoc
+install-protoc:
+ifeq ($(UNAME_S),Darwin)
+	@echo "Installing protoc on macOS..."
+	@if ! command -v brew &> /dev/null; then \
+		echo "Homebrew is required but not installed. Please install it first."; \
+		exit 1; \
+	fi
+	brew install protobuf
+else ifeq ($(UNAME_S),Linux)
+	@echo "Installing protoc on Linux..."
+	@if command -v apt-get &> /dev/null; then \
+		sudo apt-get update && sudo apt-get install -y protobuf-compiler; \
+	elif command -v yum &> /dev/null; then \
+		sudo yum install -y protobuf-compiler; \
+	elif command -v dnf &> /dev/null; then \
+		sudo dnf install -y protobuf-compiler; \
+	else \
+		echo "Unsupported Linux distribution. Please install protoc manually."; \
+		exit 1; \
+	fi
+else
+	@echo "Unsupported platform: $(UNAME_S)"
+	@exit 1
+endif
 
 .PHONY: install-protoc-plugins
 install-protoc-plugins:
@@ -102,9 +194,8 @@ test-coverage:
 
 .PHONY: test-e2e
 test-e2e: build build-cli
-	@chmod +x e2e/*.sh
 	@echo "Running E2E tests..."
-	@cd e2e && ./ttl_lru_test.sh
+	./tests/e2e/ttl_lru_test.sh
 
 # Code quality targets
 .PHONY: lint
@@ -119,6 +210,17 @@ lint:
 	@cd server && go mod tidy
 	@cd client && go mod tidy
 	@cd proto && go mod tidy
+
+.PHONY: lint-ci
+lint-ci:
+	@echo "Running gofmt..."
+	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
+	@echo "Running go mod tidy check..."
+	@go work sync
+	@cd server && go mod tidy
+	@cd client && go mod tidy
+	@cd proto && go mod tidy
+	@git diff --exit-code go.mod go.sum || (echo "go.mod or go.sum is not tidy" && exit 1)
 
 .PHONY: lint-fix
 lint-fix:
