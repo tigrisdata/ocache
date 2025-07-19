@@ -194,9 +194,8 @@ test-coverage:
 
 .PHONY: test-e2e
 test-e2e: build build-cli
-	@chmod +x e2e/*.sh
 	@echo "Running E2E tests..."
-	@cd e2e && ./ttl_lru_test.sh
+	./tests/e2e/ttl_lru_test.sh
 
 # Code quality targets
 .PHONY: lint
