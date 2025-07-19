@@ -315,16 +315,16 @@ func (s *Storage) ListKeys() ([]string, error) {
 	var keys []string
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		k := string(it.Key().Data())
-		
+
 		// Skip index entries
 		if len(k) > 0 && k[0] == '!' {
 			it.Key().Free()
 			it.Value().Free()
 			continue
 		}
-		
+
 		v := it.Value().Data()
-		
+
 		// Try to decode as proto ValueMessage to check expiry
 		valueMsg := &pb.ValueMessage{}
 		if err := proto.Unmarshal(v, valueMsg); err == nil {
@@ -335,7 +335,7 @@ func (s *Storage) ListKeys() ([]string, error) {
 				continue
 			}
 		}
-		
+
 		keys = append(keys, k)
 		it.Key().Free()
 		it.Value().Free()
