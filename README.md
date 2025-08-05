@@ -2,22 +2,40 @@
 
 A cache service that supports both in-memory and disk-based storage, with gRPC and HTTP interfaces. It uses a combination of RocksDB and local storage to manage cache items efficiently, and provides fast access to both small and large objects. The service is designed to handle high throughput and low latency, making it suitable for various caching scenarios.
 
-## Prerequisites
-
-- Go (1.18 or newer recommended)
-- [Homebrew](https://brew.sh/) (for installing dependencies on macOS)
-- [RocksDB](https://github.com/facebook/rocksdb)
-
 ## Installation
 
 ### Clone the repository
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/tigrisdata/ocache.git
 cd ocache
 ```
 
-### Build the service (macOS)
+### Build the service
+
+#### Quick Start (with Makefile)
+
+```bash
+# Install dependencies and build
+make install-deps
+make all
+```
+
+#### Static Build (Recommended)
+
+Build with statically linked RocksDB for better portability:
+
+```bash
+# Build RocksDB static library (only needed once)
+make build-rocksdb-static
+
+# Build OCache with static linking
+make build-static
+```
+
+See [docs/STATIC_BUILD.md](docs/STATIC_BUILD.md) for more details on static builds.
+
+#### Manual Build (macOS)
 
 Install RocksDB:
 
@@ -50,17 +68,21 @@ Run the service:
 
 ### Command-line Flags
 
-- `-disk` : Path for disk spill (default: `/var/cache`)
-- `-threshold`: Small object threshold in bytes (default: 262144)
-- `-ttl`: Time-to-live for items in seconds (default: 900)
-- `-port` : gRPC listen port (default: 9000)
-- `-http-port` : HTTP listen port (default: 9001)
-- `-v` : Enable debug logging (default: no)
+- `-compact-threshold` int: Compaction threshold (bytes) (default 16777216)
+- `-disk` string: Directory for disk cache (default "/var/cache")
+- `-fd-cache-size` int: Size of the file descriptor cache (entries) (default 1000)
+- `-http-port` int: HTTP port (default 9001)
+- `-max-disk-usage` int: Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)
+- `-port` int: Listen port (default 9000)
+- `-segment-size` int: Segment size (bytes) (default 268435456)
+- `-threshold` int: Small obj threshold (bytes) (default 65536)
+- `-ttl` int: Default TTL in seconds (default 900)
+- `-v` : Enable debug logging
 
 Example:
 
 ```bash
-./ocache -disk /tmp/mydisk -threshold 2097152 -port 9090 -http-port 9091 -ttl 3600 -v
+./ocache -disk /tmp/mydisk -port 9090 -http-port 9091 -ttl 3600 -v
 ```
 
 ## HTTP Endpoints

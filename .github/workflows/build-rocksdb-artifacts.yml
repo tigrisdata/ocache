@@ -1,0 +1,119 @@
+name: Build RocksDB Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      rocksdb_version:
+        description: 'RocksDB version to build'
+        required: true
+        default: '10.4.2'
+  push:
+    paths:
+      - 'scripts/build-rocksdb-static.sh'
+      - '.github/workflows/build-rocksdb-artifacts.yml'
+
+env:
+  ROCKSDB_VERSION: ${{ github.event.inputs.rocksdb_version || '10.4.2' }}
+
+jobs:
+  build-artifacts:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-latest
+            arch: aarch64
+            use_qemu: true
+          - os: macos-latest
+            arch: x86_64
+          - os: macos-latest
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        if: matrix.use_qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libsnappy-dev \
+            liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
+      
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake snappy lz4 zstd
+      
+      - name: Build RocksDB static library
+        run: |
+          ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
+          ARCH=${{ matrix.arch }} \
+          OS=${{ runner.os }} \
+          make build-rocksdb-static
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ runner.os }}-${{ matrix.arch }}
+          path: rocksdb-static/rocksdb-static-*.tar.gz
+          retention-days: 90
+  
+  create-release:
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: rocksdb-v${{ env.ROCKSDB_VERSION }}
+          release_name: RocksDB ${{ env.ROCKSDB_VERSION }} Static Libraries
+          body: |
+            Pre-built static RocksDB libraries for various platforms.
+            
+            ## Supported Platforms
+            - Linux x86_64
+            - Linux aarch64
+            - macOS x86_64
+            - macOS arm64
+            
+            ## Usage
+            1. Download the appropriate artifact for your platform
+            2. Extract to your project directory
+            3. Set build flags:
+               ```
+               export CGO_CFLAGS="-I/path/to/extracted/include"
+               export CGO_LDFLAGS="-L/path/to/extracted/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread"
+               ```
+          draft: false
+          prerelease: false
+      
+      - name: Upload Release Assets
+        run: |
+          for artifact in artifacts/*/rocksdb-static-*.tar.gz; do
+            asset_name=$(basename "$artifact")
+            echo "Uploading $asset_name..."
+            gh release upload "rocksdb-v${{ env.ROCKSDB_VERSION }}" "$artifact" \
+              --clobber
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

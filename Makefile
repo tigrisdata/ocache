@@ -45,9 +45,34 @@ endif
 .PHONY: all
 all: build build-cli
 
+# Static build configuration
+STATIC_BUILD ?= false
+ifeq ($(STATIC_BUILD),true)
+    # Use static RocksDB from artifact
+    ROCKSDB_STATIC_DIR ?= $(shell pwd)/rocksdb-static/artifact
+    CGO_CFLAGS := -I$(ROCKSDB_STATIC_DIR)/include
+    ifeq ($(UNAME_S),Darwin)
+        # On macOS, also include Homebrew paths for compression libraries
+        BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
+        CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -L$(BREW_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
+    else
+        CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
+    endif
+    # macOS doesn't support fully static binaries, so we only statically link RocksDB
+    ifeq ($(UNAME_S),Darwin)
+        LDFLAGS := -ldflags "-s -w"
+    else
+        LDFLAGS := -ldflags "-linkmode external -extldflags '-static'"
+    endif
+endif
+
 .PHONY: build
 build: proto
-	CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ocache ./server/
+	CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build $(LDFLAGS) -o ocache ./server/
+
+.PHONY: build-static
+build-static:
+	STATIC_BUILD=true $(MAKE) build
 
 .PHONY: build-cli
 build-cli:
@@ -96,6 +121,11 @@ endif
 install-rocksdb-from-source:
 	@echo "Installing RocksDB from source..."
 	@./scripts/install-rocksdb.sh
+
+.PHONY: build-rocksdb-static
+build-rocksdb-static:
+	@echo "Building RocksDB static library..."
+	@./scripts/build-rocksdb-static.sh
 
 .PHONY: install-protoc
 install-protoc:
@@ -164,7 +194,7 @@ test: test-server test-client
 .PHONY: test-server
 test-server:
 	@echo "Running server tests..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 60s ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s ./...
 
 .PHONY: test-client
 test-client:
@@ -174,14 +204,14 @@ test-client:
 .PHONY: test-race
 test-race:
 	@echo "Running race tests for server..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -race -v -timeout 60s ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 60s ./...
 	@echo "Running race tests for client..."
 	@cd client && go test -race -v -timeout 30s ./...
 
 .PHONY: test-coverage
 test-coverage:
 	@echo "Running coverage tests for server..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -coverprofile=../coverage-server.out -timeout 60s ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../coverage-server.out -timeout 60s ./...
 	@echo "Running coverage tests for client..."
 	@cd client && go test -coverprofile=../coverage-client.out -timeout 30s ./...
 	@echo "Combining coverage reports..."
@@ -201,7 +231,7 @@ test-e2e: build build-cli
 .PHONY: lint
 lint:
 	@echo "Running go vet..."
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet $(LDFLAGS) ./...
 	@cd client && go vet ./...
 	@echo "Running gofmt..."
 	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
@@ -234,7 +264,7 @@ lint-fix:
 
 .PHONY: vet
 vet:
-	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet ./...
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet $(LDFLAGS) ./...
 	@cd client && go vet ./...
 
 .PHONY: fmt
@@ -265,6 +295,7 @@ help:
 	@echo "Build targets:"
 	@echo "  all           - Build both server and CLI"
 	@echo "  build         - Build the server"
+	@echo "  build-static  - Build the server with static RocksDB"
 	@echo "  build-cli     - Build the CLI client"
 	@echo "  proto         - Generate Go code from protobuf"
 	@echo ""
@@ -292,6 +323,7 @@ help:
 	@echo "Other targets:"
 	@echo "  install-deps  - Install dependencies (RocksDB)"
 	@echo "  install-protoc-plugins - Install protoc Go plugins"
+	@echo "  build-rocksdb-static - Build RocksDB static library"
 	@echo "  clean         - Remove built binaries and generated files"
 	@echo "  help          - Show this help message"
 
