@@ -14,6 +14,8 @@ This document explains how to build OCache with a statically linked RocksDB libr
 ### Linux
 On Linux, the build creates a fully static binary with all dependencies included.
 
+**Note**: You may see a warning about `getaddrinfo` when building static binaries. This is expected and the binary will work correctly in most environments. The warning occurs because DNS resolution functions require NSS libraries that can't be fully statically linked with glibc.
+
 ### macOS
 On macOS, the build creates a mostly-static binary where RocksDB is statically linked, but system libraries (like libc) remain dynamically linked. This is because macOS doesn't support fully static binaries.
 
