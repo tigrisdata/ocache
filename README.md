@@ -5,7 +5,7 @@ High-performance cache service with dual-storage architecture, supporting both g
 ## Features
 
 - **Dual Storage**: RocksDB for small objects, segmented disk storage for large objects
-- **Multiple Interfaces**: gRPC for high performance, HTTP REST for easy integration  
+- **Multiple Interfaces**: gRPC for high performance, HTTP REST for easy integration
 - **TTL Support**: Automatic expiration with background cleanup
 - **LRU Eviction**: Optional disk usage limits with automatic eviction
 - **High Performance**: Optimized for throughput and low latency
@@ -44,7 +44,7 @@ make all
 curl -X POST "http://localhost:9001/v1/cache/mykey" \
   -d '{"data":"aGVsbG8gd29ybGQ=","ttl_seconds":3600}'
 
-# Retrieve data  
+# Retrieve data
 curl "http://localhost:9001/v1/cache/mykey"
 
 # Delete data
@@ -67,17 +67,13 @@ curl -X DELETE "http://localhost:9001/v1/cache/mykey"
 
 Key configuration flags:
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-port` | 9000 | gRPC port |
-| `-http-port` | 9001 | HTTP port |
-| `-disk` | /var/cache | Storage directory |
-| `-threshold` | 65536 | Small object threshold (bytes) |
-| `-ttl` | 900 | Default TTL (seconds) |
-| `-max-disk-usage` | 0 | Max disk usage (0=unlimited) |
+| Flag              | Default    | Description                    |
+| ----------------- | ---------- | ------------------------------ |
+| `-port`           | 9000       | gRPC port                      |
+| `-http-port`      | 9001       | HTTP port                      |
+| `-disk`           | /var/cache | Storage directory              |
+| `-threshold`      | 65536      | Small object threshold (bytes) |
+| `-ttl`            | 900        | Default TTL (seconds)          |
+| `-max-disk-usage` | 0          | Max disk usage (0=unlimited)   |
 
 See [Configuration Guide](docs/configuration.md) for complete options.
-
-## License
-
-[Add your license here]
