@@ -3,8 +3,18 @@ name: Test
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
 
 env:
   GO_VERSION: "1.21"
@@ -34,25 +44,42 @@ jobs:
           sudo apt-get install -y build-essential cmake libgflags-dev \
             libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
 
-      - name: Cache RocksDB build
-        uses: actions/cache@v4
-        id: cache-rocksdb
-        with:
-          path: |
-            /usr/local/lib/librocksdb*
-            /usr/local/include/rocksdb
-            /usr/local/lib/pkgconfig/rocksdb.pc
-            /usr/local/lib/cmake/rocksdb
-          key: ${{ runner.os }}-rocksdb-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v2
-
-      - name: Install RocksDB from source
-        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
-        run: ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} make install-rocksdb-from-source
-
-      - name: Verify RocksDB installation
+      - name: Set OS name
+        id: os-name
         run: |
-          ls -la /usr/local/include/rocksdb/c.h || echo "RocksDB header not found"
-          ls -la /usr/local/lib/librocksdb* || echo "RocksDB library not found"
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Cache RocksDB static artifact
+        uses: actions/cache@v4
+        id: cache-rocksdb-static
+        with:
+          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+
+      - name: Download pre-built RocksDB artifact
+        if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
+        run: |
+          # Try to download from GitHub releases first
+          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
+          
+          if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
+            echo "Downloaded pre-built artifact from release"
+          else
+            echo "Pre-built artifact not found, building from source..."
+            ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
+            OS=${{ steps.os-name.outputs.os_name }} \
+            ARCH=${{ matrix.arch }} \
+            make build-rocksdb-static
+            mv rocksdb-static/rocksdb-static-*.tar.gz .
+          fi
+
+      - name: Extract RocksDB static artifact
+        run: |
+          mkdir -p rocksdb-static/artifact
+          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          ls -la rocksdb-static/artifact/
 
       - name: Install dependencies
         run: make install-deps
@@ -61,16 +88,16 @@ jobs:
         run: make proto
 
       - name: Build
-        run: make all
+        run: STATIC_BUILD=true make all
 
       - name: Run linting
-        run: make lint
+        run: STATIC_BUILD=true make lint
 
       - name: Run tests with race detector
-        run: make test-race
+        run: STATIC_BUILD=true make test-race
 
       - name: Run coverage tests
-        run: make test-coverage
+        run: STATIC_BUILD=true make test-coverage
 
       - name: Upload coverage reports
         uses: actions/upload-artifact@v4
@@ -81,4 +108,4 @@ jobs:
             coverage.html
 
       - name: Run end-to-end tests
-        run: make test-e2e
+        run: STATIC_BUILD=true make test-e2e

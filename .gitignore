@@ -7,3 +7,7 @@
 # Go build artifacts
 **/ocache
 **/ocachecli
+
+# RocksDB static build artifacts
+rocksdb-static/
+rocksdb-static-*.tar.gz
