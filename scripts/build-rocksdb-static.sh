@@ -4,7 +4,7 @@ set -e
 
 ROCKSDB_VERSION="${ROCKSDB_VERSION:-10.4.2}"
 BUILD_DIR="${BUILD_DIR:-$(pwd)/rocksdb-static}"
-JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 ARCH="${ARCH:-$(uname -m)}"
 # Get OS name in lowercase
 OS_RAW="$(uname -s)"

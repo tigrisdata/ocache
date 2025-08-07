@@ -34,32 +34,41 @@ jobs:
           sudo apt-get install -y build-essential cmake libgflags-dev \
             libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
 
+      - name: Set OS name
+        id: os-name
+        run: |
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+
       - name: Cache RocksDB static artifact
         uses: actions/cache@v4
         id: cache-rocksdb-static
         with:
-          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ runner.os }}-${{ matrix.arch }}.tar.gz
-          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v4
+          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
 
       - name: Download pre-built RocksDB artifact
         if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
         run: |
           # Try to download from GitHub releases first
-          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ runner.os }}-${{ matrix.arch }}.tar.gz"
+          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
           
           if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
             echo "Downloaded pre-built artifact from release"
           else
             echo "Pre-built artifact not found, building from source..."
-            ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} make build-rocksdb-static
+            ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
+            OS=${{ steps.os-name.outputs.os_name }} \
+            ARCH=${{ matrix.arch }} \
+            make build-rocksdb-static
             mv rocksdb-static/rocksdb-static-*.tar.gz .
           fi
 
       - name: Extract RocksDB static artifact
         run: |
           mkdir -p rocksdb-static/artifact
-          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ runner.os }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
           ls -la rocksdb-static/artifact/
 
       - name: Install dependencies
