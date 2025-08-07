@@ -31,6 +31,7 @@ make all
 
 - [Installation Guide](docs/installation.md) - Build options and dependencies
 - [API Reference](docs/api.md) - HTTP REST and gRPC APIs
+- [CLI Client](docs/cli.md) - Command-line client usage
 - [Configuration](docs/configuration.md) - Server flags and tuning
 - [Development](docs/development.md) - Contributing and architecture
 - [Static Builds](docs/STATIC_BUILD.md) - Production deployment
