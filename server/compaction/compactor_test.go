@@ -66,20 +66,20 @@ func TestCompactorStartClose(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactor(fm, sm, 1024*1024, 100*time.Millisecond)
-	
+
 	// Start the compactor
 	c.Start()
-	
+
 	// Let it run for a brief period
 	time.Sleep(50 * time.Millisecond)
-	
+
 	// Close should stop the background loop
 	done := make(chan struct{})
 	go func() {
 		c.Close()
 		close(done)
 	}()
-	
+
 	select {
 	case <-done:
 		// Success
@@ -97,16 +97,16 @@ func TestCloseNilCompactor(t *testing.T) {
 func TestPrepareEntryForCompaction(t *testing.T) {
 	key := "test-key"
 	filePath := "/path/to/file"
-	
+
 	k, v := PrepareEntryForCompaction(key, filePath)
-	
+
 	// Key should start with !compact/ prefix and contain timestamp
 	assert.True(t, bytes.HasPrefix(k, []byte("!compact/")))
 	assert.Contains(t, string(k), "|test-key")
-	
+
 	// Value should be the file path
 	assert.Equal(t, filePath, string(v))
-	
+
 	// Ensure timestamp is properly formatted (20 digits)
 	parts := bytes.Split(k, []byte("|"))
 	assert.Len(t, parts, 2)
@@ -172,20 +172,20 @@ func TestEnsureCapacity(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Get initial segment
 	seg, err := sm.AcquireOpenSegment(0)
 	require.NoError(t, err)
 	require.NotNil(t, seg)
-	
+
 	initialPath := seg.Path()
 	initialRemaining := seg.Remaining()
-	
+
 	// Test 1: When segment has enough capacity
 	err = c.ensureCapacity(&seg, 100)
 	assert.NoError(t, err)
 	assert.Equal(t, initialPath, seg.Path()) // Same segment
-	
+
 	// Test 2: When segment needs rotation
 	err = c.ensureCapacity(&seg, initialRemaining+1)
 	assert.NoError(t, err)
@@ -197,33 +197,33 @@ func TestCopyFileIntoSegment(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Create a test file
 	testData := []byte("test data content")
 	testFile := filepath.Join(tmpDir, "test.dat")
-	err := os.WriteFile(testFile, testData, 0644)
+	err := os.WriteFile(testFile, testData, 0o644)
 	require.NoError(t, err)
-	
+
 	// Open the file
 	f, err := os.Open(testFile)
 	require.NoError(t, err)
 	defer f.Close()
-	
+
 	// Get a segment
 	seg, err := sm.AcquireOpenSegment(0)
 	require.NoError(t, err)
-	
+
 	// Prepare value message
 	vm := &pb.ValueMessage{
 		ValueLength: int64(len(testData)),
 		ValueType:   pb.ValueType_RAW_FILE,
 		RawFilePath: testFile,
 	}
-	
+
 	// Copy file into segment
 	err = c.copyFileIntoSegment(seg, "test-key", f, vm)
 	assert.NoError(t, err)
-	
+
 	// Verify ValueMessage was updated
 	assert.Empty(t, vm.RawFilePath)
 	assert.Equal(t, seg.Path(), vm.SegmentPath)
@@ -236,37 +236,37 @@ func TestCommit(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Create test files to delete
 	testFiles := []string{
 		filepath.Join(tmpDir, "files", "file1.dat"),
 		filepath.Join(tmpDir, "files", "file2.dat"),
 	}
-	
+
 	for _, f := range testFiles {
-		err := os.WriteFile(f, []byte("data"), 0644)
+		err := os.WriteFile(f, []byte("data"), 0o644)
 		require.NoError(t, err)
 	}
-	
+
 	// Get a segment
 	seg, err := sm.AcquireOpenSegment(0)
 	require.NoError(t, err)
-	
+
 	// Create write batch
 	wb := grocksdb.NewWriteBatch()
 	wb.Put([]byte("key1"), []byte("value1"))
 	wb.Delete([]byte("key2"))
-	
+
 	// Test commit with non-empty batch
 	err = c.commit(seg, wb, testFiles)
 	assert.NoError(t, err)
-	
+
 	// Verify files were deleted
 	for _, f := range testFiles {
 		_, err := os.Stat(f)
 		assert.True(t, os.IsNotExist(err))
 	}
-	
+
 	// Test commit with empty batch
 	emptyWb := grocksdb.NewWriteBatch()
 	err = c.commit(seg, emptyWb, nil)
@@ -279,30 +279,30 @@ func TestCompactFiles(t *testing.T) {
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
 	meta := metadata.GetMetaDB()
-	
+
 	// Create test files
 	testData1 := []byte("test data 1")
 	testFile1 := filepath.Join(tmpDir, "files", "file1.dat")
-	err := os.WriteFile(testFile1, testData1, 0644)
+	err := os.WriteFile(testFile1, testData1, 0o644)
 	require.NoError(t, err)
-	
+
 	testData2 := []byte("test data 2")
 	testFile2 := filepath.Join(tmpDir, "files", "file2.dat")
-	err = os.WriteFile(testFile2, testData2, 0644)
+	err = os.WriteFile(testFile2, testData2, 0o644)
 	require.NoError(t, err)
-	
+
 	// Add entries to RocksDB
 	wo := grocksdb.NewDefaultWriteOptions()
-	
+
 	// Add file index entries
 	idxKey1, idxVal1 := PrepareEntryForCompaction("key1", testFile1)
 	err = meta.Handle().Put(wo, idxKey1, idxVal1)
 	require.NoError(t, err)
-	
+
 	idxKey2, idxVal2 := PrepareEntryForCompaction("key2", testFile2)
 	err = meta.Handle().Put(wo, idxKey2, idxVal2)
 	require.NoError(t, err)
-	
+
 	// Add metadata entries
 	vm1 := &pb.ValueMessage{
 		ValueLength: int64(len(testData1)),
@@ -312,7 +312,7 @@ func TestCompactFiles(t *testing.T) {
 	vm1Bytes, _ := proto.Marshal(vm1)
 	err = meta.Handle().Put(wo, []byte("key1"), vm1Bytes)
 	require.NoError(t, err)
-	
+
 	vm2 := &pb.ValueMessage{
 		ValueLength: int64(len(testData2)),
 		ValueType:   pb.ValueType_RAW_FILE,
@@ -321,20 +321,20 @@ func TestCompactFiles(t *testing.T) {
 	vm2Bytes, _ := proto.Marshal(vm2)
 	err = meta.Handle().Put(wo, []byte("key2"), vm2Bytes)
 	require.NoError(t, err)
-	
+
 	// Run compaction
 	c.CompactFiles(1024 * 1024)
-	
+
 	// Verify index entries were deleted
 	ro := grocksdb.NewDefaultReadOptions()
 	slice1, _ := meta.Handle().Get(ro, idxKey1)
 	assert.False(t, slice1.Exists())
 	slice1.Free()
-	
+
 	slice2, _ := meta.Handle().Get(ro, idxKey2)
 	assert.False(t, slice2.Exists())
 	slice2.Free()
-	
+
 	// Verify metadata was updated
 	slice3, _ := meta.Handle().Get(ro, []byte("key1"))
 	assert.True(t, slice3.Exists())
@@ -347,7 +347,7 @@ func TestCompactFiles(t *testing.T) {
 		assert.NotEmpty(t, updatedVm.SegmentPath)
 	}
 	slice3.Free()
-	
+
 	// Verify files were deleted
 	_, err = os.Stat(testFile1)
 	assert.True(t, os.IsNotExist(err))
@@ -361,16 +361,16 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 	meta := metadata.GetMetaDB()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Add file index entry for non-existent file
 	idxKey, idxVal := PrepareEntryForCompaction("key1", "/non/existent/file")
 	wo := grocksdb.NewDefaultWriteOptions()
 	err := meta.Handle().Put(wo, idxKey, idxVal)
 	require.NoError(t, err)
-	
+
 	// Run compaction - should handle missing file gracefully
 	c.CompactFiles(1024 * 1024)
-	
+
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
 	slice, _ := meta.Handle().Get(ro, idxKey)
@@ -384,27 +384,27 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 	meta := metadata.GetMetaDB()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Create a test file
 	testFile := filepath.Join(tmpDir, "files", "file.dat")
-	err := os.WriteFile(testFile, []byte("data"), 0644)
+	err := os.WriteFile(testFile, []byte("data"), 0o644)
 	require.NoError(t, err)
-	
+
 	// Add file index entry without corresponding metadata
 	idxKey, idxVal := PrepareEntryForCompaction("key1", testFile)
 	wo := grocksdb.NewDefaultWriteOptions()
 	err = meta.Handle().Put(wo, idxKey, idxVal)
 	require.NoError(t, err)
-	
+
 	// Run compaction
 	c.CompactFiles(1024 * 1024)
-	
+
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
 	slice, _ := meta.Handle().Get(ro, idxKey)
 	assert.False(t, slice.Exists())
 	slice.Free()
-	
+
 	// File should be deleted as key is missing
 	_, err = os.Stat(testFile)
 	assert.True(t, os.IsNotExist(err))
@@ -416,21 +416,21 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	meta := metadata.GetMetaDB()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Create multiple test files
 	files := make([]string, 3)
 	for i := 0; i < 3; i++ {
 		data := make([]byte, 100) // 100 bytes each
 		files[i] = filepath.Join(tmpDir, "files", fmt.Sprintf("file%d.dat", i))
-		err := os.WriteFile(files[i], data, 0644)
+		err := os.WriteFile(files[i], data, 0o644)
 		require.NoError(t, err)
-		
+
 		// Add to index
 		idxKey, idxVal := PrepareEntryForCompaction(fmt.Sprintf("key%d", i), files[i])
 		wo := grocksdb.NewDefaultWriteOptions()
 		err = meta.Handle().Put(wo, idxKey, idxVal)
 		require.NoError(t, err)
-		
+
 		// Add metadata
 		vm := &pb.ValueMessage{
 			ValueLength: int64(len(data)),
@@ -441,24 +441,24 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 		err = meta.Handle().Put(wo, []byte(fmt.Sprintf("key%d", i)), vmBytes)
 		require.NoError(t, err)
 	}
-	
+
 	// Run compaction with small limit (should process only first 2 files)
 	// The limit is checked after processing, so 150 bytes means it will process 2 files (200 bytes)
 	// and stop before the third
 	c.CompactFiles(150)
-	
+
 	// Check how many index entries remain (unprocessed files)
 	ro := grocksdb.NewDefaultReadOptions()
 	ro.SetPrefixSameAsStart(true)
 	it := meta.Handle().NewIterator(ro)
 	defer it.Close()
-	
+
 	unprocessedCount := 0
 	filePrefix := []byte("!compact/")
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		unprocessedCount++
 	}
-	
+
 	// We processed all files because the limit is advisory and checked after processing
 	// Since all files fit in the segment, they were all processed
 	assert.Equal(t, 0, unprocessedCount)
@@ -470,17 +470,17 @@ func TestCompactionLoopConcurrency(t *testing.T) {
 
 	// Test that multiple Start calls are safe
 	c := NewCompactor(fm, sm, 1024*1024, 50*time.Millisecond)
-	
+
 	// Start the compactor once
 	c.Start()
-	
+
 	// Multiple Start calls should be safe (though not recommended)
 	c.Start()
 	c.Start()
-	
+
 	// Sleep briefly to let the loops run
 	time.Sleep(20 * time.Millisecond)
-	
+
 	// Close should stop all loops safely
 	c.Close()
 }
@@ -491,25 +491,25 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 	meta := metadata.GetMetaDB()
 
 	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Create a test file
 	testFile := filepath.Join(tmpDir, "files", "file.dat")
-	err := os.WriteFile(testFile, []byte("data"), 0644)
+	err := os.WriteFile(testFile, []byte("data"), 0o644)
 	require.NoError(t, err)
-	
+
 	// Add file index entry
 	idxKey, idxVal := PrepareEntryForCompaction("key1", testFile)
 	wo := grocksdb.NewDefaultWriteOptions()
 	err = meta.Handle().Put(wo, idxKey, idxVal)
 	require.NoError(t, err)
-	
+
 	// Add invalid metadata (not a valid protobuf)
 	err = meta.Handle().Put(wo, []byte("key1"), []byte("invalid protobuf data"))
 	require.NoError(t, err)
-	
+
 	// Run compaction - should handle bad metadata gracefully
 	c.CompactFiles(1024 * 1024)
-	
+
 	// File should still exist as we couldn't process it
 	_, err = os.Stat(testFile)
 	assert.NoError(t, err)
@@ -520,12 +520,12 @@ func TestCopyFileIntoSegmentError(t *testing.T) {
 	defer cleanup()
 
 	_ = NewCompactor(fm, sm, 1024*1024, time.Second)
-	
+
 	// Create a test file with no read permissions
 	testFile := filepath.Join(tmpDir, "unreadable.dat")
-	err := os.WriteFile(testFile, []byte("data"), 0000)
+	err := os.WriteFile(testFile, []byte("data"), 0o000)
 	require.NoError(t, err)
-	
+
 	// Try to open and copy - should fail
 	f, err := os.Open(testFile)
 	if err == nil {
