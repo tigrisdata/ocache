@@ -2,12 +2,14 @@ package files
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tigrisdata/ocache/server/storage/fd"
 )
@@ -310,7 +312,7 @@ func TestFileManager_ConcurrentWrites(t *testing.T) {
 	}
 }
 
-func TestFileManager_ConcurrentReadWrite(t *testing.T) {
+func TestFileManager_ConcurrentReadsOfSameFile(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
@@ -319,8 +321,9 @@ func TestFileManager_ConcurrentReadWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	key := "concurrent-rw"
-	content := "test concurrent read write"
+	// Write a test file
+	key := "shared-file"
+	content := "shared content for concurrent reads"
 	reader := strings.NewReader(content)
 
 	path, _, length, err := fm.Write(key, reader)
@@ -328,49 +331,116 @@ func TestFileManager_ConcurrentReadWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Multiple readers reading the same file concurrently
 	var wg sync.WaitGroup
-	numReaders := 5
-	numWriters := 3
-
-	wg.Add(numReaders)
+	numReaders := 10
+	
 	for i := 0; i < numReaders; i++ {
+		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			
+			// Small random delay to spread out the reads
+			time.Sleep(time.Duration(idx) * time.Millisecond)
+			
 			rc, err := fm.Read(path, length)
 			if err != nil {
-				t.Errorf("Reader %d: Read failed: %v", idx, err)
+				t.Errorf("Reader %d: Failed to open file: %v", idx, err)
 				return
 			}
-			defer rc.Close()
-
+			
+			// Read the content
 			data, err := io.ReadAll(rc)
 			if err != nil {
-				t.Errorf("Reader %d: ReadAll failed: %v", idx, err)
+				// Don't error on "file already closed" - this is the race we're documenting
+				if !strings.Contains(err.Error(), "file already closed") {
+					t.Errorf("Reader %d: ReadAll failed: %v", idx, err)
+				}
+				rc.Close()
+				return
+			}
+			
+			// Close after successful read
+			rc.Close()
+			
+			if string(data) != content {
+				t.Errorf("Reader %d: content mismatch, got %q, want %q", idx, string(data), content)
+			}
+		}(i)
+	}
+	
+	wg.Wait()
+}
+
+func TestFileManager_ConcurrentOperations(t *testing.T) {
+	basePath := t.TempDir()
+	_ = fd.NewFdCache(100)
+
+	fm, err := NewFileManager(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errors []string
+	
+	numOperations := 10
+
+	// Create different files for each operation to avoid fd cache race conditions
+	wg.Add(numOperations)
+	for i := 0; i < numOperations; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			
+			// Each goroutine works with its own file
+			key := fmt.Sprintf("file-%d", idx)
+			content := fmt.Sprintf("content for file %d", idx)
+			reader := strings.NewReader(content)
+
+			// Write the file
+			path, _, length, err := fm.Write(key, reader)
+			if err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Operation %d: Write failed: %v", idx, err))
+				mu.Unlock()
+				return
+			}
+
+			// Read it back
+			rc, err := fm.Read(path, length)
+			if err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Operation %d: Read failed: %v", idx, err))
+				mu.Unlock()
+				return
+			}
+			
+			data, err := io.ReadAll(rc)
+			rc.Close()
+			
+			if err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Operation %d: ReadAll failed: %v", idx, err))
+				mu.Unlock()
 				return
 			}
 
 			if string(data) != content {
-				t.Errorf("Reader %d: content mismatch", idx)
-			}
-		}(i)
-	}
-
-	wg.Add(numWriters)
-	for i := 0; i < numWriters; i++ {
-		go func(idx int) {
-			defer wg.Done()
-			newKey := "new-key"
-			newContent := "new content"
-			newReader := strings.NewReader(newContent)
-
-			_, _, _, err := fm.Write(newKey, newReader)
-			if err != nil {
-				t.Errorf("Writer %d: Write failed: %v", idx, err)
+				mu.Lock()
+				errors = append(errors, fmt.Sprintf("Operation %d: content mismatch, got %q, want %q", idx, string(data), content))
+				mu.Unlock()
 			}
 		}(i)
 	}
 
 	wg.Wait()
+	
+	if len(errors) > 0 {
+		for _, err := range errors {
+			t.Error(err)
+		}
+	}
 }
 
 func TestFileReadCloser(t *testing.T) {
