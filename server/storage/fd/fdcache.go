@@ -94,13 +94,18 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	// Fast-path: entry already in cache.
 	if v, ok := fc.entries.Load(path); ok {
 		e := v.(*FileEntry)
+		// Increment refs BEFORE waiting to prevent removal during acquire
+		atomic.AddInt32(&e.refs, 1)
+		
 		// Wait for file to be ready if another goroutine is opening it
 		<-e.ready
+		
 		// Check if opening failed
 		if e.f == nil {
+			// Decrement refs since we're not using it
+			atomic.AddInt32(&e.refs, -1)
 			return nil, utils.WrapError("failed to open raw file", path, nil)
 		}
-		atomic.AddInt32(&e.refs, 1)
 		return e, nil
 	}
 
@@ -119,12 +124,16 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	if loaded {
 		// Another goroutine already started opening, wait for it
 		existing := actual.(*FileEntry)
+		// Increment refs BEFORE waiting to prevent removal during acquire
+		atomic.AddInt32(&existing.refs, 1)
+		
 		<-existing.ready
 		// Check if opening failed
 		if existing.f == nil {
+			// Decrement refs since we're not using it
+			atomic.AddInt32(&existing.refs, -1)
 			return nil, utils.WrapError("failed to open raw file", path, nil)
 		}
-		atomic.AddInt32(&existing.refs, 1)
 		return existing, nil
 	}
 	
@@ -147,11 +156,14 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	entry.f = f
 	close(ready)
 	
-	// Track size for capacity management
-	if fc.capacity > 0 && atomic.AddInt32(&fc.size, 1) > int32(fc.capacity) {
+	// Track size - always increment when adding to cache
+	atomic.AddInt32(&fc.size, 1)
+	
+	// Check capacity limits
+	if fc.capacity > 0 && atomic.LoadInt32(&fc.size) > int32(fc.capacity) {
 		// Over capacity but keep in cache for now since we're using it
 		// It will be removed on Release when refs reaches 0
-		atomic.AddInt32(&fc.size, -1)
+		// Note: we don't decrement size here as the entry is still in cache
 	}
 	
 	return entry, nil
