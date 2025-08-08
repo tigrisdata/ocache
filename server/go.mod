@@ -8,7 +8,6 @@ require (
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
-	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
 )
 
@@ -19,6 +18,7 @@ require (
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
+	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	golang.org/x/net v0.40.0 // indirect
 	golang.org/x/sys v0.33.0
 	golang.org/x/text v0.25.0 // indirect
