@@ -20,7 +20,7 @@ import (
 // Callers interact with it exclusively through the FdCache APIs.
 
 type FileEntry struct {
-	refs   int32         // accessed atomically – keep first
+	refs   int32 // accessed atomically – keep first
 	f      *os.File
 	mu     *sync.RWMutex // per-file lock shared with RawFileManager
 	ready  chan struct{} // closed when file is opened (for synchronization)
@@ -113,7 +113,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	// Slow-path: need to open the file.
 	// Check if we're at capacity before creating a new entry
 	atCapacity := fc.capacity > 0 && atomic.LoadInt32(&fc.size) >= int32(fc.capacity)
-	
+
 	// Create entry with ready channel
 	ready := make(chan struct{})
 	entry := &FileEntry{
