@@ -7,7 +7,6 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/tigrisdata/ocache/proto v0.0.0
 	github.com/tigrisdata/ocache/server v0.0.0
-	google.golang.org/protobuf v1.36.5
 )
 
 require (
@@ -24,6 +23,7 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/grpc v1.72.2 // indirect
+	google.golang.org/protobuf v1.36.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 

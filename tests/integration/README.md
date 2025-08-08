@@ -4,9 +4,26 @@ This directory contains integration tests for OCache that verify the storage lay
 
 **Note**: These are integration tests that directly test the storage layer. For true end-to-end tests using the gRPC API and cache client, see the shell scripts in the e2e tests directory.
 
+## Quick Start
+
+```bash
+# Run all implemented integration tests
+make test-integration
+
+# Run a specific category (fastest to slowest)
+make test-integration-small   # ~10s
+make test-integration-medium  # ~60s
+make test-integration-large   # ~120s
+
+# Run with verbose output to see test progress
+cd tests/integration
+CGO_CFLAGS="-I/opt/homebrew/include" CGO_LDFLAGS="-L/opt/homebrew/lib -lrocksdb -lstdc++ -lz -lbz2 -lsnappy -llz4 -lzstd" \
+  go test -v ./...
+```
+
 ## Test Categories
 
-### 1. Small Object Tests (< 64KB)
+### 1. Small Object Tests (< 64KB) ✅
 
 Tests for objects stored inline in RocksDB.
 
@@ -19,11 +36,20 @@ Tests for objects stored inline in RocksDB.
 - Edge cases (empty values, binary data, unicode, etc.)
 - Update operations
 
+**Key Tests:**
+
+- `Test_SmallObject_BasicFlow` - Basic storage and retrieval
+- `Test_SmallObject_TTLExpiration` - TTL functionality
+- `Test_SmallObject_LRUEviction` - LRU eviction behavior
+- `Test_SmallObject_ConcurrentAccess` - Thread safety
+- `Test_SmallObject_EdgeCases` - Boundary conditions
+- `Test_SmallObject_UpdateOperations` - Overwrite scenarios
+
 **Files:**
 
 - `small_objects_test.go` - Test implementations
 
-### 2. Medium Object Tests (64KB - 16MB)
+### 2. Medium Object Tests (64KB - 16MB) ✅
 
 Tests for objects stored as raw files and eligible for compaction.
 
@@ -39,15 +65,47 @@ Tests for objects stored as raw files and eligible for compaction.
 - Streaming writes
 - Compaction with TTL objects
 
+**Key Tests:**
+
+- `Test_MediumObject_RawFileCreation` - Raw file storage
+- `Test_MediumObject_CompactionFlow` - Raw to segment migration
+- `Test_MediumObject_PartialCompaction` - Mixed compaction scenarios
+- `Test_MediumObject_Concurrent` - Concurrent access patterns
+- `Test_MediumObject_EdgeCases` - Boundary sizes and patterns
+- `Test_MediumObject_TTL` - TTL with medium objects
+- `Test_MediumObject_StreamingWrite` - Streaming operations
+- `Test_MediumObject_CompactionWithTTL` - Compaction + TTL interaction
+
 **Files:**
 
 - `medium_objects_test.go` - Test implementations
 
-### 3. Large Object Tests (> 16MB)
-
-_To be implemented_
+### 3. Large Object Tests (> 16MB) ✅
 
 Tests for objects stored as permanent raw files (never compacted).
+
+**Test Coverage:**
+
+- Permanent raw file storage
+- Exclusion from compaction
+- Streaming read operations
+- Concurrent access to large files
+- TTL for large objects
+- Update operations
+- Various sizes (17MB to 256MB+)
+
+**Key Tests:**
+
+- `Test_LargeObject_PermanentRawFile` - Verifies no compaction
+- `Test_LargeObject_CompactionExclusion` - Mixed size compaction
+- `Test_LargeObject_Streaming` - Chunked reading & concurrent access
+- `Test_LargeObject_MixedSizes` - Various large sizes
+- `Test_LargeObject_TTL` - TTL with large objects
+- `Test_LargeObject_Updates` - Updating large objects
+
+**Files:**
+
+- `large_objects_test.go` - Test implementations
 
 ### 4. Compaction Tests
 
@@ -80,8 +138,10 @@ make test-integration
 # Run integration tests in short mode (faster)
 make test-integration-short
 
-# Run only small object tests
-make test-integration-small
+# Run specific test categories
+make test-integration-small   # Small object tests (< 64KB)
+make test-integration-medium  # Medium object tests (64KB - 16MB)
+make test-integration-large   # Large object tests (> 16MB)
 
 # Run with race detector
 make test-integration-race
@@ -233,6 +293,27 @@ for err := range errors {
 3. **Disable test caching**: Use `-count=1`
 4. **Check temp directories**: Tests create temp dirs with pattern `ocache-integration-test-*`
 5. **View metrics**: Tests print metrics after completion
+
+## Important Implementation Notes
+
+### Architectural Considerations
+
+1. **TTL and Cleaner Coordination**: The storage layer's `Get` method no longer deletes expired keys directly. This responsibility is delegated entirely to the background Cleaner to avoid race conditions and deadlocks.
+
+2. **File Descriptor Management**: All test code properly closes `io.ReadCloser` instances returned by `storage.Get()` to prevent file descriptor leaks, especially important for large object tests.
+
+3. **Manual Cleanup Avoided**: Tests skip manual cleanup (`DeleteObject`) at the end to avoid deadlocks with background processes. The test harness teardown handles all cleanup.
+
+### Storage Behavior
+
+- **Small Objects (< 64KB)**: Stored inline in RocksDB as `ValueType_INLINE`
+- **Medium Objects (64KB - 16MB)**: Initially stored as `ValueType_RAW_FILE`, eligible for compaction to segments
+- **Large Objects (> 16MB)**: Permanently stored as `ValueType_RAW_FILE`, never compacted
+
+### Known Limitations
+
+- `VerifyNoCompactionEntry` currently only logs verification intent due to limited access to internal RocksDB compaction keys
+- Direct RocksDB verification is skipped for raw file and segment types to avoid implementation coupling
 
 ## Adding New Tests
 

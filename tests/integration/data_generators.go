@@ -137,6 +137,15 @@ func generateTestObject(key string, size int64) TestObject {
 	}
 }
 
+// GenerateSequentialData generates sequential bytes of specified size (more memory efficient for large data)
+func GenerateSequentialData(size int64) []byte {
+	data := make([]byte, size)
+	for i := int64(0); i < size; i++ {
+		data[i] = byte(i % 256)
+	}
+	return data
+}
+
 // GenerateRandomData generates random data of specified size
 func GenerateRandomData(size int64) []byte {
 	data := make([]byte, size)
@@ -300,6 +309,11 @@ func GenerateEdgeCaseObjects() []TestObject {
 	}
 
 	return objects
+}
+
+// CalculateChecksum calculates the CRC32 checksum of data
+func CalculateChecksum(data []byte) uint32 {
+	return crc32.ChecksumIEEE(data)
 }
 
 // ValidateChecksum validates the checksum of data

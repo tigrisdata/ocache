@@ -35,6 +35,20 @@ func TestIntegration_MediumObjects(t *testing.T) {
 	})
 }
 
+// TestIntegration_LargeObjects runs the large object test suite
+func TestIntegration_LargeObjects(t *testing.T) {
+	t.Run("LargeObjectSuite", func(t *testing.T) {
+		TestIntegrationLargeObjects(t)
+	})
+}
+
+// TestIntegration_Cleaner runs the cleaner test suite
+func TestIntegration_Cleaner(t *testing.T) {
+	t.Run("CleanerSuite", func(t *testing.T) {
+		TestIntegrationCleaner(t)
+	})
+}
+
 // TestIntegration_All runs all Integration test suites
 func TestIntegration_All(t *testing.T) {
 	if !*runAll {

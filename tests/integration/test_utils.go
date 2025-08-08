@@ -180,6 +180,13 @@ func (h *IntegrationTestHarness) GetObject(key string) ([]byte, error) {
 		return nil, fmt.Errorf("key not found: %s", key)
 	}
 
+	// Important: Close the reader if it's a ReadCloser to release file descriptors
+	defer func() {
+		if rc, ok := reader.(io.ReadCloser); ok {
+			rc.Close()
+		}
+	}()
+
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		h.Metrics.ErrorCount++
@@ -227,6 +234,16 @@ func (h *IntegrationTestHarness) WaitForCleanup(timeout time.Duration) error {
 	}
 
 	return fmt.Errorf("cleanup did not run within timeout")
+}
+
+// SetAccessTime sets the access time for a key (for testing LRU)
+func (h *IntegrationTestHarness) SetAccessTime(key string, timestamp int64) {
+	h.Storage.SetAccessTime(key, timestamp)
+}
+
+// FlushAccessUpdates flushes pending access time updates
+func (h *IntegrationTestHarness) FlushAccessUpdates() {
+	h.Storage.FlushAccessUpdates()
 }
 
 // VerifyStorageType checks that a key is stored with the expected type
@@ -309,16 +326,6 @@ func (h *IntegrationTestHarness) calculateDiskUsage() int64 {
 	})
 
 	return totalSize
-}
-
-// FlushAccessUpdates forces all pending access time updates to be written
-func (h *IntegrationTestHarness) FlushAccessUpdates() {
-	h.Storage.FlushAccessUpdates()
-}
-
-// SetAccessTime sets the access time for a key (for testing LRU)
-func (h *IntegrationTestHarness) SetAccessTime(key string, accessTime int64) {
-	h.Storage.SetAccessTime(key, accessTime)
 }
 
 // PrintMetrics prints test metrics

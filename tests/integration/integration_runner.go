@@ -80,6 +80,20 @@ func (s *LargeObjectSuite) SetupTest() {
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
 }
 
+// CleanerSuite tests cleaner functionality (TTL and LRU)
+type CleanerSuite struct {
+	IntegrationTestSuite
+}
+
+// SetupTest sets up for cleaner tests
+func (s *CleanerSuite) SetupTest() {
+	config := DefaultIntegrationTestConfig()
+	config.CleanupInterval = 200 * time.Millisecond // Fast cleanup for testing
+	config.MaxDiskUsage = 50 * 1024                 // 50KB limit for LRU testing
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(s.T(), config)
+}
+
 // CompactionSuite tests compaction functionality
 type CompactionSuite struct {
 	IntegrationTestSuite
@@ -132,6 +146,10 @@ func TestIntegrationMediumObjects(t *testing.T) {
 
 func TestIntegrationLargeObjects(t *testing.T) {
 	suite.Run(t, new(LargeObjectSuite))
+}
+
+func TestIntegrationCleaner(t *testing.T) {
+	suite.Run(t, new(CleanerSuite))
 }
 
 func TestIntegrationCompaction(t *testing.T) {

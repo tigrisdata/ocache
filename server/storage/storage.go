@@ -409,8 +409,9 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 
 	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
 	if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
-		zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
-		s.DeleteKey(key)
+		zlog.Debug().Str("key", key).Msg("storage.Get: key has expired, returning not found")
+		// Don't delete the key here - let the background cleaner handle it
+		// This avoids race conditions with the cleaner
 		return nil, false, nil
 	}
 

@@ -262,6 +262,11 @@ test-integration-medium:
 	@echo "Running medium object integration tests..."
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_MediumObjects -timeout 60s ./...
 
+.PHONY: test-integration-large
+test-integration-large:
+	@echo "Running large object integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_LargeObjects -timeout 120s ./...
+
 # Code quality targets
 .PHONY: lint
 lint:
@@ -344,6 +349,9 @@ help:
 	@echo "  test-e2e                - Run end-to-end tests"
 	@echo "  test-integration        - Run integration tests (storage layer)"
 	@echo "  test-integration-short  - Run integration tests in short mode"
+	@echo "  test-integration-small  - Run small object integration tests"
+	@echo "  test-integration-medium - Run medium object integration tests"
+	@echo "  test-integration-large  - Run large object integration tests"
 	@echo "  test-integration-race   - Run integration tests with race detector"
 	@echo "  test-integration-coverage - Run integration tests with coverage"
 	@echo "  bench                   - Run benchmarks"
