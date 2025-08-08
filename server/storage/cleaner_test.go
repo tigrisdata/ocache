@@ -104,7 +104,7 @@ func TestLRUEviction(t *testing.T) {
 
 	// Flush access updates to ensure they're written to RocksDB
 	s.FlushAccessUpdates()
-	
+
 	// Wait for initial size calculation to complete
 	time.Sleep(200 * time.Millisecond)
 
@@ -130,7 +130,7 @@ func TestLRUEviction(t *testing.T) {
 
 	// Verify that we have fewer keys than we started with
 	assert.Less(t, len(keys), 15, "Expected some keys to be evicted")
-	
+
 	// Count how many old keys were evicted
 	oldKeysEvicted := 0
 	for i := 0; i < 10; i++ {
@@ -146,7 +146,7 @@ func TestLRUEviction(t *testing.T) {
 			oldKeysEvicted++
 		}
 	}
-	
+
 	// At least some old keys should be evicted (they have the oldest access times)
 	assert.GreaterOrEqual(t, oldKeysEvicted, 5, "Expected at least 5 old keys to be evicted")
 

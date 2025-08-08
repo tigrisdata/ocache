@@ -334,21 +334,21 @@ func TestFileManager_ConcurrentReadsOfSameFile(t *testing.T) {
 	// Multiple readers reading the same file concurrently
 	var wg sync.WaitGroup
 	numReaders := 10
-	
+
 	for i := 0; i < numReaders; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			
+
 			// Small random delay to spread out the reads
 			time.Sleep(time.Duration(idx) * time.Millisecond)
-			
+
 			rc, err := fm.Read(path, length)
 			if err != nil {
 				t.Errorf("Reader %d: Failed to open file: %v", idx, err)
 				return
 			}
-			
+
 			// Read the content
 			data, err := io.ReadAll(rc)
 			if err != nil {
@@ -359,16 +359,16 @@ func TestFileManager_ConcurrentReadsOfSameFile(t *testing.T) {
 				rc.Close()
 				return
 			}
-			
+
 			// Close after successful read
 			rc.Close()
-			
+
 			if string(data) != content {
 				t.Errorf("Reader %d: content mismatch, got %q, want %q", idx, string(data), content)
 			}
 		}(i)
 	}
-	
+
 	wg.Wait()
 }
 
@@ -384,7 +384,7 @@ func TestFileManager_ConcurrentOperations(t *testing.T) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errors []string
-	
+
 	numOperations := 10
 
 	// Create different files for each operation to avoid fd cache race conditions
@@ -392,7 +392,7 @@ func TestFileManager_ConcurrentOperations(t *testing.T) {
 	for i := 0; i < numOperations; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			
+
 			// Each goroutine works with its own file
 			key := fmt.Sprintf("file-%d", idx)
 			content := fmt.Sprintf("content for file %d", idx)
@@ -415,10 +415,10 @@ func TestFileManager_ConcurrentOperations(t *testing.T) {
 				mu.Unlock()
 				return
 			}
-			
+
 			data, err := io.ReadAll(rc)
 			rc.Close()
-			
+
 			if err != nil {
 				mu.Lock()
 				errors = append(errors, fmt.Sprintf("Operation %d: ReadAll failed: %v", idx, err))
@@ -435,7 +435,7 @@ func TestFileManager_ConcurrentOperations(t *testing.T) {
 	}
 
 	wg.Wait()
-	
+
 	if len(errors) > 0 {
 		for _, err := range errors {
 			t.Error(err)
