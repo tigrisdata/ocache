@@ -4,17 +4,17 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
   pull_request:
     branches: [main]
     paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
 
 env:
   GO_VERSION: "1.21"
@@ -63,7 +63,7 @@ jobs:
           # Try to download from GitHub releases first
           ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
-          
+
           if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
             echo "Downloaded pre-built artifact from release"
           else
@@ -106,6 +106,9 @@ jobs:
           path: |
             coverage.out
             coverage.html
+
+      - name: Run integration tests
+        run: STATIC_BUILD=true make test-integration
 
       - name: Run end-to-end tests
         run: STATIC_BUILD=true make test-e2e

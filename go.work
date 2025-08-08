@@ -4,4 +4,5 @@ use (
 	./client
 	./proto
 	./server
+	./tests/integration
 )

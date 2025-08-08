@@ -1,0 +1,38 @@
+package integration
+
+import (
+	"flag"
+	"os"
+	"testing"
+)
+
+var (
+	runAll    = flag.Bool("all", false, "Run all Integration tests including stress tests")
+	runStress = flag.Bool("stress", false, "Run stress tests")
+)
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+
+	// Set up any global test configuration here
+	code := m.Run()
+
+	// Clean up any global resources
+	os.Exit(code)
+}
+
+// TestIntegration_SmallObjects runs the small object test suite
+func TestIntegration_SmallObjects(t *testing.T) {
+	t.Run("SmallObjectSuite", func(t *testing.T) {
+		TestIntegrationSmallObjects(t)
+	})
+}
+
+// TestIntegration_All runs all Integration test suites
+func TestIntegration_All(t *testing.T) {
+	if !*runAll {
+		t.Skip("Skipping full Integration suite. Use -all flag to run all tests")
+	}
+
+	RunAllIntegrationTests(t)
+}
