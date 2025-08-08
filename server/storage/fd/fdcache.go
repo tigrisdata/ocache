@@ -20,10 +20,11 @@ import (
 // Callers interact with it exclusively through the FdCache APIs.
 
 type FileEntry struct {
-	refs  int32 // accessed atomically – keep first
-	f     *os.File
-	mu    *sync.RWMutex // per-file lock shared with RawFileManager
-	ready chan struct{} // closed when file is opened (for synchronization)
+	refs   int32         // accessed atomically – keep first
+	f      *os.File
+	mu     *sync.RWMutex // per-file lock shared with RawFileManager
+	ready  chan struct{} // closed when file is opened (for synchronization)
+	cached bool          // whether this entry is in the cache (for capacity management)
 }
 
 // File returns the underlying os.File descriptor.
@@ -110,13 +111,17 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	}
 
 	// Slow-path: need to open the file.
+	// Check if we're at capacity before creating a new entry
+	atCapacity := fc.capacity > 0 && atomic.LoadInt32(&fc.size) >= int32(fc.capacity)
+	
 	// Create entry with ready channel
 	ready := make(chan struct{})
 	entry := &FileEntry{
-		refs:  1,
-		f:     nil,
-		mu:    fc.GetFileLock(path),
-		ready: ready,
+		refs:   1,
+		f:      nil,
+		mu:     fc.GetFileLock(path),
+		ready:  ready,
+		cached: !atCapacity, // Won't be cached if at capacity
 	}
 
 	// Try to store our entry atomically
@@ -156,14 +161,13 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	entry.f = f
 	close(ready)
 
-	// Track size - always increment when adding to cache
-	atomic.AddInt32(&fc.size, 1)
-
-	// Check capacity limits
-	if fc.capacity > 0 && atomic.LoadInt32(&fc.size) > int32(fc.capacity) {
-		// Over capacity but keep in cache for now since we're using it
-		// It will be removed on Release when refs reaches 0
-		// Note: we don't decrement size here as the entry is still in cache
+	// Track size only if we're actually caching this entry
+	if entry.cached {
+		atomic.AddInt32(&fc.size, 1)
+	} else {
+		// Not cached due to capacity limit, remove from entries map
+		// but return the entry for this caller to use
+		fc.entries.Delete(path)
 	}
 
 	return entry, nil
@@ -174,19 +178,28 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 func (fc *FdCache) Release(path string, e *FileEntry) {
 	newRefs := atomic.AddInt32(&e.refs, -1)
 	if newRefs == 0 {
-		// Atomically remove from cache first to prevent new acquisitions
-		if actual, loaded := fc.entries.LoadAndDelete(path); loaded {
-			// Only close and decrement size if we successfully removed our entry
-			if actual == e {
-				// Wait for file to be ready before closing (in case it's still opening)
-				<-e.ready
-				if e.f != nil {
-					_ = e.f.Close()
+		// If this entry was cached, remove it
+		if e.cached {
+			// Atomically remove from cache first to prevent new acquisitions
+			if actual, loaded := fc.entries.LoadAndDelete(path); loaded {
+				// Only close and decrement size if we successfully removed our entry
+				if actual == e {
+					// Wait for file to be ready before closing (in case it's still opening)
+					<-e.ready
+					if e.f != nil {
+						_ = e.f.Close()
+					}
+					atomic.AddInt32(&fc.size, -1)
+				} else {
+					// Another goroutine replaced our entry, put it back
+					fc.entries.Store(path, actual)
 				}
-				atomic.AddInt32(&fc.size, -1)
-			} else {
-				// Another goroutine replaced our entry, put it back
-				fc.entries.Store(path, actual)
+			}
+		} else {
+			// Not cached, just close the file
+			<-e.ready
+			if e.f != nil {
+				_ = e.f.Close()
 			}
 		}
 	} else if newRefs < 0 {

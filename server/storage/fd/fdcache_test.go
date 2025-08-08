@@ -56,10 +56,11 @@ func TestFileEntry(t *testing.T) {
 	ready := make(chan struct{})
 	close(ready) // Mark as ready
 	entry := &FileEntry{
-		refs:  0,
-		f:     tmpFile,
-		mu:    &sync.RWMutex{},
-		ready: ready,
+		refs:   0,
+		f:      tmpFile,
+		mu:     &sync.RWMutex{},
+		ready:  ready,
+		cached: true,
 	}
 
 	if entry.File() != tmpFile {
