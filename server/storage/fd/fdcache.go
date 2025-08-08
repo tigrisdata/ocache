@@ -138,7 +138,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		
 		if os.IsNotExist(err) {
 			zlog.Warn().Str("path", path).Msg("fdCache: file not found")
-			return nil, utils.WrapError("raw file not found", path, nil)
+			return nil, utils.WrapError("raw file not found", path, err)
 		}
 		return nil, utils.WrapError("failed to open raw file", path, err)
 	}

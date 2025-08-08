@@ -123,7 +123,7 @@ func (sm *Manager) RegisterSegment(path string, entries uint32, bytes int64) {
 // ReadValue returns an io.ReadCloser over a slice of a segment file.
 func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int64) (io.ReadCloser, error) {
 	if segPath == "" || offset < 0 || length <= 0 {
-		return nil, utils.WrapError("invalid segment path, offset or length", segPath, nil)
+		return nil, fmt.Errorf("invalid segment path, offset or length: path=%s, offset=%d, length=%d", segPath, offset, length)
 	}
 
 	sm.mu.RLock()
@@ -131,7 +131,7 @@ func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int6
 	sm.mu.RUnlock()
 
 	if seg == nil {
-		return nil, utils.WrapError("segment not found", segPath, nil)
+		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
 	// Acquire cached read-only descriptor via FdCache.
