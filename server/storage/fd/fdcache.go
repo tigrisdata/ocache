@@ -20,7 +20,7 @@ import (
 // Callers interact with it exclusively through the FdCache APIs.
 
 type FileEntry struct {
-	refs  int32         // accessed atomically – keep first
+	refs  int32 // accessed atomically – keep first
 	f     *os.File
 	mu    *sync.RWMutex // per-file lock shared with RawFileManager
 	ready chan struct{} // closed when file is opened (for synchronization)
@@ -96,10 +96,10 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		e := v.(*FileEntry)
 		// Increment refs BEFORE waiting to prevent removal during acquire
 		atomic.AddInt32(&e.refs, 1)
-		
+
 		// Wait for file to be ready if another goroutine is opening it
 		<-e.ready
-		
+
 		// Check if opening failed
 		if e.f == nil {
 			// Decrement refs since we're not using it
@@ -118,7 +118,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		mu:    fc.GetFileLock(path),
 		ready: ready,
 	}
-	
+
 	// Try to store our entry atomically
 	actual, loaded := fc.entries.LoadOrStore(path, entry)
 	if loaded {
@@ -126,7 +126,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		existing := actual.(*FileEntry)
 		// Increment refs BEFORE waiting to prevent removal during acquire
 		atomic.AddInt32(&existing.refs, 1)
-		
+
 		<-existing.ready
 		// Check if opening failed
 		if existing.f == nil {
@@ -136,7 +136,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		}
 		return existing, nil
 	}
-	
+
 	// We won the race to insert the entry, now open the file
 	f, err := os.OpenFile(path, os.O_RDONLY, 0o644)
 	if err != nil {
@@ -144,28 +144,28 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		close(ready)
 		// Remove our failed entry
 		fc.entries.Delete(path)
-		
+
 		if os.IsNotExist(err) {
 			zlog.Warn().Str("path", path).Msg("fdCache: file not found")
 			return nil, utils.WrapError("raw file not found", path, err)
 		}
 		return nil, utils.WrapError("failed to open raw file", path, err)
 	}
-	
+
 	// Set the file descriptor and signal success
 	entry.f = f
 	close(ready)
-	
+
 	// Track size - always increment when adding to cache
 	atomic.AddInt32(&fc.size, 1)
-	
+
 	// Check capacity limits
 	if fc.capacity > 0 && atomic.LoadInt32(&fc.size) > int32(fc.capacity) {
 		// Over capacity but keep in cache for now since we're using it
 		// It will be removed on Release when refs reaches 0
 		// Note: we don't decrement size here as the entry is still in cache
 	}
-	
+
 	return entry, nil
 }
 

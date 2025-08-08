@@ -453,7 +453,7 @@ func TestFdCacheRaceCondition(t *testing.T) {
 	// Create temp directory and file
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "test.dat")
-	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+	if err := os.WriteFile(testFile, []byte("test data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -526,7 +526,7 @@ func TestFdCacheConcurrentAcquireSamePath(t *testing.T) {
 	// Create temp directory and file
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "test.dat")
-	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+	if err := os.WriteFile(testFile, []byte("test data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -580,7 +580,7 @@ func TestFdCacheReleaseWhileAcquiring(t *testing.T) {
 	// Create temp directory and file
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "test.dat")
-	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+	if err := os.WriteFile(testFile, []byte("test data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -638,7 +638,7 @@ func TestFdCacheCapacityLimitExtended(t *testing.T) {
 	files := make([]string, numFiles)
 	for i := 0; i < numFiles; i++ {
 		files[i] = filepath.Join(tmpDir, fmt.Sprintf("test%d.dat", i))
-		if err := os.WriteFile(files[i], []byte("test data"), 0644); err != nil {
+		if err := os.WriteFile(files[i], []byte("test data"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -674,7 +674,7 @@ func TestFdCacheRemoveAndReacquire(t *testing.T) {
 	// Create temp directory and file
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "test.dat")
-	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+	if err := os.WriteFile(testFile, []byte("test data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

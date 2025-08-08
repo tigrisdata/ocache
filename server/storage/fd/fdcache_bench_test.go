@@ -12,7 +12,7 @@ func BenchmarkFdCacheConcurrentAcquireRelease(b *testing.B) {
 	// Create temp directory and file
 	tmpDir := b.TempDir()
 	testFile := filepath.Join(tmpDir, "test.dat")
-	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+	if err := os.WriteFile(testFile, []byte("test data"), 0o644); err != nil {
 		b.Fatal(err)
 	}
 
@@ -41,7 +41,7 @@ func BenchmarkFdCacheMixedOperations(b *testing.B) {
 	files := make([]string, numFiles)
 	for i := 0; i < numFiles; i++ {
 		files[i] = filepath.Join(tmpDir, fmt.Sprintf("test%d.dat", i))
-		if err := os.WriteFile(files[i], []byte("test data"), 0644); err != nil {
+		if err := os.WriteFile(files[i], []byte("test data"), 0o644); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -71,7 +71,7 @@ func BenchmarkFdCacheHighContention(b *testing.B) {
 	// Create temp directory and a single file
 	tmpDir := b.TempDir()
 	testFile := filepath.Join(tmpDir, "test.dat")
-	if err := os.WriteFile(testFile, []byte("test data"), 0644); err != nil {
+	if err := os.WriteFile(testFile, []byte("test data"), 0o644); err != nil {
 		b.Fatal(err)
 	}
 
