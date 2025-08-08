@@ -330,7 +330,12 @@ func (h *IntegrationTestHarness) calculateDiskUsage() int64 {
 
 // PrintMetrics prints test metrics
 func (h *IntegrationTestHarness) PrintMetrics() {
-	duration := h.Metrics.EndTime.Sub(h.Metrics.StartTime)
+	// If EndTime is not set, use current time for duration calculation
+	endTime := h.Metrics.EndTime
+	if endTime.IsZero() {
+		endTime = time.Now()
+	}
+	duration := endTime.Sub(h.Metrics.StartTime)
 	fmt.Printf("\n=== Integration Test Metrics ===\n")
 	fmt.Printf("Duration: %v\n", duration)
 	fmt.Printf("Total Writes: %d\n", h.Metrics.TotalWrites)

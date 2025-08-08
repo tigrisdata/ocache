@@ -32,8 +32,8 @@ func (s *IntegrationTestSuite) SetupTest() {
 // TearDownTest runs after each test
 func (s *IntegrationTestSuite) TearDownTest() {
 	if s.Harness != nil {
-		s.Harness.PrintMetrics()
 		s.Harness.Cleanup()
+		s.Harness.PrintMetrics()
 	}
 }
 
