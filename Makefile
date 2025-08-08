@@ -257,6 +257,11 @@ test-integration-small:
 	@echo "Running small object integration tests..."
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_SmallObjects -timeout 30s ./...
 
+.PHONY: test-integration-medium
+test-integration-medium:
+	@echo "Running medium object integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_MediumObjects -timeout 60s ./...
+
 # Code quality targets
 .PHONY: lint
 lint:

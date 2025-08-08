@@ -25,9 +25,23 @@ Tests for objects stored inline in RocksDB.
 
 ### 2. Medium Object Tests (64KB - 16MB)
 
-_To be implemented_
-
 Tests for objects stored as raw files and eligible for compaction.
+
+**Test Coverage:**
+
+- Raw file creation and storage
+- Compaction flow from raw files to segments
+- Partial compaction scenarios
+- Concurrent operations
+- Update operations
+- TTL functionality
+- Edge cases and boundary conditions
+- Streaming writes
+- Compaction with TTL objects
+
+**Files:**
+
+- `medium_objects_test.go` - Test implementations
 
 ### 3. Large Object Tests (> 16MB)
 

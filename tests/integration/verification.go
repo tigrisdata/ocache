@@ -40,7 +40,14 @@ func VerifyNoRawFiles(t *testing.T, storageDir string) {
 // VerifyRawFilesExist verifies that raw files exist for the given keys
 func VerifyRawFilesExist(t *testing.T, storageDir string, expectedCount int) {
 	rawFilesDir := filepath.Join(storageDir, "files")
-	require.DirExists(t, rawFilesDir)
+	
+	// Check if directory exists
+	if _, err := os.Stat(rawFilesDir); os.IsNotExist(err) {
+		if expectedCount > 0 || expectedCount == -1 {
+			require.FailNow(t, "Raw files directory does not exist but raw files are expected")
+		}
+		return
+	}
 
 	entries, err := os.ReadDir(rawFilesDir)
 	require.NoError(t, err)
@@ -52,8 +59,13 @@ func VerifyRawFilesExist(t *testing.T, storageDir string, expectedCount int) {
 		}
 	}
 
-	assert.Len(t, rawFiles, expectedCount, "Expected %d raw files, but found %d: %v",
-		expectedCount, len(rawFiles), rawFiles)
+	if expectedCount == -1 {
+		// -1 means at least one raw file should exist
+		assert.NotEmpty(t, rawFiles, "Expected at least one raw file, but found none")
+	} else {
+		assert.Len(t, rawFiles, expectedCount, "Expected %d raw files, but found %d: %v",
+			expectedCount, len(rawFiles), rawFiles)
+	}
 }
 
 // VerifySegmentIntegrity verifies the integrity of a segment file

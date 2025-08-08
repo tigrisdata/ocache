@@ -28,6 +28,13 @@ func TestIntegration_SmallObjects(t *testing.T) {
 	})
 }
 
+// TestIntegration_MediumObjects runs the medium object test suite
+func TestIntegration_MediumObjects(t *testing.T) {
+	t.Run("MediumObjectSuite", func(t *testing.T) {
+		TestIntegrationMediumObjects(t)
+	})
+}
+
 // TestIntegration_All runs all Integration test suites
 func TestIntegration_All(t *testing.T) {
 	if !*runAll {
