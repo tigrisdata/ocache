@@ -45,13 +45,24 @@ func TestCleanerIntegration(t *testing.T) {
 	}
 
 	// Test 2: Add data without TTL (should be subject to LRU eviction)
+	// We need to ensure different items have different access times
+	// Since access time is stored with second precision, we need to either:
+	// 1. Add a longer delay between items, or
+	// 2. Manually set different access times for testing
+	baseTime := time.Now().Unix()
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("lru-%d", i)
 		data := bytes.Repeat([]byte("b"), 1000)     // 1KB each
 		err := s.Put(key, bytes.NewReader(data), 0) // No TTL
 		require.NoError(t, err)
-		time.Sleep(5 * time.Millisecond) // Small delay to ensure different access times
+		
+		// Set explicit access time for each key to ensure deterministic LRU ordering
+		// Earlier items get older timestamps
+		s.SetAccessTime(key, baseTime-int64(100-i))
 	}
+	
+	// Flush pending access updates to ensure they're written before cleanup runs
+	s.FlushAccessUpdates()
 
 	// Wait for TTL cleanup and eviction to run
 	// Need extra time for cleaner to initialize and run multiple times
@@ -85,8 +96,11 @@ func TestCleanerIntegration(t *testing.T) {
 	require.Greater(t, lruKeysFound, 30, "Should still have some keys remaining")
 
 	// The remaining keys should be the most recently added ones
-	// Check that newer keys are more likely to exist
+	// Since we set explicit access times, keys lru-90 to lru-99 should have the newest timestamps
 	recentKeysFound := 0
+	oldKeysFound := 0
+	
+	// Check recent keys (should mostly exist)
 	for i := 90; i < 100; i++ {
 		key := fmt.Sprintf("lru-%d", i)
 		reader, found, err := s.Get(key)
@@ -96,9 +110,22 @@ func TestCleanerIntegration(t *testing.T) {
 			reader.(*bytes.Reader).Reset(nil) // Close reader
 		}
 	}
+	
+	// Check old keys (should mostly be evicted)
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("lru-%d", i)
+		reader, found, err := s.Get(key)
+		require.NoError(t, err)
+		if found {
+			oldKeysFound++
+			reader.(*bytes.Reader).Reset(nil) // Close reader
+		}
+	}
 
-	// Most recent keys should still exist
-	require.GreaterOrEqual(t, recentKeysFound, 5, "Recent keys should be retained")
+	// Most recent keys should still exist (at least 8 out of 10)
+	require.GreaterOrEqual(t, recentKeysFound, 8, "Recent keys should be retained")
+	// Most old keys should be evicted (at most 2 out of 10)
+	require.LessOrEqual(t, oldKeysFound, 2, "Old keys should be evicted")
 	require.Greater(t, evicted, int64(0), "Should have evicted some LRU keys")
 
 	t.Logf("Test completed: cleaned=%d, evicted=%d, remaining_keys=%d",
