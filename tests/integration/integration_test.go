@@ -56,6 +56,13 @@ func TestIntegration_Compaction(t *testing.T) {
 	})
 }
 
+// TestIntegration_Workflow runs the workflow test suite
+func TestIntegration_Workflow(t *testing.T) {
+	t.Run("WorkflowSuite", func(t *testing.T) {
+		TestIntegrationWorkflow(t)
+	})
+}
+
 // TestIntegration_All runs all Integration test suites
 func TestIntegration_All(t *testing.T) {
 	if !*runAll {
