@@ -103,6 +103,7 @@ type CompactionSuite struct {
 func (s *CompactionSuite) SetupTest() {
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond // Fast compaction for testing
+	config.SegmentSize = 2 * 1024 * 1024               // 2MB segments to create multiple segments during tests
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
 }

@@ -233,7 +233,7 @@ test-e2e: build build-cli
 .PHONY: test-integration
 test-integration:
 	@echo "Running integration tests..."
-	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 120s ./...
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 300s ./...
 
 .PHONY: test-integration-short
 test-integration-short:
@@ -248,7 +248,7 @@ test-integration-race:
 .PHONY: test-integration-coverage
 test-integration-coverage:
 	@echo "Running integration tests with coverage..."
-	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../../coverage-integration.out -timeout 120s ./...
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../../coverage-integration.out -timeout 300s ./...
 	@go tool cover -html=coverage-integration.out -o coverage-integration.html
 	@echo "Integration test coverage report generated at coverage-integration.html"
 
@@ -266,6 +266,11 @@ test-integration-medium:
 test-integration-large:
 	@echo "Running large object integration tests..."
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_LargeObjects -timeout 120s ./...
+
+.PHONY: test-integration-compaction
+test-integration-compaction:
+	@echo "Running compaction integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_Compaction -timeout 300s ./...
 
 # Code quality targets
 .PHONY: lint

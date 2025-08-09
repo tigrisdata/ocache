@@ -42,10 +42,10 @@ type TestMetrics struct {
 	TotalWrites    int64
 	TotalReads     int64
 	TotalDeletes   int64
-	InlineObjects  int64
-	RawFileObjects int64
-	SegmentObjects int64
+	InlineObjects  int64 // Objects written as inline (small)
+	RawFileObjects int64 // Objects written as raw files (medium/large)
 	CompactionRuns int64
+	CompactedFiles int64
 	CleanupRuns    int64
 	BytesWritten   int64
 	BytesRead      int64
@@ -74,6 +74,9 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 	// Set environment variables for test intervals
 	if config.CleanupInterval > 0 {
 		os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", config.CleanupInterval.String())
+	}
+	if config.CompactionInterval > 0 {
+		os.Setenv("OCACHE_TEST_COMPACTION_INTERVAL", config.CompactionInterval.String())
 	}
 
 	// Initialize storage
@@ -304,6 +307,22 @@ func (h *IntegrationTestHarness) GetStorageStats() StorageStats {
 		}
 	}
 
+	// Count raw files
+	filesDir := filepath.Join(h.TempDir, "files")
+	if files, err := filepath.Glob(filepath.Join(filesDir, "*")); err == nil {
+		stats.RawFileCount = len(files)
+	}
+
+	// Count segment files
+	segmentDir := filepath.Join(h.TempDir, "segments")
+	if files, err := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg")); err == nil {
+		stats.SegmentCount = len(files)
+	}
+
+	// Get disk usage (TODO: implement GetDiskUsage in Storage)
+	stats.TotalDiskUsage = 0 // h.Storage.GetDiskUsage()
+	stats.DiskUsage = stats.TotalDiskUsage
+
 	// Get cleaner stats
 	stats.CleanedKeys, stats.EvictedKeys = h.Storage.CleanerStats()
 
@@ -345,17 +364,19 @@ func (h *IntegrationTestHarness) PrintMetrics() {
 	fmt.Printf("Bytes Read: %d\n", h.Metrics.BytesRead)
 	fmt.Printf("Inline Objects: %d\n", h.Metrics.InlineObjects)
 	fmt.Printf("Raw File Objects: %d\n", h.Metrics.RawFileObjects)
-	fmt.Printf("Segment Objects: %d\n", h.Metrics.SegmentObjects)
 	fmt.Printf("Error Count: %d\n", h.Metrics.ErrorCount)
 	fmt.Printf("=======================\n")
 }
 
 // StorageStats holds storage statistics
 type StorageStats struct {
-	TotalKeys   int
-	TTLKeys     int
-	LRUKeys     int
-	CleanedKeys int64
-	EvictedKeys int64
-	DiskUsage   int64
+	TotalKeys      int
+	TTLKeys        int
+	LRUKeys        int
+	CleanedKeys    int64
+	EvictedKeys    int64
+	DiskUsage      int64
+	RawFileCount   int
+	SegmentCount   int
+	TotalDiskUsage int64
 }

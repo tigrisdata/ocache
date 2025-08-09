@@ -49,6 +49,13 @@ func TestIntegration_Cleaner(t *testing.T) {
 	})
 }
 
+// TestIntegration_Compaction runs the compaction test suite
+func TestIntegration_Compaction(t *testing.T) {
+	t.Run("CompactionSuite", func(t *testing.T) {
+		TestIntegrationCompaction(t)
+	})
+}
+
 // TestIntegration_All runs all Integration test suites
 func TestIntegration_All(t *testing.T) {
 	if !*runAll {

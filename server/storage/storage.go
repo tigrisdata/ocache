@@ -41,6 +41,16 @@ func getCleanupInterval() time.Duration {
 	return DefaultTTLCleanupInterval
 }
 
+// getCompactionInterval returns the compaction interval, allowing tests to override via env var
+func getCompactionInterval() time.Duration {
+	if testInterval := os.Getenv("OCACHE_TEST_COMPACTION_INTERVAL"); testInterval != "" {
+		if d, err := time.ParseDuration(testInterval); err == nil {
+			return d
+		}
+	}
+	return DefaultFileCompactionInterval
+}
+
 // accessUpdate represents a single access time update request
 type accessUpdate struct {
 	key  string
@@ -247,7 +257,8 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 	}
 
 	// Initialize and start background compactor that migrates raw files into segments.
-	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, DefaultFileCompactionInterval)
+	compactionInterval := getCompactionInterval()
+	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, compactionInterval)
 	compactor.Start()
 
 	s := &Storage{

@@ -182,6 +182,34 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 			slice.Free()
 			continue
 		}
+
+		// Check if this compaction entry refers to the current file for this key
+		// If not, it's a stale entry from a previous Put operation that should be cleaned up
+		if vm.ValueType == pb.ValueType_RAW_FILE && vm.RawFilePath != filePath {
+			zlog.Debug().
+				Str("key", userKey).
+				Str("stale_file", filePath).
+				Str("current_file", vm.RawFilePath).
+				Msg("compactor: skipping stale compaction entry")
+			slice.Free()
+			wb.Delete(k)                              // Remove stale compaction index entry
+			filesToDel = append(filesToDel, filePath) // Delete the stale file
+			continue
+		}
+
+		// If the value is no longer a raw file (already compacted to segment or changed to inline),
+		// clean up this compaction entry
+		if vm.ValueType != pb.ValueType_RAW_FILE {
+			zlog.Debug().
+				Str("key", userKey).
+				Str("value_type", vm.ValueType.String()).
+				Msg("compactor: value no longer needs compaction")
+			slice.Free()
+			wb.Delete(k) // Remove compaction index entry
+			// Note: don't delete the file since it might be referenced elsewhere
+			continue
+		}
+
 		slice.Free()
 
 		// Ensure we have space in the current segment.
