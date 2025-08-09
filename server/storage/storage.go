@@ -16,6 +16,7 @@ import (
 	"github.com/tigrisdata/ocache/server/storage/bufferpool"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/storage/segment"
 )
@@ -320,20 +321,17 @@ func CloseStorage() {
 // Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
 func (s *Storage) ListKeys() ([]string, error) {
 	ro := grocksdb.NewDefaultReadOptions()
+	// Use prefix iteration to only scan metadata keys
+	ro.SetPrefixSameAsStart(true)
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	var keys []string
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		k := string(it.Key().Data())
+	var keyList []string
+	prefix := []byte(keys.MetadataPrefix)
 
-		// Skip index entries
-		if len(k) > 0 && k[0] == '!' {
-			it.Key().Free()
-			it.Value().Free()
-			continue
-		}
-
+	// Seek to the metadata prefix to start iteration
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		k := it.Key().Data()
 		v := it.Value().Data()
 
 		// Try to decode as proto ValueMessage to check expiry
@@ -347,21 +345,24 @@ func (s *Storage) ListKeys() ([]string, error) {
 			}
 		}
 
-		keys = append(keys, k)
+		// Extract the original user key without the prefix
+		userKey := keys.ExtractUserKey(k)
+		keyList = append(keyList, userKey)
 		it.Key().Free()
 		it.Value().Free()
 	}
 	if err := it.Err(); err != nil {
 		return nil, err
 	}
-	return keys, nil
+	return keyList, nil
 }
 
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) {
 	// Get the value to track size changes and file cleanup
 	ro := grocksdb.NewDefaultReadOptions()
-	slice, err := s.meta.Handle().Get(ro, []byte(key))
+	metaKey := keys.MakeMetadataKey(key)
+	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil || !slice.Exists() {
 		return // Key doesn't exist, nothing to delete
 	}
@@ -388,7 +389,7 @@ func (s *Storage) DeleteKey(key string) {
 	// Delete key and its access index in a single batch
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
-	batch.Delete([]byte(key))
+	batch.Delete(metaKey)
 	batch.Delete(MakeAccessIndexKey(key))
 	s.meta.Handle().Write(wo, batch)
 }
@@ -396,8 +397,9 @@ func (s *Storage) DeleteKey(key string) {
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
 func (s *Storage) Get(key string) (io.Reader, bool, error) {
 	ro := grocksdb.NewDefaultReadOptions()
+	metaKey := keys.MakeMetadataKey(key)
 
-	slice, err := s.meta.Handle().Get(ro, []byte(key))
+	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
 		return nil, false, err
@@ -553,8 +555,9 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		batch.Put(cIdxKey, cIdxVal)
 	}
 
-	// Store the metadata in the database
-	batch.Put([]byte(key), val)
+	// Store the metadata in the database with the metadata prefix
+	metaKey := keys.MakeMetadataKey(key)
+	batch.Put(metaKey, val)
 
 	// Add access time index entry for LRU tracking only if max disk usage is set
 	if s.cleaner.maxDiskUsage > 0 {

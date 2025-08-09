@@ -8,6 +8,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -97,14 +98,17 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		keyBytes := it.Key().Data()
-		key := string(keyBytes)
 
-		// Skip index entries
-		if len(key) > 0 && key[0] == '!' {
+		// Only process user metadata keys
+		if !keys.IsMetadataKey(keyBytes) {
+			// Skip all non-metadata keys (including other internal keys)
 			it.Key().Free()
 			it.Value().Free()
 			continue
 		}
+
+		// Extract the original user key
+		key := keys.ExtractUserKey(keyBytes)
 
 		value := it.Value().Data()
 
@@ -180,10 +184,10 @@ func (c *Cleaner) calculateTotalSize() {
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		keyBytes := it.Key().Data()
-		key := string(keyBytes)
 
-		// Skip index entries
-		if len(key) > 0 && key[0] == '!' {
+		// Only process user metadata keys
+		if !keys.IsMetadataKey(keyBytes) {
+			// Skip all non-metadata keys (including other internal keys)
 			it.Key().Free()
 			it.Value().Free()
 			continue

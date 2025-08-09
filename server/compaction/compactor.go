@@ -12,6 +12,7 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/storage/segment"
 
@@ -162,7 +163,8 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 		}
 
 		// Fetch metadata for the user key.
-		slice, err := c.meta.Handle().Get(ro, []byte(userKey))
+		metaKey := keys.MakeMetadataKey(userKey)
+		slice, err := c.meta.Handle().Get(ro, metaKey)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: db.Get")
 			continue
@@ -233,7 +235,8 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 
 		// Update metadata & housekeeping.
 		metaBytes, _ := proto.Marshal(vm)
-		wb.Put([]byte(userKey), metaBytes)
+		metaKey = keys.MakeMetadataKey(userKey)
+		wb.Put(metaKey, metaBytes)
 		wb.Delete(k) // remove index row
 		filesToDel = append(filesToDel, filePath)
 

@@ -14,6 +14,7 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/storage/segment"
 	"google.golang.org/protobuf/proto"
@@ -310,7 +311,8 @@ func TestCompactFiles(t *testing.T) {
 		RawFilePath: testFile1,
 	}
 	vm1Bytes, _ := proto.Marshal(vm1)
-	err = meta.Handle().Put(wo, []byte("key1"), vm1Bytes)
+	metaKey1 := keys.MakeMetadataKey("key1")
+	err = meta.Handle().Put(wo, metaKey1, vm1Bytes)
 	require.NoError(t, err)
 
 	vm2 := &pb.ValueMessage{
@@ -319,7 +321,8 @@ func TestCompactFiles(t *testing.T) {
 		RawFilePath: testFile2,
 	}
 	vm2Bytes, _ := proto.Marshal(vm2)
-	err = meta.Handle().Put(wo, []byte("key2"), vm2Bytes)
+	metaKey2 := keys.MakeMetadataKey("key2")
+	err = meta.Handle().Put(wo, metaKey2, vm2Bytes)
 	require.NoError(t, err)
 
 	// Run compaction
@@ -336,7 +339,8 @@ func TestCompactFiles(t *testing.T) {
 	slice2.Free()
 
 	// Verify metadata was updated
-	slice3, _ := meta.Handle().Get(ro, []byte("key1"))
+	metaKey1 = keys.MakeMetadataKey("key1")
+	slice3, _ := meta.Handle().Get(ro, metaKey1)
 	assert.True(t, slice3.Exists())
 	if slice3.Exists() {
 		updatedVm := &pb.ValueMessage{}
@@ -438,7 +442,8 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 			RawFilePath: files[i],
 		}
 		vmBytes, _ := proto.Marshal(vm)
-		err = meta.Handle().Put(wo, []byte(fmt.Sprintf("key%d", i)), vmBytes)
+		metaKey := keys.MakeMetadataKey(fmt.Sprintf("key%d", i))
+		err = meta.Handle().Put(wo, metaKey, vmBytes)
 		require.NoError(t, err)
 	}
 
@@ -504,7 +509,8 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add invalid metadata (not a valid protobuf)
-	err = meta.Handle().Put(wo, []byte("key1"), []byte("invalid protobuf data"))
+	metaKey := keys.MakeMetadataKey("key1")
+	err = meta.Handle().Put(wo, metaKey, []byte("invalid protobuf data"))
 	require.NoError(t, err)
 
 	// Run compaction - should handle bad metadata gracefully

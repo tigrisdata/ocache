@@ -7,6 +7,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -51,14 +52,17 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 	it := c.storage.meta.Handle().NewIterator(ro)
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		keyBytes := it.Key().Data()
-		key := string(keyBytes)
 
-		// Skip index entries
-		if len(key) > 0 && key[0] == '!' {
+		// Only process user metadata keys
+		if !keys.IsMetadataKey(keyBytes) {
+			// Skip all non-metadata keys (including other internal keys)
 			it.Key().Free()
 			it.Value().Free()
 			continue
 		}
+
+		// Extract the original user key
+		key := keys.ExtractUserKey(keyBytes)
 
 		value := it.Value().Data()
 		valueMsg := &pb.ValueMessage{}
@@ -108,7 +112,8 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 		zlog.Debug().Str("key", entry.key).Int64("lastAccess", entry.lastAccess).Int64("size", entry.size).Msg("LRU: considering for eviction")
 
 		// Get the full value to access file paths
-		slice, err := c.storage.meta.Handle().Get(ro, []byte(entry.key))
+		metaKey := keys.MakeMetadataKey(entry.key)
+		slice, err := c.storage.meta.Handle().Get(ro, metaKey)
 		if err != nil || !slice.Exists() {
 			continue
 		}
@@ -120,8 +125,8 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 		}
 		slice.Free()
 
-		// Delete the key
-		batch.Delete([]byte(entry.key))
+		// Delete the key with its metadata prefix
+		batch.Delete(metaKey)
 
 		// Delete access index entry
 		accessKey := MakeAccessIndexKey(entry.key)

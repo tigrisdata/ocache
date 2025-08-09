@@ -3,18 +3,15 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
-)
 
-const (
-	// AccessIndexPrefix is the prefix for last access time index entries
-	AccessIndexPrefix = "!access/"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 )
 
 // PrepareAccessEntry prepares the key and value for the access time index.
 // The key format is: !access/<key>
 // The value is the unix timestamp as 8 bytes big-endian
 func PrepareAccessEntry(key string, accessTime int64) ([]byte, []byte) {
-	idxKey := fmt.Sprintf("%s%s", AccessIndexPrefix, key)
+	idxKey := fmt.Sprintf("%s%s", keys.AccessIndexPrefix, key)
 
 	// Store timestamp as 8 bytes big-endian
 	idxVal := make([]byte, 8)
@@ -33,14 +30,14 @@ func ParseAccessTime(value []byte) int64 {
 
 // MakeAccessIndexKey creates an access index key for a given cache key
 func MakeAccessIndexKey(key string) []byte {
-	return []byte(fmt.Sprintf("%s%s", AccessIndexPrefix, key))
+	return []byte(fmt.Sprintf("%s%s", keys.AccessIndexPrefix, key))
 }
 
 // ExtractKeyFromAccessIndex extracts the original key from an access index key
 func ExtractKeyFromAccessIndex(indexKey []byte) string {
 	// Remove the prefix to get the original key
-	if len(indexKey) > len(AccessIndexPrefix) {
-		return string(indexKey[len(AccessIndexPrefix):])
+	if len(indexKey) > len(keys.AccessIndexPrefix) {
+		return string(indexKey[len(keys.AccessIndexPrefix):])
 	}
 	return ""
 }
