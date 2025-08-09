@@ -159,11 +159,11 @@ func VerifyMetrics(t *testing.T, expected, actual *TestMetrics) {
 			"%s: expected %d±%d%%, got %d", name, exp, tolerance, act)
 	}
 
-	assertWithinTolerance("TotalWrites", expected.TotalWrites, actual.TotalWrites)
-	assertWithinTolerance("TotalReads", expected.TotalReads, actual.TotalReads)
-	assertWithinTolerance("TotalDeletes", expected.TotalDeletes, actual.TotalDeletes)
-	assertWithinTolerance("BytesWritten", expected.BytesWritten, actual.BytesWritten)
-	assertWithinTolerance("BytesRead", expected.BytesRead, actual.BytesRead)
+	assertWithinTolerance("TotalWrites", expected.TotalWrites.Load(), actual.TotalWrites.Load())
+	assertWithinTolerance("TotalReads", expected.TotalReads.Load(), actual.TotalReads.Load())
+	assertWithinTolerance("TotalDeletes", expected.TotalDeletes.Load(), actual.TotalDeletes.Load())
+	assertWithinTolerance("BytesWritten", expected.BytesWritten.Load(), actual.BytesWritten.Load())
+	assertWithinTolerance("BytesRead", expected.BytesRead.Load(), actual.BytesRead.Load())
 }
 
 // VerifyStorageType verifies that a key is stored with the expected ValueType
