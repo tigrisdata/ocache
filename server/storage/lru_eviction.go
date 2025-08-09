@@ -51,6 +51,14 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 	keyMap := make(map[string]int64) // key -> size
 	it := c.storage.meta.Handle().NewIterator(ro)
 	for it.SeekToFirst(); it.Valid(); it.Next() {
+		// Check if we're shutting down
+		select {
+		case <-c.closeCh:
+			zlog.Info().Msg("cleaner: LRU eviction interrupted by shutdown")
+			it.Close()
+			return
+		default:
+		}
 		keyBytes := it.Key().Data()
 
 		// Only process user metadata keys
@@ -77,6 +85,13 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 
 	// Now collect access times from the access index
 	for key, size := range keyMap {
+		// Check if we're shutting down
+		select {
+		case <-c.closeCh:
+			zlog.Info().Msg("cleaner: LRU eviction interrupted by shutdown")
+			return
+		default:
+		}
 		accessKey := MakeAccessIndexKey(key)
 		slice, err := c.storage.meta.Handle().Get(ro, accessKey)
 		if err != nil || !slice.Exists() {
@@ -108,6 +123,13 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 	defer batch.Destroy()
 
 	for h.Len() > 0 && evicted < targetBytes {
+		// Check if we're shutting down
+		select {
+		case <-c.closeCh:
+			zlog.Info().Msg("cleaner: LRU eviction interrupted by shutdown")
+			return
+		default:
+		}
 		entry := heap.Pop(h).(lruEntry)
 		zlog.Debug().Str("key", entry.key).Int64("lastAccess", entry.lastAccess).Int64("size", entry.size).Msg("LRU: considering for eviction")
 
@@ -145,6 +167,14 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 
 		// Write batch periodically
 		if batch.Count() >= 1000 {
+			// Check if we're shutting down before writing
+			select {
+			case <-c.closeCh:
+				zlog.Info().Msg("cleaner: LRU eviction interrupted by shutdown")
+				return
+			default:
+			}
+
 			if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
 				zlog.Error().Err(err).Msg("cleaner: failed to write LRU eviction batch")
 			}
