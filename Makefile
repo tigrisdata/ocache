@@ -191,6 +191,9 @@ stop:
 .PHONY: test
 test: test-server test-client
 
+.PHONY: test-all
+test-all: test-server test-client test-integration
+
 .PHONY: test-server
 test-server:
 	@echo "Running server tests..."
@@ -226,6 +229,48 @@ test-coverage:
 test-e2e: build build-cli
 	@echo "Running E2E tests..."
 	./tests/e2e/ttl_lru_test.sh
+
+.PHONY: test-integration
+test-integration:
+	@echo "Running integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 300s ./...
+
+.PHONY: test-integration-short
+test-integration-short:
+	@echo "Running integration tests (short mode)..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -short -timeout 30s ./...
+
+.PHONY: test-integration-race
+test-integration-race:
+	@echo "Running integration tests with race detector..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 180s ./...
+
+.PHONY: test-integration-coverage
+test-integration-coverage:
+	@echo "Running integration tests with coverage..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../../coverage-integration.out -timeout 300s ./...
+	@go tool cover -html=coverage-integration.out -o coverage-integration.html
+	@echo "Integration test coverage report generated at coverage-integration.html"
+
+.PHONY: test-integration-small
+test-integration-small:
+	@echo "Running small object integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_SmallObjects -timeout 30s ./...
+
+.PHONY: test-integration-medium
+test-integration-medium:
+	@echo "Running medium object integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_MediumObjects -timeout 60s ./...
+
+.PHONY: test-integration-large
+test-integration-large:
+	@echo "Running large object integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_LargeObjects -timeout 120s ./...
+
+.PHONY: test-integration-compaction
+test-integration-compaction:
+	@echo "Running compaction integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_Compaction -timeout 300s ./...
 
 # Code quality targets
 .PHONY: lint
@@ -284,8 +329,8 @@ check: fmt-check vet test
 clean:
 	rm -f ocache ocachecli ocache.log ocache.pid
 	rm -f proto/*.pb.go proto/*.pb.gw.go
-	rm -f coverage.out coverage.html
-	rm -rf /tmp/ocache /tmp/ocache-demo
+	rm -f coverage.out coverage.html coverage-integration.out coverage-integration.html
+	rm -rf /tmp/ocache /tmp/ocache-demo /tmp/ocache-integration-test-*
 
 # Help target
 .PHONY: help
@@ -300,13 +345,21 @@ help:
 	@echo "  proto         - Generate Go code from protobuf"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  test          - Run all unit tests"
-	@echo "  test-server   - Run server tests only"
-	@echo "  test-client   - Run client tests only"
-	@echo "  test-race     - Run tests with race detector"
-	@echo "  test-coverage - Run tests with coverage report"
-	@echo "  test-e2e      - Run end-to-end tests"
-	@echo "  bench         - Run benchmarks"
+	@echo "  test                    - Run unit tests (server and client)"
+	@echo "  test-all                - Run all tests (unit and integration)"
+	@echo "  test-server             - Run server tests only"
+	@echo "  test-client             - Run client tests only"
+	@echo "  test-race               - Run tests with race detector"
+	@echo "  test-coverage           - Run tests with coverage report"
+	@echo "  test-e2e                - Run end-to-end tests"
+	@echo "  test-integration        - Run integration tests (storage layer)"
+	@echo "  test-integration-short  - Run integration tests in short mode"
+	@echo "  test-integration-small  - Run small object integration tests"
+	@echo "  test-integration-medium - Run medium object integration tests"
+	@echo "  test-integration-large  - Run large object integration tests"
+	@echo "  test-integration-race   - Run integration tests with race detector"
+	@echo "  test-integration-coverage - Run integration tests with coverage"
+	@echo "  bench                   - Run benchmarks"
 	@echo ""
 	@echo "Code quality targets:"
 	@echo "  lint          - Run linters (vet, gofmt check, mod tidy)"

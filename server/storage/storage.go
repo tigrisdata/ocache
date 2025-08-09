@@ -41,6 +41,16 @@ func getCleanupInterval() time.Duration {
 	return DefaultTTLCleanupInterval
 }
 
+// getCompactionInterval returns the compaction interval, allowing tests to override via env var
+func getCompactionInterval() time.Duration {
+	if testInterval := os.Getenv("OCACHE_TEST_COMPACTION_INTERVAL"); testInterval != "" {
+		if d, err := time.ParseDuration(testInterval); err == nil {
+			return d
+		}
+	}
+	return DefaultFileCompactionInterval
+}
+
 // accessUpdate represents a single access time update request
 type accessUpdate struct {
 	key  string
@@ -247,7 +257,8 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 	}
 
 	// Initialize and start background compactor that migrates raw files into segments.
-	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, DefaultFileCompactionInterval)
+	compactionInterval := getCompactionInterval()
+	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, compactionInterval)
 	compactor.Start()
 
 	s := &Storage{
@@ -409,8 +420,9 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 
 	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
 	if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
-		zlog.Debug().Str("key", key).Msg("storage.Get: expired, deleting")
-		s.DeleteKey(key)
+		zlog.Debug().Str("key", key).Msg("storage.Get: key has expired, returning not found")
+		// Don't delete the key here - let the background cleaner handle it
+		// This avoids race conditions with the cleaner
 		return nil, false, nil
 	}
 

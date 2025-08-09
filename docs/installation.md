@@ -26,6 +26,7 @@ make all
 ```
 
 This will:
+
 - Install required Go dependencies
 - Generate gRPC code from protobuf definitions
 - Build the server and CLI binaries
@@ -43,11 +44,12 @@ make build-static
 ```
 
 The static build:
+
 - Includes RocksDB library in the binary
 - Reduces runtime dependencies
 - Improves deployment portability
 
-See [STATIC_BUILD.md](STATIC_BUILD.md) for detailed static build instructions.
+See [static_build.md](static_build.md) for detailed static build instructions.
 
 ### Manual Build
 

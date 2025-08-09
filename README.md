@@ -33,7 +33,7 @@ make all
 - [API Reference](docs/api.md) - HTTP REST and gRPC APIs
 - [CLI Client](docs/cli.md) - Command-line client usage
 - [Configuration](docs/configuration.md) - Server flags and tuning
-- [Static Builds](docs/STATIC_BUILD.md) - Production deployment
+- [Static Builds](docs/static_build.md) - Production deployment
 
 ## Basic Usage
 
