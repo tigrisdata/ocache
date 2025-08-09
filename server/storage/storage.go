@@ -24,7 +24,7 @@ import (
 const (
 	// Default compaction thresholds
 	DefaultCompactionMaxBytes     = 1 << 30 // 1GB
-	DefaultFileCompactionInterval = 5 * time.Minute
+	DefaultFileCompactionInterval = 1 * time.Minute
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
 	// Default access update buffer size and batch interval
