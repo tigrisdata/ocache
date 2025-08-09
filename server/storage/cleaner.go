@@ -51,7 +51,20 @@ func (c *Cleaner) Close() {
 		return
 	}
 	close(c.closeCh)
-	c.wg.Wait()
+
+	// Wait with timeout to avoid hanging forever
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		zlog.Info().Msg("cleaner: shutdown completed")
+	case <-time.After(5 * time.Second):
+		zlog.Warn().Msg("cleaner: shutdown timed out after 5 seconds")
+	}
 }
 
 // cleanupLoop runs periodic TTL cleanup and eviction checks
@@ -97,6 +110,13 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	now := time.Now().Unix()
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
+		// Check if we're shutting down
+		select {
+		case <-c.closeCh:
+			zlog.Info().Msg("cleaner: cleanup interrupted by shutdown")
+			return
+		default:
+		}
 		keyBytes := it.Key().Data()
 
 		// Only process user metadata keys
@@ -152,6 +172,14 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 		// Write batch periodically to avoid large batches
 		if batch.Count() >= 1000 {
+			// Check if we're shutting down before writing
+			select {
+			case <-c.closeCh:
+				zlog.Info().Msg("cleaner: cleanup interrupted by shutdown")
+				return
+			default:
+			}
+
 			if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
 				zlog.Error().Err(err).Msg("cleaner: failed to write deletion batch")
 			}
@@ -183,6 +211,13 @@ func (c *Cleaner) calculateTotalSize() {
 	defer it.Close()
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
+		// Check if we're shutting down
+		select {
+		case <-c.closeCh:
+			zlog.Info().Msg("cleaner: size calculation interrupted by shutdown")
+			return
+		default:
+		}
 		keyBytes := it.Key().Data()
 
 		// Only process user metadata keys
