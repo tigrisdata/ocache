@@ -186,6 +186,9 @@ func TestDiskUsageTracking(t *testing.T) {
 	require.NotNil(t, s)
 	require.NotNil(t, s.cleaner)
 
+	// Wait for cleaner initialization to complete
+	s.cleaner.WaitForInitialization()
+
 	// Add some data and verify size tracking
 	totalSize := int64(0)
 	for i := 0; i < 5; i++ {

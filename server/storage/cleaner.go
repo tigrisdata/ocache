@@ -16,6 +16,7 @@ type Cleaner struct {
 	storage      *Storage
 	interval     time.Duration
 	maxDiskUsage int64
+	initialized  atomic.Bool
 
 	// stats
 	totalSize   atomic.Int64
@@ -63,6 +64,7 @@ func (c *Cleaner) cleanupLoop() {
 
 	// Run initial size calculation
 	c.calculateTotalSize()
+	c.initialized.Store(true)
 
 	for {
 		select {
@@ -224,6 +226,13 @@ func (c *Cleaner) enforceDiskLimit() {
 // UpdateSize updates the tracked total size when keys are added/removed
 func (c *Cleaner) UpdateSize(delta int64) {
 	c.totalSize.Add(delta)
+}
+
+// WaitForInitialization waits until the cleaner has completed its initial size calculation
+func (c *Cleaner) WaitForInitialization() {
+	for !c.initialized.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Stats returns cleaner statistics
