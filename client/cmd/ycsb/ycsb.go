@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/pterm/pterm"
 	cacheclient "github.com/tigrisdata/ocache/client"
 )
 
@@ -112,14 +113,93 @@ func generateValue(rng *rand.Rand, size int) []byte {
 }
 
 // preloadKeys inserts NumKeys random key-value pairs into the cache service.
-func preloadKeys(cfg YCSBConfig, rng *rand.Rand) {
-	c, _ := cacheclient.New(cfg.Addr)
+// isConnectionError checks if an error is a connection-level error
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "connection") ||
+		strings.Contains(errStr, "refused") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "unavailable") ||
+		strings.Contains(errStr, "transport")
+}
+
+func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
+	// Use a small pool for preloading to avoid overwhelming the server
+	poolSize := 4
+	if cfg.Concurrency < poolSize {
+		poolSize = cfg.Concurrency
+	}
+	pool, err := cacheclient.NewConnectionPool(cfg.Addr, poolSize)
+	if err != nil {
+		return fmt.Errorf("failed to create connection pool for preload: %w", err)
+	}
+	defer pool.Close()
+
+	// Use pterm spinner for preloading
+	spinner, _ := pterm.DefaultSpinner.
+		WithText(fmt.Sprintf("Preloading %d keys...", cfg.NumKeys)).
+		Start()
+	
+	var preloadErrors int32
+	var successCount int32
+	errorCh := make(chan error, 100)
+	
 	for i := range cfg.NumKeys {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d keys", i, cfg.NumKeys))
+			return ctx.Err()
+		default:
+		}
+		
 		k := hashKey(i)
 		val := generateValue(rng, cfg.ValueSize)
-		_ = c.Put(context.Background(), k, val, 0)
+		err := pool.Execute(ctx, func(ctx context.Context, c *cacheclient.Client) error {
+			return c.Put(ctx, k, val, 0)
+		})
+		if err != nil {
+			atomic.AddInt32(&preloadErrors, 1)
+			select {
+			case errorCh <- fmt.Errorf("key %s: %w", k, err):
+			default: // Don't block on error channel
+			}
+		} else {
+			atomic.AddInt32(&successCount, 1)
+		}
+		
+		if i%100 == 0 {
+			spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)", 
+				i+1, cfg.NumKeys, atomic.LoadInt32(&preloadErrors)))
+		}
 	}
-	c.Close()
+	
+	close(errorCh)
+	
+	// Collect sample of errors
+	var sampleErrors []error
+	for err := range errorCh {
+		if len(sampleErrors) < 5 {
+			sampleErrors = append(sampleErrors, err)
+		}
+	}
+	
+	totalErrors := atomic.LoadInt32(&preloadErrors)
+	if totalErrors > 0 {
+		spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)", 
+			atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
+		if int(totalErrors) > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
+			if len(sampleErrors) > 0 {
+				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, sampleErrors[0])
+			}
+		}
+	} else {
+		spinner.Success(fmt.Sprintf("Preloaded %d keys", cfg.NumKeys))
+	}
+	return nil
 }
 
 // pickOp selects an operation type based on the provided weights and a random number generator.
@@ -161,16 +241,98 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 }
 
 func RunYCSB(cfg YCSBConfig) (Result, error) {
+	return RunYCSBWithContext(context.Background(), cfg)
+}
+
+func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	if cfg.Concurrency < 1 {
 		return Result{}, fmt.Errorf("Concurrency must be at least 1")
 	}
+	
+	// Create a cancellable context for the entire benchmark
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	ws, err := ParseWorkload(cfg.Workload)
 	if err != nil {
 		return Result{}, err
 	}
-	// Preload keys
-	preloadKeys(cfg, rng)
+	// Preload keys with context
+	if err := preloadKeys(ctx, cfg, rng); err != nil {
+		return Result{}, err
+	}
+
+	// Create connection pool with size equal to concurrency
+	// This ensures each worker can have its own connection without contention
+	pool, err := cacheclient.NewConnectionPool(cfg.Addr, cfg.Concurrency)
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to create connection pool: %w", err)
+	}
+	defer pool.Close()
+
+	// Get all clients from the pool to distribute one per worker
+	clients := pool.GetAll()
+
+	// Create metrics collector
+	metricsCollector := NewMetricsCollector()
+	
+	// Create pterm progress reporter
+	progressReporter := NewPtermProgressReporter(cfg.NumOps)
+	if err := progressReporter.Start(); err != nil {
+		return Result{}, fmt.Errorf("failed to start progress reporter: %w", err)
+	}
+	defer progressReporter.Stop()
+
+	// Channel for aggregate throughput tracking
+	throughputCh := make(chan struct {
+		ops int
+		opType OpType
+	}, 1000) // Buffered to avoid blocking workers
+	
+	// Start goroutine to track aggregate throughput
+	var throughputWg sync.WaitGroup
+	throughputWg.Add(1)
+	go func() {
+		defer throughputWg.Done()
+		lastTime := time.Now()
+		opsInInterval := 0
+		opTypeCounts := make(map[OpType]int)
+		
+		for {
+			select {
+			case <-ctx.Done():
+				return // Exit on context cancellation
+			case update, ok := <-throughputCh:
+				if !ok {
+					return // Channel closed
+				}
+				opsInInterval += update.ops
+				opTypeCounts[update.opType] += update.ops
+				
+				// Record aggregate throughput every 100ms
+				if time.Since(lastTime) >= 100*time.Millisecond {
+					if opsInInterval > 0 {
+						throughput := float64(opsInInterval) / time.Since(lastTime).Seconds()
+						// Record overall aggregate throughput
+						metricsCollector.RecordThroughput(throughput, OpNum) // OpNum as sentinel for aggregate
+						
+						// Also record per-operation type throughput
+						for opType, count := range opTypeCounts {
+							if count > 0 {
+								opThroughput := float64(count) / time.Since(lastTime).Seconds()
+								metricsCollector.RecordThroughput(opThroughput, opType)
+							}
+						}
+						
+						opsInInterval = 0
+						opTypeCounts = make(map[OpType]int)
+						lastTime = time.Now()
+					}
+				}
+			}
+		}
+	}()
 
 	var wg sync.WaitGroup
 	opsPerWorker := cfg.NumOps / cfg.Concurrency
@@ -180,51 +342,99 @@ func RunYCSB(cfg YCSBConfig) (Result, error) {
 		opCounts  []int
 	}, cfg.Concurrency)
 	t0 := time.Now()
-	for range cfg.Concurrency {
+	for i := range cfg.Concurrency {
 		wg.Add(1)
 		seed := rng.Int63() // Each goroutine gets its own seed
-		go func(seed int64) {
+		client := clients[i] // Assign dedicated client to each worker
+		go func(workerID int, seed int64, c *cacheclient.Client, reporter *PtermProgressReporter, metrics *MetricsCollector, throughputCh chan<- struct{ops int; opType OpType}) {
 			defer wg.Done()
 			localRng := rand.New(rand.NewSource(seed))
-			c, err := cacheclient.New(cfg.Addr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to connect to cache service: %v\n", err)
-				return
-			}
 			errCount := 0
+			// Pre-allocate latencies slice with exact capacity to avoid reallocation
 			latencies := make([]time.Duration, 0, opsPerWorker)
 			opCounts := make([]int, OpNum) // Track count for each op type
-			for range opsPerWorker {
+			
+			for opIdx := 0; opIdx < opsPerWorker; opIdx++ {
+				// Check for context cancellation
+				select {
+				case <-ctx.Done():
+					// Context cancelled, report partial results
+					resultCh <- struct {
+						errors    int
+						latencies []time.Duration
+						opCounts  []int
+					}{errCount, latencies, opCounts}
+					return
+				default:
+				}
+				
 				keyNum := localRng.Intn(cfg.NumKeys)
 				k := hashKey(keyNum)
 				op := pickOp(ws.Weights, localRng)
 				start := time.Now()
+				var opErr error
+				
+				// Use context with timeout for individual operations
+				opCtx, opCancel := context.WithTimeout(ctx, 5*time.Second)
 				switch op {
 				case OpRead:
-					_, err := c.Get(context.Background(), k)
-					if err != nil {
-						errCount++
-					}
+					_, opErr = c.Get(opCtx, k)
 				case OpUpdate:
 					val := generateValue(localRng, cfg.ValueSize)
-					err := c.Put(context.Background(), k, val, 0)
-					if err != nil {
-						errCount++
-					}
+					opErr = c.Put(opCtx, k, val, 0)
 				}
-				latencies = append(latencies, time.Since(start))
+				opCancel()
+				latency := time.Since(start)
+				
+				// Check for connection errors and abort worker if connection is lost
+				if opErr != nil && isConnectionError(opErr) {
+					// Log critical error and exit worker
+					pterm.Error.Printf("Worker %d: Connection failed: %v\n", workerID, opErr)
+					// Count remaining operations as errors
+					remainingOps := opsPerWorker - opIdx - 1
+					resultCh <- struct {
+						errors    int
+						latencies []time.Duration
+						opCounts  []int
+					}{errCount + remainingOps + 1, latencies, opCounts}
+					return
+				}
+				
+				// Report to progress tracker
+				reporter.RecordOp(op, latency, opErr)
+				
+				// Record in metrics collector
+				metrics.RecordOperation(op, latency, opErr)
+				
+				// Send operation to throughput tracker
+				select {
+				case throughputCh <- struct{ops int; opType OpType}{1, op}:
+				default:
+					// Channel is full, skip this update to avoid blocking
+				}
+				
+				// Keep local stats for final report
+				if opErr != nil {
+					errCount++
+				}
+				latencies = append(latencies, latency)
 				opCounts[op]++
 			}
-			c.Close()
 			resultCh <- struct {
 				errors    int
 				latencies []time.Duration
 				opCounts  []int
 			}{errCount, latencies, opCounts}
-		}(seed)
+		}(i, seed, client, progressReporter, metricsCollector, throughputCh)
 	}
 	wg.Wait()
+	close(throughputCh) // Stop the throughput tracking goroutine
+	throughputWg.Wait() // Wait for throughput goroutine to finish
 	dur := time.Since(t0)
+	
+	// Stop progress reporter before processing results
+	progressReporter.Stop()
+	
 	totalErr := 0
 	allLatencies := make([]time.Duration, 0, cfg.NumOps)
 	totalOps := make([]int, OpNum)
@@ -239,26 +449,9 @@ func RunYCSB(cfg YCSBConfig) (Result, error) {
 	slices.Sort(allLatencies)
 	result := Result{Ops: cfg.NumOps, Duration: dur, Errors: totalErr, Latencies: allLatencies}
 
-	// Print latency percentiles
-	fmt.Printf("Latency percentiles (ms): P50=%.2f, P95=%.2f, P99=%.2f, Max=%.2f\n",
-		float64(percentile(allLatencies, 0.50))/float64(time.Millisecond),
-		float64(percentile(allLatencies, 0.95))/float64(time.Millisecond),
-		float64(percentile(allLatencies, 0.99))/float64(time.Millisecond),
-		float64(percentile(allLatencies, 1.00))/float64(time.Millisecond),
-	)
+	// Display final results using pterm with enhanced metrics
+	DisplayFinalResultsWithMetrics(cfg, result, totalOps, metricsCollector)
 
-	// Compute ops/sec for each operation type
-	fmt.Println("Ops/sec by operation type:")
-	for i := range int(OpNum) {
-		count := totalOps[i]
-		fmt.Printf("  %s: %.2f\n", opNames[i], float64(count)/dur.Seconds())
-	}
-	// Print total operations executed
-	fmt.Println("Total ops by operation type:")
-	for i := range int(OpNum) {
-		count := totalOps[i]
-		fmt.Printf("  %s: %d\n", opNames[i], count)
-	}
 
 	return result, nil
 }
