@@ -51,8 +51,8 @@ func (s *WorkflowSuite) Test_Workflow_MixedObjectSizes() {
 		}
 
 		// Verify counts (metrics tracking is approximate)
-		assert.Greater(t, harness.Metrics.TotalWrites, int64(150), "Expected at least 160 writes")
-		assert.Greater(t, harness.Metrics.BytesWritten, int64(0), "Expected bytes written")
+		assert.Greater(t, harness.Metrics.TotalWrites.Load(), int64(150), "Expected at least 160 writes")
+		assert.Greater(t, harness.Metrics.BytesWritten.Load(), int64(0), "Expected bytes written")
 	})
 
 	// Phase 2: Wait for compaction to process medium objects
@@ -183,18 +183,18 @@ func (s *WorkflowSuite) Test_Workflow_MixedObjectSizes() {
 	// Phase 5: Resource monitoring
 	t.Run("ResourceUsage", func(t *testing.T) {
 		// Log metrics
-		t.Logf("Total Writes: %d", harness.Metrics.TotalWrites)
-		t.Logf("Total Reads: %d", harness.Metrics.TotalReads)
-		t.Logf("Total Deletes: %d", harness.Metrics.TotalDeletes)
-		t.Logf("Bytes Written: %d", harness.Metrics.BytesWritten)
-		t.Logf("Bytes Read: %d", harness.Metrics.BytesRead)
-		t.Logf("Error Count: %d", harness.Metrics.ErrorCount)
+		t.Logf("Total Writes: %d", harness.Metrics.TotalWrites.Load())
+		t.Logf("Total Reads: %d", harness.Metrics.TotalReads.Load())
+		t.Logf("Total Deletes: %d", harness.Metrics.TotalDeletes.Load())
+		t.Logf("Bytes Written: %d", harness.Metrics.BytesWritten.Load())
+		t.Logf("Bytes Read: %d", harness.Metrics.BytesRead.Load())
+		t.Logf("Error Count: %d", harness.Metrics.ErrorCount.Load())
 
 		// Basic validation
-		assert.Greater(t, harness.Metrics.TotalWrites, int64(0), "Expected some writes")
-		assert.Greater(t, harness.Metrics.TotalReads, int64(0), "Expected some reads")
+		assert.Greater(t, harness.Metrics.TotalWrites.Load(), int64(0), "Expected some writes")
+		assert.Greater(t, harness.Metrics.TotalReads.Load(), int64(0), "Expected some reads")
 		// Allow some errors during concurrent operations
-		assert.LessOrEqual(t, harness.Metrics.ErrorCount, int64(10), "Expected minimal errors")
+		assert.LessOrEqual(t, harness.Metrics.ErrorCount.Load(), int64(10), "Expected minimal errors")
 	})
 }
 
