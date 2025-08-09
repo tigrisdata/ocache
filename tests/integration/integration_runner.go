@@ -115,12 +115,15 @@ type WorkflowSuite struct {
 
 // SetupTest sets up for workflow tests
 func (s *WorkflowSuite) SetupTest() {
-	config := DefaultIntegrationTestConfig()
-	config.CleanupInterval = 500 * time.Millisecond
-	config.CompactionInterval = 500 * time.Millisecond
-	config.MaxDiskUsage = 100 * 1024 * 1024 // 100MB limit for LRU testing
-	s.Config = config
-	s.Harness = NewIntegrationTestHarness(s.T(), config)
+	// Each workflow test creates its own harness with custom configuration
+	// so we don't create a harness here to avoid conflicts
+	s.Config = DefaultIntegrationTestConfig()
+	s.Harness = nil
+}
+
+// TearDownTest cleans up after each workflow test
+func (s *WorkflowSuite) TearDownTest() {
+	// Cleanup is handled by each test individually
 }
 
 // StressSuite tests system under stress
@@ -157,7 +160,7 @@ func TestIntegrationCompaction(t *testing.T) {
 	suite.Run(t, new(CompactionSuite))
 }
 
-func TestIntegrationWorkflows(t *testing.T) {
+func TestIntegrationWorkflow(t *testing.T) {
 	suite.Run(t, new(WorkflowSuite))
 }
 
@@ -173,8 +176,9 @@ func RunAllIntegrationTests(t *testing.T) {
 	t.Run("SmallObjects", TestIntegrationSmallObjects)
 	t.Run("MediumObjects", TestIntegrationMediumObjects)
 	t.Run("LargeObjects", TestIntegrationLargeObjects)
+	t.Run("Cleaner", TestIntegrationCleaner)
 	t.Run("Compaction", TestIntegrationCompaction)
-	t.Run("Workflows", TestIntegrationWorkflows)
+	t.Run("Workflows", TestIntegrationWorkflow)
 	if !testing.Short() {
 		t.Run("Stress", TestIntegrationStress)
 	}

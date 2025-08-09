@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,17 +40,17 @@ func DefaultIntegrationTestConfig() IntegrationTestConfig {
 
 // TestMetrics tracks metrics during test execution
 type TestMetrics struct {
-	TotalWrites    int64
-	TotalReads     int64
-	TotalDeletes   int64
-	InlineObjects  int64 // Objects written as inline (small)
-	RawFileObjects int64 // Objects written as raw files (medium/large)
-	CompactionRuns int64
-	CompactedFiles int64
-	CleanupRuns    int64
-	BytesWritten   int64
-	BytesRead      int64
-	ErrorCount     int64
+	TotalWrites    atomic.Int64
+	TotalReads     atomic.Int64
+	TotalDeletes   atomic.Int64
+	InlineObjects  atomic.Int64 // Objects written as inline (small)
+	RawFileObjects atomic.Int64 // Objects written as raw files (medium/large)
+	CompactionRuns atomic.Int64
+	CompactedFiles atomic.Int64
+	CleanupRuns    atomic.Int64
+	BytesWritten   atomic.Int64
+	BytesRead      atomic.Int64
+	ErrorCount     atomic.Int64
 	StartTime      time.Time
 	EndTime        time.Time
 }
@@ -148,22 +149,22 @@ func (h *IntegrationTestHarness) updateStorageMetrics() {
 
 // PutObject stores an object in the cache
 func (h *IntegrationTestHarness) PutObject(key string, data []byte, ttl int64) error {
-	h.Metrics.TotalWrites++
-	h.Metrics.BytesWritten += int64(len(data))
+	h.Metrics.TotalWrites.Add(1)
+	h.Metrics.BytesWritten.Add(int64(len(data)))
 
 	err := h.Storage.Put(key, bytes.NewReader(data), int(ttl))
 	if err != nil {
-		h.Metrics.ErrorCount++
+		h.Metrics.ErrorCount.Add(1)
 		return err
 	}
 
 	// Track object type based on size
 	if int64(len(data)) <= h.Config.InlineThreshold {
-		h.Metrics.InlineObjects++
+		h.Metrics.InlineObjects.Add(1)
 	} else if int64(len(data)) <= h.Config.CompactThreshold {
-		h.Metrics.RawFileObjects++
+		h.Metrics.RawFileObjects.Add(1)
 	} else {
-		h.Metrics.RawFileObjects++ // Large objects stay as raw files
+		h.Metrics.RawFileObjects.Add(1) // Large objects stay as raw files
 	}
 
 	return nil
@@ -171,15 +172,15 @@ func (h *IntegrationTestHarness) PutObject(key string, data []byte, ttl int64) e
 
 // GetObject retrieves an object from the cache
 func (h *IntegrationTestHarness) GetObject(key string) ([]byte, error) {
-	h.Metrics.TotalReads++
+	h.Metrics.TotalReads.Add(1)
 
 	reader, exists, err := h.Storage.Get(key)
 	if err != nil {
-		h.Metrics.ErrorCount++
+		h.Metrics.ErrorCount.Add(1)
 		return nil, err
 	}
 	if !exists {
-		h.Metrics.ErrorCount++
+		h.Metrics.ErrorCount.Add(1)
 		return nil, fmt.Errorf("key not found: %s", key)
 	}
 
@@ -192,17 +193,17 @@ func (h *IntegrationTestHarness) GetObject(key string) ([]byte, error) {
 
 	data, err := io.ReadAll(reader)
 	if err != nil {
-		h.Metrics.ErrorCount++
+		h.Metrics.ErrorCount.Add(1)
 		return nil, err
 	}
 
-	h.Metrics.BytesRead += int64(len(data))
+	h.Metrics.BytesRead.Add(int64(len(data)))
 	return data, nil
 }
 
 // DeleteObject deletes an object from the cache
 func (h *IntegrationTestHarness) DeleteObject(key string) error {
-	h.Metrics.TotalDeletes++
+	h.Metrics.TotalDeletes.Add(1)
 
 	// The storage package uses DeleteKey which doesn't return an error
 	h.Storage.DeleteKey(key)
@@ -357,14 +358,14 @@ func (h *IntegrationTestHarness) PrintMetrics() {
 	duration := endTime.Sub(h.Metrics.StartTime)
 	fmt.Printf("\n=== Integration Test Metrics ===\n")
 	fmt.Printf("Duration: %v\n", duration)
-	fmt.Printf("Total Writes: %d\n", h.Metrics.TotalWrites)
-	fmt.Printf("Total Reads: %d\n", h.Metrics.TotalReads)
-	fmt.Printf("Total Deletes: %d\n", h.Metrics.TotalDeletes)
-	fmt.Printf("Bytes Written: %d\n", h.Metrics.BytesWritten)
-	fmt.Printf("Bytes Read: %d\n", h.Metrics.BytesRead)
-	fmt.Printf("Inline Objects: %d\n", h.Metrics.InlineObjects)
-	fmt.Printf("Raw File Objects: %d\n", h.Metrics.RawFileObjects)
-	fmt.Printf("Error Count: %d\n", h.Metrics.ErrorCount)
+	fmt.Printf("Total Writes: %d\n", h.Metrics.TotalWrites.Load())
+	fmt.Printf("Total Reads: %d\n", h.Metrics.TotalReads.Load())
+	fmt.Printf("Total Deletes: %d\n", h.Metrics.TotalDeletes.Load())
+	fmt.Printf("Bytes Written: %d\n", h.Metrics.BytesWritten.Load())
+	fmt.Printf("Bytes Read: %d\n", h.Metrics.BytesRead.Load())
+	fmt.Printf("Inline Objects: %d\n", h.Metrics.InlineObjects.Load())
+	fmt.Printf("Raw File Objects: %d\n", h.Metrics.RawFileObjects.Load())
+	fmt.Printf("Error Count: %d\n", h.Metrics.ErrorCount.Load())
 	fmt.Printf("=======================\n")
 }
 

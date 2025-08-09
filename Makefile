@@ -272,6 +272,11 @@ test-integration-compaction:
 	@echo "Running compaction integration tests..."
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_Compaction -timeout 300s ./...
 
+.PHONY: test-integration-workflow
+test-integration-workflow:
+	@echo "Running workflow integration tests..."
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run TestIntegration_Workflow -timeout 300s ./...
+
 # Code quality targets
 .PHONY: lint
 lint:
