@@ -80,8 +80,12 @@ func (c *Compactor) Close() {
 	if c == nil || c.cancel == nil {
 		return
 	}
+	// Cancel the context to signal shutdown
 	c.cancel()
+	// Wait for all goroutines to complete before returning
 	c.wg.Wait()
+	// Set cancel to nil to prevent double-close
+	c.cancel = nil
 	zlog.Info().Msg("compactor: shutdown completed")
 }
 
@@ -97,6 +101,10 @@ func (c *Compactor) compactionLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			// Check if context is already cancelled before starting compaction
+			if c.ctx.Err() != nil {
+				return
+			}
 			c.CompactFilesWithContext(c.ctx, c.maxBytes)
 		case <-c.ctx.Done():
 			zlog.Info().Msg("compactor: background loop stopping")
@@ -116,6 +124,10 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 
 // CompactFiles scans the RocksDB file-index and migrates files into segments.
 func (c *Compactor) CompactFiles(maxBytes int64) {
+	// Check if compactor is shutting down
+	if c.ctx.Err() != nil {
+		return
+	}
 	c.CompactFilesWithContext(c.ctx, maxBytes)
 }
 
