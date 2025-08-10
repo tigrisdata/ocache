@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,15 @@ import (
 //
 // NOTE: At present the implementation only migrates files; segment-level
 // compaction (merging/deleting) lives in Manager.compactSegments().
+
+const (
+	// CompactionIndexPrefix is the prefix for all compaction index entries in RocksDB
+	CompactionIndexPrefix = "!compact/"
+
+	// CompactionIndexKeyFormat is the format for compaction index keys
+	// Format: !compact/<timestamp>|<userKey>
+	CompactionIndexKeyFormat = "!compact/%020d|%s"
+)
 
 type Compactor struct {
 	fm       *files.FileManager
@@ -80,7 +90,7 @@ func (c *Compactor) Close() {
 	if c == nil {
 		return
 	}
-	
+
 	if c.cancel != nil {
 		c.cancel()
 		c.wg.Wait()
@@ -116,7 +126,7 @@ func (c *Compactor) compactionLoop() {
 // PrepareEntryForCompaction prepares the key and value to store in compaction index.
 func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 	ts := time.Now().UnixNano()
-	idxKey := fmt.Sprintf("!compact/%020d|%s", ts, key)
+	idxKey := fmt.Sprintf(CompactionIndexKeyFormat, ts, key)
 	idxVal := fmt.Sprintf("%s", filePath)
 
 	return []byte(idxKey), []byte(idxVal)
@@ -147,7 +157,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		return
 	}
 
-	filePrefix := []byte("!compact/")
+	filePrefix := []byte(CompactionIndexPrefix)
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		// Check if context is cancelled
 		if err := ctx.Err(); err != nil {
@@ -158,118 +168,77 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		k := it.Key().Data()
 		v := it.Value().Data()
 
-		userKey, filePath, ok := parseFileIndexRow(k, v)
-		if !ok {
-			zlog.Error().Str("row", string(k)).Msg("compactor: malformed index row")
-			wb.Delete(k)
-			continue
-		}
-
-		// Stat first – cheap, and gives us size quickly.
-		fInfo, err := os.Stat(filePath)
+		// Process the compaction entry
+		entry, err := c.processCompactionEntry(ctx, k, v, ro)
 		if err != nil {
-			if os.IsNotExist(err) {
+			// Handle different error cases
+			if err.Error() == "malformed index row" {
+				wb.Delete(k)
+				continue
+			}
+			if err.Error() == "file not exist: file does not exist" {
 				wb.Delete(k) // stale index row
 				continue
 			}
-			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: stat failed")
+			if err.Error() == "metadata not found" {
+				// Key already gone – schedule raw file + index row for deletion
+				_, filePath, _ := parseFileIndexRow(k, v)
+				wb.Delete(k)
+				filesToDel = append(filesToDel, filePath)
+				continue
+			}
+			if err.Error() == "stale entry" {
+				_, filePath, _ := parseFileIndexRow(k, v)
+				wb.Delete(k)                              // Remove stale compaction index entry
+				filesToDel = append(filesToDel, filePath) // Delete the stale file
+				continue
+			}
+			if err.Error() == "already compacted" {
+				wb.Delete(k) // Remove compaction index entry
+				// Note: don't delete the file since it might be referenced elsewhere
+				continue
+			}
+			// Handle missing files - delete the index entry
+			if strings.Contains(err.Error(), "file not exist") {
+				wb.Delete(k) // Remove compaction index entry for non-existent file
+				continue
+			}
+			// Handle missing metadata - delete the index entry and potentially the file
+			if err.Error() == "metadata not found" {
+				wb.Delete(k) // Remove compaction index entry
+				// Also delete the orphaned file if it exists
+				_, filePath, _ := parseFileIndexRow(k, v)
+				if _, statErr := os.Stat(filePath); statErr == nil {
+					filesToDel = append(filesToDel, filePath)
+				}
+				continue
+			}
+			// Other errors - just continue
 			continue
 		}
 
 		// Advisory maxBytes check: if limit already reached and the next file
 		// would overflow the current segment, stop compaction.
-		if bytesCopied >= maxBytes && seg.Remaining() < fInfo.Size() {
+		if bytesCopied >= maxBytes && seg.Remaining() < entry.fileInfo.Size() {
 			break
 		}
 
-		// Fetch metadata for the user key.
-		metaKey := keys.MakeMetadataKey(userKey)
-		slice, err := c.meta.Handle().Get(ro, metaKey)
-		if err != nil {
-			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: db.Get")
-			continue
-		}
-
-		if !slice.Exists() {
-			// Key already gone – schedule raw file + index row for deletion.
-			slice.Free()
-			wb.Delete(k)
-			filesToDel = append(filesToDel, filePath)
-			continue
-		}
-
-		vm := &pb.ValueMessage{}
-		if err := proto.Unmarshal(slice.Data(), vm); err != nil {
-			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: bad metadata")
-			slice.Free()
-			continue
-		}
-
-		// Check if this compaction entry refers to the current file for this key
-		// If not, it's a stale entry from a previous Put operation that should be cleaned up
-		if vm.ValueType == pb.ValueType_RAW_FILE && vm.RawFilePath != filePath {
-			zlog.Debug().
-				Str("key", userKey).
-				Str("stale_file", filePath).
-				Str("current_file", vm.RawFilePath).
-				Msg("compactor: skipping stale compaction entry")
-			slice.Free()
-			wb.Delete(k)                              // Remove stale compaction index entry
-			filesToDel = append(filesToDel, filePath) // Delete the stale file
-			continue
-		}
-
-		// If the value is no longer a raw file (already compacted to segment or changed to inline),
-		// clean up this compaction entry
-		if vm.ValueType != pb.ValueType_RAW_FILE {
-			zlog.Debug().
-				Str("key", userKey).
-				Str("value_type", vm.ValueType.String()).
-				Msg("compactor: value no longer needs compaction")
-			slice.Free()
-			wb.Delete(k) // Remove compaction index entry
-			// Note: don't delete the file since it might be referenced elsewhere
-			continue
-		}
-
-		slice.Free()
-
-		// Ensure we have space in the current segment.
-		if err := c.ensureCapacity(ctx, &seg, vm.ValueLength); err != nil {
+		// Compact the entry
+		if err := c.compactEntry(ctx, entry, &seg, wb); err != nil {
 			if err == context.Canceled {
-				zlog.Info().Msg("compactor: segment rotation cancelled")
+				zlog.Info().Msg("compactor: compaction cancelled")
 				return
 			}
-			zlog.Error().Err(err).Msg("compactor: segment rotation failed")
-			return
-		}
-
-		// Copy the raw file into the segment.
-		f, err := os.Open(filePath)
-		if err != nil {
-			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: open failed")
+			// Log error and continue with next entry
 			continue
 		}
-		if err := c.copyFileIntoSegment(ctx, seg, userKey, f, vm); err != nil {
-			f.Close()
-			if err == context.Canceled {
-				zlog.Info().Msg("compactor: file copy cancelled")
-				return
-			}
-			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: copy failed")
-			continue
-		}
-		f.Close()
 
-		// Update metadata & housekeeping.
-		metaBytes, _ := proto.Marshal(vm)
-		metaKey = keys.MakeMetadataKey(userKey)
-		wb.Put(metaKey, metaBytes)
+		// Housekeeping
 		wb.Delete(k) // remove index row
-		filesToDel = append(filesToDel, filePath)
+		filesToDel = append(filesToDel, entry.filePath)
 
 		processed++
-		bytesCopied += fInfo.Size()
+		bytesCopied += entry.fileInfo.Size()
 	}
 
 	// Final commit.
@@ -287,7 +256,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 // key/value pairs. Returns ok=false when the row does not follow the expected
 // format.
 func parseFileIndexRow(k, v []byte) (userKey, filePath string, ok bool) {
-	// Key format: !compact/<ts>|<userKey>
+	// Key format: CompactionIndexKeyFormat (!compact/<ts>|<userKey>)
 	pipeIdx := bytes.IndexByte(k, '|')
 	if pipeIdx <= 0 {
 		return
@@ -298,6 +267,119 @@ func parseFileIndexRow(k, v []byte) (userKey, filePath string, ok bool) {
 	filePath = string(v)
 	ok = true
 	return
+}
+
+// compactionEntry represents a single entry to be compacted
+type compactionEntry struct {
+	userKey  string
+	filePath string
+	fileInfo os.FileInfo
+	metadata *pb.ValueMessage
+}
+
+// processCompactionEntry processes a single compaction index entry
+func (c *Compactor) processCompactionEntry(ctx context.Context, k, v []byte, ro *grocksdb.ReadOptions) (*compactionEntry, error) {
+	userKey, filePath, ok := parseFileIndexRow(k, v)
+	if !ok {
+		zlog.Error().Str("row", string(k)).Msg("compactor: malformed index row")
+		return nil, fmt.Errorf("malformed index row")
+	}
+
+	// Stat first – cheap, and gives us size quickly.
+	fInfo, err := os.Stat(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("file not exist: %w", err)
+		}
+		zlog.Error().Err(err).Str("path", filePath).Msg("compactor: stat failed")
+		return nil, err
+	}
+
+	// Load and validate metadata
+	vm, err := c.loadAndValidateMetadata(ctx, userKey, filePath, ro)
+	if err != nil {
+		return nil, err
+	}
+
+	return &compactionEntry{
+		userKey:  userKey,
+		filePath: filePath,
+		fileInfo: fInfo,
+		metadata: vm,
+	}, nil
+}
+
+// loadAndValidateMetadata loads and validates metadata for a key
+func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePath string, ro *grocksdb.ReadOptions) (*pb.ValueMessage, error) {
+	metaKey := keys.MakeMetadataKey(userKey)
+	slice, err := c.meta.Handle().Get(ro, metaKey)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: db.Get")
+		return nil, err
+	}
+	defer slice.Free()
+
+	if !slice.Exists() {
+		return nil, fmt.Errorf("metadata not found")
+	}
+
+	vm := &pb.ValueMessage{}
+	if err := proto.Unmarshal(slice.Data(), vm); err != nil {
+		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: bad metadata")
+		return nil, err
+	}
+
+	// Check if this is a stale entry
+	if vm.ValueType == pb.ValueType_RAW_FILE && vm.RawFilePath != filePath {
+		zlog.Debug().
+			Str("key", userKey).
+			Str("stale_file", filePath).
+			Str("current_file", vm.RawFilePath).
+			Msg("compactor: stale compaction entry")
+		return nil, fmt.Errorf("stale entry")
+	}
+
+	// Check if already compacted
+	if vm.ValueType != pb.ValueType_RAW_FILE {
+		zlog.Debug().
+			Str("key", userKey).
+			Str("value_type", vm.ValueType.String()).
+			Msg("compactor: value already compacted")
+		return nil, fmt.Errorf("already compacted")
+	}
+
+	return vm, nil
+}
+
+// compactEntry performs the actual compaction of a single entry
+func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, wb *grocksdb.WriteBatch) error {
+	// Ensure we have space in the current segment
+	if err := c.ensureCapacity(ctx, seg, entry.metadata.ValueLength); err != nil {
+		return err
+	}
+
+	// Copy the raw file into the segment
+	f, err := os.Open(entry.filePath)
+	if err != nil {
+		zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: open failed")
+		return err
+	}
+	defer f.Close()
+
+	if err := c.copyFileIntoSegment(ctx, *seg, entry.userKey, f, entry.metadata); err != nil {
+		if err == context.Canceled {
+			return err
+		}
+		zlog.Error().Err(err).Str("key", entry.userKey).Msg("compactor: copy failed")
+		return err
+	}
+
+	// Update metadata
+	metaBytes, _ := proto.Marshal(entry.metadata)
+	metaKey := keys.MakeMetadataKey(entry.userKey)
+	wb.Put(metaKey, metaBytes)
+
+	return nil
 }
 
 // copyFileIntoSegment copies the file into an open segment using the

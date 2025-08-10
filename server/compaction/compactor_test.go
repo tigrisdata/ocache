@@ -82,7 +82,7 @@ func TestPrepareEntryForCompaction(t *testing.T) {
 	k, v := PrepareEntryForCompaction(key, filePath)
 
 	// Key should start with !compact/ prefix and contain timestamp
-	assert.True(t, bytes.HasPrefix(k, []byte("!compact/")))
+	assert.True(t, bytes.HasPrefix(k, []byte(CompactionIndexPrefix)))
 	assert.Contains(t, string(k), "|test-key")
 
 	// Value should be the file path
@@ -91,7 +91,7 @@ func TestPrepareEntryForCompaction(t *testing.T) {
 	// Ensure timestamp is properly formatted (20 digits)
 	parts := bytes.Split(k, []byte("|"))
 	assert.Len(t, parts, 2)
-	tsStr := string(parts[0][len("!compact/"):])
+	tsStr := string(parts[0][len(CompactionIndexPrefix):])
 	assert.Len(t, tsStr, 20)
 }
 
@@ -310,7 +310,7 @@ func TestCompactFiles(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024 * 1024)
+	c.CompactFiles(ctx, 1024*1024)
 
 	// Verify index entries were deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -358,7 +358,7 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 
 	// Run compaction - should handle missing file gracefully
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024 * 1024)
+	c.CompactFiles(ctx, 1024*1024)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -387,7 +387,7 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024 * 1024)
+	c.CompactFiles(ctx, 1024*1024)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -446,7 +446,7 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	defer it.Close()
 
 	unprocessedCount := 0
-	filePrefix := []byte("!compact/")
+	filePrefix := []byte(CompactionIndexPrefix)
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		unprocessedCount++
 	}
@@ -502,7 +502,7 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 
 	// Run compaction - should handle bad metadata gracefully
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024 * 1024)
+	c.CompactFiles(ctx, 1024*1024)
 
 	// File should still exist as we couldn't process it
 	_, err = os.Stat(testFile)
