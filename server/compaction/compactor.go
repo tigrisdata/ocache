@@ -77,7 +77,7 @@ func (c *Compactor) Start() {
 
 // Close stops the background compaction loop and waits for it to exit.
 func (c *Compactor) Close() {
-	if c == nil {
+	if c == nil || c.cancel == nil {
 		return
 	}
 	c.cancel()
