@@ -340,11 +340,8 @@ func (c *Compactor) commitWithContext(ctx context.Context, seg *segment.Segment,
 
 	// Check if context is cancelled
 	if err := ctx.Err(); err != nil {
-		zlog.Info().Msg("compactor: skipping sync due to cancellation")
-		// Still try to write metadata to avoid inconsistency
-		if err := c.meta.Handle().Write(grocksdb.NewDefaultWriteOptions(), wb); err != nil {
-			return err
-		}
+		zlog.Info().Msg("compactor: commit skipped due to cancellation")
+		// Return immediately without writing to avoid partial state
 		return err
 	}
 
