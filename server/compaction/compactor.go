@@ -244,9 +244,11 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 			continue
 		}
 
-		// Advisory maxBytes check: if limit already reached and the next file
-		// would overflow the current segment, stop compaction.
-		if bytesCopied >= maxBytes && seg.Remaining() < entry.fileInfo.Size() {
+		// Advisory maxBytes check: if limit already reached and the next entry
+		// (including header) would overflow the current segment, stop compaction.
+		headerSize := segment.CalculateValueHeaderSize(entry.userKey)
+		totalNeeded := headerSize + entry.fileInfo.Size()
+		if bytesCopied >= maxBytes && seg.Remaining() < totalNeeded {
 			break
 		}
 
@@ -380,8 +382,12 @@ func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePa
 
 // compactEntry performs the actual compaction of a single entry
 func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, wb *grocksdb.WriteBatch) error {
+	// Calculate total space needed: header + value
+	headerSize := segment.CalculateValueHeaderSize(entry.userKey)
+	totalNeeded := headerSize + entry.metadata.ValueLength
+
 	// Ensure we have space in the current segment
-	if err := c.ensureCapacity(ctx, seg, entry.metadata.ValueLength); err != nil {
+	if err := c.ensureCapacity(ctx, seg, totalNeeded); err != nil {
 		return err
 	}
 
