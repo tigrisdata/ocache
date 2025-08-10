@@ -61,6 +61,21 @@ func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64
 	return
 }
 
+// ReadValueHeaderAt parses the header at a specific offset in a segment file and
+// returns the value length, total header size and key length.
+func ReadValueHeaderAt(f *os.File, offset int64) (valueLen int64, headerSize int64, keyLen int64, version uint16, checksum uint32, err error) {
+	var fixed [ValueHeaderSize]byte
+	if _, err = unix.Pread(int(f.Fd()), fixed[:], offset); err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	valueLen = int64(binary.BigEndian.Uint64(fixed[0:8]))
+	keyLen = int64(binary.BigEndian.Uint32(fixed[8:12]))
+	checksum = binary.BigEndian.Uint32(fixed[12:16])
+	version = binary.BigEndian.Uint16(fixed[16:18])
+	headerSize = int64(ValueHeaderSize) + keyLen
+	return
+}
+
 // CalculateValueHeaderSize calculates the size of the header for a given key.
 func CalculateValueHeaderSize(key string) int64 {
 	return int64(ValueHeaderSize + len(key))

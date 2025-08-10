@@ -168,9 +168,21 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	// Total bytes to add
 	needed := headerSize + vm.ValueLength
 
+	// Log the write operation
+	zlog.Debug().
+		Str("key", userKey).
+		Int64("valueLength", vm.ValueLength).
+		Str("segment", seg.path).
+		Msg("writing entry to segment")
+
 	// Acquire lock to ensure only one writer to the segment at a time.
 	seg.mu.Lock()
 	defer seg.mu.Unlock()
+
+	// Check if segment file is still open
+	if seg.file == nil {
+		return 0, utils.WrapError("segment file is closed", seg.path, nil)
+	}
 
 	// Ensure we have a writable segment with space
 	// Offset where this value will be written inside the segment
@@ -185,13 +197,28 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	if _, err := seg.file.Write(header); err != nil {
 		return 0, utils.WrapError("failed to write value header", seg.path, err)
 	}
-	if _, err := io.Copy(seg.file, f); err != nil {
+
+	// Copy with progress tracking for large files
+	bytesWritten, err := io.Copy(seg.file, f)
+	if err != nil {
 		return 0, utils.WrapError("copy value to segment", userKey, err)
+	}
+
+	// Verify we wrote the expected amount
+	if bytesWritten != vm.ValueLength {
+		return 0, utils.WrapError(fmt.Sprintf("wrote %d bytes, expected %d", bytesWritten, vm.ValueLength), userKey, nil)
 	}
 
 	seg.size += needed
 	seg.entries++
 	seg.dataBytes += vm.ValueLength
+
+	zlog.Debug().
+		Str("key", userKey).
+		Int64("bytesWritten", bytesWritten).
+		Int64("segmentSize", seg.size).
+		Msg("successfully wrote entry to segment")
+
 	return startOffset, nil
 }
 
@@ -396,11 +423,20 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 	entries := uint32(0)
 	dataBytes := int64(0)
 
+	// Seek to beginning to start validation
+	if _, err := seg.file.Seek(0, io.SeekStart); err != nil {
+		return utils.WrapError("seek to start for validation", seg.path, err)
+	}
+
 	for {
-		// Read header
-		valLen, headerSize, keyLen, _, checksum, err := ReadValueHeader(seg.file)
+		// Read header at current position
+		valLen, headerSize, keyLen, _, checksum, err := ReadValueHeaderAt(seg.file, pos)
 		if err != nil {
-			return utils.WrapError("read header", seg.path, err)
+			// EOF or read error means we've reached the end of valid data
+			if err := seg.file.Truncate(pos); err != nil {
+				return utils.WrapError("truncate at read error", seg.path, err)
+			}
+			break
 		}
 
 		// Check that header values are reasonable

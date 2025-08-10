@@ -158,7 +158,22 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 	}
 
 	filePrefix := []byte(CompactionIndexPrefix)
+	iterationCount := 0
+	lastLogTime := time.Now()
+
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
+		iterationCount++
+
+		// Log progress every 100 iterations or every 10 seconds
+		if iterationCount%100 == 0 || time.Since(lastLogTime) > 10*time.Second {
+			zlog.Debug().
+				Int("iterations", iterationCount).
+				Int("processed", processed).
+				Int64("bytesCopied", bytesCopied).
+				Msg("compactor: progress update")
+			lastLogTime = time.Now()
+		}
+
 		// Check if context is cancelled
 		if err := ctx.Err(); err != nil {
 			zlog.Info().Msg("compactor: interrupted by cancellation")
@@ -169,6 +184,17 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		v := it.Value().Data()
 
 		// Process the compaction entry
+		userKey, filePath, _ := parseFileIndexRow(k, v)
+
+		// Log what we're about to process
+		if iterationCount <= 10 || iterationCount%100 == 0 {
+			zlog.Debug().
+				Int("iteration", iterationCount).
+				Str("userKey", userKey).
+				Str("filePath", filePath).
+				Msg("compactor: processing entry")
+		}
+
 		entry, err := c.processCompactionEntry(ctx, k, v, ro)
 		if err != nil {
 			// Handle different error cases
@@ -359,12 +385,22 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 	}
 
 	// Copy the raw file into the segment
+	zlog.Debug().
+		Str("key", entry.userKey).
+		Str("filePath", entry.filePath).
+		Int64("size", entry.fileInfo.Size()).
+		Msg("compactor: opening file for compaction")
+
 	f, err := os.Open(entry.filePath)
 	if err != nil {
 		zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: open failed")
 		return err
 	}
 	defer f.Close()
+
+	zlog.Debug().
+		Str("key", entry.userKey).
+		Msg("compactor: copying file to segment")
 
 	if err := c.copyFileIntoSegment(ctx, *seg, entry.userKey, f, entry.metadata); err != nil {
 		if err == context.Canceled {
@@ -373,6 +409,10 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 		zlog.Error().Err(err).Str("key", entry.userKey).Msg("compactor: copy failed")
 		return err
 	}
+
+	zlog.Debug().
+		Str("key", entry.userKey).
+		Msg("compactor: successfully copied file to segment")
 
 	// Update metadata
 	metaBytes, _ := proto.Marshal(entry.metadata)
@@ -426,13 +466,44 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 	}
 
 	// Remove obsolete raw files on best-effort basis
-	for _, p := range toDelete {
+	// Files that are currently being read will be skipped and left for next compaction run.
+	zlog.Debug().Int("count", len(toDelete)).Msg("compactor: starting file deletion")
+	skippedFiles := 0
+	for i, p := range toDelete {
 		// Check if context is cancelled during cleanup
 		if err := ctx.Err(); err != nil {
 			zlog.Info().Msg("compactor: file cleanup interrupted by cancellation")
 			return nil
 		}
-		c.fm.Remove(p)
+
+		deleted, err := c.fm.TryRemove(p)
+		if err != nil {
+			zlog.Error().
+				Err(err).
+				Str("path", p).
+				Int("index", i).
+				Msg("compactor: failed to delete file")
+			continue
+		}
+
+		if !deleted {
+			// File is currently locked for reading, will be cleaned up in next compaction
+			skippedFiles++
+			if skippedFiles <= 10 {
+				zlog.Debug().
+					Str("path", p).
+					Msg("compactor: file locked for reading, will retry in next compaction")
+			}
+		}
+	}
+
+	if skippedFiles > 0 {
+		zlog.Info().
+			Int("deleted", len(toDelete)-skippedFiles).
+			Int("skipped", skippedFiles).
+			Msg("compactor: completed file deletion with some files locked")
+	} else {
+		zlog.Debug().Int("count", len(toDelete)).Msg("compactor: completed file deletion")
 	}
 	return nil
 }
