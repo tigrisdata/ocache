@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -162,12 +163,13 @@ func TestEnsureCapacity(t *testing.T) {
 	initialRemaining := seg.Remaining()
 
 	// Test 1: When segment has enough capacity
-	err = c.ensureCapacity(&seg, 100)
+	ctx := context.Background()
+	err = c.ensureCapacity(ctx, &seg, 100)
 	assert.NoError(t, err)
 	assert.Equal(t, initialPath, seg.Path()) // Same segment
 
 	// Test 2: When segment needs rotation
-	err = c.ensureCapacity(&seg, initialRemaining+1)
+	err = c.ensureCapacity(ctx, &seg, initialRemaining+1)
 	assert.NoError(t, err)
 	assert.NotEqual(t, initialPath, seg.Path()) // New segment
 }
@@ -201,7 +203,8 @@ func TestCopyFileIntoSegment(t *testing.T) {
 	}
 
 	// Copy file into segment
-	err = c.copyFileIntoSegment(seg, "test-key", f, vm)
+	ctx := context.Background()
+	err = c.copyFileIntoSegment(ctx, seg, "test-key", f, vm)
 	assert.NoError(t, err)
 
 	// Verify ValueMessage was updated
@@ -238,7 +241,8 @@ func TestCommit(t *testing.T) {
 	wb.Delete([]byte("key2"))
 
 	// Test commit with non-empty batch
-	err = c.commit(seg, wb, testFiles)
+	ctx := context.Background()
+	err = c.commit(ctx, seg, wb, testFiles)
 	assert.NoError(t, err)
 
 	// Verify files were deleted
@@ -249,7 +253,7 @@ func TestCommit(t *testing.T) {
 
 	// Test commit with empty batch
 	emptyWb := grocksdb.NewWriteBatch()
-	err = c.commit(seg, emptyWb, nil)
+	err = c.commit(ctx, seg, emptyWb, nil)
 	assert.NoError(t, err)
 }
 
@@ -305,7 +309,8 @@ func TestCompactFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run compaction
-	c.CompactFiles(1024 * 1024)
+	ctx := context.Background()
+	c.CompactFiles(ctx, 1024 * 1024)
 
 	// Verify index entries were deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -352,7 +357,8 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run compaction - should handle missing file gracefully
-	c.CompactFiles(1024 * 1024)
+	ctx := context.Background()
+	c.CompactFiles(ctx, 1024 * 1024)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -380,7 +386,8 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run compaction
-	c.CompactFiles(1024 * 1024)
+	ctx := context.Background()
+	c.CompactFiles(ctx, 1024 * 1024)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -429,7 +436,8 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	// Run compaction with small limit (should process only first 2 files)
 	// The limit is checked after processing, so 150 bytes means it will process 2 files (200 bytes)
 	// and stop before the third
-	c.CompactFiles(150)
+	ctx := context.Background()
+	c.CompactFiles(ctx, 150)
 
 	// Check how many index entries remain (unprocessed files)
 	ro := grocksdb.NewDefaultReadOptions()
@@ -493,7 +501,8 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run compaction - should handle bad metadata gracefully
-	c.CompactFiles(1024 * 1024)
+	ctx := context.Background()
+	c.CompactFiles(ctx, 1024 * 1024)
 
 	// File should still exist as we couldn't process it
 	_, err = os.Stat(testFile)
