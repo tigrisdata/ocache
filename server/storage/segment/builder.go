@@ -2,6 +2,8 @@ package segment
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -50,13 +52,49 @@ func BuildValueHeader(key string, valueLen int64, checksum uint32, version uint1
 // random access via Pread.
 func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64, version uint16, checksum uint32, err error) {
 	var fixed [ValueHeaderSize]byte
-	if _, err = unix.Pread(int(f.Fd()), fixed[:], 0); err != nil {
+	n, err := unix.Pread(int(f.Fd()), fixed[:], 0)
+	if err != nil {
 		return 0, 0, 0, 0, 0, err
 	}
+
+	// Check if we read less than expected (EOF)
+	if n < ValueHeaderSize {
+		return 0, 0, 0, 0, 0, io.EOF
+	}
+
+	// Check if the header is all zeros (uninitialized sparse file region)
+	isZero := true
+	for _, b := range fixed {
+		if b != 0 {
+			isZero = false
+			break
+		}
+	}
+	if isZero {
+		return 0, 0, 0, 0, 0, io.EOF
+	}
+
 	valueLen = int64(binary.BigEndian.Uint64(fixed[0:8]))
 	keyLen = int64(binary.BigEndian.Uint32(fixed[8:12]))
 	checksum = binary.BigEndian.Uint32(fixed[12:16])
 	version = binary.BigEndian.Uint16(fixed[16:18])
+
+	// Validate header fields for reasonable values
+	// Key length should be positive
+	if keyLen <= 0 {
+		return 0, 0, 0, 0, 0, errors.New("invalid key length in header")
+	}
+
+	// Value length should be positive
+	if valueLen <= 0 {
+		return 0, 0, 0, 0, 0, errors.New("invalid value length in header")
+	}
+
+	// Version should be a known version
+	if version <= 0 || version > CurrentValueHeaderVersion {
+		return 0, 0, 0, 0, 0, errors.New("invalid header version")
+	}
+
 	headerSize = int64(ValueHeaderSize) + keyLen
 	return
 }
@@ -67,13 +105,49 @@ func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64
 // the file's current position, making it safe for concurrent reads.
 func ReadValueHeaderAt(f *os.File, offset int64) (valueLen int64, headerSize int64, keyLen int64, version uint16, checksum uint32, err error) {
 	var fixed [ValueHeaderSize]byte
-	if _, err = unix.Pread(int(f.Fd()), fixed[:], offset); err != nil {
+	n, err := unix.Pread(int(f.Fd()), fixed[:], offset)
+	if err != nil {
 		return 0, 0, 0, 0, 0, err
 	}
+
+	// Check if we read less than expected (EOF)
+	if n < ValueHeaderSize {
+		return 0, 0, 0, 0, 0, io.EOF
+	}
+
+	// Check if the header is all zeros (uninitialized sparse file region)
+	isZero := true
+	for _, b := range fixed {
+		if b != 0 {
+			isZero = false
+			break
+		}
+	}
+	if isZero {
+		return 0, 0, 0, 0, 0, io.EOF
+	}
+
 	valueLen = int64(binary.BigEndian.Uint64(fixed[0:8]))
 	keyLen = int64(binary.BigEndian.Uint32(fixed[8:12]))
 	checksum = binary.BigEndian.Uint32(fixed[12:16])
 	version = binary.BigEndian.Uint16(fixed[16:18])
+
+	// Validate header fields for reasonable values
+	// Key length should be positive
+	if keyLen <= 0 {
+		return 0, 0, 0, 0, 0, errors.New("invalid key length in header")
+	}
+
+	// Value length should be positive
+	if valueLen <= 0 {
+		return 0, 0, 0, 0, 0, errors.New("invalid value length in header")
+	}
+
+	// Version should be a known version
+	if version <= 0 || version > CurrentValueHeaderVersion {
+		return 0, 0, 0, 0, 0, errors.New("invalid header version")
+	}
+
 	headerSize = int64(ValueHeaderSize) + keyLen
 	return
 }

@@ -53,6 +53,27 @@ func (s *Segment) SetOpenFile(file *os.File) {
 	s.file = file
 }
 
+// GetSize returns the current size of data written to the segment.
+func (s *Segment) GetSize() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.size
+}
+
+// GetEntries returns the number of entries in the segment.
+func (s *Segment) GetEntries() uint32 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.entries
+}
+
+// HasOpenFile returns true if the segment has an open file.
+func (s *Segment) HasOpenFile() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.file != nil
+}
+
 // NewSegment creates a new segment with the given path and size.
 func NewSegment(path string, entries uint32, dataBytes int64, size int64, maxSupportedSize int64) *Segment {
 	return &Segment{path: path, entries: entries, dataBytes: dataBytes, size: size, version: CurrentSegmentVersion, maxSupportedSize: maxSupportedSize}
@@ -356,7 +377,10 @@ func (sm *Manager) loadSegments() error {
 			return utils.WrapError("failed to stat segment", entry.Name(), err)
 		}
 
-		segment := NewSegment(path, 0, 0, stat.Size(), sm.segmentSize)
+		// For open segments, we'll validate and determine actual size later
+		// For now, just track that it exists. Don't use stat.Size() as the initial
+		// size since it might be a sparse file with pre-allocated space.
+		segment := NewSegment(path, 0, 0, 0, sm.segmentSize)
 		segment.SetOpenFile(file)
 
 		// Determine if file has footer
@@ -428,6 +452,13 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		return utils.WrapError("seek to start for validation", seg.path, err)
 	}
 
+	// Get the actual file size (will be the full pre-allocated size for sparse files)
+	fileInfo, err := seg.file.Stat()
+	if err != nil {
+		return utils.WrapError("stat segment file", seg.path, err)
+	}
+	actualFileSize := fileInfo.Size()
+
 	for {
 		// Read header at current position
 		valLen, headerSize, keyLen, _, checksum, err := ReadValueHeaderAt(seg.file, pos)
@@ -451,7 +482,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		nextPos := pos + entryTotal
 
 		// Ensure we have full entry in file
-		if nextPos > seg.size {
+		if nextPos > actualFileSize {
 			if err := seg.file.Truncate(pos); err != nil {
 				return utils.WrapError("truncate partial entry", seg.path, err)
 			}
@@ -487,12 +518,12 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		pos = nextPos
 	}
 
-	zlog.Info().Str("path", seg.path).Msg("finished validating open segment")
+	zlog.Info().Str("path", seg.path).Int64("valid_data_size", pos).Int64("maxSupportedSize", seg.maxSupportedSize).Msg("finished validating open segment")
 
 	// Update segment struct
 	seg.entries = entries
 	seg.dataBytes = dataBytes
-	seg.size = pos
+	seg.size = pos // This tracks actual data written, not pre-allocated file size
 
 	// Seek file to end for further writes
 	if _, err := seg.file.Seek(pos, io.SeekStart); err != nil {
@@ -500,6 +531,25 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 	}
 
 	return nil
+}
+
+// GetSegments returns a copy of the current segments slice for testing/inspection.
+// The returned segments are safe to read but should not be modified.
+func (sm *Manager) GetSegments() []*Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	// Return a copy of the slice to prevent external modification
+	result := make([]*Segment, len(sm.segments))
+	copy(result, sm.segments)
+	return result
+}
+
+// GetSegmentCount returns the number of segments currently managed.
+func (sm *Manager) GetSegmentCount() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.segments)
 }
 
 // Close closes all segment files

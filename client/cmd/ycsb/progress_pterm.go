@@ -16,18 +16,18 @@ type PtermProgressReporter struct {
 	completedOps atomic.Int64
 	errorCount   atomic.Int64
 	startTime    time.Time
-	
+
 	// Per-operation type counters
 	opCounts [OpNum]atomic.Int64
-	
+
 	// Pterm components
 	progressBar *pterm.ProgressbarPrinter
 	liveText    *pterm.AreaPrinter
-	
+
 	// Metrics for display
-	currentOpsPerSec  atomic.Value // stores float64
-	overallOpsPerSec  atomic.Value // stores float64
-	lastLatencies     atomic.Value // stores LatencySnapshot
+	currentOpsPerSec atomic.Value // stores float64
+	overallOpsPerSec atomic.Value // stores float64
+	lastLatencies    atomic.Value // stores LatencySnapshot
 }
 
 type LatencySnapshot struct {
@@ -60,18 +60,17 @@ func (pr *PtermProgressReporter) Start() error {
 		WithShowElapsedTime(true).
 		WithRemoveWhenDone(true).
 		Start()
-	
 	if err != nil {
 		return err
 	}
 	pr.progressBar = progressBar
-	
+
 	// Create live text area for additional metrics
 	pr.liveText, _ = pterm.DefaultArea.Start()
-	
+
 	// Start metrics update goroutine
 	go pr.updateMetrics()
-	
+
 	return nil
 }
 
@@ -79,20 +78,20 @@ func (pr *PtermProgressReporter) Start() error {
 func (pr *PtermProgressReporter) updateMetrics() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	lastOps := int64(0)
 	lastTime := pr.startTime
-	
+
 	for range ticker.C {
 		completed := pr.completedOps.Load()
 		if completed >= pr.totalOps {
 			break
 		}
-		
+
 		// Calculate metrics
 		elapsed := time.Since(pr.startTime)
 		errors := pr.errorCount.Load()
-		
+
 		// Calculate ops/sec
 		intervalOps := completed - lastOps
 		intervalDuration := time.Since(lastTime).Seconds()
@@ -100,10 +99,10 @@ func (pr *PtermProgressReporter) updateMetrics() {
 			pr.currentOpsPerSec.Store(float64(intervalOps) / intervalDuration)
 		}
 		pr.overallOpsPerSec.Store(float64(completed) / elapsed.Seconds())
-		
+
 		// Build metrics display
 		var metrics string
-		
+
 		// Operations breakdown
 		metrics += pterm.LightCyan("Operations: ")
 		for i := range OpNum {
@@ -113,27 +112,27 @@ func (pr *PtermProgressReporter) updateMetrics() {
 			}
 		}
 		metrics += "\n"
-		
+
 		// Throughput
 		currentOps := pr.currentOpsPerSec.Load().(float64)
 		overallOps := pr.overallOpsPerSec.Load().(float64)
 		metrics += fmt.Sprintf("%s Current: %.0f ops/s | Overall: %.0f ops/s\n",
 			pterm.LightCyan("Throughput:"), currentOps, overallOps)
-		
+
 		// Error rate
 		errorRate := float64(errors) / float64(max(completed, 1)) * 100
 		metrics += fmt.Sprintf("%s %d (%.2f%%)\n",
 			pterm.LightCyan("Errors:"), errors, errorRate)
-		
+
 		// Latencies if available
 		if latSnapshot, ok := pr.lastLatencies.Load().(LatencySnapshot); ok && latSnapshot.P50 > 0 {
 			metrics += fmt.Sprintf("%s P50=%.1fms P95=%.1fms P99=%.1fms\n",
 				pterm.LightCyan("Latency:"), latSnapshot.P50, latSnapshot.P95, latSnapshot.P99)
 		}
-		
+
 		// Update live display
 		pr.liveText.Update(metrics)
-		
+
 		lastOps = completed
 		lastTime = time.Now()
 	}
@@ -143,11 +142,11 @@ func (pr *PtermProgressReporter) updateMetrics() {
 func (pr *PtermProgressReporter) RecordOp(opType OpType, latency time.Duration, err error) {
 	pr.completedOps.Add(1)
 	pr.opCounts[opType].Add(1)
-	
+
 	if err != nil {
 		pr.errorCount.Add(1)
 	}
-	
+
 	// Update progress bar
 	if pr.progressBar != nil {
 		pr.progressBar.Increment()
@@ -189,14 +188,14 @@ func (pr *PtermProgressReporter) GetStats() (completed int64, errors int64, opCo
 // DisplayFinalResults displays the final benchmark results using pterm tables
 func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 	pterm.Println() // Add spacing
-	
+
 	// Title with style
 	title := pterm.DefaultHeader.
 		WithFullWidth().
 		WithBackgroundStyle(pterm.NewStyle(pterm.BgGray)).
 		WithMargin(1)
 	title.Println("BENCHMARK RESULTS")
-	
+
 	// Create summary table
 	summaryTable := pterm.TableData{
 		{"Metric", "Value"},
@@ -206,18 +205,18 @@ func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 		{"Error Rate", fmt.Sprintf("%.2f%%", float64(result.Errors)/float64(cfg.NumOps)*100)},
 		{"Throughput", fmt.Sprintf("%.2f ops/s", float64(cfg.NumOps)/result.Duration.Seconds())},
 	}
-	
+
 	pterm.DefaultTable.
 		WithHasHeader(true).
 		WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
 		WithBoxed(true).
 		WithData(summaryTable).
 		Render()
-	
+
 	// Latency percentiles
 	if len(result.Latencies) > 0 {
 		pterm.DefaultSection.Println("Latency Percentiles (ms)")
-		
+
 		latencyTable := pterm.TableData{
 			{"P50", "P95", "P99", "P99.9", "Max"},
 			{
@@ -228,7 +227,7 @@ func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 				fmt.Sprintf("%.2f", float64(percentile(result.Latencies, 1.00))/float64(time.Millisecond)),
 			},
 		}
-		
+
 		pterm.DefaultTable.
 			WithHasHeader(true).
 			WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
@@ -236,21 +235,21 @@ func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 			WithData(latencyTable).
 			Render()
 	}
-	
+
 	// Operations breakdown
 	if len(totalOps) > 0 {
 		pterm.DefaultSection.Println("Operations Breakdown")
-		
+
 		opsTable := pterm.TableData{
 			{"Operation", "Count", "Percentage", "Throughput"},
 		}
-		
+
 		for i := range int(OpNum) {
 			if i < len(totalOps) && totalOps[i] > 0 {
 				count := totalOps[i]
 				percent := float64(count) / float64(cfg.NumOps) * 100
 				opsPerSec := float64(count) / result.Duration.Seconds()
-				
+
 				opsTable = append(opsTable, []string{
 					opNames[i],
 					fmt.Sprintf("%d", count),
@@ -259,7 +258,7 @@ func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 				})
 			}
 		}
-		
+
 		pterm.DefaultTable.
 			WithHasHeader(true).
 			WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
@@ -267,21 +266,21 @@ func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 			WithData(opsTable).
 			Render()
 	}
-	
+
 	pterm.Println() // Final spacing
 }
 
 // DisplayFinalResultsWithMetrics displays the final benchmark results with enhanced metrics
 func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []int, metrics *MetricsCollector) {
 	pterm.Println() // Add spacing
-	
+
 	// Title with style
 	title := pterm.DefaultHeader.
 		WithFullWidth().
 		WithBackgroundStyle(pterm.NewStyle(pterm.BgGray)).
 		WithMargin(1)
 	title.Println("BENCHMARK RESULTS")
-	
+
 	// Create summary table
 	summaryTable := pterm.TableData{
 		{"Metric", "Value"},
@@ -291,23 +290,23 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 		{"Error Rate", fmt.Sprintf("%.2f%%", float64(result.Errors)/float64(cfg.NumOps)*100)},
 		{"Throughput", fmt.Sprintf("%.2f ops/s", float64(cfg.NumOps)/result.Duration.Seconds())},
 	}
-	
+
 	pterm.DefaultTable.
 		WithHasHeader(true).
 		WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
 		WithBoxed(true).
 		WithData(summaryTable).
 		Render()
-	
+
 	// Per-Operation Statistics
 	opStats := metrics.GetPerOperationStats()
 	if len(opStats) > 0 {
 		pterm.DefaultSection.Println("Per-Operation Latency Statistics")
-		
+
 		opsLatencyTable := pterm.TableData{
 			{"Operation", "Count", "Errors", "Min", "P50", "P95", "P99", "P99.9", "Max", "Avg"},
 		}
-		
+
 		for opType, stats := range opStats {
 			if opType < OpNum {
 				errorRate := "0.0%"
@@ -328,7 +327,7 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 				})
 			}
 		}
-		
+
 		pterm.DefaultTable.
 			WithHasHeader(true).
 			WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
@@ -336,12 +335,12 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 			WithData(opsLatencyTable).
 			Render()
 	}
-	
+
 	// Latency Histogram
 	histogram := metrics.GetHistogram()
 	if len(histogram) > 0 {
 		pterm.DefaultSection.Println("Latency Distribution Histogram")
-		
+
 		// Find max count for scaling
 		maxCount := 0
 		totalCount := 0
@@ -351,29 +350,29 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 			}
 			totalCount += b.Count
 		}
-		
+
 		if maxCount > 0 {
 			histogramData := []pterm.Bar{}
-			
+
 			for _, bucket := range histogram {
 				if bucket.Count == 0 {
 					continue
 				}
-				
+
 				var label string
 				if bucket.Max == time.Duration(math.MaxInt64) {
 					label = fmt.Sprintf("> %s", formatDuration(bucket.Min))
 				} else {
 					label = fmt.Sprintf("%s-%s", formatDuration(bucket.Min), formatDuration(bucket.Max))
 				}
-				
+
 				percentage := float64(bucket.Count) / float64(totalCount) * 100
 				histogramData = append(histogramData, pterm.Bar{
 					Label: fmt.Sprintf("%-15s (%d, %.1f%%)", label, bucket.Count, percentage),
 					Value: bucket.Count,
 				})
 			}
-			
+
 			if len(histogramData) > 0 {
 				pterm.DefaultBarChart.
 					WithBars(histogramData).
@@ -384,7 +383,7 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 			}
 		}
 	}
-	
+
 	// Throughput Analysis
 	throughputSeries := metrics.GetThroughputSeries()
 	// Filter for aggregate throughput only (OpType == OpNum)
@@ -394,12 +393,12 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 			aggregateSeries = append(aggregateSeries, point)
 		}
 	}
-	
+
 	if len(aggregateSeries) > 0 {
 		summary := AnalyzeThroughput(aggregateSeries)
-		
+
 		pterm.DefaultSection.Println("Throughput Analysis")
-		
+
 		throughputTable := pterm.TableData{
 			{"Metric", "Value"},
 			{"Minimum", fmt.Sprintf("%.2f ops/s", summary.MinThroughput)},
@@ -408,20 +407,20 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 			{"Std Deviation", fmt.Sprintf("%.2f ops/s", summary.StdDevThroughput)},
 			{"Trend", summary.ThroughputTrend},
 		}
-		
+
 		pterm.DefaultTable.
 			WithHasHeader(true).
 			WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
 			WithBoxed(true).
 			WithData(throughputTable).
 			Render()
-		
+
 		// Show a simple throughput trend chart
 		if len(aggregateSeries) > 20 {
 			// Sample points for visualization
 			step := len(aggregateSeries) / 20
 			chartData := []pterm.Bar{}
-			
+
 			for i := 0; i < len(aggregateSeries); i += step {
 				point := aggregateSeries[i]
 				timeLabel := fmt.Sprintf("%.1fs", point.Time.Seconds())
@@ -430,7 +429,7 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 					Value: int(point.OpsPerSec),
 				})
 			}
-			
+
 			pterm.Println("Throughput Over Time:")
 			pterm.DefaultBarChart.
 				WithBars(chartData).
@@ -439,22 +438,22 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 				Render()
 		}
 	}
-	
+
 	// Error Breakdown
 	errorsByType, errorsByOp := metrics.GetErrorBreakdown()
 	if len(errorsByType) > 0 || len(errorsByOp) > 0 {
 		pterm.DefaultSection.Println("Error Analysis")
-		
+
 		if len(errorsByOp) > 0 {
 			errorOpTable := pterm.TableData{
 				{"Operation", "Error Count", "Percentage"},
 			}
-			
+
 			totalErrors := 0
 			for _, count := range errorsByOp {
 				totalErrors += count
 			}
-			
+
 			for opType, count := range errorsByOp {
 				if opType < OpNum && count > 0 {
 					percentage := float64(count) / float64(totalErrors) * 100
@@ -465,7 +464,7 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 					})
 				}
 			}
-			
+
 			if len(errorOpTable) > 1 {
 				pterm.Println("Errors by Operation:")
 				pterm.DefaultTable.
@@ -476,17 +475,17 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 					Render()
 			}
 		}
-		
+
 		if len(errorsByType) > 0 {
 			errorTypeTable := pterm.TableData{
 				{"Error Type", "Count", "Percentage"},
 			}
-			
+
 			totalErrors := 0
 			for _, count := range errorsByType {
 				totalErrors += count
 			}
-			
+
 			// Sort errors by count for better display
 			type errorEntry struct {
 				errType string
@@ -499,30 +498,30 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 			sort.Slice(errorList, func(i, j int) bool {
 				return errorList[i].count > errorList[j].count
 			})
-			
+
 			// Show top 10 error types
 			maxErrors := 10
 			if len(errorList) < maxErrors {
 				maxErrors = len(errorList)
 			}
-			
+
 			for i := 0; i < maxErrors; i++ {
 				entry := errorList[i]
 				percentage := float64(entry.count) / float64(totalErrors) * 100
-				
+
 				// Truncate long error messages
 				errMsg := entry.errType
 				if len(errMsg) > 50 {
 					errMsg = errMsg[:47] + "..."
 				}
-				
+
 				errorTypeTable = append(errorTypeTable, []string{
 					errMsg,
 					fmt.Sprintf("%d", entry.count),
 					fmt.Sprintf("%.1f%%", percentage),
 				})
 			}
-			
+
 			if len(errorList) > maxErrors {
 				otherCount := 0
 				for i := maxErrors; i < len(errorList); i++ {
@@ -535,7 +534,7 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 					fmt.Sprintf("%.1f%%", percentage),
 				})
 			}
-			
+
 			pterm.Println("\nErrors by Type (Top 10):")
 			pterm.DefaultTable.
 				WithHasHeader(true).
@@ -545,6 +544,6 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 				Render()
 		}
 	}
-	
+
 	pterm.Println() // Final spacing
 }

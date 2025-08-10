@@ -142,11 +142,11 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 	spinner, _ := pterm.DefaultSpinner.
 		WithText(fmt.Sprintf("Preloading %d keys...", cfg.NumKeys)).
 		Start()
-	
+
 	var preloadErrors int32
 	var successCount int32
 	errorCh := make(chan error, 100)
-	
+
 	for i := range cfg.NumKeys {
 		// Check for context cancellation
 		select {
@@ -155,7 +155,7 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 			return ctx.Err()
 		default:
 		}
-		
+
 		k := hashKey(i)
 		val := generateValue(rng, cfg.ValueSize)
 		err := pool.Execute(ctx, func(ctx context.Context, c *cacheclient.Client) error {
@@ -170,15 +170,15 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 		} else {
 			atomic.AddInt32(&successCount, 1)
 		}
-		
+
 		if i%100 == 0 {
-			spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)", 
+			spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)",
 				i+1, cfg.NumKeys, atomic.LoadInt32(&preloadErrors)))
 		}
 	}
-	
+
 	close(errorCh)
-	
+
 	// Collect sample of errors
 	var sampleErrors []error
 	for err := range errorCh {
@@ -186,10 +186,10 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 			sampleErrors = append(sampleErrors, err)
 		}
 	}
-	
+
 	totalErrors := atomic.LoadInt32(&preloadErrors)
 	if totalErrors > 0 {
-		spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)", 
+		spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)",
 			atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
 		if int(totalErrors) > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
 			if len(sampleErrors) > 0 {
@@ -248,11 +248,11 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	if cfg.Concurrency < 1 {
 		return Result{}, fmt.Errorf("Concurrency must be at least 1")
 	}
-	
+
 	// Create a cancellable context for the entire benchmark
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	
+
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	ws, err := ParseWorkload(cfg.Workload)
 	if err != nil {
@@ -276,7 +276,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 
 	// Create metrics collector
 	metricsCollector := NewMetricsCollector()
-	
+
 	// Create pterm progress reporter
 	progressReporter := NewPtermProgressReporter(cfg.NumOps)
 	if err := progressReporter.Start(); err != nil {
@@ -286,10 +286,10 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 
 	// Channel for aggregate throughput tracking
 	throughputCh := make(chan struct {
-		ops int
+		ops    int
 		opType OpType
 	}, 1000) // Buffered to avoid blocking workers
-	
+
 	// Start goroutine to track aggregate throughput
 	var throughputWg sync.WaitGroup
 	throughputWg.Add(1)
@@ -298,7 +298,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		lastTime := time.Now()
 		opsInInterval := 0
 		opTypeCounts := make(map[OpType]int)
-		
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -309,14 +309,14 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 				}
 				opsInInterval += update.ops
 				opTypeCounts[update.opType] += update.ops
-				
+
 				// Record aggregate throughput every 100ms
 				if time.Since(lastTime) >= 100*time.Millisecond {
 					if opsInInterval > 0 {
 						throughput := float64(opsInInterval) / time.Since(lastTime).Seconds()
 						// Record overall aggregate throughput
 						metricsCollector.RecordThroughput(throughput, OpNum) // OpNum as sentinel for aggregate
-						
+
 						// Also record per-operation type throughput
 						for opType, count := range opTypeCounts {
 							if count > 0 {
@@ -324,7 +324,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 								metricsCollector.RecordThroughput(opThroughput, opType)
 							}
 						}
-						
+
 						opsInInterval = 0
 						opTypeCounts = make(map[OpType]int)
 						lastTime = time.Now()
@@ -344,16 +344,20 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	t0 := time.Now()
 	for i := range cfg.Concurrency {
 		wg.Add(1)
-		seed := rng.Int63() // Each goroutine gets its own seed
+		seed := rng.Int63()  // Each goroutine gets its own seed
 		client := clients[i] // Assign dedicated client to each worker
-		go func(workerID int, seed int64, c *cacheclient.Client, reporter *PtermProgressReporter, metrics *MetricsCollector, throughputCh chan<- struct{ops int; opType OpType}) {
+		go func(workerID int, seed int64, c *cacheclient.Client, reporter *PtermProgressReporter, metrics *MetricsCollector, throughputCh chan<- struct {
+			ops    int
+			opType OpType
+		},
+		) {
 			defer wg.Done()
 			localRng := rand.New(rand.NewSource(seed))
 			errCount := 0
 			// Pre-allocate latencies slice with exact capacity to avoid reallocation
 			latencies := make([]time.Duration, 0, opsPerWorker)
 			opCounts := make([]int, OpNum) // Track count for each op type
-			
+
 			for opIdx := 0; opIdx < opsPerWorker; opIdx++ {
 				// Check for context cancellation
 				select {
@@ -367,13 +371,13 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 					return
 				default:
 				}
-				
+
 				keyNum := localRng.Intn(cfg.NumKeys)
 				k := hashKey(keyNum)
 				op := pickOp(ws.Weights, localRng)
 				start := time.Now()
 				var opErr error
-				
+
 				// Use context with timeout for individual operations
 				opCtx, opCancel := context.WithTimeout(ctx, 5*time.Second)
 				switch op {
@@ -385,7 +389,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 				}
 				opCancel()
 				latency := time.Since(start)
-				
+
 				// Check for connection errors and abort worker if connection is lost
 				if opErr != nil && isConnectionError(opErr) {
 					// Log critical error and exit worker
@@ -399,20 +403,23 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 					}{errCount + remainingOps + 1, latencies, opCounts}
 					return
 				}
-				
+
 				// Report to progress tracker
 				reporter.RecordOp(op, latency, opErr)
-				
+
 				// Record in metrics collector
 				metrics.RecordOperation(op, latency, opErr)
-				
+
 				// Send operation to throughput tracker
 				select {
-				case throughputCh <- struct{ops int; opType OpType}{1, op}:
+				case throughputCh <- struct {
+					ops    int
+					opType OpType
+				}{1, op}:
 				default:
 					// Channel is full, skip this update to avoid blocking
 				}
-				
+
 				// Keep local stats for final report
 				if opErr != nil {
 					errCount++
@@ -431,10 +438,10 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	close(throughputCh) // Stop the throughput tracking goroutine
 	throughputWg.Wait() // Wait for throughput goroutine to finish
 	dur := time.Since(t0)
-	
+
 	// Stop progress reporter before processing results
 	progressReporter.Stop()
-	
+
 	totalErr := 0
 	allLatencies := make([]time.Duration, 0, cfg.NumOps)
 	totalOps := make([]int, OpNum)
@@ -451,7 +458,6 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 
 	// Display final results using pterm with enhanced metrics
 	DisplayFinalResultsWithMetrics(cfg, result, totalOps, metricsCollector)
-
 
 	return result, nil
 }

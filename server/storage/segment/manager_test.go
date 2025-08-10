@@ -126,9 +126,17 @@ func TestManager_RegisterSegment(t *testing.T) {
 
 	manager.RegisterSegment(path, entries, bytes)
 
-	manager.mu.RLock()
-	seg, exists := manager.segMap[path]
-	manager.mu.RUnlock()
+	// Check if segment was registered (we need to access internal state for this specific test)
+	segments := manager.GetSegments()
+	var seg *Segment
+	exists := false
+	for _, s := range segments {
+		if s.Path() == path {
+			seg = s
+			exists = true
+			break
+		}
+	}
 
 	if !exists {
 		t.Error("Segment was not registered in segMap")
@@ -454,9 +462,7 @@ func TestManager_LoadSegments(t *testing.T) {
 	}
 	defer manager.Close()
 
-	manager.mu.RLock()
-	numSegments := len(manager.segments)
-	manager.mu.RUnlock()
+	numSegments := manager.GetSegmentCount()
 
 	if numSegments != 1 {
 		t.Errorf("Expected 1 loaded segment, got %d", numSegments)
@@ -490,9 +496,7 @@ func TestManager_MultipleOpenSegments(t *testing.T) {
 	}
 	defer manager.Close()
 
-	manager.mu.RLock()
-	numSegments := len(manager.segments)
-	manager.mu.RUnlock()
+	numSegments := manager.GetSegmentCount()
 
 	if numSegments > 1 {
 		t.Logf("Manager handled multiple open segments: %d segments", numSegments)
@@ -536,6 +540,188 @@ func TestReadCloserWithOnClose_NilCallback(t *testing.T) {
 	err := rc.Close()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManager_ValidateOpenSegment(t *testing.T) {
+	basePath := t.TempDir()
+	segmentSize := int64(256 * 1024 * 1024) // 256MB like in production
+	segmentsPath := filepath.Join(basePath, "segments")
+
+	if err := os.MkdirAll(segmentsPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a sparse segment file pre-allocated to full size
+	segFile := filepath.Join(segmentsPath, "segment_test.seg")
+	f, err := os.Create(segFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-allocate the file to segment size (creates sparse file)
+	if err := f.Truncate(segmentSize); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write some actual data at the beginning
+	userKey1 := "test-key-1"
+	value1 := []byte("test value data 1")
+	header1 := BuildValueHeader(userKey1, int64(len(value1)), 0, CurrentValueHeaderVersion)
+	if _, err := f.Write(header1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(value1); err != nil {
+		t.Fatal(err)
+	}
+
+	userKey2 := "test-key-2"
+	value2 := []byte("test value data 2 longer")
+	header2 := BuildValueHeader(userKey2, int64(len(value2)), 0, CurrentValueHeaderVersion)
+	if _, err := f.Write(header2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(value2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Calculate expected actual data size
+	expectedSize := int64(len(header1) + len(value1) + len(header2) + len(value2))
+
+	// Verify file is sparse (file size should be full segment size)
+	fileInfo, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileInfo.Size() != segmentSize {
+		t.Errorf("Pre-allocated file size should be %d, got %d", segmentSize, fileInfo.Size())
+	}
+
+	f.Close()
+
+	// Now test loading and validating the segment
+	_ = fd.NewFdCache(100)
+
+	manager, err := NewManager(basePath, segmentSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	// Get the loaded segment
+	segments := manager.GetSegments()
+	if len(segments) != 1 {
+		t.Fatalf("Expected 1 segment, got %d", len(segments))
+	}
+	seg := segments[0]
+
+	// Verify that validateOpenSegment set the correct actual data size
+	if seg.size != expectedSize {
+		t.Errorf("validateOpenSegment should set size to actual data (%d), got %d", expectedSize, seg.size)
+	}
+
+	// Verify maxSupportedSize is still the full segment size
+	if seg.maxSupportedSize != segmentSize {
+		t.Errorf("maxSupportedSize should remain %d, got %d", segmentSize, seg.maxSupportedSize)
+	}
+
+	// Verify remaining space calculation is correct
+	expectedRemaining := segmentSize - expectedSize
+	actualRemaining := seg.Remaining()
+	if actualRemaining != expectedRemaining {
+		t.Errorf("Remaining() should return %d, got %d", expectedRemaining, actualRemaining)
+	}
+
+	// Verify entry count
+	if seg.entries != 2 {
+		t.Errorf("Expected 2 entries, got %d", seg.entries)
+	}
+
+	// Verify data bytes count
+	expectedDataBytes := int64(len(value1) + len(value2))
+	if seg.dataBytes != expectedDataBytes {
+		t.Errorf("Expected dataBytes %d, got %d", expectedDataBytes, seg.dataBytes)
+	}
+}
+
+func TestManager_ValidateOpenSegmentWithCorruption(t *testing.T) {
+	basePath := t.TempDir()
+	segmentSize := int64(256 * 1024 * 1024)
+	segmentsPath := filepath.Join(basePath, "segments")
+
+	if err := os.MkdirAll(segmentsPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a segment file with valid data followed by corruption
+	segFile := filepath.Join(segmentsPath, "segment_corrupt.seg")
+	f, err := os.Create(segFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-allocate the file
+	if err := f.Truncate(segmentSize); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write valid entry
+	userKey := "valid-key"
+	value := []byte("valid data")
+	header := BuildValueHeader(userKey, int64(len(value)), 0, CurrentValueHeaderVersion)
+	if _, err := f.Write(header); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(value); err != nil {
+		t.Fatal(err)
+	}
+
+	validDataSize := int64(len(header) + len(value))
+
+	// Write corrupted/incomplete header
+	corruptHeader := []byte{0xFF, 0xFF, 0xFF, 0xFF} // Invalid header
+	if _, err := f.Write(corruptHeader); err != nil {
+		t.Fatal(err)
+	}
+
+	f.Close()
+
+	// Load and validate
+	_ = fd.NewFdCache(100)
+
+	manager, err := NewManager(basePath, segmentSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	// Get the loaded segment
+	segments := manager.GetSegments()
+	if len(segments) != 1 {
+		t.Fatalf("Expected 1 segment, got %d", len(segments))
+	}
+	seg := segments[0]
+
+	// Should only count valid data before corruption
+	if seg.size != validDataSize {
+		t.Errorf("validateOpenSegment should truncate at valid data (%d), got %d", validDataSize, seg.size)
+	}
+
+	if seg.entries != 1 {
+		t.Errorf("Expected 1 valid entry, got %d", seg.entries)
+	}
+
+	if seg.dataBytes != int64(len(value)) {
+		t.Errorf("Expected dataBytes %d, got %d", len(value), seg.dataBytes)
+	}
+
+	// Verify the file was actually truncated
+	fileInfo, err := os.Stat(segFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileInfo.Size() != validDataSize {
+		t.Errorf("File should be truncated to %d, got %d", validDataSize, fileInfo.Size())
 	}
 }
 
