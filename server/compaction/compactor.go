@@ -3,6 +3,7 @@ package compaction
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -468,43 +469,42 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 	// Remove obsolete raw files on best-effort basis
 	// Files that are currently being read will be skipped and left for next compaction run.
 	zlog.Debug().Int("count", len(toDelete)).Msg("compactor: starting file deletion")
+
+	filesDeleted := 0
 	skippedFiles := 0
-	for i, p := range toDelete {
+	for _, p := range toDelete {
 		// Check if context is cancelled during cleanup
 		if err := ctx.Err(); err != nil {
 			zlog.Info().Msg("compactor: file cleanup interrupted by cancellation")
 			return nil
 		}
 
-		deleted, err := c.fm.TryRemove(p)
+		err := c.fm.Remove(p)
 		if err != nil {
-			zlog.Error().
-				Err(err).
-				Str("path", p).
-				Int("index", i).
-				Msg("compactor: failed to delete file")
+			if errors.Is(err, files.ErrFileLocked) {
+				skippedFiles++
+				if skippedFiles <= 10 {
+					zlog.Debug().Str("path", p).Msg("compactor: file locked for reading, will retry in next compaction")
+				}
+			} else {
+				zlog.Error().Err(err).Str("path", p).Msg("compactor: failed to delete file")
+			}
+
 			continue
 		}
 
-		if !deleted {
-			// File is currently locked for reading, will be cleaned up in next compaction
-			skippedFiles++
-			if skippedFiles <= 10 {
-				zlog.Debug().
-					Str("path", p).
-					Msg("compactor: file locked for reading, will retry in next compaction")
-			}
+		filesDeleted++
+		if filesDeleted <= 10 || filesDeleted%100 == 0 {
+			zlog.Debug().Str("path", p).Int("deleted_so_far", filesDeleted).Msg("compactor: deleted file")
 		}
 	}
 
 	if skippedFiles > 0 {
-		zlog.Info().
-			Int("deleted", len(toDelete)-skippedFiles).
-			Int("skipped", skippedFiles).
-			Msg("compactor: completed file deletion with some files locked")
-	} else {
-		zlog.Debug().Int("count", len(toDelete)).Msg("compactor: completed file deletion")
+		zlog.Info().Int("deleted", filesDeleted).Int("skipped", skippedFiles).Int("total", len(toDelete)).Msg("compactor: commit completed with some files skipped")
+	} else if filesDeleted > 0 {
+		zlog.Info().Int("deleted", filesDeleted).Msg("compactor: commit completed, all files deleted")
 	}
+
 	return nil
 }
 
