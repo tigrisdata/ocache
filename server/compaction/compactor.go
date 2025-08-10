@@ -160,12 +160,7 @@ func (c *Compactor) CompactFilesWithContext(ctx context.Context, maxBytes int64)
 		// Check if context is cancelled
 		if err := ctx.Err(); err != nil {
 			zlog.Info().Msg("compactor: interrupted by cancellation")
-			// Commit what we've processed so far
-			if wb.Count() > 0 {
-				if err := c.commitWithContext(ctx, seg, wb, filesToDel); err != nil {
-					zlog.Error().Err(err).Msg("compactor: commit failed during cancellation")
-				}
-			}
+			// Don't attempt to commit when cancelled - just return
 			return
 		}
 		k := it.Key().Data()
