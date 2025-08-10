@@ -1,6 +1,7 @@
 package files
 
 import (
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -14,6 +15,9 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 )
+
+// ErrFileLocked is returned when a file cannot be removed because it's locked for reading
+var ErrFileLocked = errors.New("file is locked for reading")
 
 // fileReadCloser wraps a Reader and closes the underlying file while
 // releasing the per-file read lock when Close is invoked.
@@ -131,7 +135,15 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 func (fm *FileManager) Remove(filePath string) error {
 	// Get file-specific lock (use GetFileLock, not Acquire, to avoid opening the file)
 	fileLock := fm.fdCache.GetFileLock(filePath)
-	fileLock.Lock()
+
+	// Try to acquire lock without blocking
+	// If we can't get the lock immediately, the file is being read
+	if !fileLock.TryLock() {
+		zlog.Warn().Str("path", filePath).Msg("fileManager: file is currently being read, skipping deletion")
+		// Return a specific error that the compactor can recognize
+		return ErrFileLocked
+	}
+
 	defer fileLock.Unlock()
 
 	if err := os.Remove(filePath); err != nil {
@@ -148,4 +160,18 @@ func (fm *FileManager) Remove(filePath string) error {
 
 	zlog.Debug().Str("path", filePath).Msg("fileManager: deleted file")
 	return nil
+}
+
+// TryRemove attempts to remove a file but returns false if it's currently locked for reading.
+// This is useful for the compactor which can defer deletion of locked files.
+func (fm *FileManager) TryRemove(filePath string) (bool, error) {
+	err := fm.Remove(filePath)
+	if err != nil {
+		// Check if it's a lock error
+		if errors.Is(err, ErrFileLocked) {
+			return false, nil // File is locked but no actual error
+		}
+		return false, err // Real error occurred
+	}
+	return true, nil // Successfully deleted
 }
