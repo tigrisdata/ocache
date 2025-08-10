@@ -100,6 +100,11 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	if !found {
 		return status.Error(codes.NotFound, "key not found")
 	}
+	
+	// Ensure the reader is closed to release any file locks
+	if closer, ok := r.(io.Closer); ok {
+		defer closer.Close()
+	}
 
 	// Seek to start if possible
 	if start > 0 {
