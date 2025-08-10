@@ -77,16 +77,16 @@ func (c *Compactor) Start() {
 
 // Close stops the background compaction loop and waits for it to exit.
 func (c *Compactor) Close() {
-	if c == nil || c.cancel == nil {
+	if c == nil {
 		return
 	}
-	// Cancel the context to signal shutdown
-	c.cancel()
-	// Wait for all goroutines to complete before returning
-	c.wg.Wait()
-	// Set cancel to nil to prevent double-close
-	c.cancel = nil
-	zlog.Info().Msg("compactor: shutdown completed")
+	
+	if c.cancel != nil {
+		c.cancel()
+		c.wg.Wait()
+		c.cancel = nil
+		zlog.Info().Msg("compactor: shutdown completed")
+	}
 }
 
 // compactionLoop triggers file compaction on a timer until Close is called.
