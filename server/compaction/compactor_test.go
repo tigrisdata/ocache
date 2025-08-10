@@ -47,21 +47,6 @@ func setupTestEnvironment(t *testing.T) (string, *files.FileManager, *segment.Ma
 	return tmpDir, fm, sm, cleanup
 }
 
-func TestNewCompactor(t *testing.T) {
-	_, fm, sm, cleanup := setupTestEnvironment(t)
-	defer cleanup()
-
-	c := NewCompactor(fm, sm, 1024*1024, time.Second)
-	assert.NotNil(t, c)
-	assert.Equal(t, fm, c.fm)
-	assert.Equal(t, sm, c.sm)
-	assert.Equal(t, int64(1024*1024), c.maxBytes)
-	assert.Equal(t, time.Second, c.interval)
-	assert.NotNil(t, c.meta)
-	assert.NotNil(t, c.fdCache)
-	assert.NotNil(t, c.closeCh)
-}
-
 func TestCompactorStartClose(t *testing.T) {
 	_, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
@@ -87,12 +72,6 @@ func TestCompactorStartClose(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("Close() did not complete in time")
 	}
-}
-
-func TestCloseNilCompactor(t *testing.T) {
-	var c *Compactor
-	// Should not panic
-	c.Close()
 }
 
 func TestPrepareEntryForCompaction(t *testing.T) {

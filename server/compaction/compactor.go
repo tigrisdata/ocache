@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -46,13 +47,15 @@ type Compactor struct {
 	interval time.Duration
 
 	// background loop coordination
-	closeCh chan struct{}
-	wg      sync.WaitGroup
+	cancel context.CancelFunc
+	ctx    context.Context
+	wg     sync.WaitGroup
 }
 
 // NewCompactor creates a new Compactor bound to the provided FileManager and
 // Segment Manager.
 func NewCompactor(fm *files.FileManager, sm *segment.Manager, maxBytes int64, interval time.Duration) *Compactor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Compactor{
 		fm:       fm,
 		sm:       sm,
@@ -60,7 +63,8 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, maxBytes int64, in
 		fdCache:  fd.GetFdCache(),
 		maxBytes: maxBytes,
 		interval: interval,
-		closeCh:  make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 }
 
@@ -76,8 +80,9 @@ func (c *Compactor) Close() {
 	if c == nil {
 		return
 	}
-	close(c.closeCh)
+	c.cancel()
 	c.wg.Wait()
+	zlog.Info().Msg("compactor: shutdown completed")
 }
 
 // compactionLoop triggers file compaction on a timer until Close is called.
@@ -92,8 +97,8 @@ func (c *Compactor) compactionLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			c.CompactFiles(c.maxBytes)
-		case <-c.closeCh:
+			c.CompactFilesWithContext(c.ctx, c.maxBytes)
+		case <-c.ctx.Done():
 			zlog.Info().Msg("compactor: background loop stopping")
 			return
 		}
@@ -111,6 +116,11 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 
 // CompactFiles scans the RocksDB file-index and migrates files into segments.
 func (c *Compactor) CompactFiles(maxBytes int64) {
+	c.CompactFilesWithContext(c.ctx, maxBytes)
+}
+
+// CompactFilesWithContext scans the RocksDB file-index and migrates files into segments with context support.
+func (c *Compactor) CompactFilesWithContext(ctx context.Context, maxBytes int64) {
 	zlog.Info().Int64("maxBytes", maxBytes).Msg("compactor: starting file compaction")
 
 	// RocksDB iterator setup
@@ -135,6 +145,17 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 
 	filePrefix := []byte("!compact/")
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
+		// Check if context is cancelled
+		if err := ctx.Err(); err != nil {
+			zlog.Info().Msg("compactor: interrupted by cancellation")
+			// Commit what we've processed so far
+			if wb.Count() > 0 {
+				if err := c.commitWithContext(ctx, seg, wb, filesToDel); err != nil {
+					zlog.Error().Err(err).Msg("compactor: commit failed during cancellation")
+				}
+			}
+			return
+		}
 		k := it.Key().Data()
 		v := it.Value().Data()
 
@@ -215,7 +236,11 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 		slice.Free()
 
 		// Ensure we have space in the current segment.
-		if err := c.ensureCapacity(&seg, vm.ValueLength); err != nil {
+		if err := c.ensureCapacityWithContext(ctx, &seg, vm.ValueLength); err != nil {
+			if err == context.Canceled {
+				zlog.Info().Msg("compactor: segment rotation cancelled")
+				return
+			}
 			zlog.Error().Err(err).Msg("compactor: segment rotation failed")
 			return
 		}
@@ -226,9 +251,13 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: open failed")
 			continue
 		}
-		if err := c.copyFileIntoSegment(seg, userKey, f, vm); err != nil {
-			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: copy failed")
+		if err := c.copyFileIntoSegmentWithContext(ctx, seg, userKey, f, vm); err != nil {
 			f.Close()
+			if err == context.Canceled {
+				zlog.Info().Msg("compactor: file copy cancelled")
+				return
+			}
+			zlog.Error().Err(err).Str("key", userKey).Msg("compactor: copy failed")
 			continue
 		}
 		f.Close()
@@ -245,8 +274,10 @@ func (c *Compactor) CompactFiles(maxBytes int64) {
 	}
 
 	// Final commit.
-	if err := c.commit(seg, wb, filesToDel); err != nil {
-		zlog.Error().Err(err).Msg("compactor: commit failed")
+	if err := c.commitWithContext(ctx, seg, wb, filesToDel); err != nil {
+		if err != context.Canceled {
+			zlog.Error().Err(err).Msg("compactor: commit failed")
+		}
 		return
 	}
 
@@ -272,7 +303,17 @@ func parseFileIndexRow(k, v []byte) (userKey, filePath string, ok bool) {
 
 // copyFileIntoSegment copies the file into an open segment using the
 // existing segment pipeline and updates the ValueMessage.
-func (c *Compactor) copyFileIntoSegment(seg *segment.Segment, userKey string, f *os.File, vm *pb.ValueMessage) (err error) {
+func (c *Compactor) copyFileIntoSegment(seg *segment.Segment, userKey string, f *os.File, vm *pb.ValueMessage) error {
+	return c.copyFileIntoSegmentWithContext(c.ctx, seg, userKey, f, vm)
+}
+
+// copyFileIntoSegmentWithContext copies the file into an open segment with context support.
+func (c *Compactor) copyFileIntoSegmentWithContext(ctx context.Context, seg *segment.Segment, userKey string, f *os.File, vm *pb.ValueMessage) error {
+	// Check if context is cancelled before I/O operation
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	segOff, err := c.sm.WriteEntry(seg, userKey, f, vm)
 	if err != nil {
 		return err
@@ -288,8 +329,23 @@ func (c *Compactor) copyFileIntoSegment(seg *segment.Segment, userKey string, f 
 
 // commit commits pending RocksDB mutations and deletes migrated files.
 func (c *Compactor) commit(seg *segment.Segment, wb *grocksdb.WriteBatch, toDelete []string) error {
+	return c.commitWithContext(c.ctx, seg, wb, toDelete)
+}
+
+// commitWithContext commits pending RocksDB mutations and deletes migrated files with context support.
+func (c *Compactor) commitWithContext(ctx context.Context, seg *segment.Segment, wb *grocksdb.WriteBatch, toDelete []string) error {
 	if wb.Count() == 0 {
 		return nil // nothing to do
+	}
+
+	// Check if context is cancelled
+	if err := ctx.Err(); err != nil {
+		zlog.Info().Msg("compactor: skipping sync due to cancellation")
+		// Still try to write metadata to avoid inconsistency
+		if err := c.meta.Handle().Write(grocksdb.NewDefaultWriteOptions(), wb); err != nil {
+			return err
+		}
+		return err
 	}
 
 	// Persist segment first so that metadata can safely reference it.
@@ -303,6 +359,11 @@ func (c *Compactor) commit(seg *segment.Segment, wb *grocksdb.WriteBatch, toDele
 
 	// Remove obsolete raw files on best-effort basis
 	for _, p := range toDelete {
+		// Check if context is cancelled during cleanup
+		if err := ctx.Err(); err != nil {
+			zlog.Info().Msg("compactor: file cleanup interrupted by cancellation")
+			return nil
+		}
 		c.fm.Remove(p)
 	}
 	return nil
@@ -311,12 +372,24 @@ func (c *Compactor) commit(seg *segment.Segment, wb *grocksdb.WriteBatch, toDele
 // ensureCapacity ensures that the segment has at least the needed bytes
 // available, finalising and acquiring a fresh segment when necessary.
 func (c *Compactor) ensureCapacity(seg **segment.Segment, needed int64) error {
+	return c.ensureCapacityWithContext(c.ctx, seg, needed)
+}
+
+// ensureCapacityWithContext ensures capacity with context support.
+func (c *Compactor) ensureCapacityWithContext(ctx context.Context, seg **segment.Segment, needed int64) error {
 	if (*seg).Remaining() >= needed {
 		return nil
 	}
+
+	// Check if context is cancelled before finalizing
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	if err := c.sm.FinalizeSegment(*seg); err != nil {
 		return err
 	}
+
 	newSeg, err := c.sm.AcquireOpenSegment(0)
 	if err != nil {
 		return err
