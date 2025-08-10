@@ -63,6 +63,8 @@ func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64
 
 // ReadValueHeaderAt parses the header at a specific offset in a segment file and
 // returns the value length, total header size and key length.
+// This function uses pread to read from the specified offset without modifying
+// the file's current position, making it safe for concurrent reads.
 func ReadValueHeaderAt(f *os.File, offset int64) (valueLen int64, headerSize int64, keyLen int64, version uint16, checksum uint32, err error) {
 	var fixed [ValueHeaderSize]byte
 	if _, err = unix.Pread(int(f.Fd()), fixed[:], offset); err != nil {
