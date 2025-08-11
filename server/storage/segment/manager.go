@@ -219,8 +219,11 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 		return 0, utils.WrapError("failed to write value header", seg.path, err)
 	}
 
-	// Copy with progress tracking for large files
-	bytesWritten, err := io.Copy(seg.file, f)
+	// Copy with progress tracking for large files using pooled buffer
+	buf, release := bufferpool.AcquireBuffer(64 * 1024) // 64KB buffer
+	defer release()
+
+	bytesWritten, err := io.CopyBuffer(seg.file, f, buf)
 	if err != nil {
 		return 0, utils.WrapError("copy value to segment", userKey, err)
 	}
