@@ -258,7 +258,19 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 				zlog.Info().Msg("compactor: compaction cancelled")
 				return
 			}
-			// Log error and continue with next entry
+			// Check if it's a file size mismatch error
+			if strings.Contains(err.Error(), "file size mismatch") {
+				// Skip corrupted file
+				wb.Delete(k)
+				filesToDel = append(filesToDel, entry.filePath)
+				zlog.Warn().
+					Str("key", entry.userKey).
+					Str("file", entry.filePath).
+					Err(err).
+					Msg("compactor: skipping corrupted file")
+				continue
+			}
+			// Log other errors and continue with next entry
 			continue
 		}
 
@@ -382,6 +394,18 @@ func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePa
 
 // compactEntry performs the actual compaction of a single entry
 func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, wb *grocksdb.WriteBatch) error {
+	// Validate file size matches metadata
+	if entry.fileInfo.Size() != entry.metadata.ValueLength {
+		zlog.Error().
+			Str("key", entry.userKey).
+			Str("filePath", entry.filePath).
+			Int64("actualSize", entry.fileInfo.Size()).
+			Int64("expectedSize", entry.metadata.ValueLength).
+			Msg("compactor: file size mismatch - possible corruption")
+		// Return error to skip this file
+		return fmt.Errorf("file size mismatch: actual=%d expected=%d", entry.fileInfo.Size(), entry.metadata.ValueLength)
+	}
+
 	// Calculate total space needed: header + value
 	headerSize := segment.CalculateValueHeaderSize(entry.userKey)
 	totalNeeded := headerSize + entry.metadata.ValueLength
