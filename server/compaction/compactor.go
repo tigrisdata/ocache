@@ -49,6 +49,18 @@ const (
 	CompactionIndexKeyFormat = "!compact/%020d|%s"
 )
 
+// ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
+type ErrFileSizeMismatch struct {
+	Key          string
+	FilePath     string
+	ActualSize   int64
+	ExpectedSize int64
+}
+
+func (e *ErrFileSizeMismatch) Error() string {
+	return fmt.Sprintf("file size mismatch for key %s: actual=%d expected=%d", e.Key, e.ActualSize, e.ExpectedSize)
+}
+
 type Compactor struct {
 	fm       *files.FileManager
 	sm       *segment.Manager
@@ -259,14 +271,16 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 				return
 			}
 			// Check if it's a file size mismatch error
-			if strings.Contains(err.Error(), "file size mismatch") {
+			var sizeMismatchErr *ErrFileSizeMismatch
+			if errors.As(err, &sizeMismatchErr) {
 				// Skip corrupted file
 				wb.Delete(k)
 				filesToDel = append(filesToDel, entry.filePath)
 				zlog.Warn().
-					Str("key", entry.userKey).
-					Str("file", entry.filePath).
-					Err(err).
+					Str("key", sizeMismatchErr.Key).
+					Str("file", sizeMismatchErr.FilePath).
+					Int64("actualSize", sizeMismatchErr.ActualSize).
+					Int64("expectedSize", sizeMismatchErr.ExpectedSize).
 					Msg("compactor: skipping corrupted file")
 				continue
 			}
@@ -403,7 +417,12 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 			Int64("expectedSize", entry.metadata.ValueLength).
 			Msg("compactor: file size mismatch - possible corruption")
 		// Return error to skip this file
-		return fmt.Errorf("file size mismatch: actual=%d expected=%d", entry.fileInfo.Size(), entry.metadata.ValueLength)
+		return &ErrFileSizeMismatch{
+			Key:          entry.userKey,
+			FilePath:     entry.filePath,
+			ActualSize:   entry.fileInfo.Size(),
+			ExpectedSize: entry.metadata.ValueLength,
+		}
 	}
 
 	// Calculate total space needed: header + value
