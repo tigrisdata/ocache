@@ -118,7 +118,7 @@ func TestStorage_ListKeys_WithInternalKeys(t *testing.T) {
 	keys, err := s.ListKeys()
 	assert.NoError(t, err, "ListKeys failed")
 	assert.Equal(t, len(userKeys), len(keys), "should return only user keys")
-	
+
 	for _, expected := range userKeys {
 		assert.Contains(t, keys, expected, "should contain user key %s", expected)
 	}
@@ -139,7 +139,7 @@ func TestStorage_ListKeys_WithExpiredKeys(t *testing.T) {
 	// Add expiring keys
 	err := s.Put("expired", bytes.NewReader([]byte("value")), 1) // 1 second TTL
 	assert.NoError(t, err, "Put failed for expired key")
-	
+
 	// Wait for expiration
 	time.Sleep(2 * time.Second)
 
@@ -147,7 +147,7 @@ func TestStorage_ListKeys_WithExpiredKeys(t *testing.T) {
 	keys, err := s.ListKeys()
 	assert.NoError(t, err, "ListKeys failed")
 	assert.Equal(t, len(permanentKeys), len(keys), "should return only non-expired keys")
-	
+
 	for _, expected := range permanentKeys {
 		assert.Contains(t, keys, expected, "should contain permanent key %s", expected)
 	}
