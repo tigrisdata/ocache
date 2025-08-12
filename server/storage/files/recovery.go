@@ -3,10 +3,7 @@ package files
 import (
 	"bytes"
 	"fmt"
-	"hash/crc32"
-	"io"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 
@@ -15,8 +12,27 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
-	"google.golang.org/protobuf/proto"
+	"github.com/tigrisdata/ocache/server/utils"
 )
+
+const (
+	// MaxWorkers is the maximum number of workers to use for validation
+	MaxWorkers = 16
+
+	// entryBufferSize is the buffer size for the entries channel
+	entryBufferSize = 10000
+
+	// resultBufferSize is the buffer size for the results channel
+	resultBufferSize = 10000
+)
+
+// syncEntryInfo holds a sync entry with its parsed components
+type syncEntryInfo struct {
+	Key       []byte
+	Timestamp int64
+	FilePath  string
+	Value     *pb.SyncEntry
+}
 
 // RecoveryManager handles startup recovery and validation of files with pending syncs
 type RecoveryManager struct {
@@ -30,7 +46,7 @@ func NewRecoveryManager(meta *metadata.MetaDB, filesPath string) *RecoveryManage
 	return &RecoveryManager{
 		meta:       meta,
 		filesPath:  filesPath,
-		numWorkers: runtime.NumCPU(),
+		numWorkers: MaxWorkers,
 	}
 }
 
@@ -39,30 +55,21 @@ func (r *RecoveryManager) RecoverOnStartup() error {
 	zlog.Info().Msg("files.recovery: starting startup recovery")
 	startTime := time.Now()
 
-	// Collect all sync entries
-	syncEntries, err := r.collectAllSyncEntries()
+	var stats *RecoveryStats
+	var err error
+
+	zlog.Info().Msg("files.recovery: using streaming approach")
+	stats, err = r.processEntriesStreaming()
 	if err != nil {
-		return fmt.Errorf("failed to collect sync entries: %w", err)
+		return fmt.Errorf("streaming recovery failed: %w", err)
 	}
 
-	if len(syncEntries) == 0 {
-		zlog.Info().Msg("files.recovery: no pending syncs found")
-		return nil
+	if stats == nil {
+		stats = &RecoveryStats{}
 	}
 
-	zlog.Info().
-		Int("entries", len(syncEntries)).
-		Msg("files.recovery: validating sync entries")
+	stats.Duration = time.Since(startTime)
 
-	// Validate entries in parallel
-	results := r.validateEntriesParallel(syncEntries)
-
-	// Perform cleanup based on validation results
-	if err := r.performCleanup(results); err != nil {
-		return fmt.Errorf("cleanup failed: %w", err)
-	}
-
-	stats := r.calculateStats(results, time.Since(startTime))
 	zlog.Info().
 		Int("total", stats.Total).
 		Int("valid", stats.Valid).
@@ -76,109 +83,60 @@ func (r *RecoveryManager) RecoverOnStartup() error {
 	return nil
 }
 
-// syncEntryInfo holds a sync entry with its parsed components
-type syncEntryInfo struct {
-	Key       []byte
-	Timestamp int64
-	FilePath  string
-	Value     *pb.SyncEntry
-}
-
-// collectAllSyncEntries gathers all sync index entries from RocksDB
-func (r *RecoveryManager) collectAllSyncEntries() ([]*syncEntryInfo, error) {
-	ro := grocksdb.NewDefaultReadOptions()
-	defer ro.Destroy()
-
-	it := r.meta.Handle().NewIterator(ro)
-	defer it.Close()
-
-	var entries []*syncEntryInfo
-	prefix := []byte(SyncIndexPrefix)
-
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		key := it.Key()
-		value := it.Value()
-
-		// Parse key
-		timestamp, filepath, err := ParseSyncKey(key.Data())
-		if err != nil {
-			zlog.Warn().
-				Str("key", string(key.Data())).
-				Err(err).
-				Msg("files.recovery: failed to parse sync key")
-			key.Free()
-			value.Free()
-			continue
-		}
-
-		// Decode value
-		entry, err := DecodeSyncEntry(value.Data())
-		if err != nil {
-			zlog.Warn().
-				Str("key", string(key.Data())).
-				Err(err).
-				Msg("files.recovery: failed to decode sync entry")
-			key.Free()
-			value.Free()
-			continue
-		}
-
-		entries = append(entries, &syncEntryInfo{
-			Key:       bytes.Clone(key.Data()),
-			Timestamp: timestamp,
-			FilePath:  filepath,
-			Value:     entry,
-		})
-
-		key.Free()
-		value.Free()
+// processEntriesStreaming processes sync entries in a streaming fashion without loading all into memory
+func (r *RecoveryManager) processEntriesStreaming() (*RecoveryStats, error) {
+	proc := &streamingProcessor{
+		r:       r,
+		entries: make(chan *syncEntryInfo, entryBufferSize),
+		results: make(chan *ValidationResult, resultBufferSize),
+		stats:   &RecoveryStats{},
+		errChan: make(chan error, 1),
 	}
 
-	if err := it.Err(); err != nil {
-		return nil, fmt.Errorf("iterator error: %w", err)
-	}
-
-	return entries, nil
-}
-
-// validateEntriesParallel validates sync entries using multiple workers
-func (r *RecoveryManager) validateEntriesParallel(entries []*syncEntryInfo) []*ValidationResult {
-	var wg sync.WaitGroup
-	jobs := make(chan *syncEntryInfo, len(entries))
-	results := make(chan *ValidationResult, len(entries))
-
-	// Start workers
+	// Start validation workers
+	var workerWg sync.WaitGroup
 	for i := 0; i < r.numWorkers; i++ {
-		wg.Add(1)
-		go r.validationWorker(&wg, jobs, results)
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
+			proc.validationWorker()
+		}()
 	}
 
-	// Queue all jobs
-	for _, entry := range entries {
-		jobs <- entry
+	// Start results collector in background
+	collectorDone := make(chan struct{})
+	go func() {
+		proc.resultsCollector()
+		close(collectorDone)
+	}()
+
+	// Stream entries from RocksDB
+	if err := proc.streamEntries(); err != nil {
+		close(proc.entries)
+		workerWg.Wait()
+		close(proc.results)
+		<-collectorDone
+		return nil, err
 	}
-	close(jobs)
 
-	// Wait for workers to complete
-	wg.Wait()
-	close(results)
+	// Close entries channel to signal workers to stop
+	close(proc.entries)
 
-	// Collect results
-	var allResults []*ValidationResult
-	for result := range results {
-		allResults = append(allResults, result)
-	}
+	// Wait for all validation workers to finish
+	workerWg.Wait()
 
-	return allResults
-}
+	// Close results channel after all workers are done
+	close(proc.results)
 
-// validationWorker processes validation jobs
-func (r *RecoveryManager) validationWorker(wg *sync.WaitGroup, jobs <-chan *syncEntryInfo, results chan<- *ValidationResult) {
-	defer wg.Done()
+	// Wait for results collector to finish
+	<-collectorDone
 
-	for entry := range jobs {
-		result := r.validateEntry(entry)
-		results <- result
+	// Check for any errors from workers
+	select {
+	case err := <-proc.errChan:
+		return proc.stats, err
+	default:
+		return proc.stats, nil
 	}
 }
 
@@ -190,34 +148,24 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 	}
 
 	// Fetch metadata
-	ro := grocksdb.NewDefaultReadOptions()
-	defer ro.Destroy()
-
-	metaSlice, err := r.meta.Handle().Get(ro, []byte(entry.Value.MetadataKey))
-	if err != nil || !metaSlice.Exists() {
-		// No metadata, sync entry is orphaned
-		zlog.Debug().
-			Str("sync_key", string(entry.Key)).
-			Str("filepath", entry.FilePath).
-			Msg("files.recovery: orphaned sync entry (no metadata)")
-
-		if metaSlice != nil {
-			metaSlice.Free()
-		}
-		result.Status = StatusOrphaned
-		return result
-	}
-	defer metaSlice.Free()
-
-	// Parse metadata
-	var metadata pb.ValueMessage
-	if err := proto.Unmarshal(metaSlice.Data(), &metadata); err != nil {
+	metadata, err := utils.GetMetadata(r.meta, entry.Value.MetadataKey)
+	if err != nil {
 		zlog.Warn().
 			Str("filepath", entry.FilePath).
 			Err(err).
-			Msg("files.recovery: failed to parse metadata")
+			Msg("files.recovery: failed to fetch metadata")
 		result.Status = StatusCorrupted
 		result.Error = err
+		return result
+	}
+
+	// Check if metadata exists (orphaned sync entry)
+	if metadata == nil {
+		zlog.Warn().
+			Str("filepath", entry.FilePath).
+			Str("metadata_key", entry.Value.MetadataKey).
+			Msg("files.recovery: orphaned sync entry (metadata not found)")
+		result.Status = StatusOrphaned
 		return result
 	}
 
@@ -267,24 +215,6 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 		return result
 	}
 
-	// Optional: Validate checksum for small files
-	if metadata.ValueLength < 1024*1024 && metadata.Checksum > 0 { // < 1MB
-		actualChecksum, err := r.calculateChecksum(entry.FilePath)
-		if err != nil || actualChecksum != metadata.Checksum {
-			zlog.Error().
-				Str("filepath", entry.FilePath).
-				Str("key", entry.Value.MetadataKey).
-				Uint32("expected_checksum", metadata.Checksum).
-				Uint32("actual_checksum", actualChecksum).
-				Err(err).
-				Msg("files.recovery: file corrupted (checksum mismatch)")
-			result.Status = StatusCorrupted
-			result.MetadataKey = entry.Value.MetadataKey
-			result.Error = err
-			return result
-		}
-	}
-
 	// File is valid
 	zlog.Debug().
 		Str("filepath", entry.FilePath).
@@ -293,119 +223,184 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 	return result
 }
 
-// calculateChecksum computes CRC32 checksum of a file
-func (r *RecoveryManager) calculateChecksum(filepath string) (uint32, error) {
-	file, err := os.Open(filepath)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	hash := crc32.NewIEEE()
-	if _, err := io.Copy(hash, file); err != nil {
-		return 0, err
-	}
-
-	return hash.Sum32(), nil
+// streamingProcessor handles streaming processing of sync entries
+type streamingProcessor struct {
+	r       *RecoveryManager
+	entries chan *syncEntryInfo
+	results chan *ValidationResult
+	stats   *RecoveryStats
+	errChan chan error
 }
 
-// performCleanup removes sync entries and deletes corrupted files
-func (r *RecoveryManager) performCleanup(results []*ValidationResult) error {
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
+// streamEntries reads sync entries from RocksDB and sends them to the processing channel
+func (proc *streamingProcessor) streamEntries() error {
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
 
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
+	it := proc.r.meta.Handle().NewIterator(ro)
+	defer it.Close()
 
-	for _, result := range results {
-		// Always remove sync entry
-		batch.Delete(result.SyncKey)
+	prefix := []byte(keys.SyncIndexPrefix)
+	entriesStreamed := 0
 
-		switch result.Status {
-		case StatusCorrupted, StatusMissing:
-			// Delete corrupted/missing file
-			if result.FilePath != "" && result.Status == StatusCorrupted {
-				if err := os.Remove(result.FilePath); err != nil && !os.IsNotExist(err) {
-					zlog.Error().
-						Str("filepath", result.FilePath).
-						Err(err).
-						Msg("files.recovery: failed to delete corrupted file")
-				} else {
-					zlog.Info().
-						Str("filepath", result.FilePath).
-						Msg("files.recovery: deleted corrupted file")
-				}
-			}
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		key := it.Key()
+		value := it.Value()
 
-			// Delete metadata
-			if result.MetadataKey != "" {
-				batch.Delete([]byte(result.MetadataKey))
+		// Parse key
+		timestamp, filepath, err := keys.ParseSyncKey(key.Data())
+		if err != nil {
+			zlog.Warn().
+				Str("key", string(key.Data())).
+				Err(err).
+				Msg("files.recovery: failed to parse sync key")
+			key.Free()
+			value.Free()
+			continue
+		}
 
-				// Extract user key from metadata key for compaction index
-				userKey := extractUserKey(result.MetadataKey)
-				if userKey != "" {
-					compactionKey := makeCompactionKey(userKey)
-					batch.Delete(compactionKey)
-				}
-			}
+		// Decode value
+		entry, err := DecodeSyncEntry(value.Data())
+		if err != nil {
+			zlog.Warn().
+				Str("key", string(key.Data())).
+				Err(err).
+				Msg("files.recovery: failed to decode sync entry")
+			key.Free()
+			value.Free()
+			continue
+		}
 
-		case StatusOrphaned:
-			// Optionally delete orphaned file
-			if result.FilePath != "" {
-				if err := os.Remove(result.FilePath); err != nil && !os.IsNotExist(err) {
-					zlog.Debug().
-						Str("filepath", result.FilePath).
-						Err(err).
-						Msg("files.recovery: failed to delete orphaned file")
-				}
-			}
+		// Send to processing channel
+		proc.entries <- &syncEntryInfo{
+			Key:       bytes.Clone(key.Data()),
+			Timestamp: timestamp,
+			FilePath:  filepath,
+			Value:     entry,
+		}
+
+		key.Free()
+		value.Free()
+		entriesStreamed++
+
+		// Log progress periodically
+		if entriesStreamed%entryBufferSize == 0 {
+			zlog.Info().
+				Int("streamed", entriesStreamed).
+				Msg("files.recovery: streaming progress")
 		}
 	}
 
-	if err := r.meta.Handle().Write(wo, batch); err != nil {
-		return fmt.Errorf("failed to write cleanup batch: %w", err)
+	if err := it.Err(); err != nil {
+		return fmt.Errorf("iterator error: %w", err)
 	}
+
+	zlog.Info().
+		Int("entries", entriesStreamed).
+		Msg("files.recovery: finished streaming entries")
 
 	return nil
 }
 
-// calculateStats aggregates validation results into statistics
-func (r *RecoveryManager) calculateStats(results []*ValidationResult, duration time.Duration) *RecoveryStats {
-	stats := &RecoveryStats{
-		Total:    len(results),
-		Duration: duration,
+// validationWorker processes entries from the channel
+func (proc *streamingProcessor) validationWorker() {
+	for entry := range proc.entries {
+		result := proc.r.validateEntry(entry)
+		proc.results <- result
 	}
+}
 
-	for _, result := range results {
+// resultsCollector collects validation results and processes deletions
+func (proc *streamingProcessor) resultsCollector() {
+	batch := make([]*ValidationResult, 0, 100)
+
+	for result := range proc.results {
+		// Update stats
+		proc.stats.Total++
 		switch result.Status {
 		case StatusValid:
-			stats.Valid++
+			proc.stats.Valid++
 		case StatusCorrupted:
-			stats.Corrupted++
+			proc.stats.Corrupted++
 		case StatusStale:
-			stats.Stale++
+			proc.stats.Stale++
 		case StatusOrphaned:
-			stats.Orphaned++
+			proc.stats.Orphaned++
 		case StatusMissing:
-			stats.Missing++
+			proc.stats.Missing++
+		}
+
+		// Add ALL results to deletion batch
+		// After recovery, we remove all sync entries regardless of status
+		// Valid entries mean files are good and have been synced (after restart)
+		// Invalid entries need cleanup
+		batch = append(batch, result)
+
+		// Process batch when it reaches the size limit
+		if len(batch) >= 100 {
+			if err := proc.processDeletionBatch(batch); err != nil {
+				select {
+				case proc.errChan <- err:
+				default:
+				}
+			}
+			batch = batch[:0] // Reset batch
 		}
 	}
 
-	return stats
-}
-
-// Helper functions
-
-func extractUserKey(metadataKey string) string {
-	// Remove metadata prefix to get user key
-	prefix := keys.MetadataPrefix
-	if len(metadataKey) > len(prefix) {
-		return metadataKey[len(prefix):]
+	// Process any remaining items in the batch
+	if len(batch) > 0 {
+		if err := proc.processDeletionBatch(batch); err != nil {
+			select {
+			case proc.errChan <- err:
+			default:
+			}
+		}
 	}
-	return ""
 }
 
-func makeCompactionKey(userKey string) []byte {
-	// This should match the compaction key format used elsewhere
-	return []byte(fmt.Sprintf("!compact/%s", userKey))
+// processDeletionBatch processes a batch of deletions
+func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+
+	writeBatch := grocksdb.NewWriteBatch()
+	defer writeBatch.Destroy()
+
+	for _, result := range batch {
+		// Always remove sync entry
+		writeBatch.Delete(result.SyncKey)
+
+		switch result.Status {
+		case StatusCorrupted, StatusOrphaned, StatusMissing:
+			// Delete corrupted/orphaned file
+			if result.FilePath != "" && (result.Status == StatusCorrupted || result.Status == StatusOrphaned) {
+				if err := os.Remove(result.FilePath); err != nil && !os.IsNotExist(err) {
+					zlog.Error().
+						Str("filepath", result.FilePath).
+						Err(err).
+						Msg("files.recovery: failed to delete corrupted/orphaned file")
+				} else if err == nil {
+					zlog.Info().
+						Str("filepath", result.FilePath).
+						Msg("files.recovery: deleted corrupted/orphaned file")
+				}
+			}
+
+			// Delete metadata for corrupted, orphaned, and missing files
+			if result.MetadataKey != "" {
+				writeBatch.Delete([]byte(result.MetadataKey))
+			}
+		}
+	}
+
+	if err := proc.r.meta.Handle().Write(wo, writeBatch); err != nil {
+		return fmt.Errorf("failed to write deletion batch: %w", err)
+	}
+
+	return nil
 }

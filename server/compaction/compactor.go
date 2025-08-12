@@ -40,15 +40,6 @@ import (
 // NOTE: At present the implementation only migrates files; segment-level
 // compaction (merging/deleting) lives in Manager.compactSegments().
 
-const (
-	// CompactionIndexPrefix is the prefix for all compaction index entries in RocksDB
-	CompactionIndexPrefix = "!compact/"
-
-	// CompactionIndexKeyFormat is the format for compaction index keys
-	// Format: !compact/<timestamp>|<userKey>
-	CompactionIndexKeyFormat = "!compact/%020d|%s"
-)
-
 // ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
 type ErrFileSizeMismatch struct {
 	Key          string
@@ -139,10 +130,10 @@ func (c *Compactor) compactionLoop() {
 // PrepareEntryForCompaction prepares the key and value to store in compaction index.
 func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 	ts := time.Now().UnixNano()
-	idxKey := fmt.Sprintf(CompactionIndexKeyFormat, ts, key)
-	idxVal := fmt.Sprintf("%s", filePath)
+	idxKey := keys.MakeCompactionKey(ts, key)
+	idxVal := []byte(filePath)
 
-	return []byte(idxKey), []byte(idxVal)
+	return idxKey, idxVal
 }
 
 // CompactFiles scans the RocksDB file-index and migrates files into segments.
@@ -170,7 +161,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		return
 	}
 
-	filePrefix := []byte(CompactionIndexPrefix)
+	filePrefix := []byte(keys.CompactionIndexPrefix)
 	iterationCount := 0
 	lastLogTime := time.Now()
 

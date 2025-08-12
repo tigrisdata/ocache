@@ -66,7 +66,7 @@ func TestRecoveryDeletesCorruptedFiles(t *testing.T) {
 	batch.Put(metaKey, vmBytes)
 
 	// Add sync entry
-	syncKey := MakeSyncKey(testFile)
+	syncKey := keys.MakeSyncKey(testFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
@@ -128,7 +128,7 @@ func TestRecoveryHandlesStaleEntries(t *testing.T) {
 	batch.Put(metaKey, vmBytes)
 
 	// Add stale sync entry for OLD file
-	syncKey := MakeSyncKey(oldFile)
+	syncKey := keys.MakeSyncKey(oldFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
@@ -184,7 +184,7 @@ func TestRecoveryHandlesOrphanedFiles(t *testing.T) {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
-	syncKey := MakeSyncKey(orphanFile)
+	syncKey := keys.MakeSyncKey(orphanFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(keys.MakeMetadataKey("nonexistent-key")),
 		Timestamp:   time.Now().Unix(),
@@ -235,7 +235,7 @@ func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
 
 	// Add OLD sync entry (simulate >30s old)
 	oldTimestamp := time.Now().Add(-time.Hour).UnixNano()
-	syncKey := []byte(fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, oldTimestamp, testFile))
+	syncKey := []byte(fmt.Sprintf("%s%020d/%s", keys.SyncIndexPrefix, oldTimestamp, testFile))
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Add(-time.Hour).Unix(),
@@ -298,7 +298,7 @@ func TestParallelRecovery(t *testing.T) {
 			vmBytes, _ := proto.Marshal(vm)
 			batch.Put(metaKey, vmBytes)
 
-			syncKey := MakeSyncKey(filePath)
+			syncKey := keys.MakeSyncKey(filePath)
 			syncEntry := &pb.SyncEntry{
 				MetadataKey: string(metaKey),
 				Timestamp:   time.Now().Unix(),
@@ -320,7 +320,7 @@ func TestParallelRecovery(t *testing.T) {
 			vmBytes, _ := proto.Marshal(vm)
 			batch.Put(metaKey, vmBytes)
 
-			syncKey := MakeSyncKey(filePath)
+			syncKey := keys.MakeSyncKey(filePath)
 			syncEntry := &pb.SyncEntry{
 				MetadataKey: string(metaKey),
 				Timestamp:   time.Now().Unix(),
@@ -343,7 +343,7 @@ func TestParallelRecovery(t *testing.T) {
 			vmBytes, _ := proto.Marshal(vm)
 			batch.Put(metaKey, vmBytes)
 
-			syncKey := MakeSyncKey(filePath)
+			syncKey := keys.MakeSyncKey(filePath)
 			syncEntry := &pb.SyncEntry{
 				MetadataKey: string(metaKey),
 				Timestamp:   time.Now().Unix(),
@@ -361,14 +361,14 @@ func TestParallelRecovery(t *testing.T) {
 	err := recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
-	// Verify all sync entries were removed
+	// Verify all sync entries were removed after recovery
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 	it := meta.Handle().NewIterator(ro)
 	defer it.Close()
 
 	syncCount := 0
-	prefix := []byte(SyncIndexPrefix)
+	prefix := []byte(keys.SyncIndexPrefix)
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		syncCount++
 	}

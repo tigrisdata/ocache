@@ -1,18 +1,10 @@
 package files
 
 import (
-	"bytes"
-	"fmt"
-	"strings"
 	"time"
 
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/protobuf/proto"
-)
-
-const (
-	// SyncIndexPrefix is the prefix for all sync tracking entries in RocksDB
-	SyncIndexPrefix = "!sync/"
 )
 
 // EncodeSyncEntry serializes a SyncEntry to bytes
@@ -27,42 +19,6 @@ func DecodeSyncEntry(data []byte) (*pb.SyncEntry, error) {
 		return nil, err
 	}
 	return &entry, nil
-}
-
-// MakeSyncKey creates a sync index key for a file
-func MakeSyncKey(filepath string) []byte {
-	key := fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, time.Now().UnixNano(), filepath)
-	return []byte(key)
-}
-
-// ParseSyncKey extracts timestamp and filepath from a sync key
-func ParseSyncKey(key []byte) (int64, string, error) {
-	keyStr := string(key)
-	if !strings.HasPrefix(keyStr, SyncIndexPrefix) {
-		return 0, "", fmt.Errorf("invalid sync key prefix")
-	}
-
-	// Remove prefix
-	remainder := keyStr[len(SyncIndexPrefix):]
-
-	// Split by first slash to separate timestamp from filepath
-	parts := strings.SplitN(remainder, "/", 2)
-	if len(parts) != 2 {
-		return 0, "", fmt.Errorf("invalid sync key format")
-	}
-
-	// Parse timestamp
-	var timestamp int64
-	if _, err := fmt.Sscanf(parts[0], "%020d", &timestamp); err != nil {
-		return 0, "", fmt.Errorf("failed to parse timestamp: %w", err)
-	}
-
-	return timestamp, parts[1], nil
-}
-
-// IsSyncKey checks if a key is a sync index entry
-func IsSyncKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(SyncIndexPrefix))
 }
 
 // ValidationStatus represents the status of a file during validation

@@ -82,7 +82,7 @@ func TestPrepareEntryForCompaction(t *testing.T) {
 	k, v := PrepareEntryForCompaction(key, filePath)
 
 	// Key should start with !compact/ prefix and contain timestamp
-	assert.True(t, bytes.HasPrefix(k, []byte(CompactionIndexPrefix)))
+	assert.True(t, bytes.HasPrefix(k, []byte(keys.CompactionIndexPrefix)))
 	assert.Contains(t, string(k), "|test-key")
 
 	// Value should be the file path
@@ -91,7 +91,7 @@ func TestPrepareEntryForCompaction(t *testing.T) {
 	// Ensure timestamp is properly formatted (20 digits)
 	parts := bytes.Split(k, []byte("|"))
 	assert.Len(t, parts, 2)
-	tsStr := string(parts[0][len(CompactionIndexPrefix):])
+	tsStr := string(parts[0][len(keys.CompactionIndexPrefix):])
 	assert.Len(t, tsStr, 20)
 }
 
@@ -446,7 +446,7 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	defer it.Close()
 
 	unprocessedCount := 0
-	filePrefix := []byte(CompactionIndexPrefix)
+	filePrefix := []byte(keys.CompactionIndexPrefix)
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		unprocessedCount++
 	}
@@ -605,7 +605,7 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 	defer it.Close()
 
 	remainingCount := 0
-	filePrefix := []byte(CompactionIndexPrefix)
+	filePrefix := []byte(keys.CompactionIndexPrefix)
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		remainingCount++
 	}

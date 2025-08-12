@@ -40,12 +40,12 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	vmBytes, _ := proto.Marshal(vm)
 	batch.Put(metaKey, vmBytes)
 
-	// Add sync entry with old timestamp (>30s ago)
-	oldTimestamp := time.Now().Add(-35 * time.Second).UnixNano()
-	syncKey := []byte(fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, oldTimestamp, testFile))
+	// Add sync entry with old timestamp (>60s ago)
+	oldTimestamp := time.Now().Add(-65 * time.Second).UnixNano()
+	syncKey := []byte(fmt.Sprintf("%s%020d/%s", keys.SyncIndexPrefix, oldTimestamp, testFile))
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
-		Timestamp:   time.Now().Add(-35 * time.Second).Unix(),
+		Timestamp:   time.Now().Add(-65 * time.Second).Unix(),
 	}
 	syncVal, _ := EncodeSyncEntry(syncEntry)
 	batch.Put(syncKey, syncVal)
@@ -74,7 +74,7 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	assert.NoError(t, err, "File should still exist")
 }
 
-func TestMonitorRemovesStaleEntriesAndDeletesOrphanedFiles(t *testing.T) {
+func TestMonitorRemovesStaleEntries(t *testing.T) {
 	filesDir, meta, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
@@ -103,7 +103,7 @@ func TestMonitorRemovesStaleEntriesAndDeletesOrphanedFiles(t *testing.T) {
 	batch.Put(metaKey, vmBytes)
 
 	// Add stale sync entry for OLD file (recent timestamp)
-	syncKey := MakeSyncKey(oldFile)
+	syncKey := keys.MakeSyncKey(oldFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
@@ -154,9 +154,9 @@ func TestMonitorDeletesFileWhenMetadataDeleted(t *testing.T) {
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	
+
 	// Add sync entry WITHOUT metadata (simulating deleted metadata)
-	syncKey := MakeSyncKey(testFile)
+	syncKey := keys.MakeSyncKey(testFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(keys.MakeMetadataKey("deleted-key")),
 		Timestamp:   time.Now().Unix(),
@@ -211,7 +211,7 @@ func TestMonitorKeepsPendingEntries(t *testing.T) {
 	batch.Put(metaKey, vmBytes)
 
 	// Add RECENT sync entry (<30s old)
-	syncKey := MakeSyncKey(testFile)
+	syncKey := keys.MakeSyncKey(testFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
@@ -251,16 +251,16 @@ func TestMonitorHandlesCompactedFiles(t *testing.T) {
 	// Add metadata for SEGMENT (file was compacted)
 	metaKey := keys.MakeMetadataKey("compacted-key")
 	vm := &pb.ValueMessage{
-		ValueLength:    4,
-		ValueType:      pb.ValueType_SEGMENT, // Not RAW_FILE anymore
-		SegmentPath:    "/path/to/segment",
-		SegmentOffset:  100,
+		ValueLength:   4,
+		ValueType:     pb.ValueType_SEGMENT, // Not RAW_FILE anymore
+		SegmentPath:   "/path/to/segment",
+		SegmentOffset: 100,
 	}
 	vmBytes, _ := proto.Marshal(vm)
 	batch.Put(metaKey, vmBytes)
 
 	// Add sync entry for the old raw file
-	syncKey := MakeSyncKey(testFile)
+	syncKey := keys.MakeSyncKey(testFile)
 	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
@@ -314,12 +314,12 @@ func TestMonitorConcurrentOperation(t *testing.T) {
 		// Mix of old and new entries
 		var timestamp int64
 		if i%2 == 0 {
-			timestamp = time.Now().Add(-40 * time.Second).UnixNano() // Old
+			timestamp = time.Now().Add(-70 * time.Second).UnixNano() // Old
 		} else {
 			timestamp = time.Now().UnixNano() // Recent
 		}
 
-		syncKey := []byte(fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, timestamp, filePath))
+		syncKey := []byte(fmt.Sprintf("%s%020d/%s", keys.SyncIndexPrefix, timestamp, filePath))
 		syncEntry := &pb.SyncEntry{
 			MetadataKey: string(metaKey),
 			Timestamp:   timestamp / 1e9,
@@ -342,7 +342,7 @@ func TestMonitorConcurrentOperation(t *testing.T) {
 	defer it.Close()
 
 	remainingCount := 0
-	prefix := []byte(SyncIndexPrefix)
+	prefix := []byte(keys.SyncIndexPrefix)
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		remainingCount++
 	}
