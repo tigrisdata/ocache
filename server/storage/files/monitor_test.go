@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -44,7 +43,7 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	// Add sync entry with old timestamp (>30s ago)
 	oldTimestamp := time.Now().Add(-35 * time.Second).UnixNano()
 	syncKey := []byte(fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, oldTimestamp, testFile))
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Add(-35 * time.Second).Unix(),
 	}
@@ -75,7 +74,7 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	assert.NoError(t, err, "File should still exist")
 }
 
-func TestMonitorRemovesStaleEntries(t *testing.T) {
+func TestMonitorRemovesStaleEntriesAndDeletesOrphanedFiles(t *testing.T) {
 	filesDir, meta, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
@@ -105,7 +104,7 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 
 	// Add stale sync entry for OLD file (recent timestamp)
 	syncKey := MakeSyncKey(oldFile)
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
 	}
@@ -114,6 +113,10 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
+
+	// Verify old file exists before cleanup
+	_, err = os.Stat(oldFile)
+	require.NoError(t, err, "Old file should exist before cleanup")
 
 	// Create and run monitor once
 	monitor := NewSyncMonitor(meta, time.Hour)
@@ -126,10 +129,60 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 	assert.False(t, syncSlice.Exists(), "Stale sync entry should be removed")
 	syncSlice.Free()
 
+	// Verify orphaned file was deleted
+	_, err = os.Stat(oldFile)
+	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted")
+
+	// Verify new file still exists
+	_, err = os.Stat(newFile)
+	assert.NoError(t, err, "New file should still exist")
+
 	// Verify metadata still exists
 	metaSlice, _ := meta.Handle().Get(ro, metaKey)
 	assert.True(t, metaSlice.Exists(), "Metadata should still exist")
 	metaSlice.Free()
+}
+
+func TestMonitorDeletesFileWhenMetadataDeleted(t *testing.T) {
+	filesDir, meta, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Create a file
+	testFile := filepath.Join(filesDir, "deleted.dat")
+	err := os.WriteFile(testFile, []byte("to be deleted"), 0o644)
+	require.NoError(t, err)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	
+	// Add sync entry WITHOUT metadata (simulating deleted metadata)
+	syncKey := MakeSyncKey(testFile)
+	syncEntry := &pb.SyncEntry{
+		MetadataKey: string(keys.MakeMetadataKey("deleted-key")),
+		Timestamp:   time.Now().Unix(),
+	}
+	syncVal, _ := EncodeSyncEntry(syncEntry)
+	err = meta.Handle().Put(wo, syncKey, syncVal)
+	require.NoError(t, err)
+
+	// Verify file exists before cleanup
+	_, err = os.Stat(testFile)
+	require.NoError(t, err, "File should exist before cleanup")
+
+	// Create and run monitor once
+	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor.checkAndCleanup()
+
+	// Verify sync entry was removed
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	syncSlice, _ := meta.Handle().Get(ro, syncKey)
+	assert.False(t, syncSlice.Exists(), "Sync entry should be removed")
+	syncSlice.Free()
+
+	// Verify orphaned file was deleted
+	_, err = os.Stat(testFile)
+	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted when metadata is missing")
 }
 
 func TestMonitorKeepsPendingEntries(t *testing.T) {
@@ -159,7 +212,7 @@ func TestMonitorKeepsPendingEntries(t *testing.T) {
 
 	// Add RECENT sync entry (<30s old)
 	syncKey := MakeSyncKey(testFile)
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
 	}
@@ -198,20 +251,17 @@ func TestMonitorHandlesCompactedFiles(t *testing.T) {
 	// Add metadata for SEGMENT (file was compacted)
 	metaKey := keys.MakeMetadataKey("compacted-key")
 	vm := &pb.ValueMessage{
-		ValueLength: 4,
-		ValueType:   pb.ValueType_SEGMENT, // Not RAW_FILE anymore
-		SegmentInfo: &pb.SegmentInfo{
-			SegmentPath: "/path/to/segment",
-			Offset:      100,
-			Length:      4,
-		},
+		ValueLength:    4,
+		ValueType:      pb.ValueType_SEGMENT, // Not RAW_FILE anymore
+		SegmentPath:    "/path/to/segment",
+		SegmentOffset:  100,
 	}
 	vmBytes, _ := proto.Marshal(vm)
 	batch.Put(metaKey, vmBytes)
 
 	// Add sync entry for the old raw file
 	syncKey := MakeSyncKey(testFile)
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
 	}
@@ -270,7 +320,7 @@ func TestMonitorConcurrentOperation(t *testing.T) {
 		}
 
 		syncKey := []byte(fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, timestamp, filePath))
-		syncEntry := &SyncEntry{
+		syncEntry := &pb.SyncEntry{
 			MetadataKey: string(metaKey),
 			Timestamp:   timestamp / 1e9,
 		}

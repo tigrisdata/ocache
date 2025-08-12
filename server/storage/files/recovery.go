@@ -81,7 +81,7 @@ type syncEntryInfo struct {
 	Key       []byte
 	Timestamp int64
 	FilePath  string
-	Value     *SyncEntry
+	Value     *pb.SyncEntry
 }
 
 // collectAllSyncEntries gathers all sync index entries from RocksDB

@@ -1,7 +1,6 @@
 package files
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,7 +67,7 @@ func TestRecoveryDeletesCorruptedFiles(t *testing.T) {
 
 	// Add sync entry
 	syncKey := MakeSyncKey(testFile)
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
 	}
@@ -130,7 +129,7 @@ func TestRecoveryHandlesStaleEntries(t *testing.T) {
 
 	// Add stale sync entry for OLD file
 	syncKey := MakeSyncKey(oldFile)
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Unix(),
 	}
@@ -186,7 +185,7 @@ func TestRecoveryHandlesOrphanedFiles(t *testing.T) {
 	defer batch.Destroy()
 
 	syncKey := MakeSyncKey(orphanFile)
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(keys.MakeMetadataKey("nonexistent-key")),
 		Timestamp:   time.Now().Unix(),
 	}
@@ -237,7 +236,7 @@ func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
 	// Add OLD sync entry (simulate >30s old)
 	oldTimestamp := time.Now().Add(-time.Hour).UnixNano()
 	syncKey := []byte(fmt.Sprintf("%s%020d/%s", SyncIndexPrefix, oldTimestamp, testFile))
-	syncEntry := &SyncEntry{
+	syncEntry := &pb.SyncEntry{
 		MetadataKey: string(metaKey),
 		Timestamp:   time.Now().Add(-time.Hour).Unix(),
 	}
@@ -300,7 +299,7 @@ func TestParallelRecovery(t *testing.T) {
 			batch.Put(metaKey, vmBytes)
 
 			syncKey := MakeSyncKey(filePath)
-			syncEntry := &SyncEntry{
+			syncEntry := &pb.SyncEntry{
 				MetadataKey: string(metaKey),
 				Timestamp:   time.Now().Unix(),
 			}
@@ -322,7 +321,7 @@ func TestParallelRecovery(t *testing.T) {
 			batch.Put(metaKey, vmBytes)
 
 			syncKey := MakeSyncKey(filePath)
-			syncEntry := &SyncEntry{
+			syncEntry := &pb.SyncEntry{
 				MetadataKey: string(metaKey),
 				Timestamp:   time.Now().Unix(),
 			}
@@ -345,7 +344,7 @@ func TestParallelRecovery(t *testing.T) {
 			batch.Put(metaKey, vmBytes)
 
 			syncKey := MakeSyncKey(filePath)
-			syncEntry := &SyncEntry{
+			syncEntry := &pb.SyncEntry{
 				MetadataKey: string(metaKey),
 				Timestamp:   time.Now().Unix(),
 			}

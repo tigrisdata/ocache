@@ -578,7 +578,7 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Add sync tracking for raw files
 	if filePath != "" {
 		syncKey := files.MakeSyncKey(filePath)
-		syncEntry := &files.SyncEntry{
+		syncEntry := &pb.SyncEntry{
 			MetadataKey: string(metaKey),
 			Timestamp:   time.Now().Unix(),
 		}

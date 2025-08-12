@@ -2,10 +2,12 @@ package files
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	pb "github.com/tigrisdata/ocache/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -13,21 +15,15 @@ const (
 	SyncIndexPrefix = "!sync/"
 )
 
-// SyncEntry represents a file pending sync in the sync index
-type SyncEntry struct {
-	MetadataKey string `json:"metadata_key"` // Key to fetch metadata for validation
-	Timestamp   int64  `json:"timestamp"`    // Unix timestamp when file was written
-}
-
 // EncodeSyncEntry serializes a SyncEntry to bytes
-func EncodeSyncEntry(entry *SyncEntry) ([]byte, error) {
-	return json.Marshal(entry)
+func EncodeSyncEntry(entry *pb.SyncEntry) ([]byte, error) {
+	return proto.Marshal(entry)
 }
 
 // DecodeSyncEntry deserializes a SyncEntry from bytes
-func DecodeSyncEntry(data []byte) (*SyncEntry, error) {
-	var entry SyncEntry
-	if err := json.Unmarshal(data, &entry); err != nil {
+func DecodeSyncEntry(data []byte) (*pb.SyncEntry, error) {
+	var entry pb.SyncEntry
+	if err := proto.Unmarshal(data, &entry); err != nil {
 		return nil, err
 	}
 	return &entry, nil

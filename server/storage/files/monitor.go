@@ -3,6 +3,7 @@ package files
 import (
 	"bytes"
 	"context"
+	"os"
 	"sync"
 	"time"
 
@@ -11,6 +12,11 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	// KernelSyncAge is the age when we estimate kernel syncs
+	KernelSyncAge = 60 * time.Second
 )
 
 // SyncMonitor passively monitors files and removes sync entries for files that have been synced
@@ -30,7 +36,7 @@ func NewSyncMonitor(meta *metadata.MetaDB, interval time.Duration) *SyncMonitor 
 	return &SyncMonitor{
 		meta:          meta,
 		interval:      interval,
-		kernelSyncAge: 30 * time.Second,
+		kernelSyncAge: KernelSyncAge,
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -76,11 +82,12 @@ func (m *SyncMonitor) run() {
 
 // monitorStats tracks statistics for a monitoring run
 type monitorStats struct {
-	checked int
-	synced  int
-	stale   int
-	pending int
-	errors  int
+	checked       int
+	synced        int
+	stale         int
+	pending       int
+	errors        int
+	filesDeleted  int
 }
 
 // checkAndCleanup checks for synced files and removes their tracking entries
@@ -95,6 +102,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 	defer it.Close()
 
 	var toDelete [][]byte
+	var filesToDelete []string
 	prefix := []byte(SyncIndexPrefix)
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -131,6 +139,8 @@ func (m *SyncMonitor) checkAndCleanup() {
 		// Check if entry is stale (metadata changed)
 		if m.isStaleEntry(entry, filepath) {
 			toDelete = append(toDelete, bytes.Clone(key.Data()))
+			// Mark orphaned file for deletion
+			filesToDelete = append(filesToDelete, filepath)
 			stats.stale++
 			key.Free()
 			value.Free()
@@ -170,6 +180,24 @@ func (m *SyncMonitor) checkAndCleanup() {
 		}
 	}
 
+	// Delete orphaned files
+	for _, filepath := range filesToDelete {
+		if err := os.Remove(filepath); err != nil {
+			if !os.IsNotExist(err) {
+				zlog.Warn().
+					Str("filepath", filepath).
+					Err(err).
+					Msg("files.monitor: failed to delete orphaned file")
+				stats.errors++
+			}
+		} else {
+			stats.filesDeleted++
+			zlog.Debug().
+				Str("filepath", filepath).
+				Msg("files.monitor: deleted orphaned file")
+		}
+	}
+
 	// Log statistics
 	if stats.checked > 0 || len(toDelete) > 0 {
 		zlog.Info().
@@ -177,6 +205,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 			Int("synced", stats.synced).
 			Int("stale", stats.stale).
 			Int("pending", stats.pending).
+			Int("files_deleted", stats.filesDeleted).
 			Int("errors", stats.errors).
 			Dur("duration", time.Since(startTime)).
 			Msg("files.monitor: cleanup completed")
@@ -184,7 +213,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 }
 
 // isStaleEntry checks if a sync entry is stale (metadata has changed)
-func (m *SyncMonitor) isStaleEntry(entry *SyncEntry, filepath string) bool {
+func (m *SyncMonitor) isStaleEntry(entry *pb.SyncEntry, filepath string) bool {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 

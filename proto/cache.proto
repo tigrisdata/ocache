@@ -85,3 +85,9 @@ message ValueMessage {
   int64 value_length = 7; // Length of the value in bytes within the segment
   uint32 checksum = 8; // CRC32 checksum of the value
 }
+
+// SyncEntry tracks a file pending sync in the sync index
+message SyncEntry {
+  string metadata_key = 1; // Key to fetch metadata for validation
+  int64 timestamp = 2; // Unix timestamp when file was written
+}
