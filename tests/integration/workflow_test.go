@@ -573,10 +573,10 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 		// Create a new harness with the same directory to simulate restart
 		// This will re-initialize storage and reload existing data
 		newHarness := &IntegrationTestHarness{
-			T:        t,
-			TempDir:  tempDir,
-			Config:   testConfig,
-			Metrics:  &TestMetrics{},
+			T:       t,
+			TempDir: tempDir,
+			Config:  testConfig,
+			Metrics: &TestMetrics{},
 		}
 
 		// Re-initialize storage with same directory (simulates cache warming)
@@ -593,10 +593,10 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 		// Get the new storage instance
 		newHarness.Storage = storage.GetStorage()
 		require.NotNil(t, newHarness.Storage, "Storage should be initialized after restart")
-		
+
 		// Replace the old harness with the new one
 		harness = newHarness
-		
+
 		// Log that restart completed
 		t.Logf("Storage restarted successfully with directory: %s", tempDir)
 	})
@@ -607,7 +607,7 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 		smallAvailable := 0
 		mediumAvailable := 0
 		largeAvailable := 0
-		
+
 		// Verify small objects
 		for key, expectedData := range smallObjects {
 			data, err := harness.GetObject(key)
@@ -640,17 +640,17 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 				t.Logf("Large object not available after restart: %s", key)
 			}
 		}
-		
+
 		// Verify at least most objects are available
 		t.Logf("Objects available after restart - Small: %d/%d, Medium: %d/%d, Large: %d/%d",
 			smallAvailable, len(smallObjects),
 			mediumAvailable, len(mediumObjects),
 			largeAvailable, len(largeObjects))
-		
+
 		// Expect at least 80% of objects to be available after restart
 		totalExpected := len(smallObjects) + len(mediumObjects) + len(largeObjects)
 		totalAvailable := smallAvailable + mediumAvailable + largeAvailable
-		assert.GreaterOrEqual(t, totalAvailable, int(float64(totalExpected)*0.8), 
+		assert.GreaterOrEqual(t, totalAvailable, int(float64(totalExpected)*0.8),
 			"Expected at least 80%% of objects to be available after restart")
 	})
 

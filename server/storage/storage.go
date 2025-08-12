@@ -211,6 +211,7 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
+	syncMonitor      *files.SyncMonitor    // Passive monitor for file sync tracking
 }
 
 var storage *Storage
@@ -257,6 +258,13 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 		return nil, err
 	}
 
+	// Run recovery for raw files BEFORE starting any services
+	recovery := files.NewRecoveryManager(meta, diskPath)
+	if err := recovery.RecoverOnStartup(); err != nil {
+		zlog.Error().Err(err).Msg("storage: file recovery failed")
+		return nil, fmt.Errorf("file recovery failed: %w", err)
+	}
+
 	// Initialize and start background compactor that migrates raw files into segments.
 	compactionInterval := getCompactionInterval()
 	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, compactionInterval)
@@ -292,6 +300,11 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 			Msg("storage: started async access updater for LRU tracking")
 	}
 
+	// Initialize and start the passive sync monitor
+	s.syncMonitor = files.NewSyncMonitor(meta, 30*time.Second)
+	s.syncMonitor.Start()
+	zlog.Info().Msg("storage: started passive sync monitor")
+
 	return s, nil
 }
 
@@ -302,6 +315,9 @@ func CloseStorage() {
 	}
 
 	// Stop background services
+	if storage.syncMonitor != nil {
+		storage.syncMonitor.Stop()
+	}
 	if storage.accessUpdater != nil {
 		storage.accessUpdater.Stop()
 	}
@@ -558,6 +574,17 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Store the metadata in the database with the metadata prefix
 	metaKey := keys.MakeMetadataKey(key)
 	batch.Put(metaKey, val)
+
+	// Add sync tracking for raw files
+	if filePath != "" {
+		syncKey := keys.MakeSyncKey(filePath)
+		syncEntry := &pb.SyncEntry{
+			MetadataKey: string(metaKey),
+			Timestamp:   time.Now().Unix(),
+		}
+		syncVal, _ := files.EncodeSyncEntry(syncEntry)
+		batch.Put(syncKey, syncVal)
+	}
 
 	// Add access time index entry for LRU tracking only if max disk usage is set
 	if s.cleaner.maxDiskUsage > 0 {

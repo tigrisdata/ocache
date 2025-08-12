@@ -82,7 +82,7 @@ func TestPrepareEntryForCompaction(t *testing.T) {
 	k, v := PrepareEntryForCompaction(key, filePath)
 
 	// Key should start with !compact/ prefix and contain timestamp
-	assert.True(t, bytes.HasPrefix(k, []byte(CompactionIndexPrefix)))
+	assert.True(t, bytes.HasPrefix(k, []byte(keys.CompactionIndexPrefix)))
 	assert.Contains(t, string(k), "|test-key")
 
 	// Value should be the file path
@@ -91,7 +91,7 @@ func TestPrepareEntryForCompaction(t *testing.T) {
 	// Ensure timestamp is properly formatted (20 digits)
 	parts := bytes.Split(k, []byte("|"))
 	assert.Len(t, parts, 2)
-	tsStr := string(parts[0][len(CompactionIndexPrefix):])
+	tsStr := string(parts[0][len(keys.CompactionIndexPrefix):])
 	assert.Len(t, tsStr, 20)
 }
 
@@ -446,7 +446,7 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	defer it.Close()
 
 	unprocessedCount := 0
-	filePrefix := []byte(CompactionIndexPrefix)
+	filePrefix := []byte(keys.CompactionIndexPrefix)
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		unprocessedCount++
 	}
@@ -525,20 +525,20 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 	// We'll create entries that should fill the segment without causing premature rotation
 	userKey := "test-key-with-reasonable-length"
 	headerSize := segment.CalculateValueHeaderSize(userKey)
-	
+
 	// Create multiple test files with known sizes
 	// Each entry needs header + value space
 	valueSize := int64(100 * 1024) // 100KB per value
 	totalPerEntry := headerSize + valueSize
-	
+
 	// Calculate how many entries should fit in the segment
 	// Leave some space for segment footer
 	expectedEntries := int((segmentSize - segment.SegmentFooterSize) / totalPerEntry)
-	
+
 	// Create test files and add to compaction index
 	wo := grocksdb.NewDefaultWriteOptions()
 	testFiles := []string{}
-	
+
 	for i := 0; i < expectedEntries+2; i++ { // Create more entries than should fit
 		// Create test file
 		testData := make([]byte, valueSize)
@@ -549,13 +549,13 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 		err := os.WriteFile(testFile, testData, 0o644)
 		require.NoError(t, err)
 		testFiles = append(testFiles, testFile)
-		
+
 		// Add to compaction index
 		key := fmt.Sprintf("%s-%d", userKey, i)
 		idxKey, idxVal := PrepareEntryForCompaction(key, testFile)
 		err = meta.Handle().Put(wo, idxKey, idxVal)
 		require.NoError(t, err)
-		
+
 		// Add metadata
 		vm := &pb.ValueMessage{
 			ValueLength: valueSize,
@@ -567,51 +567,51 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 		err = meta.Handle().Put(wo, metaKey, vmBytes)
 		require.NoError(t, err)
 	}
-	
+
 	// Run compaction
 	ctx := context.Background()
 	c.CompactFiles(ctx, 10*1024*1024) // High limit to not stop early
-	
+
 	// Check how many segments were created
 	numSegments := sm.GetSegmentCount()
-	
+
 	// We should have at least 2 segments since we created more entries than fit in one
 	assert.GreaterOrEqual(t, numSegments, 2, "Should have created multiple segments")
-	
+
 	// Verify first segment is properly filled
 	segments := sm.GetSegments()
 	if len(segments) > 0 {
 		firstSeg := segments[0]
-		
+
 		// First segment should be nearly full (at least 90% utilized)
 		// Taking into account headers and footer
 		minExpectedUsage := int64(float64(segmentSize) * 0.9)
-		
+
 		// The size should reflect actual data written
-		assert.Greater(t, firstSeg.GetSize(), minExpectedUsage, 
+		assert.Greater(t, firstSeg.GetSize(), minExpectedUsage,
 			"First segment should be at least 90%% full before rotation (size: %d, expected > %d)",
 			firstSeg.GetSize(), minExpectedUsage)
-		
+
 		// Verify the segment has the expected number of entries (approximately)
 		// Due to headers, the actual number might be slightly less than calculated
-		assert.GreaterOrEqual(t, int(firstSeg.GetEntries()), expectedEntries-1, 
+		assert.GreaterOrEqual(t, int(firstSeg.GetEntries()), expectedEntries-1,
 			"First segment should have close to the expected number of entries")
 	}
-	
+
 	// Count how many files were actually processed
 	ro := grocksdb.NewDefaultReadOptions()
 	ro.SetPrefixSameAsStart(true)
 	it := meta.Handle().NewIterator(ro)
 	defer it.Close()
-	
+
 	remainingCount := 0
-	filePrefix := []byte(CompactionIndexPrefix)
+	filePrefix := []byte(keys.CompactionIndexPrefix)
 	for it.Seek(filePrefix); it.ValidForPrefix(filePrefix); it.Next() {
 		remainingCount++
 	}
-	
+
 	// All or most entries should be processed
-	assert.LessOrEqual(t, remainingCount, 2, 
+	assert.LessOrEqual(t, remainingCount, 2,
 		"Most entries should be processed, only a few might remain if segment filled exactly")
 }
 
@@ -636,26 +636,26 @@ func TestSegmentRotationWithMixedSizes(t *testing.T) {
 		80 * 1024,  // 80KB
 		60 * 1024,  // 60KB
 	}
-	
+
 	wo := grocksdb.NewDefaultWriteOptions()
 	totalDataSize := int64(0)
-	
+
 	for i, size := range sizes {
 		// Create test file
 		testData := make([]byte, size)
 		testFile := filepath.Join(tmpDir, "files", fmt.Sprintf("mixed%d.dat", i))
 		err := os.WriteFile(testFile, testData, 0o644)
 		require.NoError(t, err)
-		
+
 		key := fmt.Sprintf("mixed-key-%d", i)
 		headerSize := segment.CalculateValueHeaderSize(key)
 		totalDataSize += headerSize + size
-		
+
 		// Add to compaction index
 		idxKey, idxVal := PrepareEntryForCompaction(key, testFile)
 		err = meta.Handle().Put(wo, idxKey, idxVal)
 		require.NoError(t, err)
-		
+
 		// Add metadata
 		vm := &pb.ValueMessage{
 			ValueLength: size,
@@ -667,29 +667,29 @@ func TestSegmentRotationWithMixedSizes(t *testing.T) {
 		err = meta.Handle().Put(wo, metaKey, vmBytes)
 		require.NoError(t, err)
 	}
-	
+
 	// Run compaction
 	ctx := context.Background()
 	c.CompactFiles(ctx, 10*1024*1024)
-	
+
 	// Verify segments were created appropriately
 	numSegments := sm.GetSegmentCount()
-	
+
 	// With 515KB of data and 512KB segments, we should have at least 2 segments
 	expectedMinSegments := int((totalDataSize + segmentSize - 1) / segmentSize)
-	assert.GreaterOrEqual(t, numSegments, expectedMinSegments, 
+	assert.GreaterOrEqual(t, numSegments, expectedMinSegments,
 		"Should have created appropriate number of segments for the data")
-	
+
 	// Verify no premature rotation occurred
 	// The last segment should still have reasonable utilization if it's not the active one
 	segments := sm.GetSegments()
-	
+
 	for i, seg := range segments {
 		// Skip the currently active segment (last one if it has an open file)
 		if i == len(segments)-1 && seg.HasOpenFile() {
 			continue
 		}
-		
+
 		// Finalized segments should be well-utilized (at least 70% for mixed sizes)
 		minUtilization := int64(float64(segmentSize) * 0.7)
 		assert.Greater(t, seg.GetSize(), minUtilization,
@@ -716,4 +716,139 @@ func TestCopyFileIntoSegmentError(t *testing.T) {
 		// If we can open it (running as root?), skip this test
 		t.Skip("Cannot test with unreadable file - possibly running as root")
 	}
+}
+
+func TestCompactFilesWithCorruptedFile(t *testing.T) {
+	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+	meta := metadata.GetMetaDB()
+
+	c := NewCompactor(fm, sm, 1024*1024, time.Second)
+
+	// Create test files with mismatched sizes
+	actualData := []byte("actual data content")
+	testFile := filepath.Join(tmpDir, "files", "corrupted.dat")
+	err := os.WriteFile(testFile, actualData, 0o644)
+	require.NoError(t, err)
+
+	// Add file index entry
+	idxKey, idxVal := PrepareEntryForCompaction("corrupted-key", testFile)
+	wo := grocksdb.NewDefaultWriteOptions()
+	err = meta.Handle().Put(wo, idxKey, idxVal)
+	require.NoError(t, err)
+
+	// Add metadata with WRONG size (simulating corruption)
+	wrongSize := int64(len(actualData) + 100) // Metadata says file is larger than it actually is
+	vm := &pb.ValueMessage{
+		ValueLength: wrongSize,
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: testFile,
+	}
+	vmBytes, _ := proto.Marshal(vm)
+	metaKey := keys.MakeMetadataKey("corrupted-key")
+	err = meta.Handle().Put(wo, metaKey, vmBytes)
+	require.NoError(t, err)
+
+	// Run compaction
+	ctx := context.Background()
+	c.CompactFiles(ctx, 1024*1024)
+
+	// Verify that the compaction index entry was removed (corruption detected)
+	ro := grocksdb.NewDefaultReadOptions()
+	slice, _ := meta.Handle().Get(ro, idxKey)
+	assert.False(t, slice.Exists(), "Compaction index entry should be removed for corrupted file")
+	slice.Free()
+
+	// Verify metadata was NOT updated to segment type
+	metaSlice, _ := meta.Handle().Get(ro, metaKey)
+	if metaSlice.Exists() {
+		checkVm := &pb.ValueMessage{}
+		err = proto.Unmarshal(metaSlice.Data(), checkVm)
+		assert.NoError(t, err)
+		assert.Equal(t, pb.ValueType_RAW_FILE, checkVm.ValueType, "Metadata should still show RAW_FILE type")
+		assert.Equal(t, testFile, checkVm.RawFilePath, "File path should remain unchanged")
+	}
+	metaSlice.Free()
+}
+
+func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
+	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+	meta := metadata.GetMetaDB()
+
+	c := NewCompactor(fm, sm, 1024*1024, time.Second)
+
+	// Create mix of valid and corrupted files
+	wo := grocksdb.NewDefaultWriteOptions()
+
+	// Valid file
+	validData := []byte("valid file content")
+	validFile := filepath.Join(tmpDir, "files", "valid.dat")
+	err := os.WriteFile(validFile, validData, 0o644)
+	require.NoError(t, err)
+
+	idxKeyValid, idxValValid := PrepareEntryForCompaction("valid-key", validFile)
+	err = meta.Handle().Put(wo, idxKeyValid, idxValValid)
+	require.NoError(t, err)
+
+	vmValid := &pb.ValueMessage{
+		ValueLength: int64(len(validData)), // Correct size
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: validFile,
+	}
+	vmValidBytes, _ := proto.Marshal(vmValid)
+	metaKeyValid := keys.MakeMetadataKey("valid-key")
+	err = meta.Handle().Put(wo, metaKeyValid, vmValidBytes)
+	require.NoError(t, err)
+
+	// Corrupted file (size mismatch)
+	corruptData := []byte("corrupt")
+	corruptFile := filepath.Join(tmpDir, "files", "corrupt.dat")
+	err = os.WriteFile(corruptFile, corruptData, 0o644)
+	require.NoError(t, err)
+
+	idxKeyCorrupt, idxValCorrupt := PrepareEntryForCompaction("corrupt-key", corruptFile)
+	err = meta.Handle().Put(wo, idxKeyCorrupt, idxValCorrupt)
+	require.NoError(t, err)
+
+	vmCorrupt := &pb.ValueMessage{
+		ValueLength: int64(1000), // Wrong size
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: corruptFile,
+	}
+	vmCorruptBytes, _ := proto.Marshal(vmCorrupt)
+	metaKeyCorrupt := keys.MakeMetadataKey("corrupt-key")
+	err = meta.Handle().Put(wo, metaKeyCorrupt, vmCorruptBytes)
+	require.NoError(t, err)
+
+	// Run compaction
+	ctx := context.Background()
+	c.CompactFiles(ctx, 1024*1024)
+
+	// Check results
+	ro := grocksdb.NewDefaultReadOptions()
+
+	// Valid file should be compacted
+	sliceValid, _ := meta.Handle().Get(ro, idxKeyValid)
+	assert.False(t, sliceValid.Exists(), "Valid file's compaction index should be removed")
+	sliceValid.Free()
+
+	// Valid file metadata should be updated
+	metaSliceValid, _ := meta.Handle().Get(ro, metaKeyValid)
+	if metaSliceValid.Exists() {
+		checkVm := &pb.ValueMessage{}
+		err = proto.Unmarshal(metaSliceValid.Data(), checkVm)
+		assert.NoError(t, err)
+		assert.Equal(t, pb.ValueType_SEGMENT, checkVm.ValueType, "Valid file should be in segment")
+	}
+	metaSliceValid.Free()
+
+	// Corrupted file's compaction index should be removed
+	sliceCorrupt, _ := meta.Handle().Get(ro, idxKeyCorrupt)
+	assert.False(t, sliceCorrupt.Exists(), "Corrupt file's compaction index should be removed")
+	sliceCorrupt.Free()
+
+	// Valid file should be deleted after successful compaction
+	_, err = os.Stat(validFile)
+	assert.True(t, os.IsNotExist(err), "Valid file should be deleted after compaction")
 }

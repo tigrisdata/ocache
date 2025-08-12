@@ -40,14 +40,17 @@ import (
 // NOTE: At present the implementation only migrates files; segment-level
 // compaction (merging/deleting) lives in Manager.compactSegments().
 
-const (
-	// CompactionIndexPrefix is the prefix for all compaction index entries in RocksDB
-	CompactionIndexPrefix = "!compact/"
+// ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
+type ErrFileSizeMismatch struct {
+	Key          string
+	FilePath     string
+	ActualSize   int64
+	ExpectedSize int64
+}
 
-	// CompactionIndexKeyFormat is the format for compaction index keys
-	// Format: !compact/<timestamp>|<userKey>
-	CompactionIndexKeyFormat = "!compact/%020d|%s"
-)
+func (e *ErrFileSizeMismatch) Error() string {
+	return fmt.Sprintf("file size mismatch for key %s: actual=%d expected=%d", e.Key, e.ActualSize, e.ExpectedSize)
+}
 
 type Compactor struct {
 	fm       *files.FileManager
@@ -127,10 +130,10 @@ func (c *Compactor) compactionLoop() {
 // PrepareEntryForCompaction prepares the key and value to store in compaction index.
 func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 	ts := time.Now().UnixNano()
-	idxKey := fmt.Sprintf(CompactionIndexKeyFormat, ts, key)
-	idxVal := fmt.Sprintf("%s", filePath)
+	idxKey := keys.MakeCompactionKey(ts, key)
+	idxVal := []byte(filePath)
 
-	return []byte(idxKey), []byte(idxVal)
+	return idxKey, idxVal
 }
 
 // CompactFiles scans the RocksDB file-index and migrates files into segments.
@@ -158,7 +161,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		return
 	}
 
-	filePrefix := []byte(CompactionIndexPrefix)
+	filePrefix := []byte(keys.CompactionIndexPrefix)
 	iterationCount := 0
 	lastLogTime := time.Now()
 
@@ -258,7 +261,21 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 				zlog.Info().Msg("compactor: compaction cancelled")
 				return
 			}
-			// Log error and continue with next entry
+			// Check if it's a file size mismatch error
+			var sizeMismatchErr *ErrFileSizeMismatch
+			if errors.As(err, &sizeMismatchErr) {
+				// Skip corrupted file
+				wb.Delete(k)
+				filesToDel = append(filesToDel, entry.filePath)
+				zlog.Warn().
+					Str("key", sizeMismatchErr.Key).
+					Str("file", sizeMismatchErr.FilePath).
+					Int64("actualSize", sizeMismatchErr.ActualSize).
+					Int64("expectedSize", sizeMismatchErr.ExpectedSize).
+					Msg("compactor: skipping corrupted file")
+				continue
+			}
+			// Log other errors and continue with next entry
 			continue
 		}
 
@@ -382,6 +399,23 @@ func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePa
 
 // compactEntry performs the actual compaction of a single entry
 func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, wb *grocksdb.WriteBatch) error {
+	// Validate file size matches metadata
+	if entry.fileInfo.Size() != entry.metadata.ValueLength {
+		zlog.Error().
+			Str("key", entry.userKey).
+			Str("filePath", entry.filePath).
+			Int64("actualSize", entry.fileInfo.Size()).
+			Int64("expectedSize", entry.metadata.ValueLength).
+			Msg("compactor: file size mismatch - possible corruption")
+		// Return error to skip this file
+		return &ErrFileSizeMismatch{
+			Key:          entry.userKey,
+			FilePath:     entry.filePath,
+			ActualSize:   entry.fileInfo.Size(),
+			ExpectedSize: entry.metadata.ValueLength,
+		}
+	}
+
 	// Calculate total space needed: header + value
 	headerSize := segment.CalculateValueHeaderSize(entry.userKey)
 	totalNeeded := headerSize + entry.metadata.ValueLength
