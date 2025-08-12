@@ -17,6 +17,9 @@ func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThresh
 
 	cleanup := func() {
 		// Stop background services
+		if s.syncMonitor != nil {
+			s.syncMonitor.Stop()
+		}
 		if s.accessUpdater != nil {
 			s.accessUpdater.Stop()
 		}

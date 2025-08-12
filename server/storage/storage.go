@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -65,6 +66,7 @@ type accessUpdater struct {
 	flush    chan chan struct{} // Channel to request flush with completion notification
 	storage  *Storage
 	interval time.Duration
+	wg       sync.WaitGroup
 }
 
 // newAccessUpdater creates a new access updater
@@ -80,12 +82,17 @@ func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration) *acces
 
 // Start begins the background goroutine for processing access updates
 func (a *accessUpdater) Start() {
-	go a.run()
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.run()
+	}()
 }
 
-// Stop stops the access updater
+// Stop stops the access updater and waits for it to finish
 func (a *accessUpdater) Stop() {
 	close(a.done)
+	a.wg.Wait()
 }
 
 // Update queues an access time update (non-blocking)
