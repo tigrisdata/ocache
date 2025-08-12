@@ -15,12 +15,17 @@ func GetMetadata(meta *metadata.MetaDB, key string) (*pb.ValueMessage, error) {
 	defer ro.Destroy()
 
 	metaSlice, err := meta.Handle().Get(ro, []byte(key))
-	if err != nil || !metaSlice.Exists() {
+	if err != nil {
 		if metaSlice != nil {
 			metaSlice.Free()
 		}
-
 		return nil, err
+	}
+	if !metaSlice.Exists() {
+		if metaSlice != nil {
+			metaSlice.Free()
+		}
+		return nil, ErrMetadataNotFound
 	}
 	defer metaSlice.Free()
 
@@ -43,9 +48,11 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 	if metadata == nil {
 		// Metadata doesn't exist - entry is stale
 		zlog.Debug().
+			Str("context", context).
 			Str("key", key).
 			Str("filepath", filePath).
-			Msg(context + ": stale entry (metadata not found)")
+			Str("reason", "metadata not found").
+			Msg("stale entry")
 		return ErrMetadataNotFound
 	}
 
@@ -54,16 +61,20 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 		// File was compacted or changed to inline
 		if metadata.ValueType == pb.ValueType_SEGMENT {
 			zlog.Debug().
+				Str("context", context).
 				Str("key", key).
 				Str("file", filePath).
-				Msg(context + ": already compacted")
+				Str("reason", "already compacted").
+				Msg("stale entry")
 			return ErrAlreadyCompacted
 		}
 		zlog.Debug().
+			Str("context", context).
 			Str("key", key).
 			Str("filepath", filePath).
 			Str("value_type", metadata.ValueType.String()).
-			Msg(context + ": stale entry (not raw file)")
+			Str("reason", "not raw file").
+			Msg("stale entry")
 		return ErrNotRawFile
 	}
 
@@ -71,10 +82,12 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 	if metadata.RawFilePath != filePath {
 		// Key was updated with new file
 		zlog.Debug().
+			Str("context", context).
 			Str("key", key).
 			Str("old_file", filePath).
 			Str("new_file", metadata.RawFilePath).
-			Msg(context + ": stale entry (metadata updated)")
+			Str("reason", "metadata updated").
+			Msg("stale entry")
 		return ErrFilePathMismatch
 	}
 

@@ -31,5 +31,5 @@ var (
 	ErrMalformedIndexRow = errors.New("malformed index row")
 
 	// ErrFileNotExist indicates the file doesn't exist on disk
-	ErrFileNotExist = errors.New("file not exist")
+	ErrFileNotExist = errors.New("file does not exist")
 )

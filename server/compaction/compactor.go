@@ -349,6 +349,10 @@ func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePa
 	// Load metadata first
 	meta, err := utils.GetMetadata(c.meta, string(metaKey))
 	if err != nil {
+		// If metadata not found, return the specific error
+		if errors.Is(err, utils.ErrMetadataNotFound) {
+			return nil, utils.ErrMetadataNotFound
+		}
 		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: bad metadata")
 		return nil, err
 	}
