@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/storage/segment"
+	"github.com/tigrisdata/ocache/server/utils"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -201,50 +201,37 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 
 		entry, err := c.processCompactionEntry(ctx, k, v, ro)
 		if err != nil {
-			// Handle different error cases
-			if err.Error() == "malformed index row" {
-				wb.Delete(k)
-				continue
-			}
-			if err.Error() == "file not exist: file does not exist" {
-				wb.Delete(k) // stale index row
-				continue
-			}
-			if err.Error() == "metadata not found" {
+			_, filePath, _ := parseFileIndexRow(k, v)
+
+			// Handle different error cases using error types
+			switch {
+			case errors.Is(err, utils.ErrMetadataNotFound):
 				// Key already gone – schedule raw file + index row for deletion
-				_, filePath, _ := parseFileIndexRow(k, v)
 				wb.Delete(k)
 				filesToDel = append(filesToDel, filePath)
 				continue
-			}
-			if err.Error() == "stale entry" {
-				_, filePath, _ := parseFileIndexRow(k, v)
-				wb.Delete(k)                              // Remove stale compaction index entry
-				filesToDel = append(filesToDel, filePath) // Delete the stale file
-				continue
-			}
-			if err.Error() == "already compacted" {
-				wb.Delete(k) // Remove compaction index entry
+			case errors.Is(err, utils.ErrAlreadyCompacted):
+				// Remove compaction index entry
 				// Note: don't delete the file since it might be referenced elsewhere
+				wb.Delete(k)
+				continue
+			case errors.Is(err, utils.ErrNotRawFile), errors.Is(err, utils.ErrFilePathMismatch):
+				// Stale entry - remove index and delete file
+				wb.Delete(k)
+				filesToDel = append(filesToDel, filePath)
+				continue
+			case errors.Is(err, utils.ErrMalformedIndexRow):
+				// Malformed index row - remove it
+				wb.Delete(k)
+				continue
+			case errors.Is(err, utils.ErrFileNotExist):
+				// File doesn't exist - remove stale index
+				wb.Delete(k)
+				continue
+			default:
+				// Other errors - just continue
 				continue
 			}
-			// Handle missing files - delete the index entry
-			if strings.Contains(err.Error(), "file not exist") {
-				wb.Delete(k) // Remove compaction index entry for non-existent file
-				continue
-			}
-			// Handle missing metadata - delete the index entry and potentially the file
-			if err.Error() == "metadata not found" {
-				wb.Delete(k) // Remove compaction index entry
-				// Also delete the orphaned file if it exists
-				_, filePath, _ := parseFileIndexRow(k, v)
-				if _, statErr := os.Stat(filePath); statErr == nil {
-					filesToDel = append(filesToDel, filePath)
-				}
-				continue
-			}
-			// Other errors - just continue
-			continue
 		}
 
 		// Advisory maxBytes check: if limit already reached and the next entry
@@ -328,21 +315,21 @@ func (c *Compactor) processCompactionEntry(ctx context.Context, k, v []byte, ro 
 	userKey, filePath, ok := parseFileIndexRow(k, v)
 	if !ok {
 		zlog.Error().Str("row", string(k)).Msg("compactor: malformed index row")
-		return nil, fmt.Errorf("malformed index row")
+		return nil, utils.ErrMalformedIndexRow
 	}
 
 	// Stat first – cheap, and gives us size quickly.
 	fInfo, err := os.Stat(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("file not exist: %w", err)
+			return nil, utils.ErrFileNotExist
 		}
 		zlog.Error().Err(err).Str("path", filePath).Msg("compactor: stat failed")
 		return nil, err
 	}
 
 	// Load and validate metadata
-	vm, err := c.loadAndValidateMetadata(ctx, userKey, filePath, ro)
+	meta, err := c.loadAndValidateMetadata(ctx, userKey, filePath, ro)
 	if err != nil {
 		return nil, err
 	}
@@ -351,50 +338,31 @@ func (c *Compactor) processCompactionEntry(ctx context.Context, k, v []byte, ro 
 		userKey:  userKey,
 		filePath: filePath,
 		fileInfo: fInfo,
-		metadata: vm,
+		metadata: meta,
 	}, nil
 }
 
 // loadAndValidateMetadata loads and validates metadata for a key
 func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePath string, ro *grocksdb.ReadOptions) (*pb.ValueMessage, error) {
 	metaKey := keys.MakeMetadataKey(userKey)
-	slice, err := c.meta.Handle().Get(ro, metaKey)
+
+	// Load metadata first
+	meta, err := utils.GetMetadata(c.meta, string(metaKey))
 	if err != nil {
-		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: db.Get")
-		return nil, err
-	}
-	defer slice.Free()
-
-	if !slice.Exists() {
-		return nil, fmt.Errorf("metadata not found")
-	}
-
-	vm := &pb.ValueMessage{}
-	if err := proto.Unmarshal(slice.Data(), vm); err != nil {
+		// If metadata not found, return the specific error
+		if errors.Is(err, utils.ErrMetadataNotFound) {
+			return nil, utils.ErrMetadataNotFound
+		}
 		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: bad metadata")
 		return nil, err
 	}
 
-	// Check if this is a stale entry
-	if vm.ValueType == pb.ValueType_RAW_FILE && vm.RawFilePath != filePath {
-		zlog.Debug().
-			Str("key", userKey).
-			Str("stale_file", filePath).
-			Str("current_file", vm.RawFilePath).
-			Msg("compactor: stale compaction entry")
-		return nil, fmt.Errorf("stale entry")
+	// Validate the file entry
+	if err := utils.ValidateFileEntry(meta, filePath, "compactor", userKey); err != nil {
+		return nil, err
 	}
 
-	// Check if already compacted
-	if vm.ValueType != pb.ValueType_RAW_FILE {
-		zlog.Debug().
-			Str("key", userKey).
-			Str("value_type", vm.ValueType.String()).
-			Msg("compactor: value already compacted")
-		return nil, fmt.Errorf("already compacted")
-	}
-
-	return vm, nil
+	return meta, nil
 }
 
 // compactEntry performs the actual compaction of a single entry

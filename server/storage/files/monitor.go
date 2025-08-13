@@ -243,33 +243,16 @@ func (m *SyncMonitor) isStaleEntry(entry *pb.SyncEntry, filepath string) bool {
 	default:
 	}
 
-	// Fetch current metadata
+	// Fetch current metadata once
 	metadata, err := utils.GetMetadata(m.meta, entry.MetadataKey)
-	if err != nil || metadata == nil {
-		// Metadata doesn't exist - entry is stale
+	if err != nil {
+		// Error fetching metadata - consider it stale
 		return true
 	}
 
-	// Check if metadata still points to this file
-	if metadata.ValueType != pb.ValueType_RAW_FILE {
-		// File was compacted or changed to inline
-		zlog.Debug().
-			Str("filepath", filepath).
-			Str("value_type", metadata.ValueType.String()).
-			Msg("files.monitor: stale entry (not raw file)")
-		return true
-	}
-
-	if metadata.RawFilePath != filepath {
-		// Key was updated with new file
-		zlog.Debug().
-			Str("old_file", filepath).
-			Str("new_file", metadata.RawFilePath).
-			Msg("files.monitor: stale entry (metadata updated)")
-		return true
-	}
-
-	return false
+	// Validate the file entry
+	err = utils.ValidateFileEntry(metadata, filepath, "files.monitor", entry.MetadataKey)
+	return err != nil // Stale if any validation error
 }
 
 // deleteEntries batch deletes sync entries

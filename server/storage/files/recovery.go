@@ -2,6 +2,7 @@ package files
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -150,22 +151,21 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 	// Fetch metadata
 	metadata, err := utils.GetMetadata(r.meta, entry.Value.MetadataKey)
 	if err != nil {
+		// Check if it's specifically metadata not found
+		if errors.Is(err, utils.ErrMetadataNotFound) {
+			zlog.Warn().
+				Str("filepath", entry.FilePath).
+				Str("metadata_key", entry.Value.MetadataKey).
+				Msg("files.recovery: orphaned sync entry (metadata not found)")
+			result.Status = StatusOrphaned
+			return result
+		}
 		zlog.Warn().
 			Str("filepath", entry.FilePath).
 			Err(err).
 			Msg("files.recovery: failed to fetch metadata")
 		result.Status = StatusCorrupted
 		result.Error = err
-		return result
-	}
-
-	// Check if metadata exists (orphaned sync entry)
-	if metadata == nil {
-		zlog.Warn().
-			Str("filepath", entry.FilePath).
-			Str("metadata_key", entry.Value.MetadataKey).
-			Msg("files.recovery: orphaned sync entry (metadata not found)")
-		result.Status = StatusOrphaned
 		return result
 	}
 
