@@ -329,7 +329,7 @@ func (c *Compactor) processCompactionEntry(ctx context.Context, k, v []byte, ro 
 	}
 
 	// Load and validate metadata
-	meta, err := c.loadAndValidateMetadata(ctx, userKey, filePath, ro)
+	meta, err := c.loadAndValidateMetadata(userKey, filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +343,7 @@ func (c *Compactor) processCompactionEntry(ctx context.Context, k, v []byte, ro 
 }
 
 // loadAndValidateMetadata loads and validates metadata for a key
-func (c *Compactor) loadAndValidateMetadata(ctx context.Context, userKey, filePath string, ro *grocksdb.ReadOptions) (*pb.ValueMessage, error) {
+func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.ValueMessage, error) {
 	metaKey := keys.MakeMetadataKey(userKey)
 
 	// Load metadata first
