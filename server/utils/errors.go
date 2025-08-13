@@ -32,4 +32,27 @@ var (
 
 	// ErrFileNotExist indicates the file doesn't exist on disk
 	ErrFileNotExist = errors.New("file does not exist")
+
+	// ErrEntryStale indicates a sync entry is stale (metadata changed or missing)
+	ErrEntryStale = errors.New("sync entry is stale")
+
+	// ErrFileCorrupted indicates a file is corrupted (size mismatch)
+	ErrFileCorrupted = errors.New("file corrupted: size mismatch")
 )
+
+// FileSizeMismatchError represents a file size mismatch error with details
+type FileSizeMismatchError struct {
+	Key          string
+	FilePath     string
+	ActualSize   int64
+	ExpectedSize int64
+}
+
+func (e *FileSizeMismatchError) Error() string {
+	return fmt.Sprintf("file corrupted: size mismatch for key %s, file %s: actual=%d expected=%d",
+		e.Key, e.FilePath, e.ActualSize, e.ExpectedSize)
+}
+
+func (e *FileSizeMismatchError) Is(target error) bool {
+	return target == ErrFileCorrupted
+}

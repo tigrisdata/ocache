@@ -3,6 +3,7 @@ package files
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ type monitorStats struct {
 	checked      int
 	synced       int
 	stale        int
+	corrupted    int
 	pending      int
 	errors       int
 	filesDeleted int
@@ -169,12 +171,26 @@ func (m *SyncMonitor) checkAndCleanup() {
 			continue
 		}
 
-		// Check if entry is stale (metadata changed)
-		if m.isStaleEntry(entry, filepath) {
+		// Check if entry is stale (metadata changed) or corrupted
+		err = m.checkEntryStatus(entry, filepath)
+		if err != nil {
 			toDelete = append(toDelete, bytes.Clone(key.Data()))
 			filesToDelete = append(filesToDelete, filepath)
 
-			stats.stale++
+			if errors.Is(err, utils.ErrFileCorrupted) {
+				stats.corrupted++
+				var sizeMismatch *utils.FileSizeMismatchError
+				if errors.As(err, &sizeMismatch) {
+					zlog.Warn().
+						Str("filepath", sizeMismatch.FilePath).
+						Str("key", sizeMismatch.Key).
+						Int64("actualSize", sizeMismatch.ActualSize).
+						Int64("expectedSize", sizeMismatch.ExpectedSize).
+						Msg("files.monitor: file corrupted (size mismatch)")
+				}
+			} else {
+				stats.stale++
+			}
 			key.Free()
 			value.Free()
 
@@ -225,6 +241,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 			Int("checked", stats.checked).
 			Int("synced", stats.synced).
 			Int("stale", stats.stale).
+			Int("corrupted", stats.corrupted).
 			Int("pending", stats.pending).
 			Int("files_deleted", stats.filesDeleted).
 			Int("errors", stats.errors).
@@ -233,13 +250,14 @@ func (m *SyncMonitor) checkAndCleanup() {
 	}
 }
 
-// isStaleEntry checks if a sync entry is stale (metadata has changed)
-func (m *SyncMonitor) isStaleEntry(entry *pb.SyncEntry, filepath string) bool {
+// checkEntryStatus checks if a sync entry is stale (metadata changed) or corrupted (size mismatch)
+// Returns nil if valid, utils.ErrEntryStale if stale, or utils.FileSizeMismatchError if corrupted
+func (m *SyncMonitor) checkEntryStatus(entry *pb.SyncEntry, filepath string) error {
 	// Check if context is cancelled before accessing database
 	select {
 	case <-m.ctx.Done():
 		// Consider it stale if we're shutting down
-		return true
+		return utils.ErrEntryStale
 	default:
 	}
 
@@ -247,12 +265,47 @@ func (m *SyncMonitor) isStaleEntry(entry *pb.SyncEntry, filepath string) bool {
 	metadata, err := utils.GetMetadata(m.meta, entry.MetadataKey)
 	if err != nil {
 		// Error fetching metadata - consider it stale
-		return true
+		return utils.ErrEntryStale
 	}
 
 	// Validate the file entry
 	err = utils.ValidateFileEntry(metadata, filepath, "files.monitor", entry.MetadataKey)
-	return err != nil // Stale if any validation error
+	if err != nil {
+		// Entry is stale if validation fails
+		return utils.ErrEntryStale
+	}
+
+	// Check for file size mismatch (corruption)
+	// Only check if metadata indicates it's a raw file
+	if metadata.ValueType == pb.ValueType_RAW_FILE && metadata.RawFilePath == filepath {
+		fileInfo, err := os.Stat(filepath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// File doesn't exist - consider it stale
+				return utils.ErrEntryStale
+			}
+			// Other stat error - log and consider stale
+			zlog.Warn().
+				Str("filepath", filepath).
+				Err(err).
+				Msg("files.monitor: failed to stat file")
+			return utils.ErrEntryStale
+		}
+
+		// Check if file size matches metadata
+		if fileInfo.Size() != metadata.ValueLength {
+			// Return detailed corruption error
+			return &utils.FileSizeMismatchError{
+				Key:          entry.MetadataKey,
+				FilePath:     filepath,
+				ActualSize:   fileInfo.Size(),
+				ExpectedSize: metadata.ValueLength,
+			}
+		}
+	}
+
+	// Entry is valid
+	return nil
 }
 
 // deleteEntries batch deletes sync entries

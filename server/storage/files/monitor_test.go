@@ -74,6 +74,70 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	assert.NoError(t, err, "File should still exist")
 }
 
+func TestMonitorRemovesCorruptedFiles(t *testing.T) {
+	filesDir, meta, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Create a file with initial data
+	testFile := filepath.Join(filesDir, "corrupted.dat")
+	initialData := []byte("initial data content")
+	err := os.WriteFile(testFile, initialData, 0o644)
+	require.NoError(t, err)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	// Add metadata with expected size (initial size)
+	metaKey := keys.MakeMetadataKey("corrupted-key")
+	vm := &pb.ValueMessage{
+		ValueLength: int64(len(initialData)),
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: testFile,
+	}
+	vmBytes, _ := proto.Marshal(vm)
+	batch.Put(metaKey, vmBytes)
+
+	// Add sync entry (recent, so it won't be removed due to age)
+	timestamp := time.Now().UnixNano()
+	syncKey := []byte(fmt.Sprintf("%s%020d/%s", keys.SyncIndexPrefix, timestamp, testFile))
+	syncEntry := &pb.SyncEntry{
+		MetadataKey: string(metaKey),
+		Timestamp:   time.Now().Unix(),
+	}
+	syncVal, _ := EncodeSyncEntry(syncEntry)
+	batch.Put(syncKey, syncVal)
+
+	err = meta.Handle().Write(wo, batch)
+	require.NoError(t, err)
+
+	// Now corrupt the file by changing its size
+	corruptedData := []byte("corrupted")
+	err = os.WriteFile(testFile, corruptedData, 0o644)
+	require.NoError(t, err)
+
+	// Create and run monitor once
+	monitor := NewSyncMonitor(meta, time.Hour) // Long interval so it doesn't repeat
+	monitor.checkAndCleanup()
+
+	// Verify sync entry was removed
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	syncSlice, _ := meta.Handle().Get(ro, syncKey)
+	assert.False(t, syncSlice.Exists(), "Sync entry for corrupted file should be removed")
+	syncSlice.Free()
+
+	// Verify metadata still exists (monitor doesn't remove metadata)
+	metaSlice, _ := meta.Handle().Get(ro, metaKey)
+	assert.True(t, metaSlice.Exists(), "Metadata should still exist")
+	metaSlice.Free()
+
+	// Verify corrupted file was deleted
+	_, err = os.Stat(testFile)
+	assert.True(t, os.IsNotExist(err), "Corrupted file should be deleted")
+}
+
 func TestMonitorRemovesStaleEntries(t *testing.T) {
 	filesDir, meta, cleanup := setupTestEnvironment(t)
 	defer cleanup()
