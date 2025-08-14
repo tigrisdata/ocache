@@ -377,7 +377,11 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 	defer cleanup()
 	meta := metadata.GetMetaDB()
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, deletion.DefaultConfig()), 1024*1024, time.Second)
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
+	c := NewCompactor(fm, sm, deletionQueue, 1024*1024, time.Second)
 
 	// Create a test file
 	testFile := filepath.Join(tmpDir, "files", "file.dat")
@@ -400,7 +404,14 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 	assert.False(t, slice.Exists())
 	slice.Free()
 
-	// File should be deleted as key is missing
+	// File should still exist (queued but not yet processed)
+	_, err = os.Stat(testFile)
+	assert.NoError(t, err)
+
+	// Process the deletion queue
+	deletionQueue.ProcessBatch()
+
+	// Now file should be deleted as key is missing
 	_, err = os.Stat(testFile)
 	assert.True(t, os.IsNotExist(err))
 }
@@ -780,7 +791,11 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 	defer cleanup()
 	meta := metadata.GetMetaDB()
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, deletion.DefaultConfig()), 1024*1024, time.Second)
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
+	c := NewCompactor(fm, sm, deletionQueue, 1024*1024, time.Second)
 
 	// Create mix of valid and corrupted files
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -852,7 +867,14 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 	assert.False(t, sliceCorrupt.Exists(), "Corrupt file's compaction index should be removed")
 	sliceCorrupt.Free()
 
-	// Valid file should be deleted after successful compaction
+	// Valid file should still exist (queued but not yet processed)
 	_, err = os.Stat(validFile)
-	assert.True(t, os.IsNotExist(err), "Valid file should be deleted after compaction")
+	assert.NoError(t, err, "Valid file should still exist (queued for deletion)")
+
+	// Process the deletion queue
+	deletionQueue.ProcessBatch()
+
+	// Now valid file should be deleted after successful compaction
+	_, err = os.Stat(validFile)
+	assert.True(t, os.IsNotExist(err), "Valid file should be deleted after queue processing")
 }

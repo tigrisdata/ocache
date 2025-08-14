@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 )
@@ -188,9 +189,10 @@ func TestQueue_LockedFile(t *testing.T) {
 	err := os.WriteFile(testFile, []byte("test"), 0644)
 	require.NoError(t, err)
 
-	// Open file to simulate it being locked/in use
-	f, err := os.Open(testFile)
-	require.NoError(t, err)
+	// Lock the file using the file lock manager
+	lockManager := fd.GetFileLockManager()
+	lock := lockManager.GetFileLock(testFile)
+	lock.Lock()
 
 	// Add to queue
 	err = queue.Add(testFile)
@@ -199,15 +201,15 @@ func TestQueue_LockedFile(t *testing.T) {
 	// Process batch - should fail to delete
 	queue.ProcessBatch()
 
-	// File should still exist (couldn't delete due to being open)
+	// File should still exist (couldn't delete due to being locked)
 	_, err = os.Stat(testFile)
 	require.NoError(t, err, "file should still exist")
 
 	// Should count as failed
 	require.Equal(t, int64(1), queue.failed)
 
-	// Close the file
-	f.Close()
+	// Unlock the file
+	lock.Unlock()
 
 	// Process again - should succeed now
 	queue.ProcessBatch()
@@ -311,7 +313,7 @@ func TestQueue_ContextCancellation(t *testing.T) {
 func TestQueue_KeyFunctions(t *testing.T) {
 	// Test MakeDeletionQueueKey
 	key := keys.MakeDeletionQueueKey(1234567890123456789, "/path/to/file.txt")
-	expected := []byte("!del/1234567890123456789/path/to/file.txt")
+	expected := []byte("!del/1234567890123456789//path/to/file.txt")
 	require.Equal(t, expected, key)
 
 	// Test ParseDeletionQueueKey
