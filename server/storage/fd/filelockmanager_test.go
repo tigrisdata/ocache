@@ -65,8 +65,18 @@ func TestFileLockManager_RemoveFileLock(t *testing.T) {
 		t.Fatal("GetFileLock returned nil")
 	}
 
+	// Verify lock exists
+	if !flm.HasLock(path) {
+		t.Error("HasLock should return true after GetFileLock")
+	}
+
 	// Remove the lock
 	flm.RemoveFileLock(path)
+
+	// Verify lock is removed
+	if flm.HasLock(path) {
+		t.Error("HasLock should return false after RemoveFileLock")
+	}
 
 	// Getting the lock again should return a new lock
 	lock2 := flm.GetFileLock(path)

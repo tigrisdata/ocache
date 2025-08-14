@@ -54,3 +54,12 @@ func (flm *FileLockManager) GetFileLock(path string) *sync.RWMutex {
 func (flm *FileLockManager) RemoveFileLock(path string) {
 	flm.fileLocks.Delete(path)
 }
+
+// HasLock returns true if a lock exists in the manager for the given path.
+// Note: This only indicates whether a lock object exists in the manager,
+// not whether the lock is currently held by any goroutine.
+// This method is primarily intended for testing purposes.
+func (flm *FileLockManager) HasLock(path string) bool {
+	_, ok := flm.fileLocks.Load(path)
+	return ok
+}
