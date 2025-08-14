@@ -35,6 +35,7 @@ var (
 	concurrency int
 	workload    string
 	seed        int64
+	noProgress  bool
 )
 
 func newClient() *cacheclient.Client {
@@ -123,6 +124,7 @@ var benchCmd = &cobra.Command{
 			Concurrency: concurrency,
 			Workload:    workload,
 			Seed:        seed,
+			NoProgress:  noProgress,
 		}
 		_, err := ycsb.RunYCSB(cfg)
 		if err != nil {
@@ -141,4 +143,5 @@ func init() {
 	benchCmd.Flags().IntVar(&concurrency, "concurrency", 8, "Number of concurrent workers")
 	benchCmd.Flags().StringVar(&workload, "workload", "A", "Workload type or custom mix (e.g. A, B, read=70,update=30)")
 	benchCmd.Flags().Int64Var(&seed, "seed", time.Now().UnixNano(), "Random seed")
+	benchCmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress output during benchmark")
 }
