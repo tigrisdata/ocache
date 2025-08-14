@@ -456,11 +456,6 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	throughputWg.Wait() // Wait for throughput goroutine to finish
 	dur := time.Since(t0)
 
-	// Stop progress reporter before processing results (if enabled)
-	if progressReporter != nil {
-		progressReporter.Stop()
-	}
-
 	totalErr := 0
 	allLatencies := make([]time.Duration, 0, cfg.NumOps)
 	totalOps := make([]int, OpNum)
