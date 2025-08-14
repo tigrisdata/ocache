@@ -191,7 +191,6 @@ func TestQueue_LockedFile(t *testing.T) {
 	// Open file to simulate it being locked/in use
 	f, err := os.Open(testFile)
 	require.NoError(t, err)
-	defer f.Close()
 
 	// Add to queue
 	err = queue.Add(testFile)

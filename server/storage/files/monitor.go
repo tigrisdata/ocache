@@ -25,13 +25,13 @@ const (
 
 // monitorStats tracks statistics for a monitoring run
 type monitorStats struct {
-	checked      int
-	synced       int
-	stale        int
-	corrupted    int
-	pending      int
-	errors       int
-	filesDeleted int
+	checked     int
+	synced      int
+	stale       int
+	corrupted   int
+	pending     int
+	errors      int
+	filesQueued int // Files queued for deletion (not yet deleted)
 }
 
 // SyncMonitor passively monitors files and removes sync entries for files that have been synced
@@ -187,7 +187,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 					Msg("files.monitor: failed to queue file for deletion")
 				stats.errors++
 			} else {
-				stats.filesDeleted++
+				stats.filesQueued++
 				zlog.Debug().
 					Str("filepath", filepath).
 					Msg("files.monitor: queued orphaned file for deletion")
@@ -258,7 +258,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 			Int("stale", stats.stale).
 			Int("corrupted", stats.corrupted).
 			Int("pending", stats.pending).
-			Int("files_deleted", stats.filesDeleted).
+			Int("files_queued", stats.filesQueued).
 			Int("errors", stats.errors).
 			Dur("duration", time.Since(startTime)).
 			Msg("files.monitor: cleanup completed")
