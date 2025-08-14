@@ -11,6 +11,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/deletion"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
@@ -36,6 +37,7 @@ type monitorStats struct {
 // SyncMonitor passively monitors files and removes sync entries for files that have been synced
 type SyncMonitor struct {
 	meta          *metadata.MetaDB
+	deletionQueue *deletion.Queue
 	interval      time.Duration // How often to check
 	kernelSyncAge time.Duration // Age when kernel syncs (30s)
 
@@ -45,10 +47,11 @@ type SyncMonitor struct {
 }
 
 // NewSyncMonitor creates a new sync monitor
-func NewSyncMonitor(meta *metadata.MetaDB, interval time.Duration) *SyncMonitor {
+func NewSyncMonitor(meta *metadata.MetaDB, deletionQueue *deletion.Queue, interval time.Duration) *SyncMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SyncMonitor{
 		meta:          meta,
+		deletionQueue: deletionQueue,
 		interval:      interval,
 		kernelSyncAge: KernelSyncAge,
 		ctx:           ctx,
@@ -126,7 +129,6 @@ func (m *SyncMonitor) checkAndCleanup() {
 	defer it.Close()
 
 	var toDelete [][]byte
-	var filesToDelete []string
 	prefix := []byte(keys.SyncIndexPrefix)
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -176,7 +178,20 @@ func (m *SyncMonitor) checkAndCleanup() {
 		err = m.checkEntryStatus(entry, filepath)
 		if err != nil {
 			toDelete = append(toDelete, bytes.Clone(key.Data()))
-			filesToDelete = append(filesToDelete, filepath)
+			
+			// Queue file for deletion immediately
+			if err := m.deletionQueue.Add(filepath); err != nil {
+				zlog.Error().
+					Str("filepath", filepath).
+					Err(err).
+					Msg("files.monitor: failed to queue file for deletion")
+				stats.errors++
+			} else {
+				stats.filesDeleted++
+				zlog.Debug().
+					Str("filepath", filepath).
+					Msg("files.monitor: queued orphaned file for deletion")
+			}
 
 			if errors.Is(err, utils.ErrFileCorrupted) {
 				stats.corrupted++
@@ -233,8 +248,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 		}
 	}
 
-	// Delete orphaned files
-	m.deleteFiles(filesToDelete, stats)
+	// Note: Files have already been queued for deletion inline above
 
 	// Log statistics
 	if stats.checked > 0 || len(toDelete) > 0 {
@@ -332,45 +346,3 @@ func (m *SyncMonitor) deleteEntries(keys [][]byte) error {
 	return m.meta.Handle().Write(wo, batch)
 }
 
-// deleteFiles deletes orphaned files
-// These are files where the metadata no longer points to them (stale entries)
-// It's safe to delete because the metadata has been updated or removed
-func (m *SyncMonitor) deleteFiles(filesToDelete []string, stats *monitorStats) {
-	lockManager := fd.GetFileLockManager()
-	for _, filepath := range filesToDelete {
-		// Track whether the file was successfully deleted
-		deleted := false
-
-		// Use a function to ensure proper lock handling with defer
-		func() {
-			// Acquire exclusive lock for the file before deletion
-			fileLock := lockManager.GetFileLock(filepath)
-			fileLock.Lock()
-			defer fileLock.Unlock()
-
-			if err := os.Remove(filepath); err != nil {
-				if !os.IsNotExist(err) {
-					zlog.Warn().
-						Str("filepath", filepath).
-						Err(err).
-						Msg("files.monitor: failed to delete orphaned file")
-					stats.errors++
-				}
-				// Don't mark as deleted if there was an error
-				return
-			}
-
-			stats.filesDeleted++
-			deleted = true
-			zlog.Debug().
-				Str("filepath", filepath).
-				Msg("files.monitor: deleted orphaned file")
-		}()
-
-		// Remove the lock from the manager only if the file was successfully deleted
-		// This happens outside the locked section to avoid any issues
-		if deleted {
-			lockManager.RemoveFileLock(filepath)
-		}
-	}
-}

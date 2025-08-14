@@ -15,6 +15,7 @@ import (
 
 	"github.com/tigrisdata/ocache/server/compaction"
 	"github.com/tigrisdata/ocache/server/storage/bufferpool"
+	"github.com/tigrisdata/ocache/server/storage/deletion"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
 	"github.com/tigrisdata/ocache/server/storage/keys"
@@ -215,6 +216,7 @@ type Storage struct {
 	segmentManager   *segment.Manager      // Segment manager for large objects on disk
 	fileManager      *files.FileManager    // File manager for large objects on disk
 	fdCache          *fd.FdCache           // File descriptor cache for open files
+	deletionQueue    *deletion.Queue       // Centralized file deletion queue
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
@@ -272,9 +274,13 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 		return nil, fmt.Errorf("file recovery failed: %w", err)
 	}
 
+	// Initialize and start the centralized deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+
 	// Initialize and start background compactor that migrates raw files into segments.
 	compactionInterval := getCompactionInterval()
-	compactor := compaction.NewCompactor(fileManager, segmentManager, DefaultCompactionMaxBytes, compactionInterval)
+	compactor := compaction.NewCompactor(fileManager, segmentManager, deletionQueue, DefaultCompactionMaxBytes, compactionInterval)
 	compactor.Start()
 
 	s := &Storage{
@@ -285,6 +291,7 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 		segmentManager:   segmentManager,
 		fileManager:      fileManager,
 		fdCache:          fdCache,
+		deletionQueue:    deletionQueue,
 		compactor:        compactor,
 	}
 
@@ -308,7 +315,7 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 	}
 
 	// Initialize and start the passive sync monitor
-	s.syncMonitor = files.NewSyncMonitor(meta, 30*time.Second)
+	s.syncMonitor = files.NewSyncMonitor(meta, deletionQueue, 30*time.Second)
 	s.syncMonitor.Start()
 	zlog.Info().Msg("storage: started passive sync monitor")
 
@@ -331,6 +338,9 @@ func CloseStorage() {
 	storage.cleaner.Close()
 	if storage.compactor != nil {
 		storage.compactor.Close()
+	}
+	if storage.deletionQueue != nil {
+		storage.deletionQueue.Stop()
 	}
 
 	// Close the segment manager
