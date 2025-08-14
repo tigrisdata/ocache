@@ -178,19 +178,21 @@ func (fc *FdCache) Release(path string, e *FileEntry) {
 	if newRefs == 0 {
 		// If this entry was cached, remove it
 		if e.cached {
-			// Atomically remove from cache first to prevent new acquisitions
-			if actual, loaded := fc.entries.LoadAndDelete(path); loaded {
-				// Only close and decrement size if we successfully removed our entry
-				if actual == e {
-					// Wait for file to be ready before closing (in case it's still opening)
-					<-e.ready
-					if e.f != nil {
-						_ = e.f.Close()
-					}
-					atomic.AddInt32(&fc.size, -1)
-				} else {
-					// Another goroutine replaced our entry, put it back
-					fc.entries.Store(path, actual)
+			// Try to remove from cache. We use CompareAndDelete to ensure we only
+			// remove our specific entry and not one that another goroutine may have added
+			if fc.entries.CompareAndDelete(path, e) {
+				// Successfully removed our entry, clean up
+				<-e.ready
+				if e.f != nil {
+					_ = e.f.Close()
+				}
+				atomic.AddInt32(&fc.size, -1)
+			} else {
+				// Either already removed or replaced by another goroutine
+				// Just close the file if it's ready
+				<-e.ready
+				if e.f != nil {
+					_ = e.f.Close()
 				}
 			}
 		} else {
