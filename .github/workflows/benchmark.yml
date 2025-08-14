@@ -1,0 +1,146 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+
+env:
+  GO_VERSION: "1.21"
+  ROCKSDB_VERSION: "10.4.2"
+
+jobs:
+  benchmark:
+    strategy:
+      matrix:
+        os: [namespace-profile-ubuntu-2404]
+        include:
+          - os: namespace-profile-ubuntu-2404
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgflags-dev \
+            libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
+
+      - name: Set OS name
+        id: os-name
+        run: |
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Cache RocksDB static artifact
+        uses: actions/cache@v4
+        id: cache-rocksdb-static
+        with:
+          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+
+      - name: Download pre-built RocksDB artifact
+        if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
+        run: |
+          # Try to download from GitHub releases first
+          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
+
+          if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
+            echo "Downloaded pre-built artifact from release"
+          else
+            echo "Pre-built artifact not found, building from source..."
+            ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
+            OS=${{ steps.os-name.outputs.os_name }} \
+            ARCH=${{ matrix.arch }} \
+            make build-rocksdb-static
+            mv rocksdb-static/rocksdb-static-*.tar.gz .
+          fi
+
+      - name: Extract RocksDB static artifact
+        run: |
+          mkdir -p rocksdb-static/artifact
+          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          ls -la rocksdb-static/artifact/
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Generate proto files
+        run: make proto
+
+      - name: Build server and CLI
+        run: STATIC_BUILD=true make all
+
+      - name: Start OCache server
+        run: |
+          echo "Starting OCache server..."
+          ./ocache -disk /tmp/ocache-bench -addr :9000 &
+          SERVER_PID=$!
+          echo "SERVER_PID=${SERVER_PID}" >> $GITHUB_ENV
+          
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if nc -z localhost 9000 2>/dev/null; then
+              echo "Server is ready"
+              break
+            fi
+            echo "Waiting for server to start..."
+            sleep 1
+          done
+
+      - name: Run benchmark - 100 bytes
+        run: |
+          echo "=== Running benchmark with 100 byte objects ==="
+          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 100 --workload "read=80,update=20"
+
+      - name: Run benchmark - 100 KB
+        run: |
+          echo "=== Running benchmark with 100 KB objects ==="
+          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 102400 --workload "read=80,update=20"
+
+      - name: Run benchmark - 1 MB
+        run: |
+          echo "=== Running benchmark with 1 MB objects ==="
+          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20"
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ ! -z "${SERVER_PID}" ]; then
+            echo "Stopping OCache server (PID: ${SERVER_PID})"
+            kill ${SERVER_PID} || true
+            wait ${SERVER_PID} 2>/dev/null || true
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.os }}
+          path: |
+            *.log
+            *.out
