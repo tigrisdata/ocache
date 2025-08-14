@@ -329,4 +329,3 @@ func TestQueue_KeyFunctions(t *testing.T) {
 	require.True(t, keys.IsDeletionQueueKey(key))
 	require.False(t, keys.IsDeletionQueueKey(badKey))
 }
-
