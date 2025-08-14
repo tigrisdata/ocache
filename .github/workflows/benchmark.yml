@@ -98,10 +98,9 @@ jobs:
       - name: Start OCache server
         run: |
           echo "Starting OCache server..."
-          ./ocache -disk /tmp/ocache-bench -addr :9000 &
-          SERVER_PID=$!
-          echo "SERVER_PID=${SERVER_PID}" >> $GITHUB_ENV
-          
+          make run-background
+          echo "SERVER_PID=$(cat ocache.pid)" >> $GITHUB_ENV
+
           # Wait for server to be ready
           for i in {1..30}; do
             if nc -z localhost 9000 2>/dev/null; then
@@ -115,26 +114,23 @@ jobs:
       - name: Run benchmark - 100 bytes
         run: |
           echo "=== Running benchmark with 100 byte objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 100 --workload "read=80,update=20"
+          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 100 --workload "read=80,update=20" | tee 100-byte-read-80-update-20.log
 
       - name: Run benchmark - 100 KB
         run: |
           echo "=== Running benchmark with 100 KB objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 102400 --workload "read=80,update=20"
+          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 102400 --workload "read=80,update=20" | tee 100kb-read-80-update-20.log
 
       - name: Run benchmark - 1 MB
         run: |
           echo "=== Running benchmark with 1 MB objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20"
+          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" | tee 1mb-read-80-update-20.log
 
       - name: Stop server
         if: always()
         run: |
-          if [ ! -z "${SERVER_PID}" ]; then
-            echo "Stopping OCache server (PID: ${SERVER_PID})"
-            kill ${SERVER_PID} || true
-            wait ${SERVER_PID} 2>/dev/null || true
-          fi
+          echo "Stopping OCache server (PID: ${SERVER_PID})"
+          make stop
 
       - name: Upload benchmark results
         if: always()
