@@ -225,7 +225,7 @@ func TestFdCache_CleanUp(t *testing.T) {
 	if _, ok := cache.entries.Load(tmpFile.Name()); ok {
 		t.Error("Entry should be removed from cache")
 	}
-	if _, ok := cache.fileLocks.Load(tmpFile.Name()); ok {
+	if GetFileLockManager().IsFileLocked(tmpFile.Name()) {
 		t.Error("File lock should be removed")
 	}
 

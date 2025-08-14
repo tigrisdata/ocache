@@ -71,7 +71,7 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 
 	// Get file-specific lock (exclusive for writers). As the file does not exist yet, we need to
 	// take the lock bypassing the fdCache.
-	fileLock := fm.fdCache.GetFileLock(filePath)
+	fileLock := fd.GetFileLockManager().GetFileLock(filePath)
 	fileLock.Lock()
 	defer fileLock.Unlock()
 
@@ -135,7 +135,7 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 // Remove removes a file for the given key without blocking if it's being read
 func (fm *FileManager) Remove(filePath string) error {
 	// Get file-specific lock (use GetFileLock, not Acquire, to avoid opening the file)
-	fileLock := fm.fdCache.GetFileLock(filePath)
+	fileLock := fd.GetFileLockManager().GetFileLock(filePath)
 
 	// Use TryLock to avoid blocking if file is being read
 	if !fileLock.TryLock() {

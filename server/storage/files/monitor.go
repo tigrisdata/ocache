@@ -11,6 +11,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/utils"
@@ -335,7 +336,12 @@ func (m *SyncMonitor) deleteEntries(keys [][]byte) error {
 // These are files where the metadata no longer points to them (stale entries)
 // It's safe to delete because the metadata has been updated or removed
 func (m *SyncMonitor) deleteFiles(filesToDelete []string, stats *monitorStats) {
+	lockManager := fd.GetFileLockManager()
 	for _, filepath := range filesToDelete {
+		// Acquire exclusive lock for the file before deletion
+		fileLock := lockManager.GetFileLock(filepath)
+		fileLock.Lock()
+
 		if err := os.Remove(filepath); err != nil {
 			if !os.IsNotExist(err) {
 				zlog.Warn().
@@ -349,6 +355,10 @@ func (m *SyncMonitor) deleteFiles(filesToDelete []string, stats *monitorStats) {
 			zlog.Debug().
 				Str("filepath", filepath).
 				Msg("files.monitor: deleted orphaned file")
+			// Remove the lock from the manager after successful deletion
+			lockManager.RemoveFileLock(filepath)
 		}
+
+		fileLock.Unlock()
 	}
 }
