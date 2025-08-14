@@ -16,6 +16,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func defaultDeletionQueueConfig() deletion.Config {
+	return deletion.Config{
+		BatchSize:       1000,
+		ProcessInterval: time.Second,
+		PruneAge:        24 * time.Hour,
+	}
+}
+
 func TestMonitorRemovesAgedEntries(t *testing.T) {
 	filesDir, meta, cleanup := setupTestEnvironment(t)
 	defer cleanup()
@@ -55,7 +63,7 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
@@ -124,7 +132,7 @@ func TestMonitorRemovesCorruptedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
@@ -201,7 +209,7 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 	require.NoError(t, err, "Old file should exist before cleanup")
 
 	// Create deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
@@ -264,7 +272,7 @@ func TestMonitorDeletesFileWhenMetadataDeleted(t *testing.T) {
 	require.NoError(t, err, "File should exist before cleanup")
 
 	// Create deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
@@ -329,7 +337,7 @@ func TestMonitorKeepsPendingEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
@@ -383,7 +391,7 @@ func TestMonitorHandlesCompactedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
@@ -448,7 +456,7 @@ func TestMonitorConcurrentOperation(t *testing.T) {
 	}
 
 	// Run monitor
-	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, defaultDeletionQueueConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Count remaining sync entries

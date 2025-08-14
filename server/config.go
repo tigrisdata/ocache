@@ -7,10 +7,10 @@ package main
 
 type Config struct {
 	DiskPath         string // Directory for on-disk cache data
-	InlineThreshold  int    // Threshold for small objects (bytes)
+	InlineThreshold  int    // Threshold for small objects that are inlined in RocksDB (bytes)
 	CompactThreshold int64  // Objects less than this size are compacted to segments (bytes)
 	SegmentSize      int64  // Segment size (bytes)
-	TTL              int    // Default TTL (seconds)
+	TTL              int    // Default TTL when no key-level TTL is set (seconds)
 	Port             int    // gRPC listen port
 	HTTPPort         int    // HTTP (grpc-gateway) port
 	Verbose          bool   // Enable verbose/debug logging

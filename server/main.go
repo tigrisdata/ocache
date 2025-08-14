@@ -14,14 +14,14 @@ import (
 
 var (
 	diskPath         = flag.String("disk", "/var/cache", "Directory for disk cache")
-	inlineThreshold  = flag.Int("threshold", 64*1024, "Small obj threshold (bytes)")
+	inlineThreshold  = flag.Int("threshold", 64*1024, "Small object threshold (bytes) that are inlined with metadata")
 	compactThreshold = flag.Int64("compact-threshold", 16*1024*1024, "Compaction threshold (bytes)")
 	segmentSize      = flag.Int64("segment-size", 256*1024*1024, "Segment size (bytes)")
-	ttl              = flag.Int("ttl", 900, "Default TTL in seconds")
+	ttl              = flag.Int("ttl", 0, "Default TTL in seconds when no key-level TTL is set")
 	port             = flag.Int("port", 9000, "Listen port")
 	httpPort         = flag.Int("http-port", 9001, "HTTP port")
 	verbose          = flag.Bool("v", false, "Enable debug logging")
-	fdCacheSize      = flag.Int("fd-cache-size", 1000, "Size of the file descriptor cache (entries)")
+	fdCacheSize      = flag.Int("fd-cache-size", 10000, "Size of the file descriptor cache (entries)")
 	maxDiskUsage     = flag.Int64("max-disk-usage", 0, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 )
 

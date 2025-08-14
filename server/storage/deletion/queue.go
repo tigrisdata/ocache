@@ -15,31 +15,11 @@ import (
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 )
 
-const (
-	// DefaultBatchSize is the default number of deletions to process per batch
-	DefaultBatchSize = 1000
-
-	// DefaultProcessInterval is the default interval between batch processing
-	DefaultProcessInterval = time.Second
-
-	// DefaultPruneAge is the default age after which queue entries are pruned
-	DefaultPruneAge = 24 * time.Hour
-)
-
 // Config holds configuration for the deletion queue
 type Config struct {
 	BatchSize       int           // Number of deletions per batch
 	ProcessInterval time.Duration // Interval between batch processing
 	PruneAge        time.Duration // Age after which entries are pruned
-}
-
-// DefaultConfig returns default configuration
-func DefaultConfig() Config {
-	return Config{
-		BatchSize:       DefaultBatchSize,
-		ProcessInterval: DefaultProcessInterval,
-		PruneAge:        DefaultPruneAge,
-	}
 }
 
 // Queue manages centralized file deletion
