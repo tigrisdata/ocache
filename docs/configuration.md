@@ -12,33 +12,33 @@ OCache can be configured through command-line flags when starting the server.
 
 ### Network Configuration
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `-port` | int | 9000 | gRPC server port |
-| `-http-port` | int | 9001 | HTTP API server port |
+| Flag         | Type | Default | Description          |
+| ------------ | ---- | ------- | -------------------- |
+| `-port`      | int  | 9000    | gRPC server port     |
+| `-http-port` | int  | 9001    | HTTP API server port |
 
 ### Storage Configuration
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `-disk` | string | `/var/cache` | Directory for disk cache storage |
-| `-threshold` | int | 65536 | Small object threshold in bytes (64KB). Objects smaller than this are stored in RocksDB |
-| `-segment-size` | int | 268435456 | Segment size in bytes (256MB) for large object storage |
-| `-compact-threshold` | int | 16777216 | Compaction threshold in bytes (16MB) |
-| `-max-disk-usage` | int | 0 | Maximum disk usage in bytes (0 = unlimited). When set, uses LRU eviction |
+| Flag                 | Type   | Default      | Description                                                                             |
+| -------------------- | ------ | ------------ | --------------------------------------------------------------------------------------- |
+| `-disk`              | string | `/var/cache` | Directory for disk cache storage                                                        |
+| `-threshold`         | int    | 65536        | Small object threshold in bytes (64KB). Objects smaller than this are stored in RocksDB |
+| `-segment-size`      | int    | 268435456    | Segment size in bytes (256MB) for large object storage                                  |
+| `-compact-threshold` | int    | 16777216     | Compaction threshold in bytes (16MB)                                                    |
+| `-max-disk-usage`    | int    | 0            | Maximum disk usage in bytes (0 = unlimited). When set, uses LRU eviction                |
 
 ### Cache Configuration
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `-ttl` | int | 900 | Default TTL in seconds (15 minutes) |
-| `-fd-cache-size` | int | 1000 | Size of the file descriptor cache (number of entries) |
+| Flag             | Type | Default | Description                                           |
+| ---------------- | ---- | ------- | ----------------------------------------------------- |
+| `-ttl`           | int  | 0       | Default TTL in seconds when no key-level TTL is set   |
+| `-fd-cache-size` | int  | 10000   | Size of the file descriptor cache (number of entries) |
 
 ### Logging
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `-v` | bool | false | Enable verbose/debug logging |
+| Flag | Type | Default | Description                  |
+| ---- | ---- | ------- | ---------------------------- |
+| `-v` | bool | false   | Enable verbose/debug logging |
 
 ## Configuration Examples
 
@@ -98,6 +98,7 @@ Smaller threshold, larger segments:
 OCache uses a dual-storage strategy:
 
 1. **Small Objects** (< threshold):
+
    - Stored directly in RocksDB
    - Fast access, lower overhead
    - Good for metadata, small files, JSON objects
@@ -136,6 +137,7 @@ OCache uses a dual-storage strategy:
 ## Monitoring
 
 Enable verbose logging (`-v`) to monitor:
+
 - Cache hits/misses
 - Storage operations
 - Compaction events

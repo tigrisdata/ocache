@@ -27,11 +27,18 @@ const (
 	// Default compaction thresholds
 	DefaultCompactionMaxBytes     = 1 << 30 // 1GB
 	DefaultFileCompactionInterval = 1 * time.Minute
+
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
+
 	// Default access update buffer size and batch interval
 	DefaultAccessUpdateBufferSize = 10000
 	DefaultAccessUpdateInterval   = 100 * time.Millisecond
+
+	// Default queue config
+	DeleteBatchSize       = 1000           // Number of deletions to process per batch
+	DeleteProcessInterval = time.Second    // Interval between batch processing
+	DeletePruneAge        = 24 * time.Hour // Age after which entries are pruned
 )
 
 // getCleanupInterval returns the cleanup interval, allowing tests to override via env var
@@ -275,7 +282,11 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 	}
 
 	// Initialize and start the centralized deletion queue
-	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue := deletion.NewQueue(meta, deletion.Config{
+		BatchSize:       DeleteBatchSize,
+		ProcessInterval: DeleteProcessInterval,
+		PruneAge:        DeletePruneAge,
+	})
 	deletionQueue.Start()
 
 	// Initialize and start background compactor that migrates raw files into segments.

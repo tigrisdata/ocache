@@ -73,7 +73,7 @@ Key configuration flags:
 | `-http-port`      | 9001       | HTTP port                      |
 | `-disk`           | /var/cache | Storage directory              |
 | `-threshold`      | 65536      | Small object threshold (bytes) |
-| `-ttl`            | 900        | Default TTL (seconds)          |
+| `-ttl`            | 0          | Default TTL (seconds)          |
 | `-max-disk-usage` | 0          | Max disk usage (0=unlimited)   |
 
 See [Configuration Guide](docs/configuration.md) for complete options.
