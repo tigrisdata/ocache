@@ -12,7 +12,6 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/deletion"
-	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/utils"
@@ -178,7 +177,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 		err = m.checkEntryStatus(entry, filepath)
 		if err != nil {
 			toDelete = append(toDelete, bytes.Clone(key.Data()))
-			
+
 			// Queue file for deletion immediately
 			if err := m.deletionQueue.Add(filepath); err != nil {
 				zlog.Error().
@@ -345,4 +344,3 @@ func (m *SyncMonitor) deleteEntries(keys [][]byte) error {
 
 	return m.meta.Handle().Write(wo, batch)
 }
-

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/deletion"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"google.golang.org/protobuf/proto"
 )
@@ -54,7 +55,7 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour) // Long interval so it doesn't repeat
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour) // Long interval so it doesn't repeat
 	monitor.checkAndCleanup()
 
 	// Verify aged sync entry was removed
@@ -118,7 +119,8 @@ func TestMonitorRemovesCorruptedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour) // Long interval so it doesn't repeat
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour) // Long interval so it doesn't repeat
+	monitor.deletionQueue = deletion.NewQueue(meta, deletion.DefaultConfig())
 	monitor.checkAndCleanup()
 
 	// Verify sync entry was removed
@@ -183,7 +185,7 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 	require.NoError(t, err, "Old file should exist before cleanup")
 
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify stale sync entry was removed
@@ -234,7 +236,7 @@ func TestMonitorDeletesFileWhenMetadataDeleted(t *testing.T) {
 	require.NoError(t, err, "File should exist before cleanup")
 
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify sync entry was removed
@@ -287,7 +289,7 @@ func TestMonitorKeepsPendingEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify pending sync entry still exists
@@ -336,7 +338,7 @@ func TestMonitorHandlesCompactedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify stale sync entry was removed (file was compacted)
@@ -396,7 +398,7 @@ func TestMonitorConcurrentOperation(t *testing.T) {
 	}
 
 	// Run monitor
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Count remaining sync entries

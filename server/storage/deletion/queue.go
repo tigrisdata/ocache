@@ -1,6 +1,7 @@
 package deletion
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -371,7 +372,7 @@ func (q *Queue) GetQueueDepth() int64 {
 // logQueueDepth logs the current queue depth and stats
 func (q *Queue) logQueueDepth() {
 	depth := q.GetQueueDepth()
-	
+
 	// Always log if there are items in the queue, or periodically log stats
 	if depth > 0 {
 		zlog.Info().
@@ -390,4 +391,3 @@ func (q *Queue) logQueueDepth() {
 			Msg("deletion queue: status (empty)")
 	}
 }
-
