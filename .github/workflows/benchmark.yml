@@ -24,9 +24,9 @@ jobs:
   benchmark:
     strategy:
       matrix:
-        os: [namespace-profile-ubuntu-2404]
+        os: [namespace-profile-ubuntu-2404-medium]
         include:
-          - os: namespace-profile-ubuntu-2404
+          - os: namespace-profile-ubuntu-2404-medium
             arch: x86_64
     runs-on: ${{ matrix.os }}
 
