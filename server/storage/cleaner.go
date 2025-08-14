@@ -158,11 +158,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			cleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
-			// Also delete associated files
+			// Queue associated files for deletion
 			switch valueMsg.ValueType {
 			case pb.ValueType_RAW_FILE:
-				if err := c.storage.fileManager.Remove(valueMsg.RawFilePath); err != nil {
-					zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to delete raw file")
+				if err := c.storage.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
+					zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to queue raw file for deletion")
 				}
 			}
 		}

@@ -12,6 +12,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/deletion"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
 	"github.com/tigrisdata/ocache/server/storage/keys"
@@ -53,12 +54,13 @@ func (e *ErrFileSizeMismatch) Error() string {
 }
 
 type Compactor struct {
-	fm       *files.FileManager
-	sm       *segment.Manager
-	meta     *metadata.MetaDB
-	fdCache  *fd.FdCache
-	maxBytes int64
-	interval time.Duration
+	fm            *files.FileManager
+	sm            *segment.Manager
+	meta          *metadata.MetaDB
+	fdCache       *fd.FdCache
+	deletionQueue *deletion.Queue
+	maxBytes      int64
+	interval      time.Duration
 
 	// background loop coordination
 	cancel context.CancelFunc
@@ -68,17 +70,18 @@ type Compactor struct {
 
 // NewCompactor creates a new Compactor bound to the provided FileManager and
 // Segment Manager.
-func NewCompactor(fm *files.FileManager, sm *segment.Manager, maxBytes int64, interval time.Duration) *Compactor {
+func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *deletion.Queue, maxBytes int64, interval time.Duration) *Compactor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Compactor{
-		fm:       fm,
-		sm:       sm,
-		meta:     metadata.GetMetaDB(),
-		fdCache:  fd.GetFdCache(),
-		maxBytes: maxBytes,
-		interval: interval,
-		ctx:      ctx,
-		cancel:   cancel,
+		fm:            fm,
+		sm:            sm,
+		meta:          metadata.GetMetaDB(),
+		fdCache:       fd.GetFdCache(),
+		deletionQueue: deletionQueue,
+		maxBytes:      maxBytes,
+		interval:      interval,
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
@@ -151,7 +154,6 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 	var (
 		processed   int
 		bytesCopied int64
-		filesToDel  []string
 	)
 
 	// Acquire the initial open segment.
@@ -206,9 +208,11 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 			// Handle different error cases using error types
 			switch {
 			case errors.Is(err, utils.ErrMetadataNotFound):
-				// Key already gone – schedule raw file + index row for deletion
+				// Key already gone – queue file for deletion and remove index
 				wb.Delete(k)
-				filesToDel = append(filesToDel, filePath)
+				if err := c.deletionQueue.Add(filePath); err != nil {
+					zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue file for deletion")
+				}
 				continue
 			case errors.Is(err, utils.ErrAlreadyCompacted):
 				// Remove compaction index entry
@@ -216,9 +220,11 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 				wb.Delete(k)
 				continue
 			case errors.Is(err, utils.ErrNotRawFile), errors.Is(err, utils.ErrFilePathMismatch):
-				// Stale entry - remove index and delete file
+				// Stale entry - remove index and queue file for deletion
 				wb.Delete(k)
-				filesToDel = append(filesToDel, filePath)
+				if err := c.deletionQueue.Add(filePath); err != nil {
+					zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue file for deletion")
+				}
 				continue
 			case errors.Is(err, utils.ErrMalformedIndexRow):
 				// Malformed index row - remove it
@@ -251,9 +257,11 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 			// Check if it's a file size mismatch error
 			var sizeMismatchErr *ErrFileSizeMismatch
 			if errors.As(err, &sizeMismatchErr) {
-				// Skip corrupted file
+				// Skip corrupted file - queue for deletion
 				wb.Delete(k)
-				filesToDel = append(filesToDel, entry.filePath)
+				if err := c.deletionQueue.Add(entry.filePath); err != nil {
+					zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: failed to queue corrupted file for deletion")
+				}
 				zlog.Warn().
 					Str("key", sizeMismatchErr.Key).
 					Str("file", sizeMismatchErr.FilePath).
@@ -266,16 +274,18 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 			continue
 		}
 
-		// Housekeeping
+		// Housekeeping - queue successfully compacted file for deletion
 		wb.Delete(k) // remove index row
-		filesToDel = append(filesToDel, entry.filePath)
+		if err := c.deletionQueue.Add(entry.filePath); err != nil {
+			zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: failed to queue compacted file for deletion")
+		}
 
 		processed++
 		bytesCopied += entry.fileInfo.Size()
 	}
 
 	// Final commit.
-	if err := c.commit(ctx, seg, wb, filesToDel); err != nil {
+	if err := c.commit(ctx, seg, wb); err != nil {
 		if err != context.Canceled {
 			zlog.Error().Err(err).Msg("compactor: commit failed")
 		}
@@ -452,8 +462,8 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 	return nil
 }
 
-// commit commits pending RocksDB mutations and deletes migrated files.
-func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocksdb.WriteBatch, toDelete []string) error {
+// commit commits pending RocksDB mutations.
+func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocksdb.WriteBatch) error {
 	if wb.Count() == 0 {
 		return nil // nothing to do
 	}
@@ -472,45 +482,6 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 
 	if err := c.meta.Handle().Write(grocksdb.NewDefaultWriteOptions(), wb); err != nil {
 		return err
-	}
-
-	// Remove obsolete raw files on best-effort basis
-	// Files that are currently being read will be skipped and left for next compaction run.
-	zlog.Debug().Int("count", len(toDelete)).Msg("compactor: starting file deletion")
-
-	filesDeleted := 0
-	skippedFiles := 0
-	for _, p := range toDelete {
-		// Check if context is cancelled during cleanup
-		if err := ctx.Err(); err != nil {
-			zlog.Info().Msg("compactor: file cleanup interrupted by cancellation")
-			return nil
-		}
-
-		err := c.fm.Remove(p)
-		if err != nil {
-			if errors.Is(err, files.ErrFileLocked) {
-				skippedFiles++
-				if skippedFiles <= 10 {
-					zlog.Debug().Str("path", p).Msg("compactor: file locked for reading, will retry in next compaction")
-				}
-			} else {
-				zlog.Error().Err(err).Str("path", p).Msg("compactor: failed to delete file")
-			}
-
-			continue
-		}
-
-		filesDeleted++
-		if filesDeleted <= 10 || filesDeleted%100 == 0 {
-			zlog.Debug().Str("path", p).Int("deleted_so_far", filesDeleted).Msg("compactor: deleted file")
-		}
-	}
-
-	if skippedFiles > 0 {
-		zlog.Info().Int("deleted", filesDeleted).Int("skipped", skippedFiles).Int("total", len(toDelete)).Msg("compactor: commit completed with some files skipped")
-	} else if filesDeleted > 0 {
-		zlog.Info().Int("deleted", filesDeleted).Msg("compactor: commit completed, all files deleted")
 	}
 
 	return nil

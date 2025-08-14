@@ -29,6 +29,9 @@ func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThresh
 		if s.compactor != nil {
 			s.compactor.Close()
 		}
+		if s.deletionQueue != nil {
+			s.deletionQueue.Stop()
+		}
 		if s.segmentManager != nil {
 			s.segmentManager.Close()
 		}

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/deletion"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"google.golang.org/protobuf/proto"
 )
@@ -53,8 +54,13 @@ func TestMonitorRemovesAgedEntries(t *testing.T) {
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
 
+	// Create deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour) // Long interval so it doesn't repeat
+	monitor := NewSyncMonitor(meta, deletionQueue, time.Hour) // Long interval so it doesn't repeat
 	monitor.checkAndCleanup()
 
 	// Verify aged sync entry was removed
@@ -117,8 +123,13 @@ func TestMonitorRemovesCorruptedFiles(t *testing.T) {
 	err = os.WriteFile(testFile, corruptedData, 0o644)
 	require.NoError(t, err)
 
+	// Create deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour) // Long interval so it doesn't repeat
+	monitor := NewSyncMonitor(meta, deletionQueue, time.Hour) // Long interval so it doesn't repeat
 	monitor.checkAndCleanup()
 
 	// Verify sync entry was removed
@@ -133,9 +144,16 @@ func TestMonitorRemovesCorruptedFiles(t *testing.T) {
 	assert.True(t, metaSlice.Exists(), "Metadata should still exist")
 	metaSlice.Free()
 
-	// Verify corrupted file was deleted
+	// File should still exist (queued but not yet processed)
 	_, err = os.Stat(testFile)
-	assert.True(t, os.IsNotExist(err), "Corrupted file should be deleted")
+	assert.NoError(t, err, "Corrupted file should still exist (queued for deletion)")
+
+	// Process the deletion queue
+	deletionQueue.ProcessBatch()
+
+	// Now verify corrupted file was deleted
+	_, err = os.Stat(testFile)
+	assert.True(t, os.IsNotExist(err), "Corrupted file should be deleted after queue processing")
 }
 
 func TestMonitorRemovesStaleEntries(t *testing.T) {
@@ -182,8 +200,13 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 	_, err = os.Stat(oldFile)
 	require.NoError(t, err, "Old file should exist before cleanup")
 
+	// Create deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletionQueue, time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify stale sync entry was removed
@@ -193,9 +216,16 @@ func TestMonitorRemovesStaleEntries(t *testing.T) {
 	assert.False(t, syncSlice.Exists(), "Stale sync entry should be removed")
 	syncSlice.Free()
 
-	// Verify orphaned file was deleted
+	// File should still exist (queued but not yet processed)
 	_, err = os.Stat(oldFile)
-	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted")
+	assert.NoError(t, err, "Orphaned file should still exist (queued for deletion)")
+
+	// Process the deletion queue
+	deletionQueue.ProcessBatch()
+
+	// Now verify orphaned file was deleted
+	_, err = os.Stat(oldFile)
+	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted after queue processing")
 
 	// Verify new file still exists
 	_, err = os.Stat(newFile)
@@ -233,8 +263,13 @@ func TestMonitorDeletesFileWhenMetadataDeleted(t *testing.T) {
 	_, err = os.Stat(testFile)
 	require.NoError(t, err, "File should exist before cleanup")
 
+	// Create deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletionQueue, time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify sync entry was removed
@@ -244,9 +279,16 @@ func TestMonitorDeletesFileWhenMetadataDeleted(t *testing.T) {
 	assert.False(t, syncSlice.Exists(), "Sync entry should be removed")
 	syncSlice.Free()
 
-	// Verify orphaned file was deleted
+	// File should still exist (queued but not yet processed)
 	_, err = os.Stat(testFile)
-	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted when metadata is missing")
+	assert.NoError(t, err, "Orphaned file should still exist (queued for deletion)")
+
+	// Process the deletion queue
+	deletionQueue.ProcessBatch()
+
+	// Now verify orphaned file was deleted
+	_, err = os.Stat(testFile)
+	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted after queue processing")
 }
 
 func TestMonitorKeepsPendingEntries(t *testing.T) {
@@ -286,8 +328,13 @@ func TestMonitorKeepsPendingEntries(t *testing.T) {
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
 
+	// Create deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletionQueue, time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify pending sync entry still exists
@@ -335,8 +382,13 @@ func TestMonitorHandlesCompactedFiles(t *testing.T) {
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
 
+	// Create deletion queue
+	deletionQueue := deletion.NewQueue(meta, deletion.DefaultConfig())
+	deletionQueue.Start()
+	defer deletionQueue.Stop()
+
 	// Create and run monitor once
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletionQueue, time.Hour)
 	monitor.checkAndCleanup()
 
 	// Verify stale sync entry was removed (file was compacted)
@@ -396,7 +448,7 @@ func TestMonitorConcurrentOperation(t *testing.T) {
 	}
 
 	// Run monitor
-	monitor := NewSyncMonitor(meta, time.Hour)
+	monitor := NewSyncMonitor(meta, deletion.NewQueue(meta, deletion.DefaultConfig()), time.Hour)
 	monitor.checkAndCleanup()
 
 	// Count remaining sync entries
