@@ -7,6 +7,18 @@ import (
 // FileLockManager manages file-level locks for concurrent access control.
 // It provides RWMutex locks for files, allowing multiple concurrent readers
 // while giving exclusive access to writers (Write/Delete operations).
+//
+// Thread-safety: All methods are safe for concurrent use.
+//
+// Usage pattern:
+//
+//	lock := manager.GetFileLock(path)
+//	lock.Lock() // or lock.RLock() for read operations
+//	defer lock.Unlock() // or lock.RUnlock()
+//	// ... perform file operations ...
+//
+// Note: RemoveFileLock should only be called after the file has been
+// successfully deleted and the lock has been released.
 type FileLockManager struct {
 	fileLocks sync.Map // path -> *sync.RWMutex
 }
@@ -35,14 +47,10 @@ func (flm *FileLockManager) GetFileLock(path string) *sync.RWMutex {
 	return lock.(*sync.RWMutex)
 }
 
-// RemoveFileLock removes the lock for the given path.
-// This should be called when a file is permanently deleted.
+// RemoveFileLock removes the lock for the given path from the manager.
+// This should be called only after a file has been successfully deleted
+// and its lock has been released. Calling this while a lock is still held
+// may lead to unexpected behavior.
 func (flm *FileLockManager) RemoveFileLock(path string) {
 	flm.fileLocks.Delete(path)
-}
-
-// IsFileLocked returns true if the file is locked.
-func (flm *FileLockManager) IsFileLocked(path string) bool {
-	_, ok := flm.fileLocks.Load(path)
-	return ok
 }

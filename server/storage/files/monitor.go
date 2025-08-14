@@ -338,27 +338,39 @@ func (m *SyncMonitor) deleteEntries(keys [][]byte) error {
 func (m *SyncMonitor) deleteFiles(filesToDelete []string, stats *monitorStats) {
 	lockManager := fd.GetFileLockManager()
 	for _, filepath := range filesToDelete {
-		// Acquire exclusive lock for the file before deletion
-		fileLock := lockManager.GetFileLock(filepath)
-		fileLock.Lock()
+		// Track whether the file was successfully deleted
+		deleted := false
 
-		if err := os.Remove(filepath); err != nil {
-			if !os.IsNotExist(err) {
-				zlog.Warn().
-					Str("filepath", filepath).
-					Err(err).
-					Msg("files.monitor: failed to delete orphaned file")
-				stats.errors++
+		// Use a function to ensure proper lock handling with defer
+		func() {
+			// Acquire exclusive lock for the file before deletion
+			fileLock := lockManager.GetFileLock(filepath)
+			fileLock.Lock()
+			defer fileLock.Unlock()
+
+			if err := os.Remove(filepath); err != nil {
+				if !os.IsNotExist(err) {
+					zlog.Warn().
+						Str("filepath", filepath).
+						Err(err).
+						Msg("files.monitor: failed to delete orphaned file")
+					stats.errors++
+				}
+				// Don't mark as deleted if there was an error
+				return
 			}
-		} else {
+
 			stats.filesDeleted++
+			deleted = true
 			zlog.Debug().
 				Str("filepath", filepath).
 				Msg("files.monitor: deleted orphaned file")
-			// Remove the lock from the manager after successful deletion
+		}()
+
+		// Remove the lock from the manager only if the file was successfully deleted
+		// This happens outside the locked section to avoid any issues
+		if deleted {
 			lockManager.RemoveFileLock(filepath)
 		}
-
-		fileLock.Unlock()
 	}
 }
