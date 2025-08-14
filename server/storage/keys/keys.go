@@ -98,7 +98,7 @@ func IsSyncKey(key []byte) bool {
 // MakeDeletionQueueKey creates a deletion queue key for a file
 // Format: !del/<timestamp>/<filepath>
 func MakeDeletionQueueKey(timestamp int64, filepath string) []byte {
-	return []byte(fmt.Sprintf("%s%019d/%s", DeletionQueuePrefix, timestamp, filepath))
+	return []byte(fmt.Sprintf("%s%020d/%s", DeletionQueuePrefix, timestamp, filepath))
 }
 
 // ParseDeletionQueueKey extracts timestamp and filepath from a deletion queue key
@@ -119,7 +119,7 @@ func ParseDeletionQueueKey(key []byte) (int64, string, error) {
 
 	// Parse timestamp
 	var timestamp int64
-	if _, err := fmt.Sscanf(parts[0], "%019d", &timestamp); err != nil {
+	if _, err := fmt.Sscanf(parts[0], "%020d", &timestamp); err != nil {
 		return 0, "", fmt.Errorf("failed to parse timestamp: %w", err)
 	}
 

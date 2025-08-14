@@ -313,7 +313,7 @@ func TestQueue_ContextCancellation(t *testing.T) {
 func TestQueue_KeyFunctions(t *testing.T) {
 	// Test MakeDeletionQueueKey
 	key := keys.MakeDeletionQueueKey(1234567890123456789, "/path/to/file.txt")
-	expected := []byte("!del/1234567890123456789//path/to/file.txt")
+	expected := []byte("!del/01234567890123456789//path/to/file.txt")
 	require.Equal(t, expected, key)
 
 	// Test ParseDeletionQueueKey
