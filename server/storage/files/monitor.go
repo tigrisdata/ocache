@@ -11,6 +11,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/utils"
@@ -335,20 +336,41 @@ func (m *SyncMonitor) deleteEntries(keys [][]byte) error {
 // These are files where the metadata no longer points to them (stale entries)
 // It's safe to delete because the metadata has been updated or removed
 func (m *SyncMonitor) deleteFiles(filesToDelete []string, stats *monitorStats) {
+	lockManager := fd.GetFileLockManager()
 	for _, filepath := range filesToDelete {
-		if err := os.Remove(filepath); err != nil {
-			if !os.IsNotExist(err) {
-				zlog.Warn().
-					Str("filepath", filepath).
-					Err(err).
-					Msg("files.monitor: failed to delete orphaned file")
-				stats.errors++
+		// Track whether the file was successfully deleted
+		deleted := false
+
+		// Use a function to ensure proper lock handling with defer
+		func() {
+			// Acquire exclusive lock for the file before deletion
+			fileLock := lockManager.GetFileLock(filepath)
+			fileLock.Lock()
+			defer fileLock.Unlock()
+
+			if err := os.Remove(filepath); err != nil {
+				if !os.IsNotExist(err) {
+					zlog.Warn().
+						Str("filepath", filepath).
+						Err(err).
+						Msg("files.monitor: failed to delete orphaned file")
+					stats.errors++
+				}
+				// Don't mark as deleted if there was an error
+				return
 			}
-		} else {
+
 			stats.filesDeleted++
+			deleted = true
 			zlog.Debug().
 				Str("filepath", filepath).
 				Msg("files.monitor: deleted orphaned file")
+		}()
+
+		// Remove the lock from the manager only if the file was successfully deleted
+		// This happens outside the locked section to avoid any issues
+		if deleted {
+			lockManager.RemoveFileLock(filepath)
 		}
 	}
 }

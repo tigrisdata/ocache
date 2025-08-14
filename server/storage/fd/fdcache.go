@@ -59,10 +59,9 @@ func (e *FileEntry) RUnlock() {
 // All public APIs (`Acquire`, `Release`, `Remove`) are safe for concurrent use.
 
 type FdCache struct {
-	capacity  int      // maximum number of cached entries (0 = unlimited)
-	size      int32    // current size, accessed atomically
-	entries   sync.Map // path -> *FileEntry
-	fileLocks sync.Map // path -> *sync.RWMutex
+	capacity int      // maximum number of cached entries (0 = unlimited)
+	size     int32    // current size, accessed atomically
+	entries  sync.Map // path -> *FileEntry
 }
 
 // fdCache is a singleton instance of FdCache.
@@ -80,8 +79,7 @@ func NewFdCache(capacity int) *FdCache {
 	}
 
 	fdCache = &FdCache{
-		capacity:  capacity,
-		fileLocks: sync.Map{},
+		capacity: capacity,
 	}
 
 	return fdCache
@@ -119,7 +117,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 	entry := &FileEntry{
 		refs:   1,
 		f:      nil,
-		mu:     fc.GetFileLock(path),
+		mu:     GetFileLockManager().GetFileLock(path),
 		ready:  ready,
 		cached: !atCapacity, // Won't be cached if at capacity
 	}
@@ -228,14 +226,14 @@ func (fc *FdCache) Remove(path string) {
 // An RWMutex allows multiple concurrent readers while still giving exclusive
 // access to writers (Write/Delete), which is exactly the behaviour we need for
 // raw files.
+// Deprecated: Use GetFileLockManager().GetFileLock(path) instead.
 func (fc *FdCache) GetFileLock(path string) *sync.RWMutex {
-	lock, _ := fc.fileLocks.LoadOrStore(path, &sync.RWMutex{})
-	return lock.(*sync.RWMutex)
+	return GetFileLockManager().GetFileLock(path)
 }
 
 // CleanUp removes the entry for `path` from the cache and closes the file.
 // This is primarily used when the file itself has been deleted from disk.
 func (fc *FdCache) CleanUp(path string) {
 	fc.Remove(path)
-	fc.fileLocks.Delete(path)
+	GetFileLockManager().RemoveFileLock(path)
 }

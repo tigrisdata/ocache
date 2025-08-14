@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 )
 
@@ -18,8 +17,7 @@ func BenchmarkFdCacheConcurrentAcquireRelease(b *testing.B) {
 
 	// Create fd cache
 	cache := &FdCache{
-		capacity:  100,
-		fileLocks: sync.Map{},
+		capacity: 100,
 	}
 
 	b.ResetTimer()
@@ -48,8 +46,7 @@ func BenchmarkFdCacheMixedOperations(b *testing.B) {
 
 	// Create fd cache
 	cache := &FdCache{
-		capacity:  50,
-		fileLocks: sync.Map{},
+		capacity: 50,
 	}
 
 	b.ResetTimer()
@@ -77,8 +74,7 @@ func BenchmarkFdCacheHighContention(b *testing.B) {
 
 	// Create fd cache
 	cache := &FdCache{
-		capacity:  10,
-		fileLocks: sync.Map{},
+		capacity: 10,
 	}
 
 	// Pre-acquire to ensure cache hit path
