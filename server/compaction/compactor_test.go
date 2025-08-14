@@ -250,10 +250,10 @@ func TestCommit(t *testing.T) {
 	err = c.commit(ctx, seg, wb)
 	assert.NoError(t, err)
 
-	// Verify files were deleted
+	// Files should still exist (queued for deletion, not immediately deleted)
 	for _, f := range testFiles {
 		_, err := os.Stat(f)
-		assert.True(t, os.IsNotExist(err))
+		assert.NoError(t, err)
 	}
 
 	// Test commit with empty batch
@@ -341,11 +341,11 @@ func TestCompactFiles(t *testing.T) {
 	}
 	slice3.Free()
 
-	// Verify files were deleted
+	// Files should still exist (queued for deletion, not immediately deleted)
 	_, err = os.Stat(testFile1)
-	assert.True(t, os.IsNotExist(err))
+	assert.NoError(t, err)
 	_, err = os.Stat(testFile2)
-	assert.True(t, os.IsNotExist(err))
+	assert.NoError(t, err)
 }
 
 func TestCompactFilesWithMissingFile(t *testing.T) {
