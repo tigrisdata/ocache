@@ -362,7 +362,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		go func(workerID int, seed int64, c *cacheclient.Client, reporter *PtermProgressReporter, metrics *MetricsCollector, throughputCh chan<- struct {
 			ops    int
 			opType OpType
-		}, noProgress bool,
+		}, NoProgress bool,
 		) {
 			defer wg.Done()
 			localRng := rand.New(rand.NewSource(seed))
@@ -406,7 +406,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 				// Check for connection errors and abort worker if connection is lost
 				if opErr != nil && isConnectionError(opErr) {
 					// Log critical error and exit worker (only if progress is enabled)
-					if !noProgress {
+					if !NoProgress {
 						pterm.Error.Printf("Worker %d: Connection failed: %v\n", workerID, opErr)
 					}
 					// Count remaining operations as errors
