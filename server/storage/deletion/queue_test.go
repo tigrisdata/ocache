@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 )
 
@@ -18,7 +19,7 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 	require.NoError(t, err)
 
 	config := Config{
-		BatchSize:       10,
+		BatchSize:       10, // Small batch size for testing
 		ProcessInterval: 100 * time.Millisecond,
 		PruneAge:        1 * time.Hour,
 	}
@@ -308,28 +309,25 @@ func TestQueue_ContextCancellation(t *testing.T) {
 	}
 }
 
-func TestQueue_ExtractFunctions(t *testing.T) {
-	queue, cleanup := setupTestQueue(t)
-	defer cleanup()
-
-	// Test makeQueueKey
-	key := queue.makeQueueKey(1234567890123456789, "/path/to/file.txt")
+func TestQueue_KeyFunctions(t *testing.T) {
+	// Test MakeDeletionQueueKey
+	key := keys.MakeDeletionQueueKey(1234567890123456789, "/path/to/file.txt")
 	expected := []byte("!del/1234567890123456789/path/to/file.txt")
 	require.Equal(t, expected, key)
 
-	// Test extractFilepath
-	filepath := queue.extractFilepath(key)
-	require.Equal(t, "/path/to/file.txt", filepath)
-
-	// Test extractTimestamp
-	timestamp := queue.extractTimestamp(key)
+	// Test ParseDeletionQueueKey
+	timestamp, filepath, err := keys.ParseDeletionQueueKey(key)
+	require.NoError(t, err)
 	require.Equal(t, int64(1234567890123456789), timestamp)
+	require.Equal(t, "/path/to/file.txt", filepath)
 
 	// Test with malformed key
 	badKey := []byte("malformed")
-	filepath = queue.extractFilepath(badKey)
-	require.Equal(t, "", filepath)
-	timestamp = queue.extractTimestamp(badKey)
-	require.Equal(t, int64(0), timestamp)
+	_, _, err = keys.ParseDeletionQueueKey(badKey)
+	require.Error(t, err)
+
+	// Test IsDeletionQueueKey
+	require.True(t, keys.IsDeletionQueueKey(key))
+	require.False(t, keys.IsDeletionQueueKey(badKey))
 }
 

@@ -1,7 +1,6 @@
 package deletion
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,15 +10,13 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 )
 
 const (
-	// DeletionQueuePrefix is the RocksDB key prefix for deletion queue entries
-	DeletionQueuePrefix = "!del/"
-
 	// DefaultBatchSize is the default number of deletions to process per batch
-	DefaultBatchSize = 100
+	DefaultBatchSize = 1000
 
 	// DefaultProcessInterval is the default interval between batch processing
 	DefaultProcessInterval = time.Second
@@ -101,7 +98,7 @@ func (q *Queue) Add(filepath string) error {
 		return fmt.Errorf("empty filepath")
 	}
 
-	key := q.makeQueueKey(time.Now().UnixNano(), filepath)
+	key := keys.MakeDeletionQueueKey(time.Now().UnixNano(), filepath)
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 
@@ -131,12 +128,18 @@ func (q *Queue) processingLoop() {
 	pruneTicker := time.NewTicker(time.Hour)
 	defer pruneTicker.Stop()
 
+	// Log queue depth periodically (every 5 minutes)
+	depthTicker := time.NewTicker(5 * time.Minute)
+	defer depthTicker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 			q.ProcessBatch()
 		case <-pruneTicker.C:
 			q.pruneOldEntries()
+		case <-depthTicker.C:
+			q.logQueueDepth()
 		case <-q.ctx.Done():
 			return
 		}
@@ -155,7 +158,7 @@ func (q *Queue) ProcessBatch() {
 	it := q.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	prefix := []byte(DeletionQueuePrefix)
+	prefix := []byte(keys.DeletionQueuePrefix)
 	count := 0
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix) && count < q.config.BatchSize; it.Next() {
@@ -170,8 +173,8 @@ func (q *Queue) ProcessBatch() {
 		keyData := key.Data()
 
 		// Extract filepath from key: !del/<timestamp>/<filepath>
-		filepath := q.extractFilepath(keyData)
-		if filepath == "" {
+		_, filepath, err := keys.ParseDeletionQueueKey(keyData)
+		if err != nil {
 			key.Free()
 			it.Value().Free()
 			continue
@@ -286,7 +289,7 @@ func (q *Queue) pruneOldEntries() {
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
-	prefix := []byte(DeletionQueuePrefix)
+	prefix := []byte(keys.DeletionQueuePrefix)
 	pruned := 0
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -301,13 +304,13 @@ func (q *Queue) pruneOldEntries() {
 		keyData := key.Data()
 
 		// Extract timestamp from key
-		timestamp := q.extractTimestamp(keyData)
-		if timestamp > 0 && timestamp < cutoff {
+		timestamp, _, err := keys.ParseDeletionQueueKey(keyData)
+		if err == nil && timestamp > 0 && timestamp < cutoff {
 			batch.Delete(bytes.Clone(keyData))
 			pruned++
 			q.pruned++
 
-			filepath := q.extractFilepath(keyData)
+			_, filepath, _ := keys.ParseDeletionQueueKey(keyData)
 			zlog.Warn().
 				Str("filepath", filepath).
 				Dur("age", time.Since(time.Unix(0, timestamp))).
@@ -345,35 +348,6 @@ func (q *Queue) pruneOldEntries() {
 	}
 }
 
-// makeQueueKey creates a RocksDB key for the queue
-func (q *Queue) makeQueueKey(timestamp int64, filepath string) []byte {
-	return []byte(fmt.Sprintf("%s%019d/%s", DeletionQueuePrefix, timestamp, filepath))
-}
-
-// extractFilepath extracts the filepath from a queue key
-func (q *Queue) extractFilepath(key []byte) string {
-	// Key format: !del/<timestamp>/<filepath>
-	parts := bytes.SplitN(key, []byte("/"), 3)
-	if len(parts) != 3 {
-		return ""
-	}
-	return string(parts[2])
-}
-
-// extractTimestamp extracts the timestamp from a queue key
-func (q *Queue) extractTimestamp(key []byte) int64 {
-	// Key format: !del/<timestamp>/<filepath>
-	parts := bytes.SplitN(key, []byte("/"), 3)
-	if len(parts) < 2 {
-		return 0
-	}
-
-	// Parse timestamp (skip prefix)
-	var timestamp int64
-	fmt.Sscanf(string(parts[1]), "%019d", &timestamp)
-	return timestamp
-}
-
 // GetQueueDepth returns the current queue depth
 func (q *Queue) GetQueueDepth() int64 {
 	ro := grocksdb.NewDefaultReadOptions()
@@ -382,7 +356,7 @@ func (q *Queue) GetQueueDepth() int64 {
 	it := q.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	prefix := []byte(DeletionQueuePrefix)
+	prefix := []byte(keys.DeletionQueuePrefix)
 	count := int64(0)
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -392,5 +366,28 @@ func (q *Queue) GetQueueDepth() int64 {
 	}
 
 	return count
+}
+
+// logQueueDepth logs the current queue depth and stats
+func (q *Queue) logQueueDepth() {
+	depth := q.GetQueueDepth()
+	
+	// Always log if there are items in the queue, or periodically log stats
+	if depth > 0 {
+		zlog.Info().
+			Int64("queue_depth", depth).
+			Int64("total_processed", q.processed).
+			Int64("total_failed", q.failed).
+			Int64("total_pruned", q.pruned).
+			Msg("deletion queue: status")
+	} else {
+		// Log empty queue status less frequently
+		zlog.Debug().
+			Int64("queue_depth", depth).
+			Int64("total_processed", q.processed).
+			Int64("total_failed", q.failed).
+			Int64("total_pruned", q.pruned).
+			Msg("deletion queue: status (empty)")
+	}
 }
 

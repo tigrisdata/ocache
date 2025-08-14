@@ -25,6 +25,9 @@ const (
 
 	// SyncIndexPrefix is the prefix for all sync tracking entries in RocksDB
 	SyncIndexPrefix = "!sync/"
+
+	// DeletionQueuePrefix is the prefix for deletion queue entries in RocksDB
+	DeletionQueuePrefix = "!del/"
 )
 
 // MakeMetadataKey creates a metadata key by adding the metadata prefix to the user key
@@ -90,4 +93,40 @@ func ParseSyncKey(key []byte) (int64, string, error) {
 // IsSyncKey checks if a key is a sync index entry
 func IsSyncKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(SyncIndexPrefix))
+}
+
+// MakeDeletionQueueKey creates a deletion queue key for a file
+// Format: !del/<timestamp>/<filepath>
+func MakeDeletionQueueKey(timestamp int64, filepath string) []byte {
+	return []byte(fmt.Sprintf("%s%019d/%s", DeletionQueuePrefix, timestamp, filepath))
+}
+
+// ParseDeletionQueueKey extracts timestamp and filepath from a deletion queue key
+func ParseDeletionQueueKey(key []byte) (int64, string, error) {
+	keyStr := string(key)
+	if !strings.HasPrefix(keyStr, DeletionQueuePrefix) {
+		return 0, "", fmt.Errorf("invalid deletion queue key prefix")
+	}
+
+	// Remove prefix
+	remainder := keyStr[len(DeletionQueuePrefix):]
+
+	// Split by first slash to separate timestamp from filepath
+	parts := strings.SplitN(remainder, "/", 2)
+	if len(parts) != 2 {
+		return 0, "", fmt.Errorf("invalid deletion queue key format")
+	}
+
+	// Parse timestamp
+	var timestamp int64
+	if _, err := fmt.Sscanf(parts[0], "%019d", &timestamp); err != nil {
+		return 0, "", fmt.Errorf("failed to parse timestamp: %w", err)
+	}
+
+	return timestamp, parts[1], nil
+}
+
+// IsDeletionQueueKey checks if a key is a deletion queue entry
+func IsDeletionQueueKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(DeletionQueuePrefix))
 }
