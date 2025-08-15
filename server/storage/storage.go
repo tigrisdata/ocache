@@ -426,7 +426,8 @@ func (s *Storage) DeleteKey(key string) {
 					Msg("storage.DeleteKey: failed to remove raw file")
 			}
 		case pb.ValueType_SEGMENT:
-			// Segments are cleaned up by the compactor/segment manager
+			// Update delete index to track this deletion for future garbage collection
+			s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
 		}
 	}
 
@@ -652,4 +653,130 @@ func (s *Storage) notifyPut(size int64) {
 // notifyDelete updates the cleaner's size tracking when a key is deleted
 func (s *Storage) notifyDelete(size int64) {
 	s.cleaner.UpdateSize(-size)
+}
+
+// updateDeleteIndex updates the delete index for a segment when a key is deleted
+func (s *Storage) updateDeleteIndex(segmentPath string, deletedBytes int64) {
+	if segmentPath == "" {
+		return
+	}
+
+	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
+	ro := grocksdb.NewDefaultReadOptions()
+	wo := grocksdb.NewDefaultWriteOptions()
+
+	// Read existing delete index entry if it exists
+	var entry pb.DeleteIndexEntry
+	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
+	if err == nil && slice.Exists() {
+		// Parse existing entry
+		if err := proto.Unmarshal(slice.Data(), &entry); err != nil {
+			zlog.Error().Err(err).Str("segment", segmentPath).
+				Msg("storage.updateDeleteIndex: failed to unmarshal delete index entry")
+		}
+		slice.Free()
+	}
+
+	// Update counters
+	entry.DeletedEntries++
+	entry.DeletedBytes += deletedBytes
+
+	// Write updated entry back
+	data, err := proto.Marshal(&entry)
+	if err != nil {
+		zlog.Error().Err(err).Str("segment", segmentPath).
+			Msg("storage.updateDeleteIndex: failed to marshal delete index entry")
+		return
+	}
+
+	if err := s.meta.Handle().Put(wo, deleteIndexKey, data); err != nil {
+		zlog.Error().Err(err).Str("segment", segmentPath).
+			Msg("storage.updateDeleteIndex: failed to write delete index entry")
+	}
+}
+
+// GetDeleteIndexStats returns the delete index statistics for a segment
+func (s *Storage) GetDeleteIndexStats(segmentPath string) (deletedEntries, deletedBytes int64, err error) {
+	if segmentPath == "" {
+		return 0, 0, nil
+	}
+
+	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
+	ro := grocksdb.NewDefaultReadOptions()
+
+	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer slice.Free()
+
+	if !slice.Exists() {
+		return 0, 0, nil // No deletions tracked for this segment
+	}
+
+	var entry pb.DeleteIndexEntry
+	if err := proto.Unmarshal(slice.Data(), &entry); err != nil {
+		return 0, 0, err
+	}
+
+	return entry.DeletedEntries, entry.DeletedBytes, nil
+}
+
+// RemoveDeleteIndex removes the delete index entry for a segment (used when segment is removed)
+func (s *Storage) RemoveDeleteIndex(segmentPath string) error {
+	if segmentPath == "" {
+		return nil
+	}
+
+	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
+	wo := grocksdb.NewDefaultWriteOptions()
+	return s.meta.Handle().Delete(wo, deleteIndexKey)
+}
+
+// SegmentDeleteStats holds deletion statistics for a segment
+type SegmentDeleteStats struct {
+	SegmentPath    string
+	DeletedEntries int64
+	DeletedBytes   int64
+}
+
+// ListSegmentDeleteStats returns deletion statistics for all segments in the delete index
+func (s *Storage) ListSegmentDeleteStats() ([]SegmentDeleteStats, error) {
+	ro := grocksdb.NewDefaultReadOptions()
+	it := s.meta.Handle().NewIterator(ro)
+	defer it.Close()
+
+	var stats []SegmentDeleteStats
+	prefix := []byte(keys.DeleteIndexPrefix)
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		key := it.Key()
+		value := it.Value()
+
+		// Extract segment path from key
+		segmentPath := keys.ExtractSegmentPath(key.Data())
+		key.Free()
+
+		// Parse delete index entry
+		var entry pb.DeleteIndexEntry
+		if err := proto.Unmarshal(value.Data(), &entry); err != nil {
+			value.Free()
+			zlog.Error().Err(err).Str("segment", segmentPath).
+				Msg("storage.ListSegmentDeleteStats: failed to unmarshal delete index entry")
+			continue
+		}
+		value.Free()
+
+		stats = append(stats, SegmentDeleteStats{
+			SegmentPath:    segmentPath,
+			DeletedEntries: entry.DeletedEntries,
+			DeletedBytes:   entry.DeletedBytes,
+		})
+	}
+
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+
+	return stats, nil
 }
