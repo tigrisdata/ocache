@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ const (
 
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
+	DefaultTTLConcurrency     = 4 // Number of concurrent workers for TTL cleanup
 
 	// Default access update buffer size and batch interval
 	DefaultAccessUpdateBufferSize = 10000
@@ -59,6 +61,16 @@ func getCompactionInterval() time.Duration {
 		}
 	}
 	return DefaultFileCompactionInterval
+}
+
+// getTTLConcurrency returns the TTL cleanup concurrency, allowing override via env var
+func getTTLConcurrency() int {
+	if concurrencyStr := os.Getenv("OCACHE_TTL_CONCURRENCY"); concurrencyStr != "" {
+		if concurrency, err := strconv.Atoi(concurrencyStr); err == nil && concurrency > 0 {
+			return concurrency
+		}
+	}
+	return DefaultTTLConcurrency
 }
 
 // accessUpdate represents a single access time update request
@@ -308,10 +320,12 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
 	cleanupInterval := getCleanupInterval()
-	s.cleaner = NewCleaner(s, cleanupInterval, maxDiskUsage)
+	ttlConcurrency := getTTLConcurrency()
+	s.cleaner = NewCleanerWithConcurrency(s, cleanupInterval, maxDiskUsage, ttlConcurrency)
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
+		Int("ttl_concurrency", ttlConcurrency).
 		Int64("max_disk_usage", maxDiskUsage).
 		Msg("storage: started background cleaner with TTL cleanup and LRU eviction")
 
