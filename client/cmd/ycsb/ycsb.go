@@ -78,6 +78,7 @@ type YCSBConfig struct {
 	Concurrency int    // Number of concurrent workers
 	Workload    string // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
 	Seed        int64  // Seed for random number generation (for reproducibility)
+	NoProgress  bool   // Disable progress output during benchmark
 }
 
 type Result struct {
@@ -138,10 +139,13 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 	}
 	defer pool.Close()
 
-	// Use pterm spinner for preloading
-	spinner, _ := pterm.DefaultSpinner.
-		WithText(fmt.Sprintf("Preloading %d keys...", cfg.NumKeys)).
-		Start()
+	// Use pterm spinner for preloading only if progress is enabled
+	var spinner *pterm.SpinnerPrinter
+	if !cfg.NoProgress {
+		spinner, _ = pterm.DefaultSpinner.
+			WithText(fmt.Sprintf("Preloading %d keys...", cfg.NumKeys)).
+			Start()
+	}
 
 	var preloadErrors int32
 	var successCount int32
@@ -151,7 +155,9 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
-			spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d keys", i, cfg.NumKeys))
+			if spinner != nil {
+				spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d keys", i, cfg.NumKeys))
+			}
 			return ctx.Err()
 		default:
 		}
@@ -171,7 +177,7 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 			atomic.AddInt32(&successCount, 1)
 		}
 
-		if i%100 == 0 {
+		if spinner != nil && i%100 == 0 {
 			spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)",
 				i+1, cfg.NumKeys, atomic.LoadInt32(&preloadErrors)))
 		}
@@ -189,15 +195,19 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 
 	totalErrors := atomic.LoadInt32(&preloadErrors)
 	if totalErrors > 0 {
-		spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)",
-			atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
+		if spinner != nil {
+			spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)",
+				atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
+		}
 		if int(totalErrors) > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
 			if len(sampleErrors) > 0 {
 				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, sampleErrors[0])
 			}
 		}
 	} else {
-		spinner.Success(fmt.Sprintf("Preloaded %d keys", cfg.NumKeys))
+		if spinner != nil {
+			spinner.Success(fmt.Sprintf("Preloaded %d keys", cfg.NumKeys))
+		}
 	}
 	return nil
 }
@@ -277,12 +287,15 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	// Create metrics collector
 	metricsCollector := NewMetricsCollector()
 
-	// Create pterm progress reporter
-	progressReporter := NewPtermProgressReporter(cfg.NumOps)
-	if err := progressReporter.Start(); err != nil {
-		return Result{}, fmt.Errorf("failed to start progress reporter: %w", err)
+	// Create pterm progress reporter only if progress is enabled
+	var progressReporter *PtermProgressReporter
+	if !cfg.NoProgress {
+		progressReporter = NewPtermProgressReporter(cfg.NumOps)
+		if err := progressReporter.Start(); err != nil {
+			return Result{}, fmt.Errorf("failed to start progress reporter: %w", err)
+		}
+		defer progressReporter.Stop()
 	}
-	defer progressReporter.Stop()
 
 	// Channel for aggregate throughput tracking
 	throughputCh := make(chan struct {
@@ -349,7 +362,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		go func(workerID int, seed int64, c *cacheclient.Client, reporter *PtermProgressReporter, metrics *MetricsCollector, throughputCh chan<- struct {
 			ops    int
 			opType OpType
-		},
+		}, NoProgress bool,
 		) {
 			defer wg.Done()
 			localRng := rand.New(rand.NewSource(seed))
@@ -392,8 +405,10 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 
 				// Check for connection errors and abort worker if connection is lost
 				if opErr != nil && isConnectionError(opErr) {
-					// Log critical error and exit worker
-					pterm.Error.Printf("Worker %d: Connection failed: %v\n", workerID, opErr)
+					// Log critical error and exit worker (only if progress is enabled)
+					if !NoProgress {
+						pterm.Error.Printf("Worker %d: Connection failed: %v\n", workerID, opErr)
+					}
 					// Count remaining operations as errors
 					remainingOps := opsPerWorker - opIdx - 1
 					resultCh <- struct {
@@ -404,8 +419,10 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 					return
 				}
 
-				// Report to progress tracker
-				reporter.RecordOp(op, latency, opErr)
+				// Report to progress tracker if enabled
+				if reporter != nil {
+					reporter.RecordOp(op, latency, opErr)
+				}
 
 				// Record in metrics collector
 				metrics.RecordOperation(op, latency, opErr)
@@ -432,15 +449,12 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 				latencies []time.Duration
 				opCounts  []int
 			}{errCount, latencies, opCounts}
-		}(i, seed, client, progressReporter, metricsCollector, throughputCh)
+		}(i, seed, client, progressReporter, metricsCollector, throughputCh, cfg.NoProgress)
 	}
 	wg.Wait()
 	close(throughputCh) // Stop the throughput tracking goroutine
 	throughputWg.Wait() // Wait for throughput goroutine to finish
 	dur := time.Since(t0)
-
-	// Stop progress reporter before processing results
-	progressReporter.Stop()
 
 	totalErr := 0
 	allLatencies := make([]time.Duration, 0, cfg.NumOps)
