@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/tigrisdata/ocache/server/storage/bufferpool"
 	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/utils"
+	"github.com/tigrisdata/ocache/server/storage/utils"
 
 	zlog "github.com/rs/zerolog/log"
 )

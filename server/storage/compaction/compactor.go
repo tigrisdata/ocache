@@ -18,7 +18,7 @@ import (
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/storage/segment"
-	"github.com/tigrisdata/ocache/server/utils"
+	"github.com/tigrisdata/ocache/server/storage/utils"
 
 	"google.golang.org/protobuf/proto"
 )

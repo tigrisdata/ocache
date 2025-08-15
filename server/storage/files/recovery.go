@@ -13,7 +13,7 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/storage/keys"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
-	"github.com/tigrisdata/ocache/server/utils"
+	"github.com/tigrisdata/ocache/server/storage/utils"
 )
 
 const (

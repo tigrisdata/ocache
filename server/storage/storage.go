@@ -13,8 +13,8 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/tigrisdata/ocache/server/compaction"
 	"github.com/tigrisdata/ocache/server/storage/bufferpool"
+	"github.com/tigrisdata/ocache/server/storage/compaction"
 	"github.com/tigrisdata/ocache/server/storage/deletion"
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
