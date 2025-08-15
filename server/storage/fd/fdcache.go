@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 
 	zlog "github.com/rs/zerolog/log"
-	"github.com/tigrisdata/ocache/server/utils"
+	"github.com/tigrisdata/ocache/server/storage/utils"
 )
 
 // FileEntry wraps a cached os.File descriptor along with a per-file RWMutex and reference count.
