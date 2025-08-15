@@ -253,8 +253,9 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	// Initialize the metadata DB
-	meta, err := metadata.NewMetaDB(diskPath, ttl)
+	// Initialize the metadata DB with delete index merge operator
+	mergeOp := newDeleteIndexMergeOperator()
+	meta, err := metadata.NewMetaDB(diskPath, ttl, mergeOp)
 	if err != nil {
 		return nil, err
 	}
@@ -656,58 +657,23 @@ func (s *Storage) notifyDelete(size int64) {
 }
 
 // updateDeleteIndex updates the delete index for a segment when a key is deleted
-// NOTE: This operation is not atomic. In case of concurrent deletes to the same segment,
-// some updates might be lost. This is acceptable for our use case since:
-// 1. Segment deletions are infrequent
-// 2. The delete index is used for garbage collection heuristics, not accounting
-// 3. Slight inaccuracies won't affect correctness, only GC efficiency
-// If precise counting becomes critical, we should implement a merge operator or use locks.
+// This uses RocksDB's merge operator for atomic updates, avoiding race conditions
 func (s *Storage) updateDeleteIndex(segmentPath string, deletedBytes int64) {
 	if segmentPath == "" {
 		return
 	}
 
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
-	ro := grocksdb.NewDefaultReadOptions()
-	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 
-	// Read existing delete index entry if it exists
-	var entry pb.DeleteIndexEntry
-	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
-	if err != nil {
+	// Create operand for merge: 1 entry deleted, N bytes deleted
+	operand := makeDeleteIndexOperand(1, deletedBytes)
+
+	// Use Merge for atomic update
+	if err := s.meta.Handle().Merge(wo, deleteIndexKey, operand); err != nil {
 		zlog.Error().Err(err).Str("segment", segmentPath).
-			Msg("storage.updateDeleteIndex: failed to read delete index entry")
-		return
-	}
-	defer slice.Free() // Always free the slice, even if it doesn't exist
-
-	if slice.Exists() {
-		// Parse existing entry
-		if err := proto.Unmarshal(slice.Data(), &entry); err != nil {
-			zlog.Error().Err(err).Str("segment", segmentPath).
-				Msg("storage.updateDeleteIndex: failed to unmarshal delete index entry, skipping update")
-			// Return early to avoid resetting existing data on unmarshal failure
-			return
-		}
-	}
-
-	// Update counters
-	entry.DeletedEntries++
-	entry.DeletedBytes += deletedBytes
-
-	// Write updated entry back
-	data, err := proto.Marshal(&entry)
-	if err != nil {
-		zlog.Error().Err(err).Str("segment", segmentPath).
-			Msg("storage.updateDeleteIndex: failed to marshal delete index entry")
-		return
-	}
-
-	if err := s.meta.Handle().Put(wo, deleteIndexKey, data); err != nil {
-		zlog.Error().Err(err).Str("segment", segmentPath).
-			Msg("storage.updateDeleteIndex: failed to write delete index entry")
+			Msg("storage.updateDeleteIndex: failed to merge delete index entry")
 	}
 }
 
