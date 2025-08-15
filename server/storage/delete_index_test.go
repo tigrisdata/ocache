@@ -95,8 +95,9 @@ func TestStorage_DeleteIndex_MultipleSegmentDeletions(t *testing.T) {
 	// Verify remaining keys still exist
 	for i := deletedKeys; i < numKeys; i++ {
 		key := fmt.Sprintf("key_%d", i)
-		// We can't actually read the data since the segment doesn't exist,
-		// but we can check that the metadata is still there
+		// Note: We're testing that the metadata for non-deleted keys is preserved.
+		// The actual segment file doesn't exist in this test since we're only
+		// simulating segment storage by creating metadata entries.
 		metaKey := keys.MakeMetadataKey(key)
 		ro := grocksdb.NewDefaultReadOptions()
 		defer ro.Destroy()
@@ -139,11 +140,10 @@ func TestStorage_DeleteIndex_RawFileDeletion(t *testing.T) {
 	assert.False(t, found)
 
 	// Check that NO delete index entry was created (raw files don't use delete index)
-	// Since there's no segment path, this should return zeros
-	deletedEntries, deletedBytes, err := s.GetDeleteIndexStats("")
+	// Verify by checking that the delete index is empty
+	stats, err := s.ListSegmentDeleteStats()
 	assert.NoError(t, err)
-	assert.Equal(t, int64(0), deletedEntries)
-	assert.Equal(t, int64(0), deletedBytes)
+	assert.Len(t, stats, 0, "Raw file deletion should not create delete index entries")
 }
 
 func TestStorage_DeleteIndex_InlineDeletion(t *testing.T) {

@@ -663,7 +663,9 @@ func (s *Storage) updateDeleteIndex(segmentPath string, deletedBytes int64) {
 
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
 	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 
 	// Read existing delete index entry if it exists
 	var entry pb.DeleteIndexEntry
@@ -703,6 +705,7 @@ func (s *Storage) GetDeleteIndexStats(segmentPath string) (deletedEntries, delet
 
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
 	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
 
 	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
 	if err != nil {
@@ -730,6 +733,7 @@ func (s *Storage) RemoveDeleteIndex(segmentPath string) error {
 
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	return s.meta.Handle().Delete(wo, deleteIndexKey)
 }
 
@@ -743,6 +747,7 @@ type SegmentDeleteStats struct {
 // ListSegmentDeleteStats returns deletion statistics for all segments in the delete index
 func (s *Storage) ListSegmentDeleteStats() ([]SegmentDeleteStats, error) {
 	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
