@@ -16,7 +16,7 @@ import (
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {
 	tmpDir := t.TempDir()
-	meta, err := metadata.NewMetaDB(tmpDir, 0)
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil)
 	require.NoError(t, err)
 
 	config := Config{
@@ -272,7 +272,7 @@ func TestQueue_GetQueueDepth(t *testing.T) {
 
 func TestQueue_ContextCancellation(t *testing.T) {
 	tmpDir := t.TempDir()
-	meta, err := metadata.NewMetaDB(tmpDir, 0)
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil)
 	require.NoError(t, err)
 	defer metadata.CloseMetaDB()
 

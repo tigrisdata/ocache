@@ -27,7 +27,7 @@ func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator) (*MetaD
 
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
-	
+
 	// Set the merge operator if provided
 	if mergeOp != nil {
 		opts.SetMergeOperator(mergeOp)

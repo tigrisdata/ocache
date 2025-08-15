@@ -19,6 +19,7 @@ import (
 	"github.com/tigrisdata/ocache/server/storage/fd"
 	"github.com/tigrisdata/ocache/server/storage/files"
 	"github.com/tigrisdata/ocache/server/storage/keys"
+	"github.com/tigrisdata/ocache/server/storage/merge"
 	"github.com/tigrisdata/ocache/server/storage/metadata"
 	"github.com/tigrisdata/ocache/server/storage/segment"
 )
@@ -253,8 +254,8 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	// Initialize the metadata DB with delete index merge operator
-	mergeOp := newDeleteIndexMergeOperator()
+	// Initialize the metadata DB with multiplex merge operator
+	mergeOp := merge.NewMultiplexOperator()
 	meta, err := metadata.NewMetaDB(diskPath, ttl, mergeOp)
 	if err != nil {
 		return nil, err
@@ -668,7 +669,7 @@ func (s *Storage) updateDeleteIndex(segmentPath string, deletedBytes int64) {
 	defer wo.Destroy()
 
 	// Create operand for merge: 1 entry deleted, N bytes deleted
-	operand := makeDeleteIndexOperand(1, deletedBytes)
+	operand := merge.MakeDeleteIndexOperand(1, deletedBytes)
 
 	// Use Merge for atomic update
 	if err := s.meta.Handle().Merge(wo, deleteIndexKey, operand); err != nil {

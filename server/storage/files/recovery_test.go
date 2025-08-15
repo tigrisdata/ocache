@@ -27,7 +27,7 @@ func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, func()) {
 	require.NoError(t, err)
 
 	// Initialize metadata DB
-	meta, err := metadata.NewMetaDB(tmpDir, 0)
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil)
 	require.NoError(t, err)
 
 	cleanup := func() {
