@@ -12,7 +12,7 @@ func TestNewMetaDB(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDB(diskPath, ttl, nil) // nil merge operator for test
 	if err != nil {
 		t.Fatalf("NewMetaDB failed: %v", err)
 	}
@@ -36,12 +36,12 @@ func TestNewMetaDB_Singleton(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db1, err := NewMetaDB(diskPath, ttl, nil)
+	db1, err := NewMetaDB(diskPath, ttl, nil) // nil merge operator
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	db2, err := NewMetaDB(diskPath, ttl, nil)
+	db2, err := NewMetaDB(diskPath, ttl, nil) // nil merge operator
 	if err != nil {
 		t.Fatal(err)
 	}

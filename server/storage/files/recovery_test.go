@@ -26,7 +26,7 @@ func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, func()) {
 	err = os.MkdirAll(filesDir, 0o755)
 	require.NoError(t, err)
 
-	// Initialize metadata DB
+	// Initialize metadata DB with nil merge operator
 	meta, err := metadata.NewMetaDB(tmpDir, 0, nil)
 	require.NoError(t, err)
 
