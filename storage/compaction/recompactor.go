@@ -48,47 +48,32 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 
 	// Get all segments
 	segments := sr.sm.GetSegments()
-	if len(segments) == 0 {
+	totalSegments := len(segments)
+
+	if totalSegments == 0 {
+		return nil
+	}
+
+	// Safety check: Need at least 3 segments (2 to skip + 1 to potentially recompact)
+	if totalSegments <= 2 {
+		zlog.Debug().Int("segmentCount", totalSegments).
+			Msg("recompactor: too few segments to safely recompact")
 		return nil
 	}
 
 	// Get the current open segment to ensure we never try to recompact it
 	currentOpen := sr.sm.GetCurrentOpenSegment()
 
-	// Safety: Never recompact the most recent segments (even if closed)
-	// to avoid interfering with segments that might have just been finalized
-	skipRecentCount := 2
-	if len(segments) <= skipRecentCount {
-		zlog.Debug().Int("segmentCount", len(segments)).
-			Msg("recompactor: too few segments to safely recompact")
-		return nil
-	}
-
 	recompactedCount := 0
-	// Process segments but skip the most recent ones
+	// Process segments, checking eligibility for each
 	for i, seg := range segments {
-		// Skip the most recent segments
-		if i >= len(segments)-skipRecentCount {
-			zlog.Debug().Str("segment", seg.Path()).
-				Msg("recompactor: skipping recent segment")
-			continue
-		}
-		// Skip the currently open segment (compactor might be writing to it)
-		if currentOpen != nil && seg == currentOpen {
-			zlog.Debug().Str("segment", seg.Path()).
-				Msg("recompactor: skipping current open segment")
-			continue
-		}
-
-		// Also skip if segment has an open file handle (defensive check)
-		if seg.HasOpenFile() {
-			zlog.Debug().Str("segment", seg.Path()).
-				Msg("recompactor: skipping segment with open file")
-			continue
-		}
-
-		// Check if segment is old enough for recompaction
-		if !sr.isSegmentOldEnough(seg.Path()) {
+		// Check if this segment is eligible for recompaction
+		eligible, reason := sr.isSegmentEligibleForRecompaction(seg, currentOpen, i, totalSegments)
+		if !eligible {
+			zlog.Debug().
+				Str("segment", seg.Path()).
+				Str("reason", reason).
+				Msg("recompactor: skipping segment")
 			continue
 		}
 
@@ -341,18 +326,43 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	return nil
 }
 
-// isSegmentOldEnough checks if a segment is old enough for recompaction
-func (sr *SegmentRecompactor) isSegmentOldEnough(segmentPath string) bool {
-	// Extract timestamp from segment filename (segment_<timestamp>.seg)
-	base := filepath.Base(segmentPath)
+// isSegmentEligibleForRecompaction performs all checks to determine if a segment
+// can be safely recompacted. This includes checking if it's open, if it's too recent,
+// and if it's old enough based on timestamp.
+func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segment, currentOpen *segment.Segment, segmentIndex int, totalSegments int) (bool, string) {
+	// Check 1: Skip the currently open segment (compactor might be writing to it)
+	if currentOpen != nil && seg == currentOpen {
+		return false, "current open segment"
+	}
+
+	// Check 2: Skip if segment has an open file handle (defensive check)
+	if seg.HasOpenFile() {
+		return false, "has open file handle"
+	}
+
+	// Check 3: Skip the most recent segments (even if closed)
+	// to avoid interfering with segments that might have just been finalized
+	skipRecentCount := 2
+	if segmentIndex >= totalSegments-skipRecentCount {
+		return false, "too recent (one of last 2 segments)"
+	}
+
+	// Check 4: Verify segment age based on timestamp
+	base := filepath.Base(seg.Path())
 	var timestamp int64
 	if _, err := fmt.Sscanf(base, "segment_%d.seg", &timestamp); err != nil {
-		// Can't parse timestamp, assume it's old enough
-		return true
+		// Can't parse timestamp, assume it's old enough (legacy segment)
+		zlog.Debug().Str("segment", seg.Path()).Msg("recompactor: cannot parse timestamp, assuming old segment")
+		return true, ""
 	}
 
 	segmentTime := time.Unix(0, timestamp)
-	return time.Since(segmentTime) > sr.minSegmentAge
+	age := time.Since(segmentTime)
+	if age <= sr.minSegmentAge {
+		return false, fmt.Sprintf("too young (age: %v, required: %v)", age, sr.minSegmentAge)
+	}
+
+	return true, ""
 }
 
 // getDeleteIndexStats retrieves delete index statistics for a segment
