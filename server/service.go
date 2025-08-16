@@ -10,8 +10,8 @@ import (
 	"time"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	stor "github.com/tigrisdata/ocache/server/storage"
-	"github.com/tigrisdata/ocache/server/storage/bufferpool"
+	stor "github.com/tigrisdata/ocache/storage"
+	"github.com/tigrisdata/ocache/storage/bufferpool"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/rs/zerolog"

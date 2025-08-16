@@ -13,12 +13,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/deletion"
-	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/storage/files"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
-	"github.com/tigrisdata/ocache/server/storage/segment"
+	"github.com/tigrisdata/ocache/storage/deletion"
+	"github.com/tigrisdata/ocache/storage/fd"
+	"github.com/tigrisdata/ocache/storage/files"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/segment"
 	"google.golang.org/protobuf/proto"
 )
 

@@ -10,9 +10,9 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
-	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/fd"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/metadata"
 )
 
 // Config holds configuration for the deletion queue

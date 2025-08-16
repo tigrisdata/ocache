@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/tigrisdata/ocache/server/storage"
+	"github.com/tigrisdata/ocache/storage"
 )
 
 // IntegrationTestConfig holds configuration for Integration tests

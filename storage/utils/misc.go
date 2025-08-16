@@ -5,7 +5,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/metadata"
 	"google.golang.org/protobuf/proto"
 )
 

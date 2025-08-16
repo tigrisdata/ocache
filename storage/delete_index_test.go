@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/merge"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 
 	"github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"

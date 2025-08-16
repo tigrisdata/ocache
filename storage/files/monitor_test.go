@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/deletion"
-	"github.com/tigrisdata/ocache/server/storage/keys"
+	"github.com/tigrisdata/ocache/storage/deletion"
+	"github.com/tigrisdata/ocache/storage/keys"
 	"google.golang.org/protobuf/proto"
 )
 

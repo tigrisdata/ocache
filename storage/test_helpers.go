@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/metadata"
 )
 
 // createTestStorage creates a new storage instance for testing and returns a cleanup function

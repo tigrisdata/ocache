@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/tigrisdata/ocache/server/storage/keys"
+	"github.com/tigrisdata/ocache/storage/keys"
 )
 
 // PrepareAccessEntry prepares the key and value for the access time index.

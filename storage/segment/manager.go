@@ -11,9 +11,9 @@ import (
 	"time"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/bufferpool"
-	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/storage/utils"
+	"github.com/tigrisdata/ocache/storage/bufferpool"
+	"github.com/tigrisdata/ocache/storage/fd"
+	"github.com/tigrisdata/ocache/storage/utils"
 
 	zlog "github.com/rs/zerolog/log"
 )

@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tigrisdata/ocache/server/storage"
+	"github.com/tigrisdata/ocache/storage"
 )
 
 // Test_Workflow_MixedObjectSizes tests complete workflow with mixed object sizes

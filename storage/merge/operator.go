@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/keys"
+	"github.com/tigrisdata/ocache/storage/keys"
 
 	"google.golang.org/protobuf/proto"
 )
