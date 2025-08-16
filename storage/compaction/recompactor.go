@@ -222,6 +222,15 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	if copiedEntries == 0 {
 		zlog.Info().Str("segment", oldSeg.Path()).
 			Msg("recompactor: no live entries found, abandoning recompaction")
+		// Clean up the new segment since we're not using it
+		if err := sr.sm.FinalizeSegment(newSeg); err != nil {
+			zlog.Error().Err(err).Msg("recompactor: failed to finalize abandoned segment")
+		}
+		// Queue the empty segment for deletion
+		if err := sr.deletionQueue.Add(newSeg.Path()); err != nil {
+			zlog.Error().Err(err).Str("path", newSeg.Path()).
+				Msg("recompactor: failed to queue abandoned segment for deletion")
+		}
 		return nil
 	}
 
@@ -262,87 +271,78 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 }
 
 // copyEntry copies a single entry from old segment to new segment
+// Note: We create a temporary file to use WriteEntry since it expects an *os.File
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment,
 	userKey string, oldOffset, headerSize, valLen int64, version uint16, checksum uint32,
 	meta *pb.ValueMessage, wb *grocksdb.WriteBatch) error {
 
-	// Check if we have space in the new segment
+	// Create a temporary file for the value data
+	tmpFile, err := os.CreateTemp("", "recompact-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Copy value data to temp file
+	valueOffset := oldOffset + headerSize
+	reader := io.NewSectionReader(oldFile, valueOffset, valLen)
+
+	buf, release := bufferpool.AcquireBuffer(64 * 1024)
+	defer release()
+
+	// Verify checksum while copying if present
+	var written int64
+	if checksum != 0 {
+		h := crc32.NewIEEE()
+		teeReader := io.TeeReader(reader, h)
+		written, err = io.CopyBuffer(tmpFile, teeReader, buf)
+		if err != nil {
+			return fmt.Errorf("failed to copy value to temp file: %w", err)
+		}
+		if h.Sum32() != checksum {
+			return fmt.Errorf("checksum mismatch")
+		}
+	} else {
+		written, err = io.CopyBuffer(tmpFile, reader, buf)
+		if err != nil {
+			return fmt.Errorf("failed to copy value to temp file: %w", err)
+		}
+	}
+
+	if written != valLen {
+		return fmt.Errorf("copied %d bytes, expected %d", written, valLen)
+	}
+
+	// Seek to start of temp file for WriteEntry
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to seek temp file: %w", err)
+	}
+
+	// Check if we need a new segment
 	totalNeeded := headerSize + valLen
 	if (*newSeg).Remaining() < totalNeeded {
-		// Need to finalize current segment and get a new one
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
-
-		var err error
 		*newSeg, err = sr.sm.AcquireOpenSegment(0)
 		if err != nil {
 			return fmt.Errorf("failed to acquire new segment: %w", err)
 		}
 	}
 
-	// Build new header
-	header := segment.BuildValueHeader(userKey, valLen, checksum, version)
-
-	// Get the write position in new segment
-	(*newSeg).Lock()
-	defer (*newSeg).Unlock()
-
-	newOffset := (*newSeg).GetSizeUnsafe()
-
-	// Check if segment file is open
-	if (*newSeg).File() == nil {
-		return fmt.Errorf("segment file is not open")
+	// Create ValueMessage for WriteEntry
+	vm := &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		ValueLength: valLen,
+		Checksum:    checksum,
 	}
 
-	// Write header to new segment
-	if _, err := (*newSeg).File().Write(header); err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
+	// Use segment manager's WriteEntry function
+	newOffset, err := sr.sm.WriteEntry(*newSeg, userKey, tmpFile, vm)
+	if err != nil {
+		return fmt.Errorf("failed to write entry: %w", err)
 	}
-
-	// Copy value data
-	valueOffset := oldOffset + headerSize
-	buf, release := bufferpool.AcquireBuffer(64 * 1024)
-	defer release()
-
-	// Create section reader for the value
-	reader := io.NewSectionReader(oldFile, valueOffset, valLen)
-
-	// Verify checksum if present
-	if checksum != 0 {
-		h := crc32.NewIEEE()
-		teeReader := io.TeeReader(reader, h)
-
-		written, err := io.CopyBuffer((*newSeg).File(), teeReader, buf)
-		if err != nil {
-			return fmt.Errorf("failed to copy value: %w", err)
-		}
-
-		if written != valLen {
-			return fmt.Errorf("copied %d bytes, expected %d", written, valLen)
-		}
-
-		if h.Sum32() != checksum {
-			return fmt.Errorf("checksum mismatch")
-		}
-
-		// Reset reader for metadata update
-		reader.Seek(0, io.SeekStart)
-	} else {
-		written, err := io.CopyBuffer((*newSeg).File(), reader, buf)
-		if err != nil {
-			return fmt.Errorf("failed to copy value: %w", err)
-		}
-
-		if written != valLen {
-			return fmt.Errorf("copied %d bytes, expected %d", written, valLen)
-		}
-	}
-
-	// Update segment stats
-	(*newSeg).IncrementSize(totalNeeded)
-	(*newSeg).IncrementEntries()
-	(*newSeg).IncrementDataBytes(valLen)
 
 	// Update metadata to point to new location
 	meta.SegmentPath = (*newSeg).Path()

@@ -37,10 +37,27 @@ const (
 	DefaultAccessUpdateInterval   = 100 * time.Millisecond
 
 	// Default queue config
-	DeleteBatchSize       = 1000           // Number of deletions to process per batch
-	DeleteProcessInterval = time.Second    // Interval between batch processing
-	DeletePruneAge        = 24 * time.Hour // Age after which entries are pruned
+	DeleteBatchSize = 1000 // Number of deletions to process per batch
+
+	// Default segment recompaction settings
+	DefaultFragmentationThreshold = 0.5              // Recompact when dead space exceeds 50%
+	MinSegmentAgeForRecompaction  = 30 * time.Minute // Don't recompact segments younger than 30 minutes
+	DeleteProcessInterval         = time.Second      // Interval between batch processing
+	DeletePruneAge                = 24 * time.Hour   // Age after which entries are pruned
 )
+
+// StorageConfig holds all configuration parameters for initializing storage
+type StorageConfig struct {
+	DiskPath            string  // Directory for on-disk cache data
+	TTL                 int     // Default TTL when no key-level TTL is set (seconds)
+	InlineThreshold     int     // Threshold for small objects that are inlined in RocksDB (bytes)
+	CompactThreshold    int64   // Objects less than this size are compacted to segments (bytes)
+	SegmentSize         int64   // Segment size (bytes)
+	FdCacheSize         int     // Size of the file descriptor cache
+	MaxDiskUsage        int64   // Maximum disk usage in bytes (0 = unlimited)
+	FragThreshold       float64 // Fragmentation threshold for segment recompaction (0.0-1.0)
+	DisableRecompaction bool    // Disable automatic segment recompaction
+}
 
 // getCleanupInterval returns the cleanup interval, allowing tests to override via env var
 func getCleanupInterval() time.Duration {
@@ -238,31 +255,54 @@ func GetStorage() *Storage {
 	return storage
 }
 
-// InitStorage initializes storage at dbPath
-func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) {
-	s, err := newStorage(diskPath, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize, maxDiskUsage)
-	if err != nil {
-		zlog.Fatal().Err(err).Msg("failed to open storage")
-	}
-	storage = s
-}
-
-// InitStorageWithRecompaction initializes storage with segment recompaction configuration
-func InitStorageWithRecompaction(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64, fragThreshold float64, disableRecompaction bool) {
-	s, err := newStorage(diskPath, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize, maxDiskUsage)
+// InitStorageWithConfig initializes storage with a config struct
+func InitStorageWithConfig(config *StorageConfig) {
+	s, err := newStorage(config.DiskPath, config.TTL, config.InlineThreshold,
+		config.CompactThreshold, config.SegmentSize, config.FdCacheSize, config.MaxDiskUsage)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to open storage")
 	}
 
 	// Configure recompaction if not disabled
-	if !disableRecompaction && s.compactor != nil {
-		s.compactor.SetFragmentationThreshold(fragThreshold)
-		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
-	} else if disableRecompaction {
+	if !config.DisableRecompaction && s.compactor != nil {
+		s.compactor.SetFragmentationThreshold(config.FragThreshold)
+		zlog.Info().Float64("threshold", config.FragThreshold).Msg("Segment recompaction enabled")
+	} else if config.DisableRecompaction {
 		zlog.Info().Msg("Segment recompaction disabled")
 	}
 
 	storage = s
+}
+
+// InitStorage initializes storage at dbPath (deprecated - use InitStorageWithConfig)
+func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) {
+	config := &StorageConfig{
+		DiskPath:         diskPath,
+		TTL:              ttl,
+		InlineThreshold:  inlineThreshold,
+		CompactThreshold: compactThreshold,
+		SegmentSize:      segmentSize,
+		FdCacheSize:      fdCacheSize,
+		MaxDiskUsage:     maxDiskUsage,
+		FragThreshold:    DefaultFragmentationThreshold,
+	}
+	InitStorageWithConfig(config)
+}
+
+// InitStorageWithRecompaction initializes storage with segment recompaction configuration (deprecated - use InitStorageWithConfig)
+func InitStorageWithRecompaction(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64, fragThreshold float64, disableRecompaction bool) {
+	config := &StorageConfig{
+		DiskPath:            diskPath,
+		TTL:                 ttl,
+		InlineThreshold:     inlineThreshold,
+		CompactThreshold:    compactThreshold,
+		SegmentSize:         segmentSize,
+		FdCacheSize:         fdCacheSize,
+		MaxDiskUsage:        maxDiskUsage,
+		FragThreshold:       fragThreshold,
+		DisableRecompaction: disableRecompaction,
+	}
+	InitStorageWithConfig(config)
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance

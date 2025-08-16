@@ -38,17 +38,19 @@ func configureLogger() {
 }
 
 func RunServer() {
-	stor.InitStorageWithRecompaction(
-		AppConfig.DiskPath,
-		AppConfig.TTL,
-		AppConfig.InlineThreshold,
-		AppConfig.CompactThreshold,
-		AppConfig.SegmentSize,
-		AppConfig.FdCacheSize,
-		AppConfig.MaxDiskUsage,
-		AppConfig.FragThreshold,
-		AppConfig.RecompactDisable,
-	)
+	// Create storage config from AppConfig
+	storageConfig := &stor.StorageConfig{
+		DiskPath:            AppConfig.DiskPath,
+		TTL:                 AppConfig.TTL,
+		InlineThreshold:     AppConfig.InlineThreshold,
+		CompactThreshold:    AppConfig.CompactThreshold,
+		SegmentSize:         AppConfig.SegmentSize,
+		FdCacheSize:         AppConfig.FdCacheSize,
+		MaxDiskUsage:        AppConfig.MaxDiskUsage,
+		FragThreshold:       AppConfig.FragThreshold,
+		DisableRecompaction: AppConfig.RecompactDisable,
+	}
+	stor.InitStorageWithConfig(storageConfig)
 
 	grpcAddr := fmt.Sprintf(":%d", *port)
 	go startGRPCServer()                           // Start gRPC server in goroutine

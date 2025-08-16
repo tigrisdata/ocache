@@ -87,11 +87,17 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 	}
 }
 
-// Start launches a background goroutine that periodically calls CompactFiles
-// at the interval defined by DefaultFileCompactionInterval.
+// Start launches background goroutines for file and segment compaction
 func (c *Compactor) Start() {
+	// Start file compaction loop
 	c.wg.Add(1)
-	go c.compactionLoop()
+	go c.fileCompactionLoop()
+
+	// Start segment recompaction loop if enabled
+	if c.recompactor != nil && c.recompactor.fragThreshold > 0 {
+		c.wg.Add(1)
+		go c.segmentRecompactionLoop()
+	}
 }
 
 // Close stops the background compaction loop and waits for it to exit.
@@ -115,17 +121,14 @@ func (c *Compactor) SetFragmentationThreshold(threshold float64) {
 	}
 }
 
-// compactionLoop triggers file compaction on a timer until Close is called.
-func (c *Compactor) compactionLoop() {
+// fileCompactionLoop triggers file compaction on a timer until Close is called.
+func (c *Compactor) fileCompactionLoop() {
 	defer c.wg.Done()
 
-	zlog.Info().Msg("compactor: starting background compaction loop")
+	zlog.Info().Msg("compactor: starting file compaction loop")
 
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
-
-	// Alternate between file compaction and segment recompaction
-	compactionRound := 0
 
 	for {
 		select {
@@ -134,23 +137,39 @@ func (c *Compactor) compactionLoop() {
 			if c.ctx.Err() != nil {
 				return
 			}
+			c.CompactFiles(c.ctx, c.maxBytes)
+		case <-c.ctx.Done():
+			zlog.Info().Msg("compactor: file compaction loop stopping")
+			return
+		}
+	}
+}
 
-			// Alternate between file compaction and segment recompaction
-			if compactionRound%2 == 0 {
-				c.CompactFiles(c.ctx, c.maxBytes)
-			} else {
-				// Run segment recompaction
-				if c.recompactor != nil {
-					if err := c.recompactor.RecompactFragmentedSegments(c.ctx); err != nil {
-						if err != context.Canceled {
-							zlog.Error().Err(err).Msg("compactor: segment recompaction failed")
-						}
-					}
+// segmentRecompactionLoop triggers segment recompaction on a timer until Close is called.
+func (c *Compactor) segmentRecompactionLoop() {
+	defer c.wg.Done()
+
+	zlog.Info().Msg("compactor: starting segment recompaction loop")
+
+	// Use a longer interval for segment recompaction (2x the file compaction interval)
+	recompactionInterval := c.interval * 2
+	ticker := time.NewTicker(recompactionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if context is already cancelled before starting recompaction
+			if c.ctx.Err() != nil {
+				return
+			}
+			if err := c.recompactor.RecompactFragmentedSegments(c.ctx); err != nil {
+				if err != context.Canceled {
+					zlog.Error().Err(err).Msg("compactor: segment recompaction failed")
 				}
 			}
-			compactionRound++
 		case <-c.ctx.Done():
-			zlog.Info().Msg("compactor: background loop stopping")
+			zlog.Info().Msg("compactor: segment recompaction loop stopping")
 			return
 		}
 	}
