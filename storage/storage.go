@@ -265,44 +265,17 @@ func InitStorageWithConfig(config *StorageConfig) {
 
 	// Configure recompaction if not disabled
 	if !config.DisableRecompaction && s.compactor != nil {
-		s.compactor.SetFragmentationThreshold(config.FragThreshold)
-		zlog.Info().Float64("threshold", config.FragThreshold).Msg("Segment recompaction enabled")
+		fragThreshold := config.FragThreshold
+		if fragThreshold <= 0 || fragThreshold > 1 {
+			fragThreshold = DefaultFragmentationThreshold
+		}
+		s.compactor.SetRecompactor(fragThreshold, MinSegmentAgeForRecompaction)
+		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
 	} else if config.DisableRecompaction {
 		zlog.Info().Msg("Segment recompaction disabled")
 	}
 
 	storage = s
-}
-
-// InitStorage initializes storage at dbPath (deprecated - use InitStorageWithConfig)
-func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) {
-	config := &StorageConfig{
-		DiskPath:         diskPath,
-		TTL:              ttl,
-		InlineThreshold:  inlineThreshold,
-		CompactThreshold: compactThreshold,
-		SegmentSize:      segmentSize,
-		FdCacheSize:      fdCacheSize,
-		MaxDiskUsage:     maxDiskUsage,
-		FragThreshold:    DefaultFragmentationThreshold,
-	}
-	InitStorageWithConfig(config)
-}
-
-// InitStorageWithRecompaction initializes storage with segment recompaction configuration (deprecated - use InitStorageWithConfig)
-func InitStorageWithRecompaction(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64, fragThreshold float64, disableRecompaction bool) {
-	config := &StorageConfig{
-		DiskPath:            diskPath,
-		TTL:                 ttl,
-		InlineThreshold:     inlineThreshold,
-		CompactThreshold:    compactThreshold,
-		SegmentSize:         segmentSize,
-		FdCacheSize:         fdCacheSize,
-		MaxDiskUsage:        maxDiskUsage,
-		FragThreshold:       fragThreshold,
-		DisableRecompaction: disableRecompaction,
-	}
-	InitStorageWithConfig(config)
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance

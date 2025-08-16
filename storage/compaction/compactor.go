@@ -81,7 +81,7 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 		deletionQueue: deletionQueue,
 		maxBytes:      maxBytes,
 		interval:      interval,
-		recompactor:   NewSegmentRecompactor(sm, deletionQueue, DefaultFragmentationThreshold),
+		recompactor:   nil, // Will be set with SetRecompactor
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -114,11 +114,9 @@ func (c *Compactor) Close() {
 	}
 }
 
-// SetFragmentationThreshold sets the fragmentation threshold for segment recompaction
-func (c *Compactor) SetFragmentationThreshold(threshold float64) {
-	if c.recompactor != nil {
-		c.recompactor.fragThreshold = threshold
-	}
+// SetRecompactor sets up the segment recompactor with the given parameters
+func (c *Compactor) SetRecompactor(fragThreshold float64, minSegmentAge time.Duration) {
+	c.recompactor = NewSegmentRecompactor(c.sm, c.deletionQueue, fragThreshold, minSegmentAge)
 }
 
 // fileCompactionLoop triggers file compaction on a timer until Close is called.

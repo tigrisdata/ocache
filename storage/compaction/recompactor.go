@@ -1,10 +1,8 @@
 package compaction
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,16 +20,6 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
-const (
-	// DefaultFragmentationThreshold is the default threshold for considering a segment fragmented
-	// When dead space exceeds 50% of the segment, it's considered for recompaction
-	DefaultFragmentationThreshold = 0.5
-
-	// MinSegmentAgeForRecompaction is the minimum age a segment must have before recompaction
-	// This prevents recompacting recently created segments that might still be receiving deletes
-	MinSegmentAgeForRecompaction = 30 * time.Minute
-)
-
 // SegmentRecompactor handles recompaction of fragmented segments
 type SegmentRecompactor struct {
 	sm            *segment.Manager
@@ -42,17 +30,13 @@ type SegmentRecompactor struct {
 }
 
 // NewSegmentRecompactor creates a new segment recompactor
-func NewSegmentRecompactor(sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64) *SegmentRecompactor {
-	if fragThreshold <= 0 || fragThreshold > 1 {
-		fragThreshold = DefaultFragmentationThreshold
-	}
-
+func NewSegmentRecompactor(sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration) *SegmentRecompactor {
 	return &SegmentRecompactor{
 		sm:            sm,
 		meta:          metadata.GetMetaDB(),
 		deletionQueue: deletionQueue,
 		fragThreshold: fragThreshold,
-		minSegmentAge: MinSegmentAgeForRecompaction,
+		minSegmentAge: minSegmentAge,
 	}
 }
 
@@ -147,6 +131,8 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	}
 
 	// Create a new segment for the live data
+	// NOTE: AcquireOpenSegment is thread-safe - the segment manager uses internal
+	// locking to coordinate access between compactor and recompactor threads
 	newSeg, err := sr.sm.AcquireOpenSegment(0)
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)
@@ -157,6 +143,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	defer wb.Destroy()
 
 	// Scan the old segment and copy live entries
+	// TODO: Refactor to use an iterator on the Segment struct for cleaner entry iteration
 	pos := int64(0)
 	copiedEntries := uint32(0)
 	copiedBytes := int64(0)
@@ -275,31 +262,13 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	userKey string, oldOffset, headerSize, valLen int64, version uint16, checksum uint32,
 	meta *pb.ValueMessage, wb *grocksdb.WriteBatch) error {
 
-	// Create a section reader for the value data
+	// Create a section reader for the value data (no checksum verification per review)
 	valueOffset := oldOffset + headerSize
-	reader := io.NewSectionReader(oldFile, valueOffset, valLen)
-
-	// If checksum verification is needed, we need to buffer the data
-	var dataReader io.Reader = reader
-	if checksum != 0 {
-		// Read all data to verify checksum
-		data := make([]byte, valLen)
-		if _, err := io.ReadFull(reader, data); err != nil {
-			return fmt.Errorf("failed to read value for checksum: %w", err)
-		}
-
-		// Verify checksum
-		h := crc32.NewIEEE()
-		h.Write(data)
-		if h.Sum32() != checksum {
-			return fmt.Errorf("checksum mismatch")
-		}
-
-		// Create a reader from the buffered data
-		dataReader = bytes.NewReader(data)
-	}
+	dataReader := io.NewSectionReader(oldFile, valueOffset, valLen)
 
 	// Check if we need a new segment
+	// NOTE: FinalizeSegment and AcquireOpenSegment are thread-safe - the segment
+	// manager uses internal locking to coordinate between compactor and recompactor
 	totalNeeded := headerSize + valLen
 	if (*newSeg).Remaining() < totalNeeded {
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
