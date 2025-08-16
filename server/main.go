@@ -23,6 +23,8 @@ var (
 	verbose          = flag.Bool("v", false, "Enable debug logging")
 	fdCacheSize      = flag.Int("fd-cache-size", 10000, "Size of the file descriptor cache (entries)")
 	maxDiskUsage     = flag.Int64("max-disk-usage", 0, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
+	fragThreshold    = flag.Float64("fragmentation-threshold", 0.5, "Segment fragmentation threshold for recompaction (0.0-1.0)")
+	recompactDisable = flag.Bool("disable-recompaction", false, "Disable automatic segment recompaction")
 )
 
 func configureLogger() {
@@ -36,7 +38,7 @@ func configureLogger() {
 }
 
 func RunServer() {
-	stor.InitStorage(
+	stor.InitStorageWithRecompaction(
 		AppConfig.DiskPath,
 		AppConfig.TTL,
 		AppConfig.InlineThreshold,
@@ -44,6 +46,8 @@ func RunServer() {
 		AppConfig.SegmentSize,
 		AppConfig.FdCacheSize,
 		AppConfig.MaxDiskUsage,
+		AppConfig.FragThreshold,
+		AppConfig.RecompactDisable,
 	)
 
 	grpcAddr := fmt.Sprintf(":%d", *port)

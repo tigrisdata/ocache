@@ -247,6 +247,24 @@ func InitStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold
 	storage = s
 }
 
+// InitStorageWithRecompaction initializes storage with segment recompaction configuration
+func InitStorageWithRecompaction(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64, fragThreshold float64, disableRecompaction bool) {
+	s, err := newStorage(diskPath, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize, maxDiskUsage)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("failed to open storage")
+	}
+
+	// Configure recompaction if not disabled
+	if !disableRecompaction && s.compactor != nil {
+		s.compactor.SetFragmentationThreshold(fragThreshold)
+		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
+	} else if disableRecompaction {
+		zlog.Info().Msg("Segment recompaction disabled")
+	}
+
+	storage = s
+}
+
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
 func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) (*Storage, error) {
 	// Create the data directory if it doesn't exist

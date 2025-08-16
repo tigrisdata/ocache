@@ -61,6 +61,7 @@ type Compactor struct {
 	deletionQueue *deletion.Queue
 	maxBytes      int64
 	interval      time.Duration
+	recompactor   *SegmentRecompactor
 
 	// background loop coordination
 	cancel context.CancelFunc
@@ -80,6 +81,7 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 		deletionQueue: deletionQueue,
 		maxBytes:      maxBytes,
 		interval:      interval,
+		recompactor:   NewSegmentRecompactor(sm, deletionQueue, DefaultFragmentationThreshold),
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -106,6 +108,13 @@ func (c *Compactor) Close() {
 	}
 }
 
+// SetFragmentationThreshold sets the fragmentation threshold for segment recompaction
+func (c *Compactor) SetFragmentationThreshold(threshold float64) {
+	if c.recompactor != nil {
+		c.recompactor.fragThreshold = threshold
+	}
+}
+
 // compactionLoop triggers file compaction on a timer until Close is called.
 func (c *Compactor) compactionLoop() {
 	defer c.wg.Done()
@@ -115,6 +124,9 @@ func (c *Compactor) compactionLoop() {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
+	// Alternate between file compaction and segment recompaction
+	compactionRound := 0
+
 	for {
 		select {
 		case <-ticker.C:
@@ -122,7 +134,21 @@ func (c *Compactor) compactionLoop() {
 			if c.ctx.Err() != nil {
 				return
 			}
-			c.CompactFiles(c.ctx, c.maxBytes)
+
+			// Alternate between file compaction and segment recompaction
+			if compactionRound%2 == 0 {
+				c.CompactFiles(c.ctx, c.maxBytes)
+			} else {
+				// Run segment recompaction
+				if c.recompactor != nil {
+					if err := c.recompactor.RecompactFragmentedSegments(c.ctx); err != nil {
+						if err != context.Canceled {
+							zlog.Error().Err(err).Msg("compactor: segment recompaction failed")
+						}
+					}
+				}
+			}
+			compactionRound++
 		case <-c.ctx.Done():
 			zlog.Info().Msg("compactor: background loop stopping")
 			return

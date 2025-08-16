@@ -74,6 +74,41 @@ func (s *Segment) HasOpenFile() bool {
 	return s.file != nil
 }
 
+// Lock locks the segment for exclusive access
+func (s *Segment) Lock() {
+	s.mu.Lock()
+}
+
+// Unlock unlocks the segment
+func (s *Segment) Unlock() {
+	s.mu.Unlock()
+}
+
+// File returns the underlying file (must be called while holding lock)
+func (s *Segment) File() *os.File {
+	return s.file
+}
+
+// IncrementSize increments the segment size (must be called while holding lock)
+func (s *Segment) IncrementSize(delta int64) {
+	s.size += delta
+}
+
+// IncrementEntries increments the entry count (must be called while holding lock)
+func (s *Segment) IncrementEntries() {
+	s.entries++
+}
+
+// IncrementDataBytes increments the data bytes count (must be called while holding lock)
+func (s *Segment) IncrementDataBytes(delta int64) {
+	s.dataBytes += delta
+}
+
+// GetSizeUnsafe returns the size without locking (must be called while holding lock)
+func (s *Segment) GetSizeUnsafe() int64 {
+	return s.size
+}
+
 // NewSegment creates a new segment with the given path and size.
 func NewSegment(path string, entries uint32, dataBytes int64, size int64, maxSupportedSize int64) *Segment {
 	return &Segment{path: path, entries: entries, dataBytes: dataBytes, size: size, version: CurrentSegmentVersion, maxSupportedSize: maxSupportedSize}
@@ -553,6 +588,39 @@ func (sm *Manager) GetSegmentCount() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.segments)
+}
+
+// GetFragmentationRatio calculates the fragmentation ratio for a segment
+// Returns the ratio of dead space to total segment size (0.0 to 1.0)
+func (sm *Manager) GetFragmentationRatio(segmentPath string, deletedBytes int64) float64 {
+	sm.mu.RLock()
+	seg, exists := sm.segMap[segmentPath]
+	sm.mu.RUnlock()
+
+	if !exists || seg == nil {
+		return 0.0
+	}
+
+	// Get the actual size of the segment
+	segmentSize := seg.GetSize()
+	if segmentSize == 0 {
+		return 0.0
+	}
+
+	// Calculate fragmentation as ratio of deleted bytes to total size
+	return float64(deletedBytes) / float64(segmentSize)
+}
+
+// IsSegmentFragmented checks if a segment exceeds the fragmentation threshold
+func (sm *Manager) IsSegmentFragmented(segmentPath string, deletedBytes int64, threshold float64) bool {
+	return sm.GetFragmentationRatio(segmentPath, deletedBytes) > threshold
+}
+
+// GetSegmentByPath returns a segment by its path
+func (sm *Manager) GetSegmentByPath(path string) *Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.segMap[path]
 }
 
 // Close closes all segment files
