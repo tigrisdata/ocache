@@ -52,10 +52,38 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		return nil
 	}
 
+	// Get the current open segment to ensure we never try to recompact it
+	currentOpen := sr.sm.GetCurrentOpenSegment()
+
+	// Safety: Never recompact the most recent segments (even if closed)
+	// to avoid interfering with segments that might have just been finalized
+	skipRecentCount := 2
+	if len(segments) <= skipRecentCount {
+		zlog.Debug().Int("segmentCount", len(segments)).
+			Msg("recompactor: too few segments to safely recompact")
+		return nil
+	}
+
 	recompactedCount := 0
-	for _, seg := range segments {
-		// Skip open segments (still being written to)
+	// Process segments but skip the most recent ones
+	for i, seg := range segments {
+		// Skip the most recent segments
+		if i >= len(segments)-skipRecentCount {
+			zlog.Debug().Str("segment", seg.Path()).
+				Msg("recompactor: skipping recent segment")
+			continue
+		}
+		// Skip the currently open segment (compactor might be writing to it)
+		if currentOpen != nil && seg == currentOpen {
+			zlog.Debug().Str("segment", seg.Path()).
+				Msg("recompactor: skipping current open segment")
+			continue
+		}
+
+		// Also skip if segment has an open file handle (defensive check)
 		if seg.HasOpenFile() {
+			zlog.Debug().Str("segment", seg.Path()).
+				Msg("recompactor: skipping segment with open file")
 			continue
 		}
 
@@ -131,8 +159,12 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	}
 
 	// Create a new segment for the live data
-	// NOTE: AcquireOpenSegment is thread-safe - the segment manager uses internal
-	// locking to coordinate access between compactor and recompactor threads
+	// WARNING: This calls AcquireOpenSegment which returns THE SAME segment that
+	// the compactor might be writing to. This is a design limitation - the segment
+	// manager only supports one open segment at a time. Both compactor and recompactor
+	// will write to the same segment, which is safe due to internal locking but may
+	// cause inefficient interleaving of data from different sources.
+	// TODO: Enhance segment manager to support multiple concurrent open segments
 	newSeg, err := sr.sm.AcquireOpenSegment(0)
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)

@@ -40,10 +40,10 @@ const (
 	DeleteBatchSize = 1000 // Number of deletions to process per batch
 
 	// Default segment recompaction settings
-	DefaultFragmentationThreshold = 0.5              // Recompact when dead space exceeds 50%
-	MinSegmentAgeForRecompaction  = 30 * time.Minute // Don't recompact segments younger than 30 minutes
-	DeleteProcessInterval         = time.Second      // Interval between batch processing
-	DeletePruneAge                = 24 * time.Hour   // Age after which entries are pruned
+	DefaultFragmentationThreshold = 0.5            // Recompact when dead space exceeds 50%
+	MinSegmentAgeForRecompaction  = 2 * time.Hour  // Don't recompact segments younger than 2 hours (ensures they're cold)
+	DeleteProcessInterval         = time.Second    // Interval between batch processing
+	DeletePruneAge                = 24 * time.Hour // Age after which entries are pruned
 )
 
 // StorageConfig holds all configuration parameters for initializing storage
