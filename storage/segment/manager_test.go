@@ -11,6 +11,62 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 )
 
+func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
+	basePath := t.TempDir()
+	segmentSize := int64(1024 * 1024)
+
+	_ = fd.NewFdCache(100)
+
+	manager, err := NewManager(basePath, segmentSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	// Initially, no open segment should exist
+	if manager.GetCurrentOpenSegment() != nil {
+		t.Error("Expected no current open segment initially")
+	}
+
+	// Acquire an open segment
+	seg1, err := manager.AcquireOpenSegment(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it's tracked as currentOpen
+	if manager.GetCurrentOpenSegment() != seg1 {
+		t.Error("Expected seg1 to be tracked as currentOpen")
+	}
+
+	// Finalize the segment
+	err = manager.FinalizeSegment(seg1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// After finalization, currentOpen should be nil
+	if manager.GetCurrentOpenSegment() != nil {
+		t.Error("Expected currentOpen to be nil after finalization")
+	}
+
+	// Acquire another segment
+	seg2, err := manager.AcquireOpenSegment(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the new segment is tracked
+	if manager.GetCurrentOpenSegment() != seg2 {
+		t.Error("Expected seg2 to be tracked as currentOpen")
+	}
+
+	// Verify seg1 and seg2 are different
+	if seg1 == seg2 {
+		t.Error("Expected different segments after finalization")
+	}
+}
+
 func TestNewSegment(t *testing.T) {
 	path := "/test/segment.seg"
 	entries := uint32(10)

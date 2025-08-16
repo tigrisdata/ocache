@@ -120,6 +120,7 @@ type Manager struct {
 	segmentSize  int64
 	segments     []*Segment          // ordered list (oldest→newest)
 	segMap       map[string]*Segment // path → *Segment for O(1) lookup
+	currentOpen  *Segment            // explicitly track the current open segment for writing
 	mu           sync.RWMutex
 	fdCache      *fd.FdCache // descriptor cache for closed segments
 
@@ -289,23 +290,26 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 
 // Returns an open segment (may create a new one)
 func (sm *Manager) AcquireOpenSegment(needed int64) (*Segment, error) {
-	// If no open segments, create a new one
-	if len(sm.segments) == 0 {
+	sm.mu.RLock()
+	currentOpen := sm.currentOpen
+	sm.mu.RUnlock()
+
+	// If no open segment exists, create a new one
+	if currentOpen == nil {
 		return sm.createNewSegment()
 	}
 
-	// Get the newest (currently writable) segment
-	lastSeg := sm.segments[len(sm.segments)-1]
+	// Check if the current segment is still open for writing
+	currentOpen.mu.RLock()
+	isOpen := currentOpen.file != nil
+	currentOpen.mu.RUnlock()
 
-	lastSeg.mu.RLock()
-	defer lastSeg.mu.RUnlock()
-
-	// If the segment is already finalized (file == nil) create a new one
-	if lastSeg.file == nil {
+	if !isOpen {
+		// Current segment was finalized, create a new one
 		return sm.createNewSegment()
 	}
 
-	return lastSeg, nil
+	return currentOpen, nil
 }
 
 // SyncSegment syncs the segment.
@@ -360,6 +364,13 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	// Clear pointer – closed segments will use fdCache for reads.
 	seg.file = nil
 
+	// Clear currentOpen if this was the open segment
+	sm.mu.Lock()
+	if sm.currentOpen == seg {
+		sm.currentOpen = nil
+	}
+	sm.mu.Unlock()
+
 	zlog.Info().Str("path", seg.path).Msg("finished finalizing segment")
 
 	return nil
@@ -390,6 +401,7 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 
 	sm.segments = append(sm.segments, segment)
 	sm.segMap[path] = segment
+	sm.currentOpen = segment // Set as the current open segment
 	return segment, nil
 }
 
@@ -478,6 +490,11 @@ func (sm *Manager) loadSegments() error {
 	}
 
 	zlog.Info().Str("path", sm.segmentsPath).Msg("finished finalizing open segments")
+
+	// Set the last open segment as currentOpen
+	if len(openSegs) > 0 {
+		sm.currentOpen = openSegs[len(openSegs)-1]
+	}
 
 	return nil
 }
@@ -587,6 +604,14 @@ func (sm *Manager) GetSegments() []*Segment {
 	result := make([]*Segment, len(sm.segments))
 	copy(result, sm.segments)
 	return result
+}
+
+// GetCurrentOpenSegment returns the current open segment for writing, if any.
+// This is primarily for testing/debugging purposes.
+func (sm *Manager) GetCurrentOpenSegment() *Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.currentOpen
 }
 
 // GetSegmentCount returns the number of segments currently managed.
