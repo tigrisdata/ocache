@@ -13,15 +13,15 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/tigrisdata/ocache/server/storage/bufferpool"
-	"github.com/tigrisdata/ocache/server/storage/compaction"
-	"github.com/tigrisdata/ocache/server/storage/deletion"
-	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/storage/files"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/merge"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
-	"github.com/tigrisdata/ocache/server/storage/segment"
+	"github.com/tigrisdata/ocache/storage/bufferpool"
+	"github.com/tigrisdata/ocache/storage/compaction"
+	"github.com/tigrisdata/ocache/storage/deletion"
+	"github.com/tigrisdata/ocache/storage/fd"
+	"github.com/tigrisdata/ocache/storage/files"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
+	"github.com/tigrisdata/ocache/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/segment"
 )
 
 const (

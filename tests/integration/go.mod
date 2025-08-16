@@ -6,7 +6,7 @@ require (
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/stretchr/testify v1.10.0
 	github.com/tigrisdata/ocache/proto v0.0.0
-	github.com/tigrisdata/ocache/server v0.0.0
+	github.com/tigrisdata/ocache/storage v0.0.0
 )
 
 require (
@@ -30,3 +30,5 @@ require (
 replace github.com/tigrisdata/ocache/proto => ../../proto
 
 replace github.com/tigrisdata/ocache/server => ../../server
+
+replace github.com/tigrisdata/ocache/storage => ../../storage

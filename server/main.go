@@ -9,7 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
-	stor "github.com/tigrisdata/ocache/server/storage"
+	stor "github.com/tigrisdata/ocache/storage"
 )
 
 var (

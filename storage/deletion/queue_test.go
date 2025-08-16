@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/tigrisdata/ocache/server/storage/fd"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/fd"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/metadata"
 )
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {

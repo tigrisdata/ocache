@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/storage/fd"
 )
 
 func TestNewSegment(t *testing.T) {

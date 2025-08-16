@@ -11,10 +11,10 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/deletion"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/metadata"
-	"github.com/tigrisdata/ocache/server/storage/utils"
+	"github.com/tigrisdata/ocache/storage/deletion"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/metadata"
+	"github.com/tigrisdata/ocache/storage/utils"
 )
 
 const (

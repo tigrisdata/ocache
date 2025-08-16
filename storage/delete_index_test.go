@@ -7,8 +7,8 @@ import (
 	"testing"
 
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage/keys"
-	"github.com/tigrisdata/ocache/server/storage/merge"
+	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 
 	"github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"
@@ -344,11 +344,11 @@ func TestStorage_DeleteIndex_ConcurrentDeletions(t *testing.T) {
 	// Verify that all deletions were tracked correctly
 	deletedEntries, deletedBytes, err := s.GetDeleteIndexStats(segmentPath)
 	assert.NoError(t, err)
-	
+
 	expectedEntries := int64(numGoroutines * keysPerGoroutine)
 	expectedBytes := expectedEntries * valueSize
-	
-	assert.Equal(t, expectedEntries, deletedEntries, 
+
+	assert.Equal(t, expectedEntries, deletedEntries,
 		"All concurrent deletions should be tracked atomically via merge operator")
 	assert.Equal(t, expectedBytes, deletedBytes,
 		"Total deleted bytes should match expected value")
@@ -359,32 +359,32 @@ func TestStorage_DeleteIndex_MergeOperatorAccumulation(t *testing.T) {
 	defer cleanup()
 
 	segmentPath := "/data/segments/merge_test.seg"
-	
+
 	// Directly test merge operator functionality
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	
+
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
-	
+
 	// Perform multiple merge operations directly
 	for i := 0; i < 5; i++ {
 		operand := merge.MakeDeleteIndexOperand(1, 2048)
 		err := s.meta.Handle().Merge(wo, deleteIndexKey, operand)
 		require.NoError(t, err)
 	}
-	
+
 	// Read back the accumulated value
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
-	
+
 	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
 	require.NoError(t, err)
 	defer slice.Free()
-	
+
 	var entry pb.DeleteIndexEntry
 	err = proto.Unmarshal(slice.Data(), &entry)
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, int64(5), entry.DeletedEntries,
 		"Merge operator should accumulate entries count")
 	assert.Equal(t, int64(10240), entry.DeletedBytes,
@@ -397,10 +397,10 @@ func TestStorage_DeleteIndex_MergeOnExistingValue(t *testing.T) {
 
 	segmentPath := "/data/segments/existing_value.seg"
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
-	
+
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	
+
 	// First, put an existing value
 	initialEntry := &pb.DeleteIndexEntry{
 		DeletedEntries: 10,
@@ -408,27 +408,27 @@ func TestStorage_DeleteIndex_MergeOnExistingValue(t *testing.T) {
 	}
 	data, err := proto.Marshal(initialEntry)
 	require.NoError(t, err)
-	
+
 	err = s.meta.Handle().Put(wo, deleteIndexKey, data)
 	require.NoError(t, err)
-	
+
 	// Now merge additional deletes
 	operand := merge.MakeDeleteIndexOperand(5, 10240)
 	err = s.meta.Handle().Merge(wo, deleteIndexKey, operand)
 	require.NoError(t, err)
-	
+
 	// Read back and verify accumulation
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
-	
+
 	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
 	require.NoError(t, err)
 	defer slice.Free()
-	
+
 	var entry pb.DeleteIndexEntry
 	err = proto.Unmarshal(slice.Data(), &entry)
 	require.NoError(t, err)
-	
+
 	assert.Equal(t, int64(15), entry.DeletedEntries,
 		"Merge operator should add to existing entries count")
 	assert.Equal(t, int64(30720), entry.DeletedBytes,

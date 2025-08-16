@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tigrisdata/ocache/server/storage/fd"
+	"github.com/tigrisdata/ocache/storage/fd"
 )
 
 func TestNewFileManager(t *testing.T) {

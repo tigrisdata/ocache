@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/storage"
+	"github.com/tigrisdata/ocache/storage"
 )
 
 // VerifyNoRawFiles verifies that no raw files exist in the storage directory
