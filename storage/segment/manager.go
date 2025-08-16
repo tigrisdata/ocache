@@ -114,13 +114,24 @@ func NewSegment(path string, entries uint32, dataBytes int64, size int64, maxSup
 	return &Segment{path: path, entries: entries, dataBytes: dataBytes, size: size, version: CurrentSegmentVersion, maxSupportedSize: maxSupportedSize}
 }
 
+// SegmentPurpose identifies the purpose of an open segment
+type SegmentPurpose string
+
+const (
+	// PurposeCompaction is for segments used by the compactor
+	PurposeCompaction SegmentPurpose = "compaction"
+	// PurposeRecompaction is for segments used by the recompactor
+	PurposeRecompaction SegmentPurpose = "recompaction"
+)
+
 // Manager manages the segments on disk.
 type Manager struct {
 	segmentsPath string
 	segmentSize  int64
-	segments     []*Segment          // ordered list (oldest→newest)
-	segMap       map[string]*Segment // path → *Segment for O(1) lookup
-	currentOpen  *Segment            // explicitly track the current open segment for writing
+	segments     []*Segment                  // ordered list (oldest→newest)
+	segMap       map[string]*Segment         // path → *Segment for O(1) lookup
+	currentOpen  *Segment                    // explicitly track the current open segment for writing (deprecated, use openSegments)
+	openSegments map[SegmentPurpose]*Segment // track multiple open segments by purpose
 	mu           sync.RWMutex
 	fdCache      *fd.FdCache // descriptor cache for closed segments
 
@@ -150,6 +161,7 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 		segmentsPath: segmentsPath,
 		segmentSize:  segmentSize,
 		segMap:       make(map[string]*Segment),
+		openSegments: make(map[SegmentPurpose]*Segment),
 		closeCh:      make(chan struct{}),
 	}
 
@@ -288,21 +300,28 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	return sm.WriteEntryFromReader(seg, userKey, f, vm)
 }
 
-// Returns an open segment (may create a new one)
+// Returns an open segment (may create a new one) - DEPRECATED, use AcquireOpenSegmentForPurpose
 func (sm *Manager) AcquireOpenSegment(needed int64) (*Segment, error) {
+	// For backward compatibility, default to compaction purpose
+	return sm.AcquireOpenSegmentForPurpose(PurposeCompaction, needed)
+}
+
+// AcquireOpenSegmentForPurpose returns an open segment for a specific purpose
+// This allows compactor and recompactor to work with independent segments
+func (sm *Manager) AcquireOpenSegmentForPurpose(purpose SegmentPurpose, needed int64) (*Segment, error) {
 	// First check with read lock for the common case (segment exists and is open)
 	sm.mu.RLock()
-	currentOpen := sm.currentOpen
+	openSeg := sm.openSegments[purpose]
 	sm.mu.RUnlock()
 
-	// Fast path: current segment exists and is open
-	if currentOpen != nil {
-		currentOpen.mu.RLock()
-		isOpen := currentOpen.file != nil
-		currentOpen.mu.RUnlock()
-		
+	// Fast path: segment for this purpose exists and is open
+	if openSeg != nil {
+		openSeg.mu.RLock()
+		isOpen := openSeg.file != nil
+		openSeg.mu.RUnlock()
+
 		if isOpen {
-			return currentOpen, nil
+			return openSeg, nil
 		}
 	}
 
@@ -313,19 +332,19 @@ func (sm *Manager) AcquireOpenSegment(needed int64) (*Segment, error) {
 
 	// Double-check after acquiring write lock
 	// Another thread might have created a segment while we were waiting
-	if sm.currentOpen != nil {
-		sm.currentOpen.mu.RLock()
-		isOpen := sm.currentOpen.file != nil
-		sm.currentOpen.mu.RUnlock()
-		
+	if sm.openSegments[purpose] != nil {
+		sm.openSegments[purpose].mu.RLock()
+		isOpen := sm.openSegments[purpose].file != nil
+		sm.openSegments[purpose].mu.RUnlock()
+
 		if isOpen {
-			return sm.currentOpen, nil
+			return sm.openSegments[purpose], nil
 		}
 	}
 
 	// Now we're sure we need to create a new segment
-	// Call createNewSegmentLocked which assumes the write lock is held
-	return sm.createNewSegmentLocked()
+	// Call createNewSegmentForPurposeLocked which assumes the write lock is held
+	return sm.createNewSegmentForPurposeLocked(purpose)
 }
 
 // SyncSegment syncs the segment.
@@ -380,8 +399,14 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	// Clear pointer – closed segments will use fdCache for reads.
 	seg.file = nil
 
-	// Clear currentOpen if this was the open segment
+	// Clear from openSegments if this was an open segment
 	sm.mu.Lock()
+	for purpose, openSeg := range sm.openSegments {
+		if openSeg == seg {
+			delete(sm.openSegments, purpose)
+		}
+	}
+	// Also clear currentOpen for backward compatibility
 	if sm.currentOpen == seg {
 		sm.currentOpen = nil
 	}
@@ -396,15 +421,22 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 func (sm *Manager) createNewSegment() (*Segment, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
-	
+
 	return sm.createNewSegmentLocked()
 }
 
 // createNewSegmentLocked creates a new segment file (assumes lock is held)
 func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
-	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
+	// For backward compatibility, default to compaction purpose
+	return sm.createNewSegmentForPurposeLocked(PurposeCompaction)
+}
 
-	zlog.Info().Str("path", path).Msg("creating new segment")
+// createNewSegmentForPurposeLocked creates a new segment file for a specific purpose (assumes lock is held)
+func (sm *Manager) createNewSegmentForPurposeLocked(purpose SegmentPurpose) (*Segment, error) {
+	// Include purpose in filename for easier debugging
+	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%s_%d.seg", purpose, time.Now().UnixNano()))
+
+	zlog.Info().Str("path", path).Str("purpose", string(purpose)).Msg("creating new segment")
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -422,7 +454,13 @@ func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
 
 	sm.segments = append(sm.segments, segment)
 	sm.segMap[path] = segment
-	sm.currentOpen = segment // Set as the current open segment
+	sm.openSegments[purpose] = segment // Set as the open segment for this purpose
+
+	// For backward compatibility, also set currentOpen for compaction purpose
+	if purpose == PurposeCompaction {
+		sm.currentOpen = segment
+	}
+
 	return segment, nil
 }
 
@@ -512,9 +550,11 @@ func (sm *Manager) loadSegments() error {
 
 	zlog.Info().Str("path", sm.segmentsPath).Msg("finished finalizing open segments")
 
-	// Set the last open segment as currentOpen
+	// Set the last open segment as currentOpen and in openSegments for compaction
 	if len(openSegs) > 0 {
-		sm.currentOpen = openSegs[len(openSegs)-1]
+		lastOpen := openSegs[len(openSegs)-1]
+		sm.currentOpen = lastOpen
+		sm.openSegments[PurposeCompaction] = lastOpen
 	}
 
 	return nil
@@ -629,10 +669,31 @@ func (sm *Manager) GetSegments() []*Segment {
 
 // GetCurrentOpenSegment returns the current open segment for writing, if any.
 // This is primarily for testing/debugging purposes.
+// DEPRECATED: Use GetOpenSegmentForPurpose instead
 func (sm *Manager) GetCurrentOpenSegment() *Segment {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.currentOpen
+}
+
+// GetOpenSegmentForPurpose returns the open segment for a specific purpose
+func (sm *Manager) GetOpenSegmentForPurpose(purpose SegmentPurpose) *Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.openSegments[purpose]
+}
+
+// GetAllOpenSegments returns all open segments (for testing/debugging)
+func (sm *Manager) GetAllOpenSegments() map[SegmentPurpose]*Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	// Return a copy to prevent external modification
+	result := make(map[SegmentPurpose]*Segment)
+	for k, v := range sm.openSegments {
+		result[k] = v
+	}
+	return result
 }
 
 // GetSegmentCount returns the number of segments currently managed.

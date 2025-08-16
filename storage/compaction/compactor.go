@@ -200,7 +200,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 	)
 
 	// Acquire the initial open segment.
-	seg, err := c.sm.AcquireOpenSegment(0)
+	seg, err := c.sm.AcquireOpenSegmentForPurpose(segment.PurposeCompaction, 0)
 	if err != nil {
 		zlog.Error().Err(err).Msg("compactor: acquire open segment")
 		return
@@ -546,7 +546,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, n
 		return err
 	}
 
-	newSeg, err := c.sm.AcquireOpenSegment(0)
+	newSeg, err := c.sm.AcquireOpenSegmentForPurpose(segment.PurposeCompaction, 0)
 	if err != nil {
 		return err
 	}

@@ -144,13 +144,10 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	}
 
 	// Create a new segment for the live data
-	// WARNING: This calls AcquireOpenSegment which returns THE SAME segment that
-	// the compactor might be writing to. This is a design limitation - the segment
-	// manager only supports one open segment at a time. Both compactor and recompactor
-	// will write to the same segment, which is safe due to internal locking but may
-	// cause inefficient interleaving of data from different sources.
-	// TODO: Enhance segment manager to support multiple concurrent open segments
-	newSeg, err := sr.sm.AcquireOpenSegment(0)
+	// The recompactor now uses its own dedicated segment (PurposeRecompaction)
+	// separate from the compactor's segment (PurposeCompaction), allowing both
+	// to work independently without interfering with each other
+	newSeg, err := sr.sm.AcquireOpenSegmentForPurpose(segment.PurposeRecompaction, 0)
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)
 	}
@@ -292,7 +289,7 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
 		var err error
-		*newSeg, err = sr.sm.AcquireOpenSegment(0)
+		*newSeg, err = sr.sm.AcquireOpenSegmentForPurpose(segment.PurposeRecompaction, 0)
 		if err != nil {
 			return fmt.Errorf("failed to acquire new segment: %w", err)
 		}
@@ -330,9 +327,13 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 // can be safely recompacted. This includes checking if it's open, if it's too recent,
 // and if it's old enough based on timestamp.
 func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segment, currentOpen *segment.Segment, segmentIndex int, totalSegments int) (bool, string) {
-	// Check 1: Skip the currently open segment (compactor might be writing to it)
-	if currentOpen != nil && seg == currentOpen {
-		return false, "current open segment"
+	// Check 1: Skip any currently open segments (both compaction and recompaction)
+	// Get all open segments to ensure we don't recompact any of them
+	allOpen := sr.sm.GetAllOpenSegments()
+	for _, openSeg := range allOpen {
+		if openSeg != nil && seg == openSeg {
+			return false, "is an open segment"
+		}
 	}
 
 	// Check 2: Skip if segment has an open file handle (defensive check)
@@ -350,10 +351,15 @@ func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segm
 	// Check 4: Verify segment age based on timestamp
 	base := filepath.Base(seg.Path())
 	var timestamp int64
+	// Try parsing both old and new segment name formats
 	if _, err := fmt.Sscanf(base, "segment_%d.seg", &timestamp); err != nil {
-		// Can't parse timestamp, assume it's old enough (legacy segment)
-		zlog.Debug().Str("segment", seg.Path()).Msg("recompactor: cannot parse timestamp, assuming old segment")
-		return true, ""
+		// Try the new format with purpose prefix
+		var purpose string
+		if _, err := fmt.Sscanf(base, "segment_%s_%d.seg", &purpose, &timestamp); err != nil {
+			// Can't parse timestamp, assume it's old enough (legacy segment)
+			zlog.Debug().Str("segment", seg.Path()).Msg("recompactor: cannot parse timestamp, assuming old segment")
+			return true, ""
+		}
 	}
 
 	segmentTime := time.Unix(0, timestamp)

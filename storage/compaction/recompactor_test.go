@@ -41,9 +41,8 @@ func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, 
 	deletionQueue := deletion.NewQueue(meta, config)
 	deletionQueue.Start()
 
-	// Create recompactor
-	recompactor := NewSegmentRecompactor(sm, deletionQueue, 0.5)
-	recompactor.minSegmentAge = 0 // Disable age check for testing
+	// Create recompactor with 0 age for testing
+	recompactor := NewSegmentRecompactor(sm, deletionQueue, 0.5, 0)
 
 	cleanup := func() {
 		sm.Close()
