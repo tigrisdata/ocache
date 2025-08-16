@@ -18,7 +18,7 @@ var metaDB *MetaDB
 
 // NewMetaDB initializes the global metadata DB. It should be called exactly
 // once during Storage initialization.
-func NewMetaDB(diskPath string, ttl int) (*MetaDB, error) {
+func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator) (*MetaDB, error) {
 	if metaDB != nil {
 		return metaDB, nil
 	}
@@ -27,6 +27,11 @@ func NewMetaDB(diskPath string, ttl int) (*MetaDB, error) {
 
 	opts := grocksdb.NewDefaultOptions()
 	opts.SetCreateIfMissing(true)
+
+	// Set the merge operator if provided
+	if mergeOp != nil {
+		opts.SetMergeOperator(mergeOp)
+	}
 
 	dbPath := diskPath + "/rocksdb"
 	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)

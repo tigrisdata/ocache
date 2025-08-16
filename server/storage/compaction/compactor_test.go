@@ -34,8 +34,8 @@ func setupTestEnvironment(t *testing.T) (string, *files.FileManager, *segment.Ma
 	tmpDir, err := os.MkdirTemp("", "compactor-test-*")
 	require.NoError(t, err)
 
-	// Initialize metadata DB
-	_, err = metadata.NewMetaDB(tmpDir, 0)
+	// Initialize metadata DB with nil merge operator
+	_, err = metadata.NewMetaDB(tmpDir, 0, nil)
 	require.NoError(t, err)
 
 	// Initialize FD cache

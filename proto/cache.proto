@@ -91,3 +91,9 @@ message SyncEntry {
   string metadata_key = 1; // Key to fetch metadata for validation
   int64 timestamp = 2; // Unix timestamp when file was written
 }
+
+// DeleteIndexEntry tracks deleted entries in a segment for garbage collection
+message DeleteIndexEntry {
+  int64 deleted_entries = 1; // Number of deleted entries in this segment
+  int64 deleted_bytes = 2; // Total bytes of deleted entries in this segment
+}

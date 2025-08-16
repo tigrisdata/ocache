@@ -28,6 +28,9 @@ const (
 
 	// DeletionQueuePrefix is the prefix for deletion queue entries in RocksDB
 	DeletionQueuePrefix = "!del/"
+
+	// DeleteIndexPrefix is the prefix for segment deletion tracking entries in RocksDB
+	DeleteIndexPrefix = "!delete:segment/"
 )
 
 // MakeMetadataKey creates a metadata key by adding the metadata prefix to the user key
@@ -129,4 +132,23 @@ func ParseDeletionQueueKey(key []byte) (int64, string, error) {
 // IsDeletionQueueKey checks if a key is a deletion queue entry
 func IsDeletionQueueKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(DeletionQueuePrefix))
+}
+
+// MakeDeleteIndexKey creates a delete index key for tracking segment deletions
+func MakeDeleteIndexKey(segmentPath string) []byte {
+	return []byte(DeleteIndexPrefix + segmentPath)
+}
+
+// ExtractSegmentPath extracts the segment path from a delete index key
+func ExtractSegmentPath(deleteIndexKey []byte) string {
+	key := string(deleteIndexKey)
+	if strings.HasPrefix(key, DeleteIndexPrefix) {
+		return key[len(DeleteIndexPrefix):]
+	}
+	return ""
+}
+
+// IsDeleteIndexKey checks if a key is a delete index entry
+func IsDeleteIndexKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(DeleteIndexPrefix))
 }
