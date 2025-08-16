@@ -290,26 +290,42 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 
 // Returns an open segment (may create a new one)
 func (sm *Manager) AcquireOpenSegment(needed int64) (*Segment, error) {
+	// First check with read lock for the common case (segment exists and is open)
 	sm.mu.RLock()
 	currentOpen := sm.currentOpen
 	sm.mu.RUnlock()
 
-	// If no open segment exists, create a new one
-	if currentOpen == nil {
-		return sm.createNewSegment()
+	// Fast path: current segment exists and is open
+	if currentOpen != nil {
+		currentOpen.mu.RLock()
+		isOpen := currentOpen.file != nil
+		currentOpen.mu.RUnlock()
+		
+		if isOpen {
+			return currentOpen, nil
+		}
 	}
 
-	// Check if the current segment is still open for writing
-	currentOpen.mu.RLock()
-	isOpen := currentOpen.file != nil
-	currentOpen.mu.RUnlock()
+	// Slow path: need to create a new segment
+	// Use write lock to prevent race condition
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	if !isOpen {
-		// Current segment was finalized, create a new one
-		return sm.createNewSegment()
+	// Double-check after acquiring write lock
+	// Another thread might have created a segment while we were waiting
+	if sm.currentOpen != nil {
+		sm.currentOpen.mu.RLock()
+		isOpen := sm.currentOpen.file != nil
+		sm.currentOpen.mu.RUnlock()
+		
+		if isOpen {
+			return sm.currentOpen, nil
+		}
 	}
 
-	return currentOpen, nil
+	// Now we're sure we need to create a new segment
+	// Call createNewSegmentLocked which assumes the write lock is held
+	return sm.createNewSegmentLocked()
 }
 
 // SyncSegment syncs the segment.
@@ -376,11 +392,16 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	return nil
 }
 
-// createNewSegment creates a new segment file
+// createNewSegment creates a new segment file (acquires lock)
 func (sm *Manager) createNewSegment() (*Segment, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+	
+	return sm.createNewSegmentLocked()
+}
 
+// createNewSegmentLocked creates a new segment file (assumes lock is held)
+func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
 	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
 
 	zlog.Info().Str("path", path).Msg("creating new segment")
