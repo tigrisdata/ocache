@@ -213,8 +213,9 @@ func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int6
 	}, nil
 }
 
-func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.ValueMessage) (int64, error) {
-	if vm.ValueType != pb.ValueType_RAW_FILE {
+// WriteEntryFromReader writes an entry to a segment from an io.Reader
+func (sm *Manager) WriteEntryFromReader(seg *Segment, userKey string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
+	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
 		return 0, utils.WrapError("invalid value type", userKey, nil)
 	}
 
@@ -229,7 +230,7 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 		Str("key", userKey).
 		Int64("valueLength", vm.ValueLength).
 		Str("segment", seg.path).
-		Msg("writing entry to segment")
+		Msg("writing entry to segment from reader")
 
 	// Acquire lock to ensure only one writer to the segment at a time.
 	seg.mu.Lock()
@@ -244,11 +245,6 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	// Offset where this value will be written inside the segment
 	startOffset := seg.size
 
-	// Reset file cursor
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, utils.WrapError("seek to start", userKey, err)
-	}
-
 	// Sequential write: header then payload
 	if _, err := seg.file.Write(header); err != nil {
 		return 0, utils.WrapError("failed to write value header", seg.path, err)
@@ -258,7 +254,7 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	buf, release := bufferpool.AcquireBuffer(64 * 1024) // 64KB buffer
 	defer release()
 
-	bytesWritten, err := io.CopyBuffer(seg.file, f, buf)
+	bytesWritten, err := io.CopyBuffer(seg.file, r, buf)
 	if err != nil {
 		return 0, utils.WrapError("copy value to segment", userKey, err)
 	}
@@ -279,6 +275,16 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 		Msg("successfully wrote entry to segment")
 
 	return startOffset, nil
+}
+
+func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.ValueMessage) (int64, error) {
+	// Reset file cursor
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, utils.WrapError("seek to start", userKey, err)
+	}
+
+	// Use the reader-based implementation
+	return sm.WriteEntryFromReader(seg, userKey, f, vm)
 }
 
 // Returns an open segment (may create a new one)

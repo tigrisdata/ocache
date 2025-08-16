@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"hash/crc32"
@@ -11,7 +12,6 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
@@ -271,52 +271,32 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 }
 
 // copyEntry copies a single entry from old segment to new segment
-// Note: We create a temporary file to use WriteEntry since it expects an *os.File
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment,
 	userKey string, oldOffset, headerSize, valLen int64, version uint16, checksum uint32,
 	meta *pb.ValueMessage, wb *grocksdb.WriteBatch) error {
 
-	// Create a temporary file for the value data
-	tmpFile, err := os.CreateTemp("", "recompact-*.tmp")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
-	// Copy value data to temp file
+	// Create a section reader for the value data
 	valueOffset := oldOffset + headerSize
 	reader := io.NewSectionReader(oldFile, valueOffset, valLen)
 
-	buf, release := bufferpool.AcquireBuffer(64 * 1024)
-	defer release()
-
-	// Verify checksum while copying if present
-	var written int64
+	// If checksum verification is needed, we need to buffer the data
+	var dataReader io.Reader = reader
 	if checksum != 0 {
-		h := crc32.NewIEEE()
-		teeReader := io.TeeReader(reader, h)
-		written, err = io.CopyBuffer(tmpFile, teeReader, buf)
-		if err != nil {
-			return fmt.Errorf("failed to copy value to temp file: %w", err)
+		// Read all data to verify checksum
+		data := make([]byte, valLen)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return fmt.Errorf("failed to read value for checksum: %w", err)
 		}
+
+		// Verify checksum
+		h := crc32.NewIEEE()
+		h.Write(data)
 		if h.Sum32() != checksum {
 			return fmt.Errorf("checksum mismatch")
 		}
-	} else {
-		written, err = io.CopyBuffer(tmpFile, reader, buf)
-		if err != nil {
-			return fmt.Errorf("failed to copy value to temp file: %w", err)
-		}
-	}
 
-	if written != valLen {
-		return fmt.Errorf("copied %d bytes, expected %d", written, valLen)
-	}
-
-	// Seek to start of temp file for WriteEntry
-	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("failed to seek temp file: %w", err)
+		// Create a reader from the buffered data
+		dataReader = bytes.NewReader(data)
 	}
 
 	// Check if we need a new segment
@@ -325,21 +305,22 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
+		var err error
 		*newSeg, err = sr.sm.AcquireOpenSegment(0)
 		if err != nil {
 			return fmt.Errorf("failed to acquire new segment: %w", err)
 		}
 	}
 
-	// Create ValueMessage for WriteEntry
+	// Create ValueMessage for WriteEntryFromReader
 	vm := &pb.ValueMessage{
-		ValueType:   pb.ValueType_RAW_FILE,
+		ValueType:   pb.ValueType_SEGMENT,
 		ValueLength: valLen,
 		Checksum:    checksum,
 	}
 
-	// Use segment manager's WriteEntry function
-	newOffset, err := sr.sm.WriteEntry(*newSeg, userKey, tmpFile, vm)
+	// Use segment manager's WriteEntryFromReader function (avoids temp files)
+	newOffset, err := sr.sm.WriteEntryFromReader(*newSeg, userKey, dataReader, vm)
 	if err != nil {
 		return fmt.Errorf("failed to write entry: %w", err)
 	}
