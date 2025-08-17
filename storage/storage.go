@@ -326,31 +326,31 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize and start background compactor that migrates raw files into segments.
 	compactionInterval := getCompactionInterval()
-	
+
 	// Configure compactor with recompaction if enabled
-	var compactor *compaction.Compactor
+
+	compactorConfig := &compaction.CompactorConfig{
+		FileManager:    fileManager,
+		SegmentManager: segmentManager,
+		DeletionQueue:  deletionQueue,
+		MaxBytes:       DefaultCompactionMaxBytes,
+		Interval:       compactionInterval,
+	}
+
 	if !config.DisableRecompaction {
 		fragThreshold := config.FragThreshold
 		if fragThreshold <= 0 || fragThreshold > 1 {
 			fragThreshold = DefaultFragmentationThreshold
 		}
-		
-		compactorConfig := &compaction.CompactorConfig{
-			FileManager:        fileManager,
-			SegmentManager:     segmentManager,
-			DeletionQueue:      deletionQueue,
-			MaxBytes:           DefaultCompactionMaxBytes,
-			Interval:           compactionInterval,
-			EnableRecompaction: true,
-			FragThreshold:      fragThreshold,
-			MinSegmentAge:      MinSegmentAgeForRecompaction,
-		}
-		compactor = compaction.NewCompactorWithConfig(compactorConfig)
+
+		compactorConfig.EnableRecompaction = true
+		compactorConfig.FragThreshold = fragThreshold
+		compactorConfig.MinSegmentAge = MinSegmentAgeForRecompaction
+
 		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
-	} else {
-		compactor = compaction.NewCompactor(fileManager, segmentManager, deletionQueue, DefaultCompactionMaxBytes, compactionInterval)
-		zlog.Info().Msg("Segment recompaction disabled")
 	}
+
+	compactor := compaction.NewCompactorWithConfig(compactorConfig)
 	compactor.Start()
 
 	s := &Storage{
