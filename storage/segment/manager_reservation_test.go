@@ -2,14 +2,20 @@ package segment
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	pb "github.com/tigrisdata/ocache/proto"
 )
 
 // TestSegmentReservation tests the segment reservation system
 func TestSegmentReservation(t *testing.T) {
-	seg := NewSegment("/tmp/test.seg", 0, 0, 0, 1024*1024)
+	tmpDir := t.TempDir()
+	segPath := filepath.Join(tmpDir, "test.seg")
+	seg := NewSegment(segPath, 0, 0, 0, 1024*1024)
 
 	// Test initial state - not reserved
 	if seg.IsReserved() {
@@ -154,7 +160,7 @@ func TestConcurrentReservations(t *testing.T) {
 		wg.Add(1)
 		go func(threadID int) {
 			defer wg.Done()
-			callerID := string(rune('A' + threadID)) // A, B, C, ...
+			callerID := fmt.Sprintf("thread-%d", threadID)
 
 			for op := 0; op < opsPerThread; op++ {
 				// Acquire segment with reservation
