@@ -580,15 +580,15 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 		}
 
 		// Re-initialize storage with same directory (simulates cache warming)
-		storage.InitStorage(
-			tempDir,
-			0, // TTL
-			int(testConfig.InlineThreshold),
-			testConfig.CompactThreshold,
-			testConfig.SegmentSize,
-			testConfig.FDCacheSize,
-			testConfig.MaxDiskUsage,
-		)
+		storage.InitStorageWithConfig(&storage.StorageConfig{
+			DiskPath:         tempDir,
+			TTL:              0,
+			InlineThreshold:  int(testConfig.InlineThreshold),
+			CompactThreshold: testConfig.CompactThreshold,
+			SegmentSize:      testConfig.SegmentSize,
+			FdCacheSize:      testConfig.FDCacheSize,
+			MaxDiskUsage:     testConfig.MaxDiskUsage,
+		})
 
 		// Get the new storage instance
 		newHarness.Storage = storage.GetStorage()

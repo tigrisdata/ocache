@@ -23,9 +23,9 @@ func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
 	}
 	defer manager.Close()
 
-	// Initially, no open segment should exist
-	if manager.GetCurrentOpenSegment() != nil {
-		t.Error("Expected no current open segment initially")
+	// Initially, no open segments should exist
+	if len(manager.GetOpenSegments()) != 0 {
+		t.Error("Expected no open segments initially")
 	}
 
 	// Acquire an open segment
@@ -34,9 +34,10 @@ func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify it's tracked as currentOpen
-	if manager.GetCurrentOpenSegment() != seg1 {
-		t.Error("Expected seg1 to be tracked as currentOpen")
+	// Verify it's tracked in open segments
+	openSegs := manager.GetOpenSegments()
+	if len(openSegs) != 1 || openSegs[0] != seg1 {
+		t.Error("Expected seg1 to be the only open segment")
 	}
 
 	// Finalize the segment
@@ -45,9 +46,9 @@ func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// After finalization, currentOpen should be nil
-	if manager.GetCurrentOpenSegment() != nil {
-		t.Error("Expected currentOpen to be nil after finalization")
+	// After finalization, no open segments should exist
+	if len(manager.GetOpenSegments()) != 0 {
+		t.Error("Expected no open segments after finalization")
 	}
 
 	// Acquire another segment
@@ -57,8 +58,9 @@ func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
 	}
 
 	// Verify the new segment is tracked
-	if manager.GetCurrentOpenSegment() != seg2 {
-		t.Error("Expected seg2 to be tracked as currentOpen")
+	openSegs = manager.GetOpenSegments()
+	if len(openSegs) != 1 || openSegs[0] != seg2 {
+		t.Error("Expected seg2 to be the only open segment")
 	}
 
 	// Verify seg1 and seg2 are different

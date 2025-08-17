@@ -1,6 +1,7 @@
 package segment
 
 import (
+	"fmt"
 	"os"
 	"testing"
 
@@ -8,7 +9,7 @@ import (
 )
 
 // TestManager_MultipleConcurrentOpenSegments tests that the manager can handle
-// multiple open segments for different purposes (compaction vs recompaction)
+// multiple open segments concurrently
 func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	tmpDir := t.TempDir()
 	manager, err := NewManager(tmpDir, 1024*1024) // 1MB segments
@@ -17,161 +18,161 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	}
 	defer manager.Close()
 
-	// Acquire segment for compaction
-	compactionSeg, err := manager.AcquireOpenSegmentForPurpose(PurposeCompaction, 0)
+	// Acquire first segment
+	seg1, err := manager.AcquireOpenSegment(0)
 	if err != nil {
-		t.Fatalf("Failed to acquire compaction segment: %v", err)
+		t.Fatalf("Failed to acquire first segment: %v", err)
 	}
-	if compactionSeg == nil {
-		t.Fatal("Compaction segment should not be nil")
-	}
-
-	// Acquire segment for recompaction
-	recompactionSeg, err := manager.AcquireOpenSegmentForPurpose(PurposeRecompaction, 0)
-	if err != nil {
-		t.Fatalf("Failed to acquire recompaction segment: %v", err)
-	}
-	if recompactionSeg == nil {
-		t.Fatal("Recompaction segment should not be nil")
+	if seg1 == nil {
+		t.Fatal("First segment should not be nil")
 	}
 
-	// Verify they are different segments
-	if compactionSeg == recompactionSeg {
-		t.Error("Compaction and recompaction should use different segments")
-	}
-	if compactionSeg.Path() == recompactionSeg.Path() {
-		t.Error("Compaction and recompaction segments should have different paths")
-	}
-
-	// Verify GetOpenSegmentForPurpose returns correct segments
-	if got := manager.GetOpenSegmentForPurpose(PurposeCompaction); got != compactionSeg {
-		t.Error("GetOpenSegmentForPurpose(PurposeCompaction) returned wrong segment")
-	}
-	if got := manager.GetOpenSegmentForPurpose(PurposeRecompaction); got != recompactionSeg {
-		t.Error("GetOpenSegmentForPurpose(PurposeRecompaction) returned wrong segment")
-	}
-
-	// Verify GetAllOpenSegments returns both
-	allOpen := manager.GetAllOpenSegments()
-	if len(allOpen) != 2 {
-		t.Errorf("Expected 2 open segments, got %d", len(allOpen))
-	}
-	if allOpen[PurposeCompaction] != compactionSeg {
-		t.Error("GetAllOpenSegments missing or wrong compaction segment")
-	}
-	if allOpen[PurposeRecompaction] != recompactionSeg {
-		t.Error("GetAllOpenSegments missing or wrong recompaction segment")
-	}
-
-	// Write to both segments to verify they work independently
-	// Write to compaction segment
-	tempFile1, err := os.CreateTemp("", "test-compaction-")
+	// Write enough data to fill the first segment
+	tempFile1, err := os.CreateTemp("", "test-seg1-")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 	defer os.Remove(tempFile1.Name())
 	defer tempFile1.Close()
-	tempFile1.WriteString("compaction data")
+
+	// Write a large amount of data to force creation of new segment
+	largeData := make([]byte, 900*1024) // 900KB
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	tempFile1.Write(largeData)
 
 	vm1 := &pb.ValueMessage{
 		ValueType:   pb.ValueType_RAW_FILE,
-		ValueLength: 15,
+		ValueLength: int64(len(largeData)),
 		Checksum:    12345,
 	}
-	offset1, err := manager.WriteEntry(compactionSeg, "key1", tempFile1, vm1)
+	offset1, err := manager.WriteEntry(seg1, "key1", tempFile1, vm1)
 	if err != nil {
-		t.Fatalf("Failed to write to compaction segment: %v", err)
+		t.Fatalf("Failed to write to first segment: %v", err)
 	}
 	if offset1 < 0 {
-		t.Error("Invalid offset returned for compaction write")
+		t.Error("Invalid offset returned for first write")
 	}
 
-	// Write to recompaction segment
-	tempFile2, err := os.CreateTemp("", "test-recompaction-")
+	// Now acquire another segment - should get a new one since first is nearly full
+	seg2, err := manager.AcquireOpenSegment(200 * 1024) // Request 200KB
+	if err != nil {
+		t.Fatalf("Failed to acquire second segment: %v", err)
+	}
+	if seg2 == nil {
+		t.Fatal("Second segment should not be nil")
+	}
+
+	// Verify they are different segments
+	if seg1 == seg2 {
+		t.Error("Should have gotten a different segment when first is nearly full")
+	}
+	if seg1.Path() == seg2.Path() {
+		t.Error("Segments should have different paths")
+	}
+
+	// Verify GetOpenSegments returns both
+	openSegs := manager.GetOpenSegments()
+	if len(openSegs) != 2 {
+		t.Errorf("Expected 2 open segments, got %d", len(openSegs))
+	}
+
+	// Write to second segment to verify it works
+	tempFile2, err := os.CreateTemp("", "test-seg2-")
 	if err != nil {
 		t.Fatalf("Failed to create temp file: %v", err)
 	}
 	defer os.Remove(tempFile2.Name())
 	defer tempFile2.Close()
-	tempFile2.WriteString("recompaction data")
+	tempFile2.WriteString("segment 2 data")
 
 	vm2 := &pb.ValueMessage{
 		ValueType:   pb.ValueType_RAW_FILE,
-		ValueLength: 17,
+		ValueLength: 14,
 		Checksum:    67890,
 	}
-	offset2, err := manager.WriteEntry(recompactionSeg, "key2", tempFile2, vm2)
+	offset2, err := manager.WriteEntry(seg2, "key2", tempFile2, vm2)
 	if err != nil {
-		t.Fatalf("Failed to write to recompaction segment: %v", err)
+		t.Fatalf("Failed to write to second segment: %v", err)
 	}
 	if offset2 < 0 {
-		t.Error("Invalid offset returned for recompaction write")
+		t.Error("Invalid offset returned for second write")
 	}
 
-	// Finalize recompaction segment
-	if err := manager.FinalizeSegment(recompactionSeg); err != nil {
-		t.Fatalf("Failed to finalize recompaction segment: %v", err)
+	// Finalize first segment
+	if err := manager.FinalizeSegment(seg1); err != nil {
+		t.Fatalf("Failed to finalize first segment: %v", err)
 	}
 
-	// Verify compaction segment is still open
-	if !compactionSeg.HasOpenFile() {
-		t.Error("Compaction segment should still be open after finalizing recompaction segment")
+	// Verify second segment is still open
+	if !seg2.HasOpenFile() {
+		t.Error("Second segment should still be open after finalizing first segment")
 	}
 
-	// Verify recompaction segment is closed
-	if recompactionSeg.HasOpenFile() {
-		t.Error("Recompaction segment should be closed after finalization")
+	// Verify first segment is closed
+	if seg1.HasOpenFile() {
+		t.Error("First segment should be closed after finalization")
 	}
 
-	// Verify GetOpenSegmentForPurpose reflects the change
-	if got := manager.GetOpenSegmentForPurpose(PurposeRecompaction); got != nil {
-		t.Error("GetOpenSegmentForPurpose(PurposeRecompaction) should return nil after finalization")
+	// Verify GetOpenSegments now returns only one
+	openSegs = manager.GetOpenSegments()
+	if len(openSegs) != 1 {
+		t.Errorf("Expected 1 open segment after finalization, got %d", len(openSegs))
+	}
+	if openSegs[0] != seg2 {
+		t.Error("Remaining open segment should be seg2")
 	}
 
-	// Acquire new recompaction segment after finalizing the previous one
-	newRecompactionSeg, err := manager.AcquireOpenSegmentForPurpose(PurposeRecompaction, 0)
+	// Acquire new segment after finalizing the first one
+	seg3, err := manager.AcquireOpenSegment(0)
 	if err != nil {
-		t.Fatalf("Failed to acquire new recompaction segment: %v", err)
+		t.Fatalf("Failed to acquire third segment: %v", err)
 	}
-	if newRecompactionSeg == nil {
-		t.Fatal("New recompaction segment should not be nil")
+	if seg3 == nil {
+		t.Fatal("Third segment should not be nil")
 	}
-	if newRecompactionSeg == recompactionSeg {
-		t.Error("Should have created a new recompaction segment")
-	}
-	if newRecompactionSeg == compactionSeg {
-		t.Error("New recompaction segment should not be the compaction segment")
-	}
+
+	// Could be the same as seg2 if it has space, or a new one
+	// Both are valid behaviors
 }
 
-// TestManager_BackwardCompatibility tests that the deprecated AcquireOpenSegment
-// still works and defaults to compaction purpose
-func TestManager_BackwardCompatibility(t *testing.T) {
+// TestManager_MultipleThreadsAcquireSegments tests concurrent acquisition of segments
+func TestManager_MultipleThreadsAcquireSegments(t *testing.T) {
 	tmpDir := t.TempDir()
-	manager, err := NewManager(tmpDir, 1024*1024) // 1MB segments
+	manager, err := NewManager(tmpDir, 100*1024) // 100KB segments (small for testing)
 	if err != nil {
 		t.Fatalf("Failed to create manager: %v", err)
 	}
 	defer manager.Close()
 
-	// Use deprecated method
-	seg, err := manager.AcquireOpenSegment(0)
-	if err != nil {
-		t.Fatalf("Failed to acquire segment: %v", err)
-	}
-	if seg == nil {
-		t.Fatal("Segment should not be nil")
+	// Run multiple goroutines that acquire segments
+	done := make(chan error, 10)
+	for i := 0; i < 10; i++ {
+		go func(id int) {
+			seg, err := manager.AcquireOpenSegment(10 * 1024) // Request 10KB
+			if err != nil {
+				done <- err
+				return
+			}
+			if seg == nil {
+				done <- fmt.Errorf("Thread %d: segment is nil", id)
+				return
+			}
+			done <- nil
+		}(i)
 	}
 
-	// Verify it's the same as compaction segment
-	compactionSeg := manager.GetOpenSegmentForPurpose(PurposeCompaction)
-	if seg != compactionSeg {
-		t.Error("Deprecated AcquireOpenSegment should return compaction segment")
+	// Wait for all goroutines
+	for i := 0; i < 10; i++ {
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
 	}
 
-	// Verify GetCurrentOpenSegment also returns it
-	currentSeg := manager.GetCurrentOpenSegment()
-	if seg != currentSeg {
-		t.Error("GetCurrentOpenSegment should return the same segment")
+	// Check that we have at least 1 open segment (could be more if threads needed more space)
+	openSegs := manager.GetOpenSegments()
+	if len(openSegs) < 1 {
+		t.Errorf("Expected at least 1 open segment, got %d", len(openSegs))
 	}
 }
