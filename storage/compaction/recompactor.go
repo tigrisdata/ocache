@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -21,7 +22,11 @@ import (
 )
 
 const (
+	// recompactorCallerIDPrefix is the prefix for the caller ID for the recompactor.
 	recompactorCallerIDPrefix = "recompactor-"
+
+	// minSegments is the minimum number of segments required for recompaction.
+	minSegmentsBeforeRecompaction = 3
 )
 
 // SegmentRecompactor handles recompaction of fragmented segments
@@ -58,9 +63,18 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		return nil
 	}
 
-	// Safety check: Need at least 3 segments (2 to skip + 1 to potentially recompact)
-	if totalSegments <= 2 {
-		zlog.Debug().Int("segmentCount", totalSegments).
+	// Safety check: Need enough segments to safely recompact
+	// In production, we need at least 3 segments (2 to skip + 1 to potentially recompact)
+	// But allow overriding for testing
+	minSegments := minSegmentsBeforeRecompaction
+	if skipStr := os.Getenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT"); skipStr != "" {
+		if skip, err := strconv.Atoi(skipStr); err == nil && skip == 0 {
+			// If set in tests, allow recompaction with just 1 segment
+			minSegments = 1
+		}
+	}
+	if totalSegments < minSegments {
+		zlog.Debug().Int("segmentCount", totalSegments).Int("minRequired", minSegments).
 			Msg("recompactor: too few segments to safely recompact")
 		return nil
 	}
@@ -232,53 +246,40 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	// If no live entries were copied, abandon the new segment but still delete the old one
 	if copiedEntries == 0 {
 		zlog.Info().Str("segment", oldSeg.Path()).
-			Msg("recompactor: no live entries found, deleting empty segment")
-		// Clean up the new segment since we're not using it
-		if err := sr.sm.FinalizeSegment(newSeg); err != nil {
-			zlog.Error().Err(err).Msg("recompactor: failed to finalize abandoned segment")
-		}
-		// Queue the abandoned new segment for deletion
-		if err := sr.deletionQueue.Add(newSeg.Path()); err != nil {
-			zlog.Error().Err(err).Str("path", newSeg.Path()).
-				Msg("recompactor: failed to queue abandoned segment for deletion")
-		}
-
-		// IMPORTANT: Remove segment from manager's tracking BEFORE deletion
-		sr.sm.RemoveSegment(oldSeg.Path())
-
-		// IMPORTANT: Also queue the old empty segment for deletion
-		if err := sr.deletionQueue.Add(oldSeg.Path()); err != nil {
-			zlog.Error().Err(err).Str("path", oldSeg.Path()).
-				Msg("recompactor: failed to queue empty old segment for deletion")
-		}
-
-		// Remove delete index for old segment
-		if err := sr.removeDeleteIndex(oldSeg.Path()); err != nil {
-			zlog.Error().Err(err).Str("segment", oldSeg.Path()).
-				Msg("recompactor: failed to remove delete index for empty segment")
-		}
-
-		return nil
+			Msg("recompactor: no live entries found")
 	}
 
-	// Finalize the new segment
-	if err := sr.sm.FinalizeSegment(newSeg); err != nil {
-		return fmt.Errorf("failed to finalize new segment: %w", err)
+	// Release the segment so it can be used by others
+	if err := sr.sm.ReleaseSegment(newSeg, callerID); err != nil {
+		zlog.Error().Err(err).Str("callerID", callerID).
+			Msg("recompactor: failed to release segment")
 	}
 
-	// Commit metadata updates
+	// CRITICAL: Remove old segment from manager's tracking BEFORE committing metadata
+	// This ensures no new reads can start on the old segment after metadata points to new segment
+	removedSeg := sr.sm.RemoveSegment(oldSeg.Path())
+	if removedSeg == nil {
+		// Segment was already removed, possibly by another process
+		zlog.Warn().Str("path", oldSeg.Path()).
+			Msg("recompactor: segment already removed from manager")
+	}
+
+	// Now commit metadata updates - readers will only see the new segment
 	if wb.Count() > 0 {
 		wo := grocksdb.NewDefaultWriteOptions()
 		defer wo.Destroy()
 		if err := sr.meta.Handle().Write(wo, wb); err != nil {
+			// If metadata commit fails, we need to restore the segment to the manager
+			// This is a critical error as we've already removed it from tracking
+			zlog.Error().Err(err).
+				Str("oldSegment", oldSeg.Path()).
+				Str("newSegment", newSeg.Path()).
+				Msg("recompactor: CRITICAL - failed to commit metadata after removing segment from manager")
 			return fmt.Errorf("failed to commit metadata updates: %w", err)
 		}
 	}
 
-	// IMPORTANT: Remove segment from manager's tracking BEFORE deletion
-	sr.sm.RemoveSegment(oldSeg.Path())
-
-	// Queue old segment for deletion
+	// Queue old segment for deletion - it's safe now as no readers can access it
 	if err := sr.deletionQueue.Add(oldSeg.Path()); err != nil {
 		zlog.Error().Err(err).Str("path", oldSeg.Path()).
 			Msg("recompactor: failed to queue old segment for deletion")
@@ -378,8 +379,14 @@ func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segm
 	// Check 3: Skip the most recent segments (even if closed)
 	// to avoid interfering with segments that might have just been finalized
 	skipRecentCount := 2
-	if segmentIndex >= totalSegments-skipRecentCount {
-		return false, "too recent (one of last 2 segments)"
+	// Allow overriding for testing
+	if skipStr := os.Getenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT"); skipStr != "" {
+		if skip, err := strconv.Atoi(skipStr); err == nil && skip >= 0 {
+			skipRecentCount = skip
+		}
+	}
+	if skipRecentCount > 0 && segmentIndex >= totalSegments-skipRecentCount {
+		return false, fmt.Sprintf("too recent (one of last %d segments)", skipRecentCount)
 	}
 
 	// Check 4: Verify segment age based on timestamp

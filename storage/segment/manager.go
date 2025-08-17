@@ -87,13 +87,22 @@ func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int6
 	sm.mu.RUnlock()
 
 	if seg == nil {
+		// Segment has been removed (likely due to recompaction)
+		// Return a specific error that can be handled by the caller
 		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
 	// Acquire cached read-only descriptor via FdCache.
 	entry, err := sm.fdCache.Acquire(segPath)
 	if err != nil {
-		return nil, err
+		// If we can't acquire the FD, the segment might have been deleted
+		// This can happen if recompaction removed it between our segMap check and here
+		return nil, fmt.Errorf("failed to acquire segment fd: %w", err)
+	}
+
+	// Check if entry is nil (defensive check)
+	if entry == nil {
+		return nil, fmt.Errorf("nil file entry for segment: %s", segPath)
 	}
 
 	// Take shared read lock to protect against concurrent writers.
@@ -678,9 +687,13 @@ func (rc *readCloserWithOnClose) Close() error {
 
 // RemoveSegment removes a segment from the manager's tracking
 // This should be called when a segment is being deleted permanently
-func (sm *Manager) RemoveSegment(segmentPath string) {
+// Returns the removed segment if found, nil otherwise
+func (sm *Manager) RemoveSegment(segmentPath string) *Segment {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	// Get the segment before removing
+	removedSeg := sm.segMap[segmentPath]
 
 	// Remove from segMap
 	delete(sm.segMap, segmentPath)
@@ -697,15 +710,20 @@ func (sm *Manager) RemoveSegment(segmentPath string) {
 
 	// Remove from openSegments if present
 	for i, seg := range sm.openSegments {
-		if seg.Path() == segmentPath {
+		if seg != nil && seg.Path() == segmentPath {
 			sm.openSegments[i] = sm.openSegments[len(sm.openSegments)-1]
 			sm.openSegments = sm.openSegments[:len(sm.openSegments)-1]
 			break
 		}
 	}
 
-	// Remove from fdCache
-	sm.fdCache.Remove(segmentPath)
+	// Remove from fdCache and FileLockManager - this will close any open file descriptors
+	// Use CleanUp instead of Remove to also remove the file lock
+	sm.fdCache.CleanUp(segmentPath)
 
-	zlog.Debug().Str("path", segmentPath).Msg("segment removed from manager")
+	if removedSeg != nil {
+		zlog.Debug().Str("path", segmentPath).Msg("segment removed from manager")
+	}
+
+	return removedSeg
 }
