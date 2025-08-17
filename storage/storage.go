@@ -257,58 +257,60 @@ func GetStorage() *Storage {
 
 // InitStorageWithConfig initializes storage with a config struct
 func InitStorageWithConfig(config *StorageConfig) {
-	s, err := newStorage(config.DiskPath, config.TTL, config.InlineThreshold,
-		config.CompactThreshold, config.SegmentSize, config.FdCacheSize, config.MaxDiskUsage)
+	s, err := newStorageWithConfig(config)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to open storage")
 	}
-
-	// Configure recompaction if not disabled
-	if !config.DisableRecompaction && s.compactor != nil {
-		fragThreshold := config.FragThreshold
-		if fragThreshold <= 0 || fragThreshold > 1 {
-			fragThreshold = DefaultFragmentationThreshold
-		}
-		s.compactor.SetRecompactor(fragThreshold, MinSegmentAgeForRecompaction)
-		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
-	} else if config.DisableRecompaction {
-		zlog.Info().Msg("Segment recompaction disabled")
-	}
-
 	storage = s
 }
 
 // newStorage initializes RocksDB inside diskPath and returns a Storage instance
+// Deprecated: Use newStorageWithConfig instead
 func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) (*Storage, error) {
+	config := &StorageConfig{
+		DiskPath:            diskPath,
+		TTL:                 ttl,
+		InlineThreshold:     inlineThreshold,
+		CompactThreshold:    compactThreshold,
+		SegmentSize:         segmentSize,
+		FdCacheSize:         fdCacheSize,
+		MaxDiskUsage:        maxDiskUsage,
+		DisableRecompaction: true, // Keep old behavior - no recompaction by default
+	}
+	return newStorageWithConfig(config)
+}
+
+// newStorageWithConfig initializes RocksDB inside diskPath and returns a Storage instance
+func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Create the data directory if it doesn't exist
-	if err := os.MkdirAll(diskPath, 0o755); err != nil {
+	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
 	// Initialize the metadata DB with multiplex merge operator
 	mergeOp := merge.NewMultiplexOperator()
-	meta, err := metadata.NewMetaDB(diskPath, ttl, mergeOp)
+	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initialize the fdCache
-	fdCache := fd.NewFdCache(fdCacheSize)
+	fdCache := fd.NewFdCache(config.FdCacheSize)
 
 	// Initialize the segment manager
-	segmentManager, err := segment.NewManager(diskPath, segmentSize)
+	segmentManager, err := segment.NewManager(config.DiskPath, config.SegmentSize)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initialize the file manager
-	fileManager, err := files.NewFileManager(diskPath)
+	fileManager, err := files.NewFileManager(config.DiskPath)
 	if err != nil {
 		return nil, err
 	}
 
 	// Run recovery for raw files BEFORE starting any services
-	recovery := files.NewRecoveryManager(meta, diskPath)
+	recovery := files.NewRecoveryManager(meta, config.DiskPath)
 	if err := recovery.RecoverOnStartup(); err != nil {
 		zlog.Error().Err(err).Msg("storage: file recovery failed")
 		return nil, fmt.Errorf("file recovery failed: %w", err)
@@ -324,14 +326,38 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 
 	// Initialize and start background compactor that migrates raw files into segments.
 	compactionInterval := getCompactionInterval()
-	compactor := compaction.NewCompactor(fileManager, segmentManager, deletionQueue, DefaultCompactionMaxBytes, compactionInterval)
+	
+	// Configure compactor with recompaction if enabled
+	var compactor *compaction.Compactor
+	if !config.DisableRecompaction {
+		fragThreshold := config.FragThreshold
+		if fragThreshold <= 0 || fragThreshold > 1 {
+			fragThreshold = DefaultFragmentationThreshold
+		}
+		
+		compactorConfig := &compaction.CompactorConfig{
+			FileManager:        fileManager,
+			SegmentManager:     segmentManager,
+			DeletionQueue:      deletionQueue,
+			MaxBytes:           DefaultCompactionMaxBytes,
+			Interval:           compactionInterval,
+			EnableRecompaction: true,
+			FragThreshold:      fragThreshold,
+			MinSegmentAge:      MinSegmentAgeForRecompaction,
+		}
+		compactor = compaction.NewCompactorWithConfig(compactorConfig)
+		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
+	} else {
+		compactor = compaction.NewCompactor(fileManager, segmentManager, deletionQueue, DefaultCompactionMaxBytes, compactionInterval)
+		zlog.Info().Msg("Segment recompaction disabled")
+	}
 	compactor.Start()
 
 	s := &Storage{
 		meta:             meta,
-		diskPath:         diskPath,
-		inlineThreshold:  inlineThreshold,
-		compactThreshold: compactThreshold,
+		diskPath:         config.DiskPath,
+		inlineThreshold:  config.InlineThreshold,
+		compactThreshold: config.CompactThreshold,
 		segmentManager:   segmentManager,
 		fileManager:      fileManager,
 		fdCache:          fdCache,
@@ -341,15 +367,15 @@ func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold 
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
 	cleanupInterval := getCleanupInterval()
-	s.cleaner = NewCleaner(s, cleanupInterval, maxDiskUsage)
+	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
-		Int64("max_disk_usage", maxDiskUsage).
+		Int64("max_disk_usage", config.MaxDiskUsage).
 		Msg("storage: started background cleaner with TTL cleanup and LRU eviction")
 
 	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
-	if maxDiskUsage > 0 {
+	if config.MaxDiskUsage > 0 {
 		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval)
 		s.accessUpdater.Start()
 		zlog.Info().

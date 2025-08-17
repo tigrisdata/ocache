@@ -46,6 +46,19 @@ const (
 	compactorCallerID = "compactor"
 )
 
+// CompactorConfig contains configuration for the compactor
+type CompactorConfig struct {
+	FileManager    *files.FileManager
+	SegmentManager *segment.Manager
+	DeletionQueue  *deletion.Queue
+	MaxBytes       int64
+	Interval       time.Duration
+	// Recompaction settings (optional)
+	EnableRecompaction bool
+	FragThreshold      float64
+	MinSegmentAge      time.Duration
+}
+
 // ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
 type ErrFileSizeMismatch struct {
 	Key          string
@@ -92,6 +105,29 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 	}
 }
 
+// NewCompactorWithConfig creates a new compactor with configuration
+func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Compactor{
+		fm:            cfg.FileManager,
+		sm:            cfg.SegmentManager,
+		meta:          metadata.GetMetaDB(),
+		fdCache:       fd.GetFdCache(),
+		deletionQueue: cfg.DeletionQueue,
+		maxBytes:      cfg.MaxBytes,
+		interval:      cfg.Interval,
+		ctx:           ctx,
+		cancel:        cancel,
+	}
+	
+	// Set up recompactor if configured
+	if cfg.EnableRecompaction && cfg.FragThreshold > 0 {
+		c.recompactor = NewSegmentRecompactor(cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge)
+	}
+	
+	return c
+}
+
 // Start launches background goroutines for file and segment compaction
 func (c *Compactor) Start() {
 	// Start file compaction loop
@@ -120,8 +156,25 @@ func (c *Compactor) Close() {
 }
 
 // SetRecompactor sets up the segment recompactor with the given parameters
+// Deprecated: Use NewCompactorWithConfig instead to configure recompaction at creation time
 func (c *Compactor) SetRecompactor(fragThreshold float64, minSegmentAge time.Duration) {
 	c.recompactor = NewSegmentRecompactor(c.sm, c.deletionQueue, fragThreshold, minSegmentAge)
+}
+
+// StartRecompaction starts the segment recompaction loop if a recompactor is configured
+// This can be used to dynamically start recompaction after the compactor has been created
+func (c *Compactor) StartRecompaction(fragThreshold float64, minSegmentAge time.Duration) {
+	// Set up recompactor if not already configured
+	if c.recompactor == nil {
+		c.recompactor = NewSegmentRecompactor(c.sm, c.deletionQueue, fragThreshold, minSegmentAge)
+	}
+	
+	// Start the recompaction loop
+	if c.recompactor != nil && c.recompactor.fragThreshold > 0 {
+		c.wg.Add(1)
+		go c.segmentRecompactionLoop()
+		zlog.Info().Float64("threshold", fragThreshold).Msg("Started segment recompaction")
+	}
 }
 
 // fileCompactionLoop triggers file compaction on a timer until Close is called.
