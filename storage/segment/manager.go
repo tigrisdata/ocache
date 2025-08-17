@@ -196,37 +196,11 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 		return nil, fmt.Errorf("callerID cannot be empty")
 	}
 
-	// Retry loop for when reservation fails
-retrySearch:
-	// Try to find an existing segment with read lock
-	sm.mu.RLock()
-	for _, seg := range sm.openSegments {
-		seg.mu.RLock()
-		if seg.file != nil && seg.Remaining() >= needed {
-			// Check reservation status
-			if seg.reservedBy == "" || seg.reservedBy == callerID {
-				seg.mu.RUnlock()
-				sm.mu.RUnlock()
-				// Try to reserve it (if not already reserved by us)
-				if !seg.Reserve(callerID) {
-					// Reservation failed - another thread got it first
-					// Restart the search with fresh segment list
-					goto retrySearch
-				}
-				return seg, nil
-			}
-		}
-		seg.mu.RUnlock()
-	}
-	sm.mu.RUnlock()
-
-	// No suitable segment found, need to create a new one
-	// Use write lock to prevent race condition
+	// Always take write lock to simplify logic and prevent race conditions
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// Double-check after acquiring write lock
-	// Another thread might have created a segment while we were waiting
+	// Look for an existing segment with enough space
 	for _, seg := range sm.openSegments {
 		seg.mu.RLock()
 		if seg.file != nil && seg.Remaining() >= needed {
@@ -234,28 +208,22 @@ retrySearch:
 			if seg.reservedBy == "" || seg.reservedBy == callerID {
 				seg.mu.RUnlock()
 				// Try to reserve it
-				if !seg.Reserve(callerID) {
-					// Reservation failed - continue searching
-					continue
+				if seg.Reserve(callerID) {
+					return seg, nil
 				}
-				return seg, nil
+				// Reservation failed - continue searching
+			} else {
+				seg.mu.RUnlock()
 			}
+		} else {
+			seg.mu.RUnlock()
 		}
-		seg.mu.RUnlock()
 	}
 
-	// Now we're sure we need to create a new segment
-	// Call createNewSegmentLocked which assumes the write lock is held
-	newSeg, err := sm.createNewSegmentLocked()
+	// No suitable segment found, create a new one with atomic reservation
+	newSeg, err := sm.createNewSegmentWithReservationLocked(callerID)
 	if err != nil {
 		return nil, err
-	}
-
-	// Reserve the new segment for the caller
-	// This should always succeed since we just created the segment
-	if !newSeg.Reserve(callerID) {
-		// This should never happen for a newly created segment
-		return nil, fmt.Errorf("failed to reserve newly created segment")
 	}
 
 	return newSeg, nil
@@ -360,6 +328,7 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 }
 
 // createNewSegmentLocked creates a new segment file (assumes lock is held)
+// Deprecated: Use createNewSegmentWithReservationLocked for atomic creation and reservation
 func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
 	// Generate unique filename using timestamp
 	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
@@ -378,6 +347,36 @@ func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
 	}
 
 	segment := NewSegment(path, 0, 0, 0, sm.segmentSize)
+	segment.SetOpenFile(file)
+
+	sm.segments = append(sm.segments, segment)
+	sm.segMap[path] = segment
+	sm.openSegments = append(sm.openSegments, segment) // Add to open segments list
+
+	return segment, nil
+}
+
+// createNewSegmentWithReservationLocked creates a new segment and atomically reserves it for the caller
+// Must be called with write lock held
+func (sm *Manager) createNewSegmentWithReservationLocked(callerID string) (*Segment, error) {
+	// Generate unique filename using timestamp
+	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
+
+	zlog.Info().Str("path", path).Str("caller", callerID).Msg("creating new segment with reservation")
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, utils.WrapError("failed to create segment file", path, err)
+	}
+
+	// Pre-allocate file to configured segment size
+	if err := file.Truncate(sm.segmentSize); err != nil {
+		file.Close()
+		return nil, utils.WrapError("truncate segment file", path, err)
+	}
+
+	// Create segment with atomic reservation
+	segment := NewSegmentWithReservation(path, 0, 0, 0, sm.segmentSize, callerID)
 	segment.SetOpenFile(file)
 
 	sm.segments = append(sm.segments, segment)

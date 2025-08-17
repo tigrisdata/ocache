@@ -156,3 +156,17 @@ func (s *Segment) GetReservedBy() string {
 func NewSegment(path string, entries uint32, dataBytes int64, size int64, maxSupportedSize int64) *Segment {
 	return &Segment{path: path, entries: entries, dataBytes: dataBytes, size: size, version: CurrentSegmentVersion, maxSupportedSize: maxSupportedSize}
 }
+
+// NewSegmentWithReservation creates a new segment with the given path and size, atomically reserved for the caller.
+// This ensures the segment is created with a reservation in place, preventing race conditions.
+func NewSegmentWithReservation(path string, entries uint32, dataBytes int64, size int64, maxSupportedSize int64, callerID string) *Segment {
+	return &Segment{
+		path:             path,
+		entries:          entries,
+		dataBytes:        dataBytes,
+		size:             size,
+		version:          CurrentSegmentVersion,
+		maxSupportedSize: maxSupportedSize,
+		reservedBy:       callerID, // Atomically set reservation during creation
+	}
+}
