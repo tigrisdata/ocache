@@ -210,7 +210,12 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		zlog.Error().Err(err).Msg("compactor: acquire open segment")
 		return
 	}
-	defer c.sm.ReleaseSegment(seg, compactorCallerID) // Ensure we release on exit
+	// Use a closure to ensure we release the final segment, not the initial one
+	defer func() {
+		if seg != nil {
+			c.sm.ReleaseSegment(seg, compactorCallerID)
+		}
+	}()
 
 	filePrefix := []byte(keys.CompactionIndexPrefix)
 	iterationCount := 0

@@ -153,7 +153,12 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)
 	}
-	defer sr.sm.ReleaseSegment(newSeg, callerID) // Ensure we release on exit
+	// Use a pointer to ensure we release the final segment, not the initial one
+	defer func() {
+		if newSeg != nil {
+			sr.sm.ReleaseSegment(newSeg, callerID)
+		}
+	}()
 
 	// Track metadata updates
 	wb := grocksdb.NewWriteBatch()
