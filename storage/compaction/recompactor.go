@@ -20,6 +20,10 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
+const (
+	recompactorCallerIDPrefix = "recompactor-"
+)
+
 // SegmentRecompactor handles recompaction of fragmented segments
 type SegmentRecompactor struct {
 	sm            *segment.Manager
@@ -144,7 +148,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	}
 
 	// Create a new segment for the live data with reservation
-	callerID := fmt.Sprintf("recompactor-%s", oldSeg.Path()) // Unique ID per segment being recompacted
+	callerID := fmt.Sprintf("%s%s", recompactorCallerIDPrefix, oldSeg.Path()) // Unique ID per segment being recompacted
 	newSeg, err := sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)
@@ -273,8 +277,8 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 // copyEntry copies a single entry from old segment to new segment
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
 	userKey string, oldOffset, headerSize, valLen int64, version uint16, checksum uint32,
-	meta *pb.ValueMessage, wb *grocksdb.WriteBatch) error {
-
+	meta *pb.ValueMessage, wb *grocksdb.WriteBatch,
+) error {
 	// Create a section reader for the value data (no checksum verification per review)
 	valueOffset := oldOffset + headerSize
 	dataReader := io.NewSectionReader(oldFile, valueOffset, valLen)

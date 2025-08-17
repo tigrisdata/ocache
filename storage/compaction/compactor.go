@@ -41,6 +41,11 @@ import (
 // NOTE: At present the implementation only migrates files; segment-level
 // compaction (merging/deleting) lives in Manager.compactSegments().
 
+const (
+	// compactorCallerID is the caller ID for the compactor.
+	compactorCallerID = "compactor"
+)
+
 // ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
 type ErrFileSizeMismatch struct {
 	Key          string
@@ -200,13 +205,12 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 	)
 
 	// Acquire the initial open segment with reservation
-	callerID := "compactor"
-	seg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
+	seg, err := c.sm.AcquireOpenSegmentWithReservation(compactorCallerID, 0)
 	if err != nil {
 		zlog.Error().Err(err).Msg("compactor: acquire open segment")
 		return
 	}
-	defer c.sm.ReleaseSegment(seg, callerID) // Ensure we release on exit
+	defer c.sm.ReleaseSegment(seg, compactorCallerID) // Ensure we release on exit
 
 	filePrefix := []byte(keys.CompactionIndexPrefix)
 	iterationCount := 0
@@ -294,7 +298,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		}
 
 		// Compact the entry
-		if err := c.compactEntry(ctx, entry, &seg, callerID, wb); err != nil {
+		if err := c.compactEntry(ctx, entry, &seg, compactorCallerID, wb); err != nil {
 			if err == context.Canceled {
 				zlog.Info().Msg("compactor: compaction cancelled")
 				return

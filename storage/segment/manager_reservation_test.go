@@ -2,13 +2,10 @@ package segment
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
-
-	pb "github.com/tigrisdata/ocache/proto"
 )
 
 // TestSegmentReservation tests the segment reservation system
