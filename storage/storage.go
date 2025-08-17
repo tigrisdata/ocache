@@ -347,6 +347,14 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		compactorConfig.FragThreshold = fragThreshold
 		compactorConfig.MinSegmentAge = MinSegmentAgeForRecompaction
 
+		// Override min segment age for testing if env var is set
+		if testMinAge := os.Getenv("OCACHE_TEST_RECOMPACTION_MIN_AGE"); testMinAge != "" {
+			if duration, err := time.ParseDuration(testMinAge); err == nil {
+				compactorConfig.MinSegmentAge = duration
+				zlog.Info().Dur("min_age", duration).Msg("Using test override for minimum segment age")
+			}
+		}
+
 		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
 	}
 

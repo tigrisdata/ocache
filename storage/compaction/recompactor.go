@@ -229,19 +229,35 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 		pos += headerSize + valLen
 	}
 
-	// If no live entries were copied, abandon the new segment
+	// If no live entries were copied, abandon the new segment but still delete the old one
 	if copiedEntries == 0 {
 		zlog.Info().Str("segment", oldSeg.Path()).
-			Msg("recompactor: no live entries found, abandoning recompaction")
+			Msg("recompactor: no live entries found, deleting empty segment")
 		// Clean up the new segment since we're not using it
 		if err := sr.sm.FinalizeSegment(newSeg); err != nil {
 			zlog.Error().Err(err).Msg("recompactor: failed to finalize abandoned segment")
 		}
-		// Queue the empty segment for deletion
+		// Queue the abandoned new segment for deletion
 		if err := sr.deletionQueue.Add(newSeg.Path()); err != nil {
 			zlog.Error().Err(err).Str("path", newSeg.Path()).
 				Msg("recompactor: failed to queue abandoned segment for deletion")
 		}
+
+		// IMPORTANT: Remove segment from manager's tracking BEFORE deletion
+		sr.sm.RemoveSegment(oldSeg.Path())
+
+		// IMPORTANT: Also queue the old empty segment for deletion
+		if err := sr.deletionQueue.Add(oldSeg.Path()); err != nil {
+			zlog.Error().Err(err).Str("path", oldSeg.Path()).
+				Msg("recompactor: failed to queue empty old segment for deletion")
+		}
+
+		// Remove delete index for old segment
+		if err := sr.removeDeleteIndex(oldSeg.Path()); err != nil {
+			zlog.Error().Err(err).Str("segment", oldSeg.Path()).
+				Msg("recompactor: failed to remove delete index for empty segment")
+		}
+
 		return nil
 	}
 
@@ -258,6 +274,9 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 			return fmt.Errorf("failed to commit metadata updates: %w", err)
 		}
 	}
+
+	// IMPORTANT: Remove segment from manager's tracking BEFORE deletion
+	sr.sm.RemoveSegment(oldSeg.Path())
 
 	// Queue old segment for deletion
 	if err := sr.deletionQueue.Add(oldSeg.Path()); err != nil {

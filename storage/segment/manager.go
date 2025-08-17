@@ -675,3 +675,37 @@ func (rc *readCloserWithOnClose) Close() error {
 	}
 	return nil
 }
+
+// RemoveSegment removes a segment from the manager's tracking
+// This should be called when a segment is being deleted permanently
+func (sm *Manager) RemoveSegment(segmentPath string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Remove from segMap
+	delete(sm.segMap, segmentPath)
+
+	// Remove from segments slice
+	for i, seg := range sm.segments {
+		if seg.Path() == segmentPath {
+			// Remove by swapping with last element and truncating
+			sm.segments[i] = sm.segments[len(sm.segments)-1]
+			sm.segments = sm.segments[:len(sm.segments)-1]
+			break
+		}
+	}
+
+	// Remove from openSegments if present
+	for i, seg := range sm.openSegments {
+		if seg.Path() == segmentPath {
+			sm.openSegments[i] = sm.openSegments[len(sm.openSegments)-1]
+			sm.openSegments = sm.openSegments[:len(sm.openSegments)-1]
+			break
+		}
+	}
+
+	// Remove from fdCache
+	sm.fdCache.Remove(segmentPath)
+
+	zlog.Debug().Str("path", segmentPath).Msg("segment removed from manager")
+}

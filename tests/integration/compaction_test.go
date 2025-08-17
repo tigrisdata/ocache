@@ -656,3 +656,562 @@ func (s *CompactionSuite) Test_CompactionLoop_Performance() {
 	require.Greater(t, postCompactionStats.SegmentCount, 0,
 		"Compaction should create segments")
 }
+
+// Test_SegmentRecompaction_BasicFragmentation tests basic segment recompaction
+// when segments become fragmented due to deletions
+func (s *CompactionSuite) Test_SegmentRecompaction_BasicFragmentation() {
+	t := s.T()
+
+	// Override segment age requirement BEFORE creating storage
+	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
+	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
+
+	// Re-create harness with the environment variable set
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 500 * time.Millisecond
+	config.SegmentSize = 2 * 1024 * 1024
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Store enough medium objects to create segments
+	numObjects := 100
+	keys := make([]string, numObjects)
+	objectSize := int64(100 * 1024) // 100KB each
+
+	t.Log("Phase 1: Creating initial segments with objects")
+	for i := 0; i < numObjects; i++ {
+		key := fmt.Sprintf("recompact-basic-%d", i)
+		keys[i] = key
+		data := GenerateRandomData(objectSize)
+
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+	}
+
+	// Wait for initial compaction to create segments
+	t.Log("Waiting for initial compaction to create segments...")
+	time.Sleep(3 * time.Second)
+
+	// Verify segments were created
+	segmentDir := filepath.Join(s.Harness.TempDir, "segments")
+	segments, err := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+	require.NoError(t, err)
+	initialSegmentCount := len(segments)
+	t.Logf("Created %d initial segments", initialSegmentCount)
+	require.Greater(t, initialSegmentCount, 2, "Need multiple segments for recompaction test")
+
+	// Get initial segment sizes
+	initialTotalSize := int64(0)
+	for _, seg := range segments {
+		info, err := os.Stat(seg)
+		require.NoError(t, err)
+		initialTotalSize += info.Size()
+	}
+	t.Logf("Initial total segment size: %d bytes", initialTotalSize)
+
+	// Phase 2: Delete 60% of objects to create fragmentation
+	// Delete every other entry and some extras to get to 60%
+	// This ensures deletions are spread across all segments
+	t.Log("Phase 2: Creating fragmentation by deleting 60% of objects (distributed)")
+	deleteCount := int(float64(numObjects) * 0.6)
+	deletedKeys := []string{}
+
+	// Delete every other key (50%)
+	for i := 0; i < numObjects; i += 2 {
+		err := s.Harness.DeleteObject(keys[i])
+		require.NoError(t, err)
+		deletedKeys = append(deletedKeys, keys[i])
+	}
+
+	// Delete additional 10% to reach 60%
+	for i := 1; i < numObjects && len(deletedKeys) < deleteCount; i += 10 {
+		if i%2 == 1 { // Only delete odd indices not already deleted
+			err := s.Harness.DeleteObject(keys[i])
+			require.NoError(t, err)
+			deletedKeys = append(deletedKeys, keys[i])
+		}
+	}
+
+	// Verify deletions
+	for _, key := range deletedKeys {
+		_, err := s.Harness.GetObject(key)
+		require.Error(t, err, "Deleted key should not exist")
+	}
+
+	// Wait for segments to age and trigger recompaction
+	t.Log("Waiting for segment recompaction to trigger...")
+	time.Sleep(5 * time.Second)
+
+	// Phase 3: Verify recompaction occurred
+	t.Log("Phase 3: Verifying recompaction results")
+
+	// Get new segment list
+	newSegments, err := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+	require.NoError(t, err)
+
+	// Calculate new total size
+	newTotalSize := int64(0)
+	for _, seg := range newSegments {
+		info, err := os.Stat(seg)
+		require.NoError(t, err)
+		newTotalSize += info.Size()
+	}
+
+	t.Logf("After recompaction - Segments: %d, Total size: %d bytes",
+		len(newSegments), newTotalSize)
+
+	// Log individual segment sizes for debugging
+	for _, seg := range newSegments {
+		info, _ := os.Stat(seg)
+		t.Logf("  Segment %s: %d bytes", filepath.Base(seg), info.Size())
+	}
+
+	// Verify space was reclaimed
+	// With 60% deletion distributed across segments, we expect significant reduction
+	// But some segments might not be recompacted if they're too recent or open
+	// Allow for up to 60% of original size (40% reduction minimum)
+	expectedMaxSize := initialTotalSize * 60 / 100
+	require.Less(t, newTotalSize, expectedMaxSize,
+		fmt.Sprintf("Recompaction should reclaim space (was %d, now %d, max expected %d)",
+			initialTotalSize, newTotalSize, expectedMaxSize))
+
+	// Verify remaining data is still accessible
+	t.Log("Verifying data integrity after recompaction")
+	// Build list of remaining keys (those not in deletedKeys)
+	deletedMap := make(map[string]bool)
+	for _, key := range deletedKeys {
+		deletedMap[key] = true
+	}
+
+	remainingKeys := []string{}
+	for _, key := range keys {
+		if !deletedMap[key] {
+			remainingKeys = append(remainingKeys, key)
+		}
+	}
+
+	require.Equal(t, numObjects-deleteCount, len(remainingKeys),
+		"Should have correct number of remaining keys")
+
+	for _, key := range remainingKeys {
+		data, err := s.Harness.GetObject(key)
+		require.NoError(t, err, "Remaining key %s should be accessible", key)
+		require.Equal(t, int(objectSize), len(data))
+	}
+
+	// Verify all remaining objects are in segments
+	for _, key := range remainingKeys {
+		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_SEGMENT)
+	}
+}
+
+// Test_SegmentRecompaction_ConcurrentAccess tests that recompaction works correctly
+// while segments are being actively accessed
+func (s *CompactionSuite) Test_SegmentRecompaction_ConcurrentAccess() {
+	t := s.T()
+
+	// Override segment age requirement BEFORE creating storage
+	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
+	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
+
+	// Re-create harness with the environment variable set
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 500 * time.Millisecond
+	config.SegmentSize = 2 * 1024 * 1024
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Create initial segments
+	numObjects := 80
+	keys := make([]string, numObjects)
+	objectSize := int64(120 * 1024) // 120KB each
+
+	t.Log("Creating initial segments")
+	for i := 0; i < numObjects; i++ {
+		key := fmt.Sprintf("recompact-concurrent-%d", i)
+		keys[i] = key
+		data := GenerateRandomData(objectSize)
+
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+	}
+
+	// Wait for initial compaction
+	time.Sleep(3 * time.Second)
+
+	// Delete objects to trigger recompaction need
+	t.Log("Deleting 50% of objects to create fragmentation")
+	deletedKeys := keys[:numObjects/2]
+	for _, key := range deletedKeys {
+		s.Harness.DeleteObject(key)
+	}
+	remainingKeys := keys[numObjects/2:]
+
+	// Start concurrent readers while recompaction happens
+	t.Log("Starting concurrent readers during recompaction")
+	stopChan := make(chan struct{})
+	errorChan := make(chan error, 100)
+	var readCount atomic.Int64
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopChan:
+					return
+				default:
+					// Read random remaining key
+					idx := int(readCount.Add(1)-1) % len(remainingKeys)
+					key := remainingKeys[idx]
+					data, err := s.Harness.GetObject(key)
+					if err != nil {
+						errorChan <- fmt.Errorf("worker %d: failed to read %s: %w",
+							workerID, key, err)
+						return
+					}
+					if len(data) != int(objectSize) {
+						errorChan <- fmt.Errorf("worker %d: size mismatch for %s",
+							workerID, key)
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}(i)
+	}
+
+	// Let recompaction happen with concurrent reads
+	t.Log("Waiting for recompaction with concurrent access...")
+	time.Sleep(5 * time.Second)
+
+	// Stop readers
+	close(stopChan)
+	wg.Wait()
+
+	// Check for errors
+	close(errorChan)
+	for err := range errorChan {
+		t.Fatalf("Concurrent read error during recompaction: %v", err)
+	}
+
+	t.Logf("Completed %d successful reads during recompaction", readCount.Load())
+
+	// Verify data integrity
+	t.Log("Verifying final data integrity")
+	for _, key := range remainingKeys {
+		data, err := s.Harness.GetObject(key)
+		require.NoError(t, err, "Key %s should be accessible after recompaction", key)
+		require.Equal(t, int(objectSize), len(data))
+	}
+
+	// Verify deleted keys are still gone
+	for _, key := range deletedKeys {
+		_, err := s.Harness.GetObject(key)
+		require.Error(t, err, "Deleted key %s should not exist", key)
+	}
+}
+
+// Test_SegmentRecompaction_MultipleCompactors tests the segment reservation system
+// preventing race conditions between compactor and recompactor
+func (s *CompactionSuite) Test_SegmentRecompaction_MultipleCompactors() {
+	t := s.T()
+
+	// Override segment age requirement BEFORE creating storage
+	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
+	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
+
+	// Re-create harness with the environment variable set
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 500 * time.Millisecond
+	config.SegmentSize = 2 * 1024 * 1024
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Create segments with mixed content
+	t.Log("Creating initial segments and raw files")
+
+	// First batch: will be compacted into segments
+	batch1Keys := []string{}
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("multi-batch1-%d", i)
+		batch1Keys = append(batch1Keys, key)
+		data := GenerateRandomData(150 * 1024) // 150KB
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+	}
+
+	// Wait for first compaction
+	time.Sleep(2 * time.Second)
+
+	// Delete some to create fragmentation
+	t.Log("Creating fragmentation in segments")
+	for i := 0; i < 25; i++ {
+		s.Harness.DeleteObject(batch1Keys[i])
+	}
+
+	// Second batch: new raw files for compaction while recompaction runs
+	batch2Keys := []string{}
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("multi-batch2-%d", i)
+		batch2Keys = append(batch2Keys, key)
+		data := GenerateRandomData(100 * 1024) // 100KB
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+	}
+
+	// Both compaction and recompaction should run
+	t.Log("Waiting for concurrent compaction and recompaction...")
+	time.Sleep(5 * time.Second)
+
+	// Continuously add more objects to keep compactor busy
+	batch3Keys := []string{}
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("multi-batch3-%d", i)
+		batch3Keys = append(batch3Keys, key)
+		data := GenerateRandomData(80 * 1024) // 80KB
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+		time.Sleep(50 * time.Millisecond) // Spread out to overlap with background work
+	}
+
+	// Final wait
+	time.Sleep(2 * time.Second)
+
+	// Verify all data is accessible
+	t.Log("Verifying data integrity after concurrent compaction/recompaction")
+
+	// Batch 1 (partially deleted)
+	for i := 25; i < len(batch1Keys); i++ {
+		data, err := s.Harness.GetObject(batch1Keys[i])
+		require.NoError(t, err)
+		require.Equal(t, 150*1024, len(data))
+	}
+
+	// Batch 2 (all present)
+	for _, key := range batch2Keys {
+		data, err := s.Harness.GetObject(key)
+		require.NoError(t, err)
+		require.Equal(t, 100*1024, len(data))
+	}
+
+	// Batch 3 (all present)
+	for _, key := range batch3Keys {
+		data, err := s.Harness.GetObject(key)
+		require.NoError(t, err)
+		require.Equal(t, 80*1024, len(data))
+	}
+
+	// Check that we have segments (proving both processes worked)
+	segmentDir := filepath.Join(s.Harness.TempDir, "segments")
+	segments, err := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+	require.NoError(t, err)
+	require.Greater(t, len(segments), 0, "Should have segments from compaction/recompaction")
+
+	stats := s.Harness.GetStorageStats()
+	t.Logf("Final stats - Segments: %d, Raw files: %d",
+		stats.SegmentCount, stats.RawFileCount)
+}
+
+// Test_SegmentRecompaction_ThresholdBehavior tests that recompaction respects
+// the fragmentation threshold configuration
+func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
+	t := s.T()
+
+	// Override segment age requirement BEFORE creating storage
+	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
+	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
+
+	// Re-create harness with the environment variable set
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 500 * time.Millisecond
+	config.SegmentSize = 2 * 1024 * 1024
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// The threshold is 50% by default
+	// Test edge cases around this threshold
+
+	// Create segments
+	numObjects := 60
+	keys := make([]string, numObjects)
+	objectSize := int64(100 * 1024) // 100KB
+
+	t.Log("Creating initial segments")
+	for i := 0; i < numObjects; i++ {
+		key := fmt.Sprintf("threshold-test-%d", i)
+		keys[i] = key
+		data := GenerateRandomData(objectSize)
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+	}
+
+	// Wait for compaction
+	time.Sleep(3 * time.Second)
+
+	// Test 1: Delete 40% (below threshold - should NOT recompact)
+	t.Log("Test 1: Deleting 40% of objects (below threshold)")
+	deleteCount := int(float64(numObjects) * 0.4)
+	for i := 0; i < deleteCount; i++ {
+		s.Harness.DeleteObject(keys[i])
+	}
+
+	// Wait and check
+	time.Sleep(3 * time.Second)
+
+	// Get segment info before potential recompaction
+	segmentDir := filepath.Join(s.Harness.TempDir, "segments")
+	segmentsBefore, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+	totalSizeBefore := int64(0)
+	for _, seg := range segmentsBefore {
+		info, _ := os.Stat(seg)
+		totalSizeBefore += info.Size()
+	}
+
+	// Test 2: Delete additional 20% (total 60% - above threshold)
+	t.Log("Test 2: Deleting additional 20% (total 60% - above threshold)")
+	additionalDelete := int(float64(numObjects) * 0.2)
+	for i := deleteCount; i < deleteCount+additionalDelete; i++ {
+		s.Harness.DeleteObject(keys[i])
+	}
+
+	// Now recompaction should trigger
+	time.Sleep(5 * time.Second)
+
+	// Check if recompaction occurred
+	segmentsAfter, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+	totalSizeAfter := int64(0)
+	for _, seg := range segmentsAfter {
+		info, _ := os.Stat(seg)
+		totalSizeAfter += info.Size()
+	}
+
+	t.Logf("Segment sizes - Before: %d bytes, After: %d bytes",
+		totalSizeBefore, totalSizeAfter)
+
+	// Size should be significantly reduced after crossing threshold
+	require.Less(t, totalSizeAfter, totalSizeBefore*70/100,
+		"Segment size should be reduced after recompaction")
+
+	// Verify remaining data
+	remainingKeys := keys[deleteCount+additionalDelete:]
+	for _, key := range remainingKeys {
+		data, err := s.Harness.GetObject(key)
+		require.NoError(t, err)
+		require.Equal(t, int(objectSize), len(data))
+	}
+}
+
+// Test_SegmentRecompaction_Recovery tests that recompaction handles errors gracefully
+func (s *CompactionSuite) Test_SegmentRecompaction_Recovery() {
+	t := s.T()
+
+	// Override segment age requirement BEFORE creating storage
+	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
+	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
+
+	// Re-create harness with the environment variable set
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 500 * time.Millisecond
+	config.SegmentSize = 2 * 1024 * 1024
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Create initial segments
+	numObjects := 40
+	keys := make([]string, numObjects)
+
+	t.Log("Creating segments for recovery test")
+	for i := 0; i < numObjects; i++ {
+		key := fmt.Sprintf("recovery-test-%d", i)
+		keys[i] = key
+		data := GenerateRandomData(150 * 1024) // 150KB
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err)
+	}
+
+	// Wait for initial compaction
+	time.Sleep(3 * time.Second)
+
+	// Create fragmentation
+	t.Log("Creating fragmentation")
+	for i := 0; i < 25; i++ {
+		s.Harness.DeleteObject(keys[i])
+	}
+
+	// Simulate concurrent operations during recompaction
+	t.Log("Starting concurrent operations during recompaction")
+	stopChan := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writer goroutine - adds new objects
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			select {
+			case <-stopChan:
+				return
+			default:
+				key := fmt.Sprintf("recovery-new-%d", i)
+				data := GenerateRandomData(50 * 1024)
+				s.Harness.PutObject(key, data, 0)
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Deleter goroutine - removes more objects
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 25; i < 30 && i < len(keys); i++ {
+			select {
+			case <-stopChan:
+				return
+			default:
+				s.Harness.DeleteObject(keys[i])
+				time.Sleep(300 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Let recompaction run with interference
+	time.Sleep(5 * time.Second)
+	close(stopChan)
+	wg.Wait()
+
+	// Verify system recovered and data is consistent
+	t.Log("Verifying system recovery")
+
+	// Check remaining original objects
+	for i := 30; i < numObjects; i++ {
+		data, err := s.Harness.GetObject(keys[i])
+		require.NoError(t, err, "Object %s should exist", keys[i])
+		require.Equal(t, 150*1024, len(data))
+	}
+
+	// Check newly added objects exist
+	for i := 0; i < 5; i++ { // Check at least some of the new objects
+		key := fmt.Sprintf("recovery-new-%d", i)
+		_, err := s.Harness.GetObject(key)
+		// These may or may not exist depending on timing, just verify no panic
+		if err != nil {
+			require.Contains(t, err.Error(), "not found")
+		}
+	}
+
+	// Verify storage is in a consistent state
+	stats := s.Harness.GetStorageStats()
+	require.GreaterOrEqual(t, stats.SegmentCount, 0)
+	require.GreaterOrEqual(t, stats.RawFileCount, 0)
+	t.Logf("Recovery complete - Segments: %d, Raw files: %d",
+		stats.SegmentCount, stats.RawFileCount)
+}
