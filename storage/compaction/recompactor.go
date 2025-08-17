@@ -156,7 +156,9 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	// Use a pointer to ensure we release the final segment, not the initial one
 	defer func() {
 		if newSeg != nil {
-			sr.sm.ReleaseSegment(newSeg, callerID)
+			if err := sr.sm.ReleaseSegment(newSeg, callerID); err != nil {
+				zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment")
+			}
 		}
 	}()
 
@@ -300,7 +302,9 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		}
 
 		// Now safe to release since it's finalized
-		sr.sm.ReleaseSegment(*newSeg, callerID)
+		if err := sr.sm.ReleaseSegment(*newSeg, callerID); err != nil {
+			zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
+		}
 		var err error
 		*newSeg, err = sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 		if err != nil {

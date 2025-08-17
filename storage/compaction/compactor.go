@@ -119,12 +119,12 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 		ctx:           ctx,
 		cancel:        cancel,
 	}
-	
+
 	// Set up recompactor if configured
 	if cfg.EnableRecompaction && cfg.FragThreshold > 0 {
 		c.recompactor = NewSegmentRecompactor(cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge)
 	}
-	
+
 	return c
 }
 
@@ -168,7 +168,7 @@ func (c *Compactor) StartRecompaction(fragThreshold float64, minSegmentAge time.
 	if c.recompactor == nil {
 		c.recompactor = NewSegmentRecompactor(c.sm, c.deletionQueue, fragThreshold, minSegmentAge)
 	}
-	
+
 	// Start the recompaction loop
 	if c.recompactor != nil && c.recompactor.fragThreshold > 0 {
 		c.wg.Add(1)
@@ -266,7 +266,9 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 	// Use a closure to ensure we release the final segment, not the initial one
 	defer func() {
 		if seg != nil {
-			c.sm.ReleaseSegment(seg, compactorCallerID)
+			if err := c.sm.ReleaseSegment(seg, compactorCallerID); err != nil {
+				zlog.Error().Err(err).Str("callerID", compactorCallerID).Msg("failed to release segment")
+			}
 		}
 	}()
 
@@ -613,7 +615,9 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 	}
 
 	// Now safe to release since it's finalized
-	c.sm.ReleaseSegment(*seg, callerID)
+	if err := c.sm.ReleaseSegment(*seg, callerID); err != nil {
+		zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
+	}
 
 	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 	if err != nil {

@@ -117,6 +117,9 @@ func (s *Segment) IsReserved() bool {
 // Reserve attempts to reserve the segment for exclusive use by the caller
 // Returns true if successful, false if already reserved or if segment is closed
 func (s *Segment) Reserve(callerID string) bool {
+	if callerID == "" {
+		return false // Cannot reserve with empty callerID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Cannot reserve a closed/finalized segment
@@ -132,6 +135,9 @@ func (s *Segment) Reserve(callerID string) bool {
 
 // Release releases the reservation on the segment
 func (s *Segment) Release(callerID string) {
+	if callerID == "" {
+		return // Ignore release attempts with empty callerID
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.reservedBy == callerID {

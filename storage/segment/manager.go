@@ -191,40 +191,36 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 // The callerID should be unique per goroutine/thread (e.g., "compactor", "recompactor-1")
 // The segment will be reserved exclusively for this caller until released
 func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int64) (*Segment, error) {
-	// Retry loop for when reservation fails
-retrySearch:
-	for {
-		// Check with read lock for an existing open segment that:
-		// 1. Has enough space
-		// 2. Is either not reserved OR already reserved by this caller
-		sm.mu.RLock()
-		for _, seg := range sm.openSegments {
-			seg.mu.RLock()
-			if seg.file != nil && seg.Remaining() >= needed {
-				// Check reservation status
-				if seg.reservedBy == "" || seg.reservedBy == callerID {
-					seg.mu.RUnlock()
-					sm.mu.RUnlock()
-					// Try to reserve it (if not already reserved by us)
-					if callerID != "" {
-						if !seg.Reserve(callerID) {
-							// Reservation failed - another thread got it first
-							// Restart the search with fresh segment list
-							goto retrySearch
-						}
-					}
-					return seg, nil
-				}
-			}
-			seg.mu.RUnlock()
-		}
-		sm.mu.RUnlock()
-
-		// No suitable segment found, break out to create a new one
-		break
+	// Strict callerID validation
+	if callerID == "" {
+		return nil, fmt.Errorf("callerID cannot be empty")
 	}
 
-	// Slow path: need to create a new segment
+	// Retry loop for when reservation fails
+retrySearch:
+	// Try to find an existing segment with read lock
+	sm.mu.RLock()
+	for _, seg := range sm.openSegments {
+		seg.mu.RLock()
+		if seg.file != nil && seg.Remaining() >= needed {
+			// Check reservation status
+			if seg.reservedBy == "" || seg.reservedBy == callerID {
+				seg.mu.RUnlock()
+				sm.mu.RUnlock()
+				// Try to reserve it (if not already reserved by us)
+				if !seg.Reserve(callerID) {
+					// Reservation failed - another thread got it first
+					// Restart the search with fresh segment list
+					goto retrySearch
+				}
+				return seg, nil
+			}
+		}
+		seg.mu.RUnlock()
+	}
+	sm.mu.RUnlock()
+
+	// No suitable segment found, need to create a new one
 	// Use write lock to prevent race condition
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -237,13 +233,10 @@ retrySearch:
 			// Check reservation status
 			if seg.reservedBy == "" || seg.reservedBy == callerID {
 				seg.mu.RUnlock()
-				// Reserve it if needed
-				if callerID != "" {
-					if !seg.Reserve(callerID) {
-						// Reservation failed - another thread got it first
-						// Continue searching for another segment
-						continue
-					}
+				// Try to reserve it
+				if !seg.Reserve(callerID) {
+					// Reservation failed - continue searching
+					continue
 				}
 				return seg, nil
 			}
@@ -260,31 +253,38 @@ retrySearch:
 
 	// Reserve the new segment for the caller
 	// This should always succeed since we just created the segment
-	if callerID != "" {
-		if !newSeg.Reserve(callerID) {
-			// This should never happen for a newly created segment
-			return nil, fmt.Errorf("failed to reserve newly created segment")
-		}
+	if !newSeg.Reserve(callerID) {
+		// This should never happen for a newly created segment
+		return nil, fmt.Errorf("failed to reserve newly created segment")
 	}
 
 	return newSeg, nil
 }
 
 // ReleaseSegment releases the reservation on a segment, making it available for other callers
-func (sm *Manager) ReleaseSegment(seg *Segment, callerID string) {
+func (sm *Manager) ReleaseSegment(seg *Segment, callerID string) error {
+	if callerID == "" {
+		return fmt.Errorf("callerID cannot be empty")
+	}
 	if seg != nil {
 		seg.Release(callerID)
 	}
+	return nil
 }
 
 // ReleaseAllSegments releases all segments reserved by the given caller
-func (sm *Manager) ReleaseAllSegments(callerID string) {
+func (sm *Manager) ReleaseAllSegments(callerID string) error {
+	if callerID == "" {
+		return fmt.Errorf("callerID cannot be empty")
+	}
+
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
 	for _, seg := range sm.openSegments {
 		seg.Release(callerID)
 	}
+	return nil
 }
 
 // SyncSegment syncs the segment.
