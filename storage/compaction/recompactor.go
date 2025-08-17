@@ -293,12 +293,14 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	// manager uses internal locking and reservations to coordinate between compactor and recompactor
 	totalNeeded := headerSize + valLen
 	if (*newSeg).Remaining() < totalNeeded {
-		// Release current segment before finalizing
-		sr.sm.ReleaseSegment(*newSeg, callerID)
-
+		// Finalize the segment first, then release it
+		// This prevents other threads from acquiring it while it's being finalized
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
+
+		// Now safe to release since it's finalized
+		sr.sm.ReleaseSegment(*newSeg, callerID)
 		var err error
 		*newSeg, err = sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 		if err != nil {

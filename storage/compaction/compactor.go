@@ -553,12 +553,14 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 		return err
 	}
 
-	// Release the current segment before finalizing
-	c.sm.ReleaseSegment(*seg, callerID)
-
+	// Finalize the segment first, then release it
+	// This prevents other threads from acquiring it while it's being finalized
 	if err := c.sm.FinalizeSegment(*seg); err != nil {
 		return err
 	}
+
+	// Now safe to release since it's finalized
+	c.sm.ReleaseSegment(*seg, callerID)
 
 	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 	if err != nil {

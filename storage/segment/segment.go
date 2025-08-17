@@ -115,10 +115,14 @@ func (s *Segment) IsReserved() bool {
 }
 
 // Reserve attempts to reserve the segment for exclusive use by the caller
-// Returns true if successful, false if already reserved
+// Returns true if successful, false if already reserved or if segment is closed
 func (s *Segment) Reserve(callerID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Cannot reserve a closed/finalized segment
+	if s.file == nil {
+		return false
+	}
 	if s.reservedBy != "" && s.reservedBy != callerID {
 		return false // Already reserved by someone else
 	}
