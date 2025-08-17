@@ -54,7 +54,7 @@ func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, 
 }
 
 func createTestSegmentWithEntries(t *testing.T, sm *segment.Manager, meta *metadata.MetaDB, entries map[string][]byte) (*segment.Segment, error) {
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +351,7 @@ func TestSegmentRecompaction_OpenSegmentSkipped(t *testing.T) {
 	defer cleanup()
 
 	// Create an open segment (not finalized)
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 	assert.True(t, seg.HasOpenFile())
 
@@ -369,7 +369,7 @@ func TestGetFragmentationRatio(t *testing.T) {
 	defer cleanup()
 
 	// Create a segment
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 
 	// Simulate some data written
@@ -400,7 +400,7 @@ func TestIsSegmentFragmented(t *testing.T) {
 	defer cleanup()
 
 	// Create a segment
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 
 	// Simulate some data written

@@ -199,12 +199,14 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		bytesCopied int64
 	)
 
-	// Acquire the initial open segment.
-	seg, err := c.sm.AcquireOpenSegment(0)
+	// Acquire the initial open segment with reservation
+	callerID := "compactor"
+	seg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 	if err != nil {
 		zlog.Error().Err(err).Msg("compactor: acquire open segment")
 		return
 	}
+	defer c.sm.ReleaseSegment(seg, callerID) // Ensure we release on exit
 
 	filePrefix := []byte(keys.CompactionIndexPrefix)
 	iterationCount := 0
@@ -292,7 +294,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		}
 
 		// Compact the entry
-		if err := c.compactEntry(ctx, entry, &seg, wb); err != nil {
+		if err := c.compactEntry(ctx, entry, &seg, callerID, wb); err != nil {
 			if err == context.Canceled {
 				zlog.Info().Msg("compactor: compaction cancelled")
 				return
@@ -419,7 +421,7 @@ func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.Value
 }
 
 // compactEntry performs the actual compaction of a single entry
-func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, wb *grocksdb.WriteBatch) error {
+func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch) error {
 	// Validate file size matches metadata
 	if entry.fileInfo.Size() != entry.metadata.ValueLength {
 		zlog.Error().
@@ -442,7 +444,7 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 	totalNeeded := headerSize + entry.metadata.ValueLength
 
 	// Ensure we have space in the current segment
-	if err := c.ensureCapacity(ctx, seg, totalNeeded); err != nil {
+	if err := c.ensureCapacity(ctx, seg, callerID, totalNeeded); err != nil {
 		return err
 	}
 
@@ -532,7 +534,7 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 
 // ensureCapacity ensures that the segment has at least the needed bytes
 // available, finalising and acquiring a fresh segment when necessary.
-func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, needed int64) error {
+func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64) error {
 	if (*seg).Remaining() >= needed {
 		return nil
 	}
@@ -542,11 +544,14 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, n
 		return err
 	}
 
+	// Release the current segment before finalizing
+	c.sm.ReleaseSegment(*seg, callerID)
+
 	if err := c.sm.FinalizeSegment(*seg); err != nil {
 		return err
 	}
 
-	newSeg, err := c.sm.AcquireOpenSegment(0)
+	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 	if err != nil {
 		return err
 	}

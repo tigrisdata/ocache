@@ -29,7 +29,7 @@ func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
 	}
 
 	// Acquire an open segment
-	seg1, err := manager.AcquireOpenSegment(0)
+	seg1, err := manager.AcquireOpenSegmentWithReservation("test", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
 	}
 
 	// Acquire another segment
-	seg2, err := manager.AcquireOpenSegment(0)
+	seg2, err := manager.AcquireOpenSegmentWithReservation("test", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +221,7 @@ func TestManager_AcquireOpenSegment(t *testing.T) {
 	defer manager.Close()
 
 	needed := int64(1024)
-	seg, err := manager.AcquireOpenSegment(needed)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", needed)
 	if err != nil {
 		t.Fatalf("AcquireOpenSegment failed: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestManager_WriteEntry(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +307,7 @@ func TestManager_SyncSegment(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +330,7 @@ func TestManager_FinalizeSegment(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestManager_ReadValue(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +794,7 @@ func TestManager_Close(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -826,7 +826,7 @@ func BenchmarkManager_WriteEntry(b *testing.B) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -864,7 +864,7 @@ func BenchmarkManager_ReadValue(b *testing.B) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		b.Fatal(err)
 	}

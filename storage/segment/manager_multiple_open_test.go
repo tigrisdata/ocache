@@ -19,7 +19,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	defer manager.Close()
 
 	// Acquire first segment
-	seg1, err := manager.AcquireOpenSegment(0)
+	seg1, err := manager.AcquireOpenSegmentWithReservation("test", 0)
 	if err != nil {
 		t.Fatalf("Failed to acquire first segment: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	}
 
 	// Now acquire another segment - should get a new one since first is nearly full
-	seg2, err := manager.AcquireOpenSegment(200 * 1024) // Request 200KB
+	seg2, err := manager.AcquireOpenSegmentWithReservation("test", 200*1024) // Request 200KB
 	if err != nil {
 		t.Fatalf("Failed to acquire second segment: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	}
 
 	// Acquire new segment after finalizing the first one
-	seg3, err := manager.AcquireOpenSegment(0)
+	seg3, err := manager.AcquireOpenSegmentWithReservation("test", 0)
 	if err != nil {
 		t.Fatalf("Failed to acquire third segment: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestManager_MultipleThreadsAcquireSegments(t *testing.T) {
 	done := make(chan error, 10)
 	for i := 0; i < 10; i++ {
 		go func(id int) {
-			seg, err := manager.AcquireOpenSegment(10 * 1024) // Request 10KB
+			seg, err := manager.AcquireOpenSegmentWithReservation("test", 10*1024) // Request 10KB
 			if err != nil {
 				done <- err
 				return

@@ -143,11 +143,13 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 		return fmt.Errorf("failed to stat segment %s: %w", oldSeg.Path(), err)
 	}
 
-	// Create a new segment for the live data
-	newSeg, err := sr.sm.AcquireOpenSegment(0)
+	// Create a new segment for the live data with reservation
+	callerID := fmt.Sprintf("recompactor-%s", oldSeg.Path()) // Unique ID per segment being recompacted
+	newSeg, err := sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)
 	}
+	defer sr.sm.ReleaseSegment(newSeg, callerID) // Ensure we release on exit
 
 	// Track metadata updates
 	wb := grocksdb.NewWriteBatch()
@@ -204,7 +206,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 		}
 
 		// This is a live entry, copy it to the new segment
-		if err := sr.copyEntry(ctx, oldFile, &newSeg, userKey, pos, headerSize, valLen, version, checksum, meta, wb); err != nil {
+		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, userKey, pos, headerSize, valLen, version, checksum, meta, wb); err != nil {
 			zlog.Error().Err(err).Str("key", userKey).
 				Msg("recompactor: failed to copy entry")
 			pos += headerSize + valLen
@@ -269,7 +271,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 }
 
 // copyEntry copies a single entry from old segment to new segment
-func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment,
+func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
 	userKey string, oldOffset, headerSize, valLen int64, version uint16, checksum uint32,
 	meta *pb.ValueMessage, wb *grocksdb.WriteBatch) error {
 
@@ -278,15 +280,18 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	dataReader := io.NewSectionReader(oldFile, valueOffset, valLen)
 
 	// Check if we need a new segment
-	// NOTE: FinalizeSegment and AcquireOpenSegment are thread-safe - the segment
-	// manager uses internal locking to coordinate between compactor and recompactor
+	// NOTE: FinalizeSegment and AcquireOpenSegmentWithReservation are thread-safe - the segment
+	// manager uses internal locking and reservations to coordinate between compactor and recompactor
 	totalNeeded := headerSize + valLen
 	if (*newSeg).Remaining() < totalNeeded {
+		// Release current segment before finalizing
+		sr.sm.ReleaseSegment(*newSeg, callerID)
+
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
 		var err error
-		*newSeg, err = sr.sm.AcquireOpenSegment(0)
+		*newSeg, err = sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
 		if err != nil {
 			return fmt.Errorf("failed to acquire new segment: %w", err)
 		}
