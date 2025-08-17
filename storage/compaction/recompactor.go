@@ -355,14 +355,11 @@ func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segm
 	// Check 4: Verify segment age based on timestamp
 	base := filepath.Base(seg.Path())
 	var timestamp int64
-	// Try parsing both old and new segment name formats
+	// Try parsing the segment name format
 	if _, err := fmt.Sscanf(base, "segment_%d.seg", &timestamp); err != nil {
-		// Couldn't parse timestamp, skip for safety
-		if err != nil {
-			// Can't parse timestamp, assume it's old enough (legacy segment)
-			zlog.Debug().Str("segment", seg.Path()).Msg("recompactor: cannot parse timestamp, assuming old segment")
-			return true, ""
-		}
+		// Can't parse timestamp - skip for safety
+		zlog.Debug().Str("segment", seg.Path()).Msg("recompactor: cannot parse timestamp, skipping for safety")
+		return false, "cannot parse timestamp"
 	}
 
 	segmentTime := time.Unix(0, timestamp)

@@ -191,32 +191,38 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 // The callerID should be unique per goroutine/thread (e.g., "compactor", "recompactor-1")
 // The segment will be reserved exclusively for this caller until released
 func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int64) (*Segment, error) {
-	// First check with read lock for an existing open segment that:
-	// 1. Has enough space
-	// 2. Is either not reserved OR already reserved by this caller
-	sm.mu.RLock()
-	for _, seg := range sm.openSegments {
-		seg.mu.RLock()
-		if seg.file != nil && seg.Remaining() >= needed {
-			// Check reservation status
-			if seg.reservedBy == "" || seg.reservedBy == callerID {
-				seg.mu.RUnlock()
-				sm.mu.RUnlock()
-				// Try to reserve it (if not already reserved by us)
-				if callerID != "" {
-					if !seg.Reserve(callerID) {
-						// Reservation failed - another thread got it first
-						// Continue searching for another segment
-						sm.mu.RLock()
-						continue
+	// Retry loop for when reservation fails
+retrySearch:
+	for {
+		// Check with read lock for an existing open segment that:
+		// 1. Has enough space
+		// 2. Is either not reserved OR already reserved by this caller
+		sm.mu.RLock()
+		for _, seg := range sm.openSegments {
+			seg.mu.RLock()
+			if seg.file != nil && seg.Remaining() >= needed {
+				// Check reservation status
+				if seg.reservedBy == "" || seg.reservedBy == callerID {
+					seg.mu.RUnlock()
+					sm.mu.RUnlock()
+					// Try to reserve it (if not already reserved by us)
+					if callerID != "" {
+						if !seg.Reserve(callerID) {
+							// Reservation failed - another thread got it first
+							// Restart the search with fresh segment list
+							goto retrySearch
+						}
 					}
+					return seg, nil
 				}
-				return seg, nil
 			}
+			seg.mu.RUnlock()
 		}
-		seg.mu.RUnlock()
+		sm.mu.RUnlock()
+
+		// No suitable segment found, break out to create a new one
+		break
 	}
-	sm.mu.RUnlock()
 
 	// Slow path: need to create a new segment
 	// Use write lock to prevent race condition
