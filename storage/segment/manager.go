@@ -204,7 +204,12 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 				sm.mu.RUnlock()
 				// Try to reserve it (if not already reserved by us)
 				if callerID != "" {
-					seg.Reserve(callerID)
+					if !seg.Reserve(callerID) {
+						// Reservation failed - another thread got it first
+						// Continue searching for another segment
+						sm.mu.RLock()
+						continue
+					}
 				}
 				return seg, nil
 			}
@@ -228,7 +233,11 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 				seg.mu.RUnlock()
 				// Reserve it if needed
 				if callerID != "" {
-					seg.Reserve(callerID)
+					if !seg.Reserve(callerID) {
+						// Reservation failed - another thread got it first
+						// Continue searching for another segment
+						continue
+					}
 				}
 				return seg, nil
 			}
@@ -244,8 +253,12 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 	}
 
 	// Reserve the new segment for the caller
+	// This should always succeed since we just created the segment
 	if callerID != "" {
-		newSeg.Reserve(callerID)
+		if !newSeg.Reserve(callerID) {
+			// This should never happen for a newly created segment
+			return nil, fmt.Errorf("failed to reserve newly created segment")
+		}
 	}
 
 	return newSeg, nil
