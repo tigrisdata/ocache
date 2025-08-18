@@ -33,6 +33,7 @@ make all
 - [API Reference](docs/api.md) - HTTP REST and gRPC APIs
 - [CLI Client](docs/cli.md) - Command-line client usage
 - [Configuration](docs/configuration.md) - Server flags and tuning
+- [Testing Guide](docs/testing.md) - Running and writing tests
 - [Static Builds](docs/static_build.md) - Production deployment
 
 ## Basic Usage
@@ -77,3 +78,20 @@ Key configuration flags:
 | `-max-disk-usage` | 0          | Max disk usage (0=unlimited)   |
 
 See [Configuration Guide](docs/configuration.md) for complete options.
+
+## Testing
+
+Run tests with `make test` for unit tests or `make test-all` for the complete suite. You can run specific tests using `TEST=TestName` or `TESTRUN=Pattern` variables:
+
+```bash
+# Run all tests
+make test-all
+
+# Run specific test
+make test TEST=TestCacheService_PutObjectAndGet
+
+# Run tests matching pattern
+make test-integration TESTRUN=Compaction
+```
+
+See [Testing Guide](docs/testing.md) for comprehensive testing documentation.
