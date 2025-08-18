@@ -565,7 +565,7 @@ func (s *CompactionSuite) Test_CompactionLoop_ErrorRecovery() {
 	// Verify final state
 	stats := s.Harness.GetStorageStats()
 	t.Logf("Final recovery stats - Raw files: %d, Segments: %d, Errors: %d",
-		stats.RawFileCount, stats.SegmentCount, s.Harness.Metrics.ErrorCount)
+		stats.RawFileCount, stats.SegmentCount, s.Harness.Metrics.ErrorCount.Load())
 
 	// Should have successfully compacted despite errors
 	require.GreaterOrEqual(t, stats.SegmentCount, 0)
