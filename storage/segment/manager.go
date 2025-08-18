@@ -286,10 +286,10 @@ func (sm *Manager) SyncSegment(seg *Segment) error {
 func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	zlog.Info().Str("path", seg.path).Msg("finalizing segment")
 
+	// First finalize the segment under its lock
 	seg.mu.Lock()
-	defer seg.mu.Unlock()
-
 	if seg.file == nil {
+		seg.mu.Unlock()
 		return nil // already closed
 	}
 
@@ -297,19 +297,23 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	footer := BuildSegmentFooterWithVersion(seg.version, seg.entries, seg.dataBytes)
 
 	if _, err := seg.file.Write(footer); err != nil {
+		seg.mu.Unlock()
 		return utils.WrapError("failed to write segment footer", seg.path, err)
 	}
 	seg.size += int64(len(footer))
 	// Shrink pre-allocated file to actual used size
 	if err := seg.file.Truncate(seg.size); err != nil {
+		seg.mu.Unlock()
 		return utils.WrapError("truncate segment", seg.path, err)
 	}
 
 	// Flush and close the R/W file descriptor
 	if err := seg.file.Sync(); err != nil {
+		seg.mu.Unlock()
 		return utils.WrapError("failed to sync segment", seg.path, err)
 	}
 	if err := seg.file.Close(); err != nil {
+		seg.mu.Unlock()
 		return utils.WrapError("failed to close segment", seg.path, err)
 	}
 
@@ -318,6 +322,9 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 
 	// Clear any reservation on this segment
 	seg.reservedBy = ""
+
+	// Release the segment lock before acquiring manager lock to prevent deadlock
+	seg.mu.Unlock()
 
 	// Clear from openSegments if this was an open segment
 	sm.mu.Lock()
