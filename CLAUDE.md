@@ -36,6 +36,8 @@ make bench                 # Run benchmarks
 
 ## Testing Commands
 
+**IMPORTANT:** Always use `make test*` targets to run tests, never run `go test` directly. The Makefile handles proper CGO flags, timeouts, and other platform-specific configurations.
+
 **Unit Tests:**
 
 ```bash
@@ -65,6 +67,24 @@ make test-integration-coverage      # With coverage
 ```bash
 make test-e2e              # Shell-based E2E tests
 make test-all              # All tests (unit + integration + e2e)
+```
+
+**Running Individual Tests:**
+
+You can run specific tests using `TEST` (exact match) or `TESTRUN` (pattern match) variables:
+
+```bash
+# Run specific test by exact name
+make test TEST=TestCacheService_PutObjectAndGet
+make test-server TEST=TestStorage
+
+# Run tests matching a pattern
+make test TESTRUN=CacheService
+make test-integration TESTRUN=Compaction
+
+# Works with all test targets
+make test-integration-small TEST=TestSmallObjects_Basic
+make test-race TESTRUN=Storage
 ```
 
 ## Code Quality
@@ -120,10 +140,13 @@ make check                 # All checks (fmt, vet, test)
 
 **Testing Strategy:**
 
+- Always use `make test*` targets to run tests (handles CGO flags and platform-specific settings)
+- Never run `go test` directly - the Makefile ensures proper configuration
 - Unit tests focus on individual components
 - Integration tests verify storage layer directly (not via gRPC)
 - E2E tests use actual gRPC API calls
 - Tests avoid manual cleanup to prevent deadlocks with background processes
+- Use `TEST=TestName` or `TESTRUN=Pattern` to run specific tests during development
 
 **Background Processes:**
 
