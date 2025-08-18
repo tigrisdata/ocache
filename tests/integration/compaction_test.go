@@ -1060,10 +1060,32 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		require.NoError(t, err)
 	}
 
-	// Wait for compaction and ensure segments are finalized
-	// Write one more object to trigger segment finalization
-	s.Harness.PutObject("trigger-finalize", GenerateRandomData(100), 0)
+	// Wait for initial compaction to complete
+	// Files should be migrated to segments
 	time.Sleep(3 * time.Second)
+
+	// Force segment finalization by writing enough data to fill current segment
+	// and start a new one. This ensures old segments are closed.
+	t.Log("Writing additional data to force segment rotation")
+	segmentSize := config.SegmentSize // 2MB
+	// Write enough to ensure we rotate to a new segment
+	numExtraObjects := int(segmentSize/(100*1024)) + 5 // Enough to fill current + start new
+	for i := 0; i < numExtraObjects; i++ {
+		key := fmt.Sprintf("rotation-trigger-%d", i)
+		data := GenerateRandomData(100 * 1024)
+		s.Harness.PutObject(key, data, 0)
+	}
+
+	// Wait for compaction to process these new files
+	time.Sleep(3 * time.Second)
+
+	// Clean up the rotation trigger objects
+	for i := 0; i < numExtraObjects; i++ {
+		s.Harness.DeleteObject(fmt.Sprintf("rotation-trigger-%d", i))
+	}
+
+	// Wait a bit more to ensure segments are ready
+	time.Sleep(2 * time.Second)
 
 	// Test 1: Delete 40% (below threshold - should NOT recompact)
 	t.Log("Test 1: Deleting 40% of objects (below threshold)")
