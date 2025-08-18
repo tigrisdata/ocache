@@ -6,16 +6,18 @@ package main
 //
 
 type Config struct {
-	DiskPath         string // Directory for on-disk cache data
-	InlineThreshold  int    // Threshold for small objects that are inlined in RocksDB (bytes)
-	CompactThreshold int64  // Objects less than this size are compacted to segments (bytes)
-	SegmentSize      int64  // Segment size (bytes)
-	TTL              int    // Default TTL when no key-level TTL is set (seconds)
-	Port             int    // gRPC listen port
-	HTTPPort         int    // HTTP (grpc-gateway) port
-	Verbose          bool   // Enable verbose/debug logging
-	FdCacheSize      int    // Size of the file descriptor cache
-	MaxDiskUsage     int64  // Maximum disk usage in bytes (0 = unlimited)
+	DiskPath         string  // Directory for on-disk cache data
+	InlineThreshold  int     // Threshold for small objects that are inlined in RocksDB (bytes)
+	CompactThreshold int64   // Objects less than this size are compacted to segments (bytes)
+	SegmentSize      int64   // Segment size (bytes)
+	TTL              int     // Default TTL when no key-level TTL is set (seconds)
+	Port             int     // gRPC listen port
+	HTTPPort         int     // HTTP (grpc-gateway) port
+	Verbose          bool    // Enable verbose/debug logging
+	FdCacheSize      int     // Size of the file descriptor cache
+	MaxDiskUsage     int64   // Maximum disk usage in bytes (0 = unlimited)
+	FragThreshold    float64 // Fragmentation threshold for segment recompaction (0.0-1.0)
+	RecompactDisable bool    // Disable automatic segment recompaction
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -36,5 +38,7 @@ func LoadConfig() {
 		Verbose:          *verbose,
 		FdCacheSize:      *fdCacheSize,
 		MaxDiskUsage:     *maxDiskUsage,
+		FragThreshold:    *fragThreshold,
+		RecompactDisable: *recompactDisable,
 	}
 }

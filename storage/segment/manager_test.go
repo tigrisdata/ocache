@@ -11,6 +11,64 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 )
 
+func TestManager_CurrentOpenSegmentTracking(t *testing.T) {
+	basePath := t.TempDir()
+	segmentSize := int64(1024 * 1024)
+
+	_ = fd.NewFdCache(100)
+
+	manager, err := NewManager(basePath, segmentSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	// Initially, no open segments should exist
+	if len(manager.GetOpenSegments()) != 0 {
+		t.Error("Expected no open segments initially")
+	}
+
+	// Acquire an open segment
+	seg1, err := manager.AcquireOpenSegmentWithReservation("test", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify it's tracked in open segments
+	openSegs := manager.GetOpenSegments()
+	if len(openSegs) != 1 || openSegs[0] != seg1 {
+		t.Error("Expected seg1 to be the only open segment")
+	}
+
+	// Finalize the segment
+	err = manager.FinalizeSegment(seg1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// After finalization, no open segments should exist
+	if len(manager.GetOpenSegments()) != 0 {
+		t.Error("Expected no open segments after finalization")
+	}
+
+	// Acquire another segment
+	seg2, err := manager.AcquireOpenSegmentWithReservation("test", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the new segment is tracked
+	openSegs = manager.GetOpenSegments()
+	if len(openSegs) != 1 || openSegs[0] != seg2 {
+		t.Error("Expected seg2 to be the only open segment")
+	}
+
+	// Verify seg1 and seg2 are different
+	if seg1 == seg2 {
+		t.Error("Expected different segments after finalization")
+	}
+}
+
 func TestNewSegment(t *testing.T) {
 	path := "/test/segment.seg"
 	entries := uint32(10)
@@ -163,7 +221,7 @@ func TestManager_AcquireOpenSegment(t *testing.T) {
 	defer manager.Close()
 
 	needed := int64(1024)
-	seg, err := manager.AcquireOpenSegment(needed)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", needed)
 	if err != nil {
 		t.Fatalf("AcquireOpenSegment failed: %v", err)
 	}
@@ -193,7 +251,7 @@ func TestManager_WriteEntry(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +307,7 @@ func TestManager_SyncSegment(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,7 +330,7 @@ func TestManager_FinalizeSegment(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +396,7 @@ func TestManager_ReadValue(t *testing.T) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -736,7 +794,7 @@ func TestManager_Close(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -768,7 +826,7 @@ func BenchmarkManager_WriteEntry(b *testing.B) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -806,7 +864,7 @@ func BenchmarkManager_ReadValue(b *testing.B) {
 	}
 	defer manager.Close()
 
-	seg, err := manager.AcquireOpenSegment(1024)
+	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
 	if err != nil {
 		b.Fatal(err)
 	}

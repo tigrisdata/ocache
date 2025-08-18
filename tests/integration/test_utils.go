@@ -81,15 +81,15 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 	}
 
 	// Initialize storage
-	storage.InitStorage(
-		tmpDir,
-		0, // TTL (will be set per object)
-		int(config.InlineThreshold),
-		config.CompactThreshold,
-		config.SegmentSize,
-		config.FDCacheSize,
-		config.MaxDiskUsage,
-	)
+	storage.InitStorageWithConfig(&storage.StorageConfig{
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  int(config.InlineThreshold),
+		CompactThreshold: config.CompactThreshold,
+		SegmentSize:      config.SegmentSize,
+		FdCacheSize:      config.FDCacheSize,
+		MaxDiskUsage:     config.MaxDiskUsage,
+	})
 
 	s := storage.GetStorage()
 	require.NotNil(t, s)

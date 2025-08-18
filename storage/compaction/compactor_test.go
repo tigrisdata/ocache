@@ -166,7 +166,7 @@ func TestEnsureCapacity(t *testing.T) {
 	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
 
 	// Get initial segment
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 	require.NotNil(t, seg)
 
@@ -175,12 +175,12 @@ func TestEnsureCapacity(t *testing.T) {
 
 	// Test 1: When segment has enough capacity
 	ctx := context.Background()
-	err = c.ensureCapacity(ctx, &seg, 100)
+	err = c.ensureCapacity(ctx, &seg, "test", 100)
 	assert.NoError(t, err)
 	assert.Equal(t, initialPath, seg.Path()) // Same segment
 
 	// Test 2: When segment needs rotation
-	err = c.ensureCapacity(ctx, &seg, initialRemaining+1)
+	err = c.ensureCapacity(ctx, &seg, "test", initialRemaining+1)
 	assert.NoError(t, err)
 	assert.NotEqual(t, initialPath, seg.Path()) // New segment
 }
@@ -204,7 +204,7 @@ func TestCopyFileIntoSegment(t *testing.T) {
 	defer f.Close()
 
 	// Get a segment
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 
 	// Prepare value message
@@ -245,7 +245,7 @@ func TestCommit(t *testing.T) {
 	}
 
 	// Get a segment
-	seg, err := sm.AcquireOpenSegment(0)
+	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 
 	// Create write batch

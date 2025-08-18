@@ -22,7 +22,15 @@ func TestTTLCleanup(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Initialize storage with short cleanup interval for testing
-	InitStorage(tmpDir, 0, 100, 1024*1024, 256*1024*1024, 100, 0)
+	InitStorageWithConfig(&StorageConfig{
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  100,
+		CompactThreshold: 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		FdCacheSize:      100,
+		MaxDiskUsage:     0,
+	})
 	defer CloseStorage()
 
 	s := GetStorage()
@@ -80,7 +88,15 @@ func TestLRUEviction(t *testing.T) {
 
 	// Initialize storage with disk usage limit
 	maxDiskUsage := int64(1000) // 1KB limit
-	InitStorage(tmpDir, 0, 100, 1024*1024, 256*1024*1024, 100, maxDiskUsage)
+	InitStorageWithConfig(&StorageConfig{
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  100,
+		CompactThreshold: 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		FdCacheSize:      100,
+		MaxDiskUsage:     maxDiskUsage,
+	})
 	defer CloseStorage()
 
 	s := GetStorage()
@@ -179,7 +195,15 @@ func TestDiskUsageTracking(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Initialize storage with short cleanup interval for testing
-	InitStorage(tmpDir, 0, 100, 1024*1024, 256*1024*1024, 100, 0)
+	InitStorageWithConfig(&StorageConfig{
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  100,
+		CompactThreshold: 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		FdCacheSize:      100,
+		MaxDiskUsage:     0,
+	})
 	defer CloseStorage()
 
 	s := GetStorage()

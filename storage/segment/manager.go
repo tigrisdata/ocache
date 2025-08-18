@@ -18,85 +18,19 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
-// Segment is a file on disk that contains key/value pairs.
-type Segment struct {
-	path string
-	size int64
-	file *os.File
-	mu   sync.RWMutex
-
-	// Statistics
-	entries   uint32 // number of key/value pairs stored in this segment
-	dataBytes int64  // total number of bytes occupied by value payloads (not counting headers)
-
-	// Format version of this segment (derived from footer when closed or set when created).
-	version int
-
-	// Maximum size of the segment.
-	maxSupportedSize int64
-}
-
-// Path returns the path of the segment.
-func (s *Segment) Path() string {
-	return s.path
-}
-
-// Remaining returns the remaining space in the segment.
-func (s *Segment) Remaining() int64 {
-	return s.maxSupportedSize - s.size
-}
-
-// SetOpenFile sets the open file for the segment.
-func (s *Segment) SetOpenFile(file *os.File) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.file = file
-}
-
-// GetSize returns the current size of data written to the segment.
-func (s *Segment) GetSize() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.size
-}
-
-// GetEntries returns the number of entries in the segment.
-func (s *Segment) GetEntries() uint32 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.entries
-}
-
-// HasOpenFile returns true if the segment has an open file.
-func (s *Segment) HasOpenFile() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.file != nil
-}
-
-// NewSegment creates a new segment with the given path and size.
-func NewSegment(path string, entries uint32, dataBytes int64, size int64, maxSupportedSize int64) *Segment {
-	return &Segment{path: path, entries: entries, dataBytes: dataBytes, size: size, version: CurrentSegmentVersion, maxSupportedSize: maxSupportedSize}
-}
-
 // Manager manages the segments on disk.
 type Manager struct {
 	segmentsPath string
 	segmentSize  int64
 	segments     []*Segment          // ordered list (oldest→newest)
 	segMap       map[string]*Segment // path → *Segment for O(1) lookup
+	openSegments []*Segment          // list of currently open segments for writing
 	mu           sync.RWMutex
 	fdCache      *fd.FdCache // descriptor cache for closed segments
 
 	// shutdown handling for background compaction goroutine
 	closeCh chan struct{}
 	wg      sync.WaitGroup
-}
-
-// Registry is implemented by segment managers that need to be informed when a
-// new segment file is created (e.g. after promotion from a raw file).
-type Registry interface {
-	RegisterSegment(path string, entries uint32, bytes int64)
 }
 
 // NewManager creates a new segment manager
@@ -114,6 +48,7 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 		segmentsPath: segmentsPath,
 		segmentSize:  segmentSize,
 		segMap:       make(map[string]*Segment),
+		openSegments: []*Segment{}, // Initialize as empty slice
 		closeCh:      make(chan struct{}),
 	}
 
@@ -152,13 +87,22 @@ func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int6
 	sm.mu.RUnlock()
 
 	if seg == nil {
+		// Segment has been removed (likely due to recompaction)
+		// Return a specific error that can be handled by the caller
 		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
 	// Acquire cached read-only descriptor via FdCache.
 	entry, err := sm.fdCache.Acquire(segPath)
 	if err != nil {
-		return nil, err
+		// If we can't acquire the FD, the segment might have been deleted
+		// This can happen if recompaction removed it between our segMap check and here
+		return nil, fmt.Errorf("failed to acquire segment fd: %w", err)
+	}
+
+	// Check if entry is nil (defensive check)
+	if entry == nil {
+		return nil, fmt.Errorf("nil file entry for segment: %s", segPath)
 	}
 
 	// Take shared read lock to protect against concurrent writers.
@@ -178,8 +122,9 @@ func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int6
 	}, nil
 }
 
-func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.ValueMessage) (int64, error) {
-	if vm.ValueType != pb.ValueType_RAW_FILE {
+// WriteEntryFromReader writes an entry to a segment from an io.Reader
+func (sm *Manager) WriteEntryFromReader(seg *Segment, userKey string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
+	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
 		return 0, utils.WrapError("invalid value type", userKey, nil)
 	}
 
@@ -194,7 +139,7 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 		Str("key", userKey).
 		Int64("valueLength", vm.ValueLength).
 		Str("segment", seg.path).
-		Msg("writing entry to segment")
+		Msg("writing entry to segment from reader")
 
 	// Acquire lock to ensure only one writer to the segment at a time.
 	seg.mu.Lock()
@@ -209,11 +154,6 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	// Offset where this value will be written inside the segment
 	startOffset := seg.size
 
-	// Reset file cursor
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, utils.WrapError("seek to start", userKey, err)
-	}
-
 	// Sequential write: header then payload
 	if _, err := seg.file.Write(header); err != nil {
 		return 0, utils.WrapError("failed to write value header", seg.path, err)
@@ -223,7 +163,7 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	buf, release := bufferpool.AcquireBuffer(64 * 1024) // 64KB buffer
 	defer release()
 
-	bytesWritten, err := io.CopyBuffer(seg.file, f, buf)
+	bytesWritten, err := io.CopyBuffer(seg.file, r, buf)
 	if err != nil {
 		return 0, utils.WrapError("copy value to segment", userKey, err)
 	}
@@ -246,25 +186,82 @@ func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.V
 	return startOffset, nil
 }
 
-// Returns an open segment (may create a new one)
-func (sm *Manager) AcquireOpenSegment(needed int64) (*Segment, error) {
-	// If no open segments, create a new one
-	if len(sm.segments) == 0 {
-		return sm.createNewSegment()
+func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.ValueMessage) (int64, error) {
+	// Reset file cursor
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, utils.WrapError("seek to start", userKey, err)
 	}
 
-	// Get the newest (currently writable) segment
-	lastSeg := sm.segments[len(sm.segments)-1]
+	// Use the reader-based implementation
+	return sm.WriteEntryFromReader(seg, userKey, f, vm)
+}
 
-	lastSeg.mu.RLock()
-	defer lastSeg.mu.RUnlock()
-
-	// If the segment is already finalized (file == nil) create a new one
-	if lastSeg.file == nil {
-		return sm.createNewSegment()
+// AcquireOpenSegmentWithReservation returns an open segment reserved for the caller
+// The callerID should be unique per goroutine/thread (e.g., "compactor", "recompactor-1")
+// The segment will be reserved exclusively for this caller until released
+func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int64) (*Segment, error) {
+	// Strict callerID validation
+	if callerID == "" {
+		return nil, fmt.Errorf("callerID cannot be empty")
 	}
 
-	return lastSeg, nil
+	// Always take write lock to simplify logic and prevent race conditions
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Look for an existing segment with enough space
+	for _, seg := range sm.openSegments {
+		seg.mu.RLock()
+		if seg.file != nil && seg.Remaining() >= needed {
+			// Check reservation status
+			if seg.reservedBy == "" || seg.reservedBy == callerID {
+				seg.mu.RUnlock()
+				// Try to reserve it
+				if seg.Reserve(callerID) {
+					return seg, nil
+				}
+				// Reservation failed - continue searching
+			} else {
+				seg.mu.RUnlock()
+			}
+		} else {
+			seg.mu.RUnlock()
+		}
+	}
+
+	// No suitable segment found, create a new one with atomic reservation
+	newSeg, err := sm.createNewSegmentWithReservationLocked(callerID)
+	if err != nil {
+		return nil, err
+	}
+
+	return newSeg, nil
+}
+
+// ReleaseSegment releases the reservation on a segment, making it available for other callers
+func (sm *Manager) ReleaseSegment(seg *Segment, callerID string) error {
+	if callerID == "" {
+		return fmt.Errorf("callerID cannot be empty")
+	}
+	if seg != nil {
+		seg.Release(callerID)
+	}
+	return nil
+}
+
+// ReleaseAllSegments releases all segments reserved by the given caller
+func (sm *Manager) ReleaseAllSegments(callerID string) error {
+	if callerID == "" {
+		return fmt.Errorf("callerID cannot be empty")
+	}
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	for _, seg := range sm.openSegments {
+		seg.Release(callerID)
+	}
+	return nil
 }
 
 // SyncSegment syncs the segment.
@@ -319,16 +316,30 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	// Clear pointer – closed segments will use fdCache for reads.
 	seg.file = nil
 
+	// Clear any reservation on this segment
+	seg.reservedBy = ""
+
+	// Clear from openSegments if this was an open segment
+	sm.mu.Lock()
+	for i, openSeg := range sm.openSegments {
+		if openSeg == seg {
+			// Remove from slice by replacing with last element and shrinking
+			sm.openSegments[i] = sm.openSegments[len(sm.openSegments)-1]
+			sm.openSegments = sm.openSegments[:len(sm.openSegments)-1]
+			break
+		}
+	}
+	sm.mu.Unlock()
+
 	zlog.Info().Str("path", seg.path).Msg("finished finalizing segment")
 
 	return nil
 }
 
-// createNewSegment creates a new segment file
-func (sm *Manager) createNewSegment() (*Segment, error) {
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-
+// createNewSegmentLocked creates a new segment file (assumes lock is held)
+// Deprecated: Use createNewSegmentWithReservationLocked for atomic creation and reservation
+func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
+	// Generate unique filename using timestamp
 	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
 
 	zlog.Info().Str("path", path).Msg("creating new segment")
@@ -349,6 +360,38 @@ func (sm *Manager) createNewSegment() (*Segment, error) {
 
 	sm.segments = append(sm.segments, segment)
 	sm.segMap[path] = segment
+	sm.openSegments = append(sm.openSegments, segment) // Add to open segments list
+
+	return segment, nil
+}
+
+// createNewSegmentWithReservationLocked creates a new segment and atomically reserves it for the caller
+// Must be called with write lock held
+func (sm *Manager) createNewSegmentWithReservationLocked(callerID string) (*Segment, error) {
+	// Generate unique filename using timestamp
+	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
+
+	zlog.Info().Str("path", path).Str("caller", callerID).Msg("creating new segment with reservation")
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, utils.WrapError("failed to create segment file", path, err)
+	}
+
+	// Pre-allocate file to configured segment size
+	if err := file.Truncate(sm.segmentSize); err != nil {
+		file.Close()
+		return nil, utils.WrapError("truncate segment file", path, err)
+	}
+
+	// Create segment with atomic reservation
+	segment := NewSegmentWithReservation(path, 0, 0, 0, sm.segmentSize, callerID)
+	segment.SetOpenFile(file)
+
+	sm.segments = append(sm.segments, segment)
+	sm.segMap[path] = segment
+	sm.openSegments = append(sm.openSegments, segment) // Add to open segments list
+
 	return segment, nil
 }
 
@@ -437,6 +480,14 @@ func (sm *Manager) loadSegments() error {
 	}
 
 	zlog.Info().Str("path", sm.segmentsPath).Msg("finished finalizing open segments")
+
+	// Keep all remaining open segments in the openSegments list
+	if len(openSegs) > 0 {
+		// The remaining open segment(s) after finalization
+		for _, seg := range openSegs[len(openSegs)-1:] {
+			sm.openSegments = append(sm.openSegments, seg)
+		}
+	}
 
 	return nil
 }
@@ -548,11 +599,55 @@ func (sm *Manager) GetSegments() []*Segment {
 	return result
 }
 
+// GetOpenSegments returns all currently open segments (for testing/debugging)
+func (sm *Manager) GetOpenSegments() []*Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	// Return a copy to prevent external modification
+	result := make([]*Segment, len(sm.openSegments))
+	copy(result, sm.openSegments)
+	return result
+}
+
 // GetSegmentCount returns the number of segments currently managed.
 func (sm *Manager) GetSegmentCount() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.segments)
+}
+
+// GetFragmentationRatio calculates the fragmentation ratio for a segment
+// Returns the ratio of dead space to total segment size (0.0 to 1.0)
+func (sm *Manager) GetFragmentationRatio(segmentPath string, deletedBytes int64) float64 {
+	sm.mu.RLock()
+	seg, exists := sm.segMap[segmentPath]
+	sm.mu.RUnlock()
+
+	if !exists || seg == nil {
+		return 0.0
+	}
+
+	// Get the actual size of the segment
+	segmentSize := seg.GetSize()
+	if segmentSize == 0 {
+		return 0.0
+	}
+
+	// Calculate fragmentation as ratio of deleted bytes to total size
+	return float64(deletedBytes) / float64(segmentSize)
+}
+
+// IsSegmentFragmented checks if a segment exceeds the fragmentation threshold
+func (sm *Manager) IsSegmentFragmented(segmentPath string, deletedBytes int64, threshold float64) bool {
+	return sm.GetFragmentationRatio(segmentPath, deletedBytes) > threshold
+}
+
+// GetSegmentByPath returns a segment by its path
+func (sm *Manager) GetSegmentByPath(path string) *Segment {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.segMap[path]
 }
 
 // Close closes all segment files
@@ -588,4 +683,47 @@ func (rc *readCloserWithOnClose) Close() error {
 		rc.onClose()
 	}
 	return nil
+}
+
+// RemoveSegment removes a segment from the manager's tracking
+// This should be called when a segment is being deleted permanently
+// Returns the removed segment if found, nil otherwise
+func (sm *Manager) RemoveSegment(segmentPath string) *Segment {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Get the segment before removing
+	removedSeg := sm.segMap[segmentPath]
+
+	// Remove from segMap
+	delete(sm.segMap, segmentPath)
+
+	// Remove from segments slice
+	for i, seg := range sm.segments {
+		if seg.Path() == segmentPath {
+			// Remove by swapping with last element and truncating
+			sm.segments[i] = sm.segments[len(sm.segments)-1]
+			sm.segments = sm.segments[:len(sm.segments)-1]
+			break
+		}
+	}
+
+	// Remove from openSegments if present
+	for i, seg := range sm.openSegments {
+		if seg != nil && seg.Path() == segmentPath {
+			sm.openSegments[i] = sm.openSegments[len(sm.openSegments)-1]
+			sm.openSegments = sm.openSegments[:len(sm.openSegments)-1]
+			break
+		}
+	}
+
+	// Remove from fdCache - this removes from cache but doesn't close active file descriptors
+	// Active readers can continue using their references
+	sm.fdCache.Remove(segmentPath)
+
+	if removedSeg != nil {
+		zlog.Debug().Str("path", segmentPath).Msg("segment removed from manager")
+	}
+
+	return removedSeg
 }
