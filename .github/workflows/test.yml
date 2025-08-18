@@ -112,8 +112,20 @@ jobs:
             coverage.out
             coverage.html
 
-      - name: Run integration tests
-        run: STATIC_BUILD=true make test-integration
+      - name: Run integration tests - Small objects
+        run: STATIC_BUILD=true make test-integration-small
+
+      - name: Run integration tests - Medium objects
+        run: STATIC_BUILD=true make test-integration-medium
+
+      - name: Run integration tests - Large objects
+        run: STATIC_BUILD=true make test-integration-large
+
+      - name: Run integration tests - Compaction
+        run: STATIC_BUILD=true make test-integration-compaction
+
+      - name: Run integration tests - Workflow
+        run: STATIC_BUILD=true make test-integration-workflow
 
       - name: Run end-to-end tests
         run: STATIC_BUILD=true make test-e2e
