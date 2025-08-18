@@ -255,15 +255,6 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 			Msg("recompactor: failed to release segment")
 	}
 
-	// CRITICAL: Remove old segment from manager's tracking BEFORE committing metadata
-	// This ensures no new reads can start on the old segment after metadata points to new segment
-	removedSeg := sr.sm.RemoveSegment(oldSeg.Path())
-	if removedSeg == nil {
-		// Segment was already removed, possibly by another process
-		zlog.Warn().Str("path", oldSeg.Path()).
-			Msg("recompactor: segment already removed from manager")
-	}
-
 	// Now commit metadata updates - readers will only see the new segment
 	if wb.Count() > 0 {
 		wo := grocksdb.NewDefaultWriteOptions()
@@ -274,9 +265,17 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 			zlog.Error().Err(err).
 				Str("oldSegment", oldSeg.Path()).
 				Str("newSegment", newSeg.Path()).
-				Msg("recompactor: CRITICAL - failed to commit metadata after removing segment from manager")
+				Msg("recompactor: failed to commit metadata")
 			return fmt.Errorf("failed to commit metadata updates: %w", err)
 		}
+	}
+
+	// This ensures no new reads can start on the old segment after metadata points to new segment
+	removedSeg := sr.sm.RemoveSegment(oldSeg.Path())
+	if removedSeg == nil {
+		// Segment was already removed, possibly by another process
+		zlog.Warn().Str("path", oldSeg.Path()).
+			Msg("recompactor: segment already removed from manager")
 	}
 
 	// Queue old segment for deletion - it's safe now as no readers can access it
