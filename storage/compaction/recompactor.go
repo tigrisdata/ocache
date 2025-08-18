@@ -167,6 +167,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	if err != nil {
 		return fmt.Errorf("failed to acquire new segment: %w", err)
 	}
+	// Release the segment so it can be used by others
 	// Use a pointer to ensure we release the final segment, not the initial one
 	defer func() {
 		if newSeg != nil {
@@ -247,12 +248,6 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	if copiedEntries == 0 {
 		zlog.Info().Str("segment", oldSeg.Path()).
 			Msg("recompactor: no live entries found")
-	}
-
-	// Release the segment so it can be used by others
-	if err := sr.sm.ReleaseSegment(newSeg, callerID); err != nil {
-		zlog.Error().Err(err).Str("callerID", callerID).
-			Msg("recompactor: failed to release segment")
 	}
 
 	// Now commit metadata updates - readers will only see the new segment
