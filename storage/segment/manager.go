@@ -717,9 +717,9 @@ func (sm *Manager) RemoveSegment(segmentPath string) *Segment {
 		}
 	}
 
-	// Remove from fdCache and FileLockManager - this will close any open file descriptors
-	// Use CleanUp instead of Remove to also remove the file lock
-	sm.fdCache.CleanUp(segmentPath)
+	// Remove from fdCache - this removes from cache but doesn't close active file descriptors
+	// Active readers can continue using their references
+	sm.fdCache.Remove(segmentPath)
 
 	if removedSeg != nil {
 		zlog.Debug().Str("path", segmentPath).Msg("segment removed from manager")
