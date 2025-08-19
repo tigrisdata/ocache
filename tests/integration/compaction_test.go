@@ -1057,45 +1057,62 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	// The threshold is 50% by default
 	// Test edge cases around this threshold
 
-	// Create segments
-	numObjects := 60
-	keys := make([]string, numObjects)
+	// Strategy: Create objects in batches to ensure they end up in different segments
+	// With 2MB segments and 100KB objects, we can fit ~20 objects per segment
 	objectSize := int64(100 * 1024) // 100KB
+	objectsPerSegment := 18 // Leave some room for overhead
+	numSegments := 3
+	numObjects := objectsPerSegment * numSegments // 54 objects
+	keys := make([]string, numObjects)
 
-	t.Log("Creating initial segments")
-	for i := 0; i < numObjects; i++ {
-		key := fmt.Sprintf("threshold-test-%d", i)
-		keys[i] = key
-		data := GenerateRandomData(objectSize)
-		err := s.Harness.PutObject(key, data, 0)
-		require.NoError(t, err)
+	t.Logf("Creating %d objects across %d segments", numObjects, numSegments)
+	
+	// Write objects in batches to ensure segment distribution
+	for seg := 0; seg < numSegments; seg++ {
+		t.Logf("Writing batch %d to create segment %d", seg+1, seg+1)
+		for i := 0; i < objectsPerSegment; i++ {
+			idx := seg*objectsPerSegment + i
+			key := fmt.Sprintf("threshold-test-%d", idx)
+			keys[idx] = key
+			data := GenerateRandomData(objectSize)
+			err := s.Harness.PutObject(key, data, 0)
+			require.NoError(t, err)
+		}
+		// Small delay between batches to help ensure segment separation
+		if seg < numSegments-1 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
 	// Wait for initial compaction to complete
 	// Files should be migrated to segments
+	t.Log("Waiting for initial compaction...")
 	time.Sleep(3 * time.Second)
 
-	// Force segment finalization by writing enough data to fill current segment
-	// and start a new one. This ensures old segments are closed.
-	t.Log("Writing additional data to force segment rotation")
-	segmentSize := config.SegmentSize // 2MB
-	// Write enough to ensure we rotate to a new segment
-	numExtraObjects := int(segmentSize/(100*1024)) + 5 // Enough to fill current + start new
-	for i := 0; i < numExtraObjects; i++ {
+	// Force segment finalization by writing a batch of objects that will go into a new segment
+	// These will all be deleted later to test segment removal during recompaction
+	t.Log("Writing rotation-trigger objects to force segment rotation")
+	numRotationObjects := 20 // These will all go into the same segment
+	rotationKeys := make([]string, numRotationObjects)
+	for i := 0; i < numRotationObjects; i++ {
 		key := fmt.Sprintf("rotation-trigger-%d", i)
+		rotationKeys[i] = key
 		data := GenerateRandomData(100 * 1024)
 		s.Harness.PutObject(key, data, 0)
 	}
 
 	// Wait for compaction to process these new files
+	t.Log("Waiting for rotation objects to be compacted...")
 	time.Sleep(3 * time.Second)
 
-	// Clean up the rotation trigger objects
-	for i := 0; i < numExtraObjects; i++ {
-		s.Harness.DeleteObject(fmt.Sprintf("rotation-trigger-%d", i))
+	// Delete all rotation trigger objects - this should create a fully fragmented segment
+	t.Log("Deleting all rotation-trigger objects to create fully fragmented segment")
+	for _, key := range rotationKeys {
+		s.Harness.DeleteObject(key)
 	}
 
-	// Wait for cleanup and recompaction of rotation objects
+	// Wait for recompaction to remove the fully fragmented segment
+	t.Log("Waiting for recompaction to remove fully fragmented segment...")
 	time.Sleep(5 * time.Second)
 
 	// Get baseline segment size after rotation objects are cleaned up
@@ -1106,17 +1123,49 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		info, _ := os.Stat(seg)
 		baselineSize += info.Size()
 	}
-	t.Logf("Baseline segment size (test data only): %d bytes", baselineSize)
+	t.Logf("Baseline: %d segments, total size: %d bytes", len(segmentsBaseline), baselineSize)
 
-	// Test 1: Delete 40% (below threshold - should NOT recompact)
-	t.Log("Test 1: Deleting 40% of objects (below threshold)")
-	deleteCount := int(float64(numObjects) * 0.4)
-	for i := 0; i < deleteCount; i++ {
-		s.Harness.DeleteObject(keys[i])
+	// Test 1: Delete objects to create different fragmentation levels per segment
+	// Delete different percentages from each segment to test threshold behavior
+	t.Log("Test 1: Creating varied fragmentation levels across segments")
+	
+	// Segment 0: Delete 30% (below threshold - should NOT recompact)
+	// Segment 1: Delete 45% (below threshold - should NOT recompact)  
+	// Segment 2: Delete 55% (above threshold - SHOULD recompact)
+	deletedIndices := make(map[int]bool)
+	
+	// Delete from segment 0 (30%)
+	seg0DeleteCount := int(float64(objectsPerSegment) * 0.30)
+	for i := 0; i < seg0DeleteCount; i++ {
+		idx := i
+		deletedIndices[idx] = true
+		s.Harness.DeleteObject(keys[idx])
 	}
+	
+	// Delete from segment 1 (45%)
+	seg1DeleteCount := int(float64(objectsPerSegment) * 0.45)
+	for i := 0; i < seg1DeleteCount; i++ {
+		idx := objectsPerSegment + i
+		deletedIndices[idx] = true
+		s.Harness.DeleteObject(keys[idx])
+	}
+	
+	// Delete from segment 2 (55%)
+	seg2DeleteCount := int(float64(objectsPerSegment) * 0.55)
+	for i := 0; i < seg2DeleteCount; i++ {
+		idx := 2*objectsPerSegment + i
+		deletedIndices[idx] = true
+		s.Harness.DeleteObject(keys[idx])
+	}
+	
+	totalDeleted := seg0DeleteCount + seg1DeleteCount + seg2DeleteCount
+	t.Logf("Deleted %d objects total (Seg0: %d/30%%, Seg1: %d/45%%, Seg2: %d/55%%)",
+		totalDeleted, seg0DeleteCount, seg1DeleteCount, seg2DeleteCount)
 
-	// Wait to see if recompaction happens (it shouldn't)
-	time.Sleep(3 * time.Second)
+	// Wait for recompaction to process
+	// Only segment 2 (with 55% fragmentation) should be recompacted
+	t.Log("Waiting for selective recompaction (only segments >50% fragmentation)...")
+	time.Sleep(5 * time.Second)
 
 	// Get segment info after first deletion batch
 	segmentsBefore, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
@@ -1125,16 +1174,41 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		info, _ := os.Stat(seg)
 		totalSizeBefore += info.Size()
 	}
-	t.Logf("Segment size after 40%% deletion (no recompaction expected): %d bytes", totalSizeBefore)
+	t.Logf("After varied deletions: %d segments, size: %d bytes", 
+		len(segmentsBefore), totalSizeBefore)
+	
+	// The size should be reduced somewhat due to segment 2 being recompacted
+	// but segments 0 and 1 should remain unchanged
+	t.Log("Note: Only segment with >50% fragmentation should have been recompacted")
 
-	// Test 2: Delete additional 20% (total 60% - above threshold)
-	t.Log("Test 2: Deleting additional 20% (total 60% - above threshold)")
-	additionalDelete := int(float64(numObjects) * 0.2)
-	for i := deleteCount; i < deleteCount+additionalDelete; i++ {
-		s.Harness.DeleteObject(keys[i])
+	// Test 2: Push remaining segments over threshold
+	// Delete more objects to push segments 0 and 1 over 50% threshold
+	t.Log("Test 2: Pushing remaining segments over 50% threshold")
+	
+	// Push segment 0 from 30% to 60% fragmentation
+	additionalSeg0 := int(float64(objectsPerSegment) * 0.30)
+	for i := seg0DeleteCount; i < seg0DeleteCount+additionalSeg0; i++ {
+		if i < objectsPerSegment {
+			idx := i
+			deletedIndices[idx] = true
+			s.Harness.DeleteObject(keys[idx])
+		}
 	}
+	
+	// Push segment 1 from 45% to 60% fragmentation
+	additionalSeg1 := int(float64(objectsPerSegment) * 0.15)
+	for i := seg1DeleteCount; i < seg1DeleteCount+additionalSeg1; i++ {
+		if i < objectsPerSegment {
+			idx := objectsPerSegment + i
+			deletedIndices[idx] = true
+			s.Harness.DeleteObject(keys[idx])
+		}
+	}
+	
+	t.Logf("Pushed segments over threshold (Seg0: 60%%, Seg1: 60%%, Seg2: already recompacted)")
 
-	// Now recompaction should trigger
+	// Now all segments should be recompacted as they're all >50% fragmentation
+	t.Log("Waiting for recompaction of remaining segments...")
 	time.Sleep(5 * time.Second)
 
 	// Check if recompaction occurred
@@ -1145,26 +1219,37 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		totalSizeAfter += info.Size()
 	}
 
-	t.Logf("Segment sizes - Baseline: %d bytes, After 40%% del: %d bytes, After recompaction: %d bytes",
+	t.Logf("Final state: %d segments, size: %d bytes", len(segmentsAfter), totalSizeAfter)
+	t.Logf("Size progression - Baseline: %d bytes, After 40%%: %d bytes, After 60%%+recompaction: %d bytes",
 		baselineSize, totalSizeBefore, totalSizeAfter)
 
-	// Size should be significantly reduced from baseline after recompaction
-	// We deleted 60% of data, so expect roughly 40% + overhead remaining
-	// However, due to segment structure overhead, fragmentation during recompaction,
-	// and the fact that not all segments may be recompacted, we need to be more lenient.
-	// Allow for up to 80% of baseline size to account for these factors
-	expectedMaxSize := baselineSize * 80 / 100
+	// Size should be significantly reduced after all recompactions
+	// We have about 40% of data remaining
+	// Allow up to 52% of baseline to account for segment overhead and metadata
+	expectedMaxSize := baselineSize * 52 / 100
 	require.Less(t, totalSizeAfter, expectedMaxSize,
-		fmt.Sprintf("Segment size should be reduced after recompaction (baseline: %d, after: %d, max expected: %d)",
+		fmt.Sprintf("Segment size should be significantly reduced after full recompaction (baseline: %d, after: %d, max expected: %d)",
 			baselineSize, totalSizeAfter, expectedMaxSize))
+	
+	// Also verify that recompaction actually happened (size should be less than before)
+	require.Less(t, totalSizeAfter, totalSizeBefore,
+		"Size should decrease after recompaction at 60% fragmentation")
 
-	// Verify remaining data
-	remainingKeys := keys[deleteCount+additionalDelete:]
-	for _, key := range remainingKeys {
-		data, err := s.Harness.GetObject(key)
-		require.NoError(t, err)
-		require.Equal(t, int(objectSize), len(data))
+	// Verify remaining data (40% of objects should still be accessible)
+	t.Log("Verifying remaining data integrity...")
+	verifiedCount := 0
+	for idx, key := range keys {
+		if !deletedIndices[idx] {
+			data, err := s.Harness.GetObject(key)
+			require.NoError(t, err, "Failed to get key: %s", key)
+			require.Equal(t, int(objectSize), len(data), "Data size mismatch for key: %s", key)
+			verifiedCount++
+		}
 	}
+	t.Logf("Successfully verified %d remaining objects", verifiedCount)
+	expectedRemaining := numObjects - len(deletedIndices)
+	require.Equal(t, expectedRemaining, verifiedCount, 
+		"Number of remaining objects should match expected")
 }
 
 // Test_SegmentRecompaction_Recovery tests that recompaction handles errors gracefully
