@@ -174,7 +174,7 @@ func (sm *Manager) WriteEntryFromReader(seg *Segment, userKey string, r io.Reade
 	}
 
 	seg.size += needed
-	seg.entries++
+	seg.numEntries++
 	seg.dataBytes += vm.ValueLength
 
 	zlog.Debug().
@@ -238,17 +238,6 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 	return newSeg, nil
 }
 
-// ReleaseSegment releases the reservation on a segment, making it available for other callers
-func (sm *Manager) ReleaseSegment(seg *Segment, callerID string) error {
-	if callerID == "" {
-		return fmt.Errorf("callerID cannot be empty")
-	}
-	if seg != nil {
-		seg.Release(callerID)
-	}
-	return nil
-}
-
 // ReleaseAllSegments releases all segments reserved by the given caller
 func (sm *Manager) ReleaseAllSegments(callerID string) error {
 	if callerID == "" {
@@ -264,67 +253,15 @@ func (sm *Manager) ReleaseAllSegments(callerID string) error {
 	return nil
 }
 
-// SyncSegment syncs the segment.
-func (sm *Manager) SyncSegment(seg *Segment) error {
-	seg.mu.RLock()
-	defer seg.mu.RUnlock()
-
-	if seg.file == nil {
-		return nil
-	}
-
-	// Flush file contents to disk
-	err := seg.file.Sync()
-	if err != nil {
-		return utils.WrapError("failed to sync current segment", seg.path, err)
-	}
-	return nil
-}
-
 // FinalizeSegment writes a footer to the segment file and closes it so that no
 // further writes are possible.
 func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	zlog.Info().Str("path", seg.path).Msg("finalizing segment")
 
 	// First finalize the segment under its lock
-	seg.mu.Lock()
-	if seg.file == nil {
-		seg.mu.Unlock()
-		return nil // already closed
+	if err := seg.Finalize(); err != nil {
+		return err
 	}
-
-	// Build footer [magic|entries|bytes]
-	footer := BuildSegmentFooterWithVersion(seg.version, seg.entries, seg.dataBytes)
-
-	if _, err := seg.file.Write(footer); err != nil {
-		seg.mu.Unlock()
-		return utils.WrapError("failed to write segment footer", seg.path, err)
-	}
-	seg.size += int64(len(footer))
-	// Shrink pre-allocated file to actual used size
-	if err := seg.file.Truncate(seg.size); err != nil {
-		seg.mu.Unlock()
-		return utils.WrapError("truncate segment", seg.path, err)
-	}
-
-	// Flush and close the R/W file descriptor
-	if err := seg.file.Sync(); err != nil {
-		seg.mu.Unlock()
-		return utils.WrapError("failed to sync segment", seg.path, err)
-	}
-	if err := seg.file.Close(); err != nil {
-		seg.mu.Unlock()
-		return utils.WrapError("failed to close segment", seg.path, err)
-	}
-
-	// Clear pointer – closed segments will use fdCache for reads.
-	seg.file = nil
-
-	// Clear any reservation on this segment
-	seg.reservedBy = ""
-
-	// Release the segment lock before acquiring manager lock to prevent deadlock
-	seg.mu.Unlock()
 
 	// Clear from openSegments if this was an open segment
 	sm.mu.Lock()
@@ -341,35 +278,6 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	zlog.Info().Str("path", seg.path).Msg("finished finalizing segment")
 
 	return nil
-}
-
-// createNewSegmentLocked creates a new segment file (assumes lock is held)
-// Deprecated: Use createNewSegmentWithReservationLocked for atomic creation and reservation
-func (sm *Manager) createNewSegmentLocked() (*Segment, error) {
-	// Generate unique filename using timestamp
-	path := filepath.Join(sm.segmentsPath, fmt.Sprintf("segment_%d.seg", time.Now().UnixNano()))
-
-	zlog.Info().Str("path", path).Msg("creating new segment")
-
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return nil, utils.WrapError("failed to create segment file", path, err)
-	}
-
-	// Pre-allocate file to configured segment size
-	if err := file.Truncate(sm.segmentSize); err != nil {
-		file.Close()
-		return nil, utils.WrapError("truncate segment file", path, err)
-	}
-
-	segment := NewSegment(path, 0, 0, 0, sm.segmentSize)
-	segment.SetOpenFile(file)
-
-	sm.segments = append(sm.segments, segment)
-	sm.segMap[path] = segment
-	sm.openSegments = append(sm.openSegments, segment) // Add to open segments list
-
-	return segment, nil
 }
 
 // createNewSegmentWithReservationLocked creates a new segment and atomically reserves it for the caller
@@ -443,7 +351,7 @@ func (sm *Manager) loadSegments() error {
 				if ver, ent, bytes, ok := ParseSegmentFooter(footer); ok {
 					// Closed / finalized segment
 					segment.version = ver
-					segment.entries = ent
+					segment.numEntries = ent
 					segment.dataBytes = bytes
 
 					// Closed segment – we don't keep a cached descriptor; rely on fdCache.
@@ -504,10 +412,6 @@ func (sm *Manager) loadSegments() error {
 func (sm *Manager) validateOpenSegment(seg *Segment) error {
 	zlog.Info().Str("path", seg.path).Msg("validating open segment")
 
-	pos := int64(0)
-	entries := uint32(0)
-	dataBytes := int64(0)
-
 	// Seek to beginning to start validation
 	if _, err := seg.file.Seek(0, io.SeekStart); err != nil {
 		return utils.WrapError("seek to start for validation", seg.path, err)
@@ -520,42 +424,57 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 	}
 	actualFileSize := fileInfo.Size()
 
+	// Create an iterator to scan through the segment
+	iter, err := seg.NewIterator(seg.file)
+	if err != nil {
+		return utils.WrapError("create iterator for validation", seg.path, err)
+	}
+
+	entries := uint32(0)
+	dataBytes := int64(0)
+	lastValidPos := int64(0)
+
 	for {
-		// Read header at current position
-		valLen, headerSize, keyLen, _, checksum, err := ReadValueHeaderAt(seg.file, pos)
+		currentPos := iter.CurrentPosition()
+
+		// Get the next entry
+		entry, err := iter.Next()
 		if err != nil {
 			// EOF or read error means we've reached the end of valid data
-			if err := seg.file.Truncate(pos); err != nil {
+			if err := seg.file.Truncate(currentPos); err != nil {
 				return utils.WrapError("truncate at read error", seg.path, err)
 			}
+			lastValidPos = currentPos
 			break
 		}
 
 		// Check that header values are reasonable
-		if valLen < 0 || keyLen < 0 {
-			if err := seg.file.Truncate(pos); err != nil {
+		if entry.ValueLength < 0 || len(entry.Key) < 0 {
+			if err := seg.file.Truncate(currentPos); err != nil {
 				return utils.WrapError("truncate invalid header", seg.path, err)
 			}
+			lastValidPos = currentPos
 			break
 		}
 
-		entryTotal := headerSize + valLen
-		nextPos := pos + entryTotal
+		entryTotal := entry.HeaderSize + entry.ValueLength
+		nextPos := currentPos + entryTotal
 
 		// Ensure we have full entry in file
 		if nextPos > actualFileSize {
-			if err := seg.file.Truncate(pos); err != nil {
+			if err := seg.file.Truncate(currentPos); err != nil {
 				return utils.WrapError("truncate partial entry", seg.path, err)
 			}
+			lastValidPos = currentPos
 			break
 		}
 
 		// Checksum validation when header contains non-zero checksum.
-		if checksum != 0 {
-			valueOffset := pos + headerSize // pos is entry start offset
+		if entry.Checksum != 0 {
+			valueOffset := currentPos + entry.HeaderSize // currentPos is entry start offset
 
 			h := crc32.NewIEEE()
-			section := io.NewSectionReader(seg.file, valueOffset, valLen)
+			section := io.NewSectionReader(seg.file, valueOffset, entry.ValueLength)
 
 			buf, releaseBuf := bufferpool.AcquireBuffer(64 * 1024)
 			if _, err := io.CopyBuffer(h, section, buf); err != nil {
@@ -564,30 +483,31 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 			}
 			releaseBuf()
 
-			if h.Sum32() != checksum {
-				zlog.Warn().Str("segment", seg.path).Int64("offset", pos).Msg("checksum mismatch – truncating segment")
-				if err := seg.file.Truncate(pos); err != nil {
+			if h.Sum32() != entry.Checksum {
+				zlog.Warn().Str("segment", seg.path).Int64("offset", currentPos).Msg("checksum mismatch – truncating segment")
+				if err := seg.file.Truncate(currentPos); err != nil {
 					return utils.WrapError("truncate after checksum mismatch", seg.path, err)
 				}
+				lastValidPos = currentPos
 				break
 			}
 		}
 
 		// Entry seems valid – advance
 		entries++
-		dataBytes += valLen
-		pos = nextPos
+		dataBytes += entry.ValueLength
+		lastValidPos = iter.CurrentPosition()
 	}
 
-	zlog.Info().Str("path", seg.path).Int64("valid_data_size", pos).Int64("maxSupportedSize", seg.maxSupportedSize).Msg("finished validating open segment")
+	zlog.Info().Str("path", seg.path).Int64("valid_data_size", lastValidPos).Int64("maxSupportedSize", seg.maxSupportedSize).Msg("finished validating open segment")
 
 	// Update segment struct
-	seg.entries = entries
+	seg.numEntries = entries
 	seg.dataBytes = dataBytes
-	seg.size = pos // This tracks actual data written, not pre-allocated file size
+	seg.size = lastValidPos // This tracks actual data written, not pre-allocated file size
 
 	// Seek file to end for further writes
-	if _, err := seg.file.Seek(pos, io.SeekStart); err != nil {
+	if _, err := seg.file.Seek(lastValidPos, io.SeekStart); err != nil {
 		return utils.WrapError("seek to end", seg.path, err)
 	}
 

@@ -266,7 +266,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 	// Use a closure to ensure we release the final segment, not the initial one
 	defer func() {
 		if seg != nil {
-			if err := c.sm.ReleaseSegment(seg, compactorCallerID); err != nil {
+			if err := seg.Release(compactorCallerID); err != nil {
 				zlog.Error().Err(err).Str("callerID", compactorCallerID).Msg("failed to release segment")
 			}
 		}
@@ -585,7 +585,7 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 	}
 
 	// Persist segment first so that metadata can safely reference it.
-	if err := c.sm.SyncSegment(seg); err != nil {
+	if err := seg.Sync(); err != nil {
 		return err
 	}
 
@@ -615,7 +615,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 	}
 
 	// Now safe to release since it's finalized
-	if err := c.sm.ReleaseSegment(*seg, callerID); err != nil {
+	if err := (*seg).Release(callerID); err != nil {
 		zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
 	}
 
