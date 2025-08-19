@@ -35,6 +35,7 @@ make all
 - [Configuration](docs/configuration.md) - Server flags and tuning
 - [Testing Guide](docs/testing.md) - Running and writing tests
 - [Static Builds](docs/static_build.md) - Production deployment
+- [Benchmark Guide](docs/benchmark.md) - Running benchmarks
 
 ## Basic Usage
 
