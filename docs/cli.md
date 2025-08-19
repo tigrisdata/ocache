@@ -70,6 +70,7 @@ Retrieve a value by its key.
 ```
 
 **Output:**
+
 - Returns the stored value if found
 - Returns error message if key doesn't exist
 
@@ -110,70 +111,9 @@ List all keys currently stored in the cache.
 ```
 
 **Output:**
+
 - Returns a list of all cache keys
 - Empty list if no keys exist
-
-### bench - Run benchmarks
-
-Run performance benchmarks against the cache service.
-
-```bash
-./ocachecli bench [options]
-```
-
-**Options:**
-
-- `--concurrency value`: Number of concurrent workers (default: 8)
-- `--num-keys value`: Number of unique keys (default: 1000)
-- `--num-ops value`: Total number of operations (default: 10000)
-- `--value-size value`: Value size in bytes (default: 100)
-- `--workload value`: Workload type or custom mix (default: "A")
-
-**Workload Types:**
-
-| Type | Description | Read % | Update % | Insert % | RMW % |
-|------|-------------|--------|----------|----------|-------|
-| A | Update heavy | 50 | 50 | 0 | 0 |
-| B | Read mostly | 95 | 5 | 0 | 0 |
-| C | Read only | 100 | 0 | 0 | 0 |
-| D | Read latest | 95 | 0 | 5 | 0 |
-| F | Read-modify-write | 50 | 0 | 0 | 50 |
-| Custom | User defined | Specify as `read=70,update=30` |
-
-**Examples:**
-
-```bash
-# Run default benchmark (Workload A)
-./ocachecli bench
-
-# Run read-heavy benchmark with more operations
-./ocachecli bench --workload B --num-ops 100000
-
-# Run with custom workload mix
-./ocachecli bench --workload "read=70,update=20,insert=10"
-
-# High concurrency test
-./ocachecli bench --concurrency 50 --num-keys 10000
-
-# Large value test
-./ocachecli bench --value-size 10240 --num-ops 1000
-
-# Comprehensive benchmark
-./ocachecli bench \
-  --workload B \
-  --concurrency 16 \
-  --num-keys 5000 \
-  --num-ops 50000 \
-  --value-size 1024
-```
-
-**Output:**
-The benchmark command provides detailed statistics including:
-- Total operations completed
-- Operations per second (throughput)
-- Latency percentiles (p50, p95, p99)
-- Operation breakdown by type
-- Error count (if any)
 
 ## Advanced Usage
 
@@ -222,12 +162,14 @@ echo "Cache contains $count keys"
 ## Error Handling
 
 The CLI client returns appropriate exit codes:
+
 - `0`: Success
 - `1`: General error
 - `2`: Connection error
 - `3`: Invalid arguments
 
 Common error messages:
+
 - `connection refused`: Server is not running or wrong address
 - `key not found`: Attempting to get a non-existent key
 - `invalid argument`: Malformed command or options
