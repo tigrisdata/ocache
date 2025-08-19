@@ -167,6 +167,84 @@ Run performance benchmarks against the cache service.
   --value-size 1024
 ```
 
+**Benchmark Examples by Object Size:**
+
+```bash
+# Small objects (100 bytes) - Tests RocksDB inline storage
+# Good for testing metadata, cache keys, session tokens
+./ocachecli bench \
+  --value-size 100 \
+  --num-keys 10000 \
+  --num-ops 100000 \
+  --workload A \
+  --concurrency 16
+
+# Medium objects (100 KB) - Tests file-based storage with compaction
+# Good for testing user profiles, API responses, small images
+./ocachecli bench \
+  --value-size 102400 \
+  --num-keys 1000 \
+  --num-ops 10000 \
+  --workload B \
+  --concurrency 8
+
+# Large objects (1 MB) - Tests raw file storage without compaction
+# Good for testing documents, images, large datasets
+./ocachecli bench \
+  --value-size 1048576 \
+  --num-keys 100 \
+  --num-ops 1000 \
+  --workload C \
+  --concurrency 4
+
+# Mixed workload benchmark suite
+# Run all three sizes sequentially to test cache behavior across object sizes
+echo "=== Testing 100 byte objects (RocksDB) ==="
+./ocachecli bench --value-size 100 --num-keys 10000 --num-ops 50000 --workload A
+
+echo "=== Testing 100 KB objects (File storage with compaction) ==="
+./ocachecli bench --value-size 102400 --num-keys 500 --num-ops 5000 --workload B
+
+echo "=== Testing 1 MB objects (Raw file storage) ==="
+./ocachecli bench --value-size 1048576 --num-keys 50 --num-ops 500 --workload C
+```
+
+**Storage Strategy by Size:**
+- **< 64 KB**: Stored inline in RocksDB for fast access
+- **64 KB - 16 MB**: Initially stored as files, eligible for segment compaction
+- **> 16 MB**: Permanent raw file storage, never compacted
+
+**Performance Tuning Examples:**
+
+```bash
+# Test cache performance under memory pressure
+# Small objects with high concurrency
+./ocachecli bench \
+  --value-size 100 \
+  --num-keys 100000 \
+  --num-ops 1000000 \
+  --workload "read=80,update=20" \
+  --concurrency 32
+
+# Test disk I/O performance
+# Large objects with sequential access
+./ocachecli bench \
+  --value-size 1048576 \
+  --num-keys 100 \
+  --num-ops 1000 \
+  --workload D \
+  --concurrency 2
+
+# Test compaction behavior
+# Medium objects with mixed read/write
+./ocachecli bench \
+  --value-size 102400 \
+  --num-keys 2000 \
+  --num-ops 20000 \
+  --workload F \
+  --concurrency 8
+```
+
 **Output:**
 The benchmark command provides detailed statistics including:
 - Total operations completed
