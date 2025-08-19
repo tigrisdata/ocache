@@ -170,23 +170,19 @@ func (s *Segment) Finalize() error {
 	footer := BuildSegmentFooterWithVersion(s.version, s.numEntries, s.dataBytes)
 
 	if _, err := s.file.Write(footer); err != nil {
-		s.mu.Unlock()
 		return utils.WrapError("failed to write segment footer", s.path, err)
 	}
 	s.size += int64(len(footer))
 	// Shrink pre-allocated file to actual used size
 	if err := s.file.Truncate(s.size); err != nil {
-		s.mu.Unlock()
 		return utils.WrapError("truncate segment", s.path, err)
 	}
 
 	// Flush and close the R/W file descriptor
 	if err := s.file.Sync(); err != nil {
-		s.mu.Unlock()
 		return utils.WrapError("failed to sync segment", s.path, err)
 	}
 	if err := s.file.Close(); err != nil {
-		s.mu.Unlock()
 		return utils.WrapError("failed to close segment", s.path, err)
 	}
 
@@ -195,9 +191,6 @@ func (s *Segment) Finalize() error {
 
 	// Clear any reservation on this segment
 	s.reservedBy = ""
-
-	// Release the segment lock before acquiring manager lock to prevent deadlock
-	s.mu.Unlock()
 
 	return nil
 }
