@@ -618,7 +618,7 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 
 		// Verify the segment has the expected number of entries (approximately)
 		// Due to headers, the actual number might be slightly less than calculated
-		assert.GreaterOrEqual(t, int(firstSeg.GetEntries()), expectedEntries-1,
+		assert.GreaterOrEqual(t, int(firstSeg.GetNumEntries()), expectedEntries-1,
 			"First segment should have close to the expected number of entries")
 	}
 

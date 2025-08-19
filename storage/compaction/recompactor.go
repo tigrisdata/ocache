@@ -155,12 +155,6 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	}
 	defer oldFile.Close()
 
-	// Get file info for size
-	fileInfo, err := oldFile.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to stat segment %s: %w", oldSeg.Path(), err)
-	}
-
 	// Create a new segment for the live data with reservation
 	callerID := fmt.Sprintf("%s%s", recompactorCallerIDPrefix, oldSeg.Path()) // Unique ID per segment being recompacted
 	newSeg, err := sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
@@ -171,7 +165,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	// Use a pointer to ensure we release the final segment, not the initial one
 	defer func() {
 		if newSeg != nil {
-			if err := sr.sm.ReleaseSegment(newSeg, callerID); err != nil {
+			if err := newSeg.Release(callerID); err != nil {
 				zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment")
 			}
 		}
@@ -181,67 +175,58 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	wb := grocksdb.NewWriteBatch()
 	defer wb.Destroy()
 
-	// Scan the old segment and copy live entries
-	// TODO: Refactor to use an iterator on the Segment struct for cleaner entry iteration
-	pos := int64(0)
+	// Create an iterator to scan the old segment
+	iter, err := oldSeg.NewIterator(oldFile)
+	if err != nil {
+		return fmt.Errorf("failed to create segment iterator: %w", err)
+	}
+
 	copiedEntries := uint32(0)
 	copiedBytes := int64(0)
 
-	for pos < fileInfo.Size()-int64(segment.SegmentFooterSize) {
+	// Iterate through all entries in the segment
+	for {
 		// Check context cancellation
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		// Read the entry header
-		valLen, headerSize, keyLen, version, checksum, err := segment.ReadValueHeaderAt(oldFile, pos)
+		// Get the next entry
+		entry, err := iter.Next()
 		if err != nil {
 			if err == io.EOF {
-				break // End of valid data
+				break // End of segment
 			}
-			zlog.Error().Err(err).Int64("offset", pos).
-				Msg("recompactor: failed to read header")
+			zlog.Error().Err(err).Int64("offset", iter.CurrentPosition()).
+				Msg("recompactor: failed to read entry")
 			break
 		}
-
-		// Extract the key
-		keyBuf := make([]byte, keyLen)
-		if _, err := oldFile.ReadAt(keyBuf, pos+segment.ValueHeaderSize); err != nil {
-			zlog.Error().Err(err).Int64("offset", pos).
-				Msg("recompactor: failed to read key")
-			break
-		}
-		userKey := string(keyBuf)
 
 		// Check if this entry is still live (not deleted)
-		metaKey := keys.MakeMetadataKey(userKey)
+		metaKey := keys.MakeMetadataKey(entry.Key)
 		meta, err := utils.GetMetadata(sr.meta, string(metaKey))
 		if err != nil {
 			// Entry has been deleted, skip it
-			pos += headerSize + valLen
 			continue
 		}
 
 		// Verify this entry still points to this segment
 		if meta.ValueType != pb.ValueType_SEGMENT ||
 			meta.SegmentPath != oldSeg.Path() ||
-			meta.SegmentOffset != pos {
+			meta.SegmentOffset != entry.Offset {
 			// Entry has been overwritten or moved, skip it
-			pos += headerSize + valLen
 			continue
 		}
 
 		// This is a live entry, copy it to the new segment
-		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, userKey, pos, headerSize, valLen, version, checksum, meta, wb); err != nil {
-			zlog.Error().Err(err).Str("key", userKey).
+		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, entry, meta, wb); err != nil {
+			zlog.Error().Err(err).Str("key", entry.Key).
 				Msg("recompactor: failed to copy entry")
-			pos += headerSize + valLen
 			continue
 		}
 
 		copiedEntries++
-		copiedBytes += valLen
-		pos += headerSize + valLen
+		copiedBytes += entry.ValueLength
 	}
 
 	// If no live entries were copied, abandon the new segment but still delete the old one
@@ -297,17 +282,16 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 
 // copyEntry copies a single entry from old segment to new segment
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
-	userKey string, oldOffset, headerSize, valLen int64, version uint16, checksum uint32,
-	meta *pb.ValueMessage, wb *grocksdb.WriteBatch,
+	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch,
 ) error {
 	// Create a section reader for the value data (no checksum verification per review)
-	valueOffset := oldOffset + headerSize
-	dataReader := io.NewSectionReader(oldFile, valueOffset, valLen)
+	valueOffset := entry.Offset + entry.HeaderSize
+	dataReader := io.NewSectionReader(oldFile, valueOffset, entry.ValueLength)
 
 	// Check if we need a new segment
 	// NOTE: FinalizeSegment and AcquireOpenSegmentWithReservation are thread-safe - the segment
 	// manager uses internal locking and reservations to coordinate between compactor and recompactor
-	totalNeeded := headerSize + valLen
+	totalNeeded := entry.HeaderSize + entry.ValueLength
 	if (*newSeg).Remaining() < totalNeeded {
 		// Finalize the segment first, then release it
 		// This prevents other threads from acquiring it while it's being finalized
@@ -316,7 +300,7 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		}
 
 		// Now safe to release since it's finalized
-		if err := sr.sm.ReleaseSegment(*newSeg, callerID); err != nil {
+		if err := (*newSeg).Release(callerID); err != nil {
 			zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
 		}
 		var err error
@@ -329,12 +313,12 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	// Create ValueMessage for WriteEntryFromReader
 	vm := &pb.ValueMessage{
 		ValueType:   pb.ValueType_SEGMENT,
-		ValueLength: valLen,
-		Checksum:    checksum,
+		ValueLength: entry.ValueLength,
+		Checksum:    entry.Checksum,
 	}
 
 	// Use segment manager's WriteEntryFromReader function (avoids temp files)
-	newOffset, err := sr.sm.WriteEntryFromReader(*newSeg, userKey, dataReader, vm)
+	newOffset, err := sr.sm.WriteEntryFromReader(*newSeg, entry.Key, dataReader, vm)
 	if err != nil {
 		return fmt.Errorf("failed to write entry: %w", err)
 	}
@@ -348,7 +332,7 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
-	metaKey := keys.MakeMetadataKey(userKey)
+	metaKey := keys.MakeMetadataKey(entry.Key)
 	wb.Put(metaKey, metaBytes)
 
 	return nil

@@ -81,8 +81,8 @@ func TestNewSegment(t *testing.T) {
 	if seg.path != path {
 		t.Errorf("Path mismatch: got %s, want %s", seg.path, path)
 	}
-	if seg.entries != entries {
-		t.Errorf("Entries mismatch: got %d, want %d", seg.entries, entries)
+	if seg.numEntries != entries {
+		t.Errorf("Entries mismatch: got %d, want %d", seg.numEntries, entries)
 	}
 	if seg.dataBytes != dataBytes {
 		t.Errorf("DataBytes mismatch: got %d, want %d", seg.dataBytes, dataBytes)
@@ -203,8 +203,8 @@ func TestManager_RegisterSegment(t *testing.T) {
 	if seg.path != path {
 		t.Errorf("Registered segment has wrong path: got %s, want %s", seg.path, path)
 	}
-	if seg.entries != entries {
-		t.Errorf("Registered segment has wrong entries: got %d, want %d", seg.entries, entries)
+	if seg.numEntries != entries {
+		t.Errorf("Registered segment has wrong entries: got %d, want %d", seg.numEntries, entries)
 	}
 }
 
@@ -286,35 +286,12 @@ func TestManager_WriteEntry(t *testing.T) {
 		t.Errorf("WriteEntry returned invalid offset: %d", offset)
 	}
 
-	if seg.entries != 1 {
-		t.Errorf("Segment entries should be 1, got %d", seg.entries)
+	if seg.numEntries != 1 {
+		t.Errorf("Segment entries should be 1, got %d", seg.numEntries)
 	}
 
 	if seg.dataBytes != int64(len(valueData)) {
 		t.Errorf("Segment dataBytes should be %d, got %d", len(valueData), seg.dataBytes)
-	}
-}
-
-func TestManager_SyncSegment(t *testing.T) {
-	basePath := t.TempDir()
-	segmentSize := int64(1024 * 1024)
-
-	_ = fd.NewFdCache(100)
-
-	manager, err := NewManager(basePath, segmentSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer manager.Close()
-
-	seg, err := manager.AcquireOpenSegmentWithReservation("test", 1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = manager.SyncSegment(seg)
-	if err != nil {
-		t.Fatalf("SyncSegment failed: %v", err)
 	}
 }
 
@@ -691,8 +668,8 @@ func TestManager_ValidateOpenSegment(t *testing.T) {
 	}
 
 	// Verify entry count
-	if seg.entries != 2 {
-		t.Errorf("Expected 2 entries, got %d", seg.entries)
+	if seg.numEntries != 2 {
+		t.Errorf("Expected 2 entries, got %d", seg.numEntries)
 	}
 
 	// Verify data bytes count
@@ -765,8 +742,8 @@ func TestManager_ValidateOpenSegmentWithCorruption(t *testing.T) {
 		t.Errorf("validateOpenSegment should truncate at valid data (%d), got %d", validDataSize, seg.size)
 	}
 
-	if seg.entries != 1 {
-		t.Errorf("Expected 1 valid entry, got %d", seg.entries)
+	if seg.numEntries != 1 {
+		t.Errorf("Expected 1 valid entry, got %d", seg.numEntries)
 	}
 
 	if seg.dataBytes != int64(len(value)) {

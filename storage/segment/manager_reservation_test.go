@@ -122,7 +122,7 @@ func TestManagerAcquireWithReservation(t *testing.T) {
 	}
 
 	// Release thread1's segment
-	manager.ReleaseSegment(seg1, "thread1")
+	seg1.Release("thread1")
 	if seg1.IsReserved() {
 		t.Error("Segment should not be reserved after release")
 	}
@@ -178,7 +178,7 @@ func TestConcurrentReservations(t *testing.T) {
 
 				// Randomly release (50% chance)
 				if op%2 == 0 {
-					manager.ReleaseSegment(seg, callerID)
+					seg.Release(callerID)
 				}
 			}
 
