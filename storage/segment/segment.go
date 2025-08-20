@@ -6,6 +6,10 @@ import (
 	"os"
 	"sync"
 
+	zlog "github.com/rs/zerolog/log"
+	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/storage/bufferpool"
+	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/utils"
 )
 
@@ -212,6 +216,107 @@ func (s *Segment) Sync() error {
 	return nil
 }
 
+// ReadEntry reads a value from the segment.
+// The caller is responsible for closing the reader when done.
+func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCache) (io.ReadCloser, error) {
+	if key == "" || offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("invalid key, offset or length: key=%s, offset=%d, length=%d", key, offset, length)
+	}
+
+	// Acquire cached read-only descriptor via FdCache.
+	entry, err := fdCache.Acquire(s.path)
+	if err != nil {
+		// If we can't acquire the FD, the segment might have been deleted
+		// This can happen if recompaction removed it between our segMap check and here
+		return nil, fmt.Errorf("failed to acquire segment fd: %w", err)
+	}
+
+	// Check if entry is nil (defensive check)
+	if entry == nil {
+		return nil, fmt.Errorf("nil file entry for segment: %s", s.path)
+	}
+
+	// Take shared read lock to protect against concurrent writers.
+	entry.RLock()
+
+	// calculate the offset of the value in the segment
+	offset += CalculateValueHeaderSize(key)
+
+	reader := io.NewSectionReader(entry.File(), offset, length)
+	return &readCloserWithOnClose{
+		Reader: reader,
+		onClose: func() {
+			// Release lock & cached FD when caller is done.
+			entry.RUnlock()
+			fdCache.Release(s.path, entry)
+		},
+	}, nil
+}
+
+// WriteEntry writes an entry to a segment from an io.Reader
+func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
+	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
+		return 0, utils.WrapError("invalid value type", key, nil)
+	}
+
+	header := BuildValueHeader(key, vm.ValueLength, vm.Checksum, CurrentValueHeaderVersion)
+	headerSize := CalculateValueHeaderSize(key)
+
+	// Total bytes to add
+	needed := headerSize + vm.ValueLength
+
+	// Log the write operation
+	zlog.Debug().
+		Str("key", key).
+		Int64("valueLength", vm.ValueLength).
+		Str("segment", s.path).
+		Msg("writing entry to segment from reader")
+
+	// Acquire lock to ensure only one writer to the segment at a time.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if segment file is still open
+	if s.file == nil {
+		return 0, utils.WrapError("segment file is closed", s.path, nil)
+	}
+
+	// Ensure we have a writable segment with space
+	// Offset where this value will be written inside the segment
+	startOffset := s.size
+
+	// Sequential write: header then payload
+	if _, err := s.file.Write(header); err != nil {
+		return 0, utils.WrapError("failed to write value header", s.path, err)
+	}
+
+	// Copy with progress tracking for large files using pooled buffer
+	buf, release := bufferpool.AcquireBuffer(64 * 1024) // 64KB buffer
+	defer release()
+
+	bytesWritten, err := io.CopyBuffer(s.file, r, buf)
+	if err != nil {
+		return 0, utils.WrapError("copy value to segment", key, err)
+	}
+
+	// Verify we wrote the expected amount
+	if bytesWritten != vm.ValueLength {
+		return 0, utils.WrapError(fmt.Sprintf("wrote %d bytes, expected %d", bytesWritten, vm.ValueLength), key, nil)
+	}
+
+	s.size += needed
+	s.numEntries++
+	s.dataBytes += vm.ValueLength
+
+	zlog.Debug().
+		Str("key", key).
+		Int64("bytesWritten", bytesWritten).
+		Int64("segmentSize", s.size).
+		Msg("successfully wrote entry to segment")
+
+	return startOffset, nil
+}
+
 // NewSegment creates a new segment with the given path and size.
 func NewSegment(path string, entries uint32, dataBytes int64, size int64, maxSupportedSize int64) *Segment {
 	return &Segment{path: path, numEntries: entries, dataBytes: dataBytes, size: size, version: CurrentSegmentVersion, maxSupportedSize: maxSupportedSize}
@@ -332,4 +437,17 @@ func (it *Iterator) LastError() error {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 	return it.lastError
+}
+
+// readCloserWithOnClose wraps a reader and calls the provided function when closed.
+type readCloserWithOnClose struct {
+	io.Reader
+	onClose func()
+}
+
+func (rc *readCloserWithOnClose) Close() error {
+	if rc.onClose != nil {
+		rc.onClose()
+	}
+	return nil
 }

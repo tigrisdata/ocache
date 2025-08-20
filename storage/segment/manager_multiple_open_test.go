@@ -47,7 +47,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 		ValueLength: int64(len(largeData)),
 		Checksum:    12345,
 	}
-	offset1, err := manager.WriteEntry(seg1, "key1", tempFile1, vm1)
+	offset1, err := seg1.WriteEntry("key1", tempFile1, vm1)
 	if err != nil {
 		t.Fatalf("Failed to write to first segment: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 		ValueLength: 14,
 		Checksum:    67890,
 	}
-	offset2, err := manager.WriteEntry(seg2, "key2", tempFile2, vm2)
+	offset2, err := seg2.WriteEntry("key2", tempFile2, vm2)
 	if err != nil {
 		t.Fatalf("Failed to write to second segment: %v", err)
 	}

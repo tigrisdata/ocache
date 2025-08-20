@@ -549,7 +549,7 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 	case pb.ValueType_INLINE:
 		return bytes.NewReader(valueMsg.Data), true, nil
 	case pb.ValueType_SEGMENT:
-		if r, err := s.segmentManager.ReadValue(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
+		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
 			return nil, false, err

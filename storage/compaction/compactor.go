@@ -558,7 +558,7 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 		return err
 	}
 
-	segOff, err := c.sm.WriteEntry(seg, userKey, f, vm)
+	segOff, err := seg.WriteEntry(userKey, f, vm)
 	if err != nil {
 		return err
 	}

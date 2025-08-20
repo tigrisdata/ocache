@@ -317,8 +317,8 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		Checksum:    entry.Checksum,
 	}
 
-	// Use segment manager's WriteEntryFromReader function (avoids temp files)
-	newOffset, err := sr.sm.WriteEntryFromReader(*newSeg, entry.Key, dataReader, vm)
+	// Use segment's WriteEntry function
+	newOffset, err := (*newSeg).WriteEntry(entry.Key, dataReader, vm)
 	if err != nil {
 		return fmt.Errorf("failed to write entry: %w", err)
 	}
