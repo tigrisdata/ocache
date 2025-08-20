@@ -13,18 +13,22 @@ import (
 )
 
 var (
-	diskPath         = flag.String("disk", "/var/cache", "Directory for disk cache")
-	inlineThreshold  = flag.Int("threshold", 64*1024, "Small object threshold (bytes) that are inlined with metadata")
-	compactThreshold = flag.Int64("compact-threshold", 16*1024*1024, "Compaction threshold (bytes)")
-	segmentSize      = flag.Int64("segment-size", 256*1024*1024, "Segment size (bytes)")
-	ttl              = flag.Int("ttl", 0, "Default TTL in seconds when no key-level TTL is set")
-	port             = flag.Int("port", 9000, "Listen port")
-	httpPort         = flag.Int("http-port", 9001, "HTTP port")
-	verbose          = flag.Bool("v", false, "Enable debug logging")
-	fdCacheSize      = flag.Int("fd-cache-size", 10000, "Size of the file descriptor cache (entries)")
-	maxDiskUsage     = flag.Int64("max-disk-usage", 0, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
-	fragThreshold    = flag.Float64("fragmentation-threshold", 0.5, "Segment fragmentation threshold for recompaction (0.0-1.0)")
-	recompactDisable = flag.Bool("disable-recompaction", false, "Disable automatic segment recompaction")
+	diskPath = flag.String("disk", stor.DefaultDiskPath, "Directory for disk cache")
+	ttl      = flag.Int("ttl", stor.DefaultTTL, "Default global TTL in seconds when no key-level TTL is set")
+
+	inlineThreshold    = flag.Int("threshold", stor.DefaultInlineThreshold, "Small object threshold (bytes) that are inlined with metadata")
+	compactThreshold   = flag.Int64("compact-threshold", stor.DefaultCompactThreshold, "Compaction threshold (bytes)")
+	segmentSize        = flag.Int64("segment-size", stor.DefaultSegmentSize, "Segment size (bytes)")
+	compactionInterval = flag.Duration("compaction-interval", stor.DefaultCompactionInterval, "Compaction interval")
+	fragThreshold      = flag.Float64("fragmentation-threshold", stor.DefaultFragmentationThreshold, "Segment fragmentation threshold for recompaction (0.0-1.0)")
+	recompactDisable   = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
+
+	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
+	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
+
+	port     = flag.Int("port", 9000, "Listen port")
+	httpPort = flag.Int("http-port", 9001, "HTTP port")
+	verbose  = flag.Bool("v", false, "Enable debug logging")
 )
 
 func configureLogger() {
@@ -47,6 +51,7 @@ func RunServer() {
 		SegmentSize:         AppConfig.SegmentSize,
 		FdCacheSize:         AppConfig.FdCacheSize,
 		MaxDiskUsage:        AppConfig.MaxDiskUsage,
+		CompactionInterval:  AppConfig.CompactionInterval,
 		FragThreshold:       AppConfig.FragThreshold,
 		DisableRecompaction: AppConfig.RecompactDisable,
 	}

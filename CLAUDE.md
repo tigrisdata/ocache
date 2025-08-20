@@ -170,4 +170,3 @@ make check                 # All checks (fmt, vet, test)
 **Test environment overrides:**
 
 - `OCACHE_TEST_CLEANUP_INTERVAL` - Override cleanup interval
-- `OCACHE_TEST_COMPACTION_INTERVAL` - Override compaction interval

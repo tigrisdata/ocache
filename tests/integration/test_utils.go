@@ -76,19 +76,17 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 	if config.CleanupInterval > 0 {
 		os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", config.CleanupInterval.String())
 	}
-	if config.CompactionInterval > 0 {
-		os.Setenv("OCACHE_TEST_COMPACTION_INTERVAL", config.CompactionInterval.String())
-	}
 
 	// Initialize storage
 	storage.InitStorageWithConfig(&storage.StorageConfig{
-		DiskPath:         tmpDir,
-		TTL:              0,
-		InlineThreshold:  int(config.InlineThreshold),
-		CompactThreshold: config.CompactThreshold,
-		SegmentSize:      config.SegmentSize,
-		FdCacheSize:      config.FDCacheSize,
-		MaxDiskUsage:     config.MaxDiskUsage,
+		DiskPath:           tmpDir,
+		TTL:                0,
+		InlineThreshold:    int(config.InlineThreshold),
+		CompactThreshold:   config.CompactThreshold,
+		SegmentSize:        config.SegmentSize,
+		FdCacheSize:        config.FDCacheSize,
+		MaxDiskUsage:       config.MaxDiskUsage,
+		CompactionInterval: config.CompactionInterval,
 	})
 
 	s := storage.GetStorage()

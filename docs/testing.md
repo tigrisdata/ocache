@@ -143,9 +143,6 @@ Some test behaviors can be controlled via environment variables:
 # Override cleanup interval for tests
 OCACHE_TEST_CLEANUP_INTERVAL=1s make test-integration
 
-# Override compaction interval for tests
-OCACHE_TEST_COMPACTION_INTERVAL=1s make test-integration
-
 # Run integration tests in short mode
 go test -short ./tests/integration/...
 ```
@@ -170,12 +167,14 @@ make test-all
 ### Common Issues
 
 1. **RocksDB not found**: Install dependencies first
+
    ```bash
    make install-deps
    make install-rocksdb
    ```
 
 2. **Tests timeout**: Increase timeout for slower systems
+
    ```bash
    # Edit Makefile to increase timeout values
    # Default is 60s for unit tests, 300s for integration
