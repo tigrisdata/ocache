@@ -90,7 +90,7 @@ func createTestSegmentWithEntries(t *testing.T, sm *segment.Manager, meta *metad
 		}
 
 		// Write to segment
-		offset, err := sm.WriteEntry(seg, key, f, vm)
+		offset, err := seg.WriteEntry(key, f, vm)
 		f.Close()
 		if err != nil {
 			return nil, err

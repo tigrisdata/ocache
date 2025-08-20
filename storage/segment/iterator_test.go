@@ -263,7 +263,7 @@ func TestSegmentIteratorWithManager(t *testing.T) {
 			t.Fatalf("failed to seek: %v", err)
 		}
 
-		if _, err := sm.WriteEntry(seg, td.key, tmpFile, vm); err != nil {
+		if _, err := seg.WriteEntry(td.key, tmpFile, vm); err != nil {
 			tmpFile.Close()
 			t.Fatalf("failed to write entry: %v", err)
 		}

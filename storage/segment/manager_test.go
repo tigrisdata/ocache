@@ -277,7 +277,7 @@ func TestManager_WriteEntry(t *testing.T) {
 		Checksum:    12345,
 	}
 
-	offset, err := manager.WriteEntry(seg, userKey, f, vm)
+	offset, err := seg.WriteEntry(userKey, f, vm)
 	if err != nil {
 		t.Fatalf("WriteEntry failed: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestManager_FinalizeSegment(t *testing.T) {
 		Checksum:    12345,
 	}
 
-	_, err = manager.WriteEntry(seg, userKey, f, vm)
+	_, err = seg.WriteEntry(userKey, f, vm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +399,7 @@ func TestManager_ReadValue(t *testing.T) {
 		Checksum:    12345,
 	}
 
-	offset, err := manager.WriteEntry(seg, userKey, f, vm)
+	offset, err := seg.WriteEntry(userKey, f, vm)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestManager_ReadValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rc, err := manager.ReadValue(userKey, seg.path, offset, int64(len(valueData)))
+	rc, err := manager.ReadEntry(userKey, seg.path, offset, int64(len(valueData)))
 	if err != nil {
 		t.Fatalf("ReadValue failed: %v", err)
 	}
@@ -437,28 +437,28 @@ func TestManager_ReadValue_InvalidParams(t *testing.T) {
 	}
 	defer manager.Close()
 
-	_, err = manager.ReadValue("key", "", 0, 100)
+	_, err = manager.ReadEntry("key", "", 0, 100)
 	if err == nil {
 		t.Error("ReadValue should fail with empty path")
 	} else if err.Error() == "" {
 		t.Error("Expected error message for empty path")
 	}
 
-	_, err = manager.ReadValue("key", "/path", -1, 100)
+	_, err = manager.ReadEntry("key", "/path", -1, 100)
 	if err == nil {
 		t.Error("ReadValue should fail with negative offset")
 	} else if err.Error() == "" {
 		t.Error("Expected error message for negative offset")
 	}
 
-	_, err = manager.ReadValue("key", "/path", 0, 0)
+	_, err = manager.ReadEntry("key", "/path", 0, 0)
 	if err == nil {
 		t.Error("ReadValue should fail with zero length")
 	} else if err.Error() == "" {
 		t.Error("Expected error message for zero length")
 	}
 
-	_, err = manager.ReadValue("key", "/nonexistent/segment.seg", 0, 100)
+	_, err = manager.ReadEntry("key", "/nonexistent/segment.seg", 0, 100)
 	if err == nil {
 		t.Error("ReadValue should fail with non-existent segment")
 	} else if err.Error() == "" {
@@ -824,7 +824,7 @@ func BenchmarkManager_WriteEntry(b *testing.B) {
 			ValueLength: int64(len(valueData)),
 			Checksum:    12345,
 		}
-		manager.WriteEntry(seg, "bench-key", f, vm)
+		seg.WriteEntry("bench-key", f, vm)
 		f.Close()
 	}
 }
@@ -860,14 +860,14 @@ func BenchmarkManager_ReadValue(b *testing.B) {
 		ValueLength: int64(len(valueData)),
 		Checksum:    12345,
 	}
-	offset, _ := manager.WriteEntry(seg, "bench-key", f, vm)
+	offset, _ := seg.WriteEntry("bench-key", f, vm)
 	f.Close()
 
 	manager.FinalizeSegment(seg)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rc, err := manager.ReadValue("bench-key", seg.path, offset, int64(len(valueData)))
+		rc, err := manager.ReadEntry("bench-key", seg.path, offset, int64(len(valueData)))
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/utils"
@@ -76,8 +75,8 @@ func (sm *Manager) RegisterSegment(path string, entries uint32, bytes int64) {
 	sm.mu.Unlock()
 }
 
-// ReadValue returns an io.ReadCloser over a slice of a segment file.
-func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int64) (io.ReadCloser, error) {
+// ReadEntry returns an io.ReadCloser over a slice of a segment file.
+func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int64) (io.ReadCloser, error) {
 	if segPath == "" || offset < 0 || length <= 0 {
 		return nil, fmt.Errorf("invalid segment path, offset or length: path=%s, offset=%d, length=%d", segPath, offset, length)
 	}
@@ -92,108 +91,7 @@ func (sm *Manager) ReadValue(userKey string, segPath string, offset, length int6
 		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
-	// Acquire cached read-only descriptor via FdCache.
-	entry, err := sm.fdCache.Acquire(segPath)
-	if err != nil {
-		// If we can't acquire the FD, the segment might have been deleted
-		// This can happen if recompaction removed it between our segMap check and here
-		return nil, fmt.Errorf("failed to acquire segment fd: %w", err)
-	}
-
-	// Check if entry is nil (defensive check)
-	if entry == nil {
-		return nil, fmt.Errorf("nil file entry for segment: %s", segPath)
-	}
-
-	// Take shared read lock to protect against concurrent writers.
-	entry.RLock()
-
-	// calculate the offset of the value in the segment
-	offset += CalculateValueHeaderSize(userKey)
-
-	reader := io.NewSectionReader(entry.File(), offset, length)
-	return &readCloserWithOnClose{
-		Reader: reader,
-		onClose: func() {
-			// Release lock & cached FD when caller is done.
-			entry.RUnlock()
-			sm.fdCache.Release(segPath, entry)
-		},
-	}, nil
-}
-
-// WriteEntryFromReader writes an entry to a segment from an io.Reader
-func (sm *Manager) WriteEntryFromReader(seg *Segment, userKey string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
-	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
-		return 0, utils.WrapError("invalid value type", userKey, nil)
-	}
-
-	header := BuildValueHeader(userKey, vm.ValueLength, vm.Checksum, CurrentValueHeaderVersion)
-	headerSize := CalculateValueHeaderSize(userKey)
-
-	// Total bytes to add
-	needed := headerSize + vm.ValueLength
-
-	// Log the write operation
-	zlog.Debug().
-		Str("key", userKey).
-		Int64("valueLength", vm.ValueLength).
-		Str("segment", seg.path).
-		Msg("writing entry to segment from reader")
-
-	// Acquire lock to ensure only one writer to the segment at a time.
-	seg.mu.Lock()
-	defer seg.mu.Unlock()
-
-	// Check if segment file is still open
-	if seg.file == nil {
-		return 0, utils.WrapError("segment file is closed", seg.path, nil)
-	}
-
-	// Ensure we have a writable segment with space
-	// Offset where this value will be written inside the segment
-	startOffset := seg.size
-
-	// Sequential write: header then payload
-	if _, err := seg.file.Write(header); err != nil {
-		return 0, utils.WrapError("failed to write value header", seg.path, err)
-	}
-
-	// Copy with progress tracking for large files using pooled buffer
-	buf, release := bufferpool.AcquireBuffer(64 * 1024) // 64KB buffer
-	defer release()
-
-	bytesWritten, err := io.CopyBuffer(seg.file, r, buf)
-	if err != nil {
-		return 0, utils.WrapError("copy value to segment", userKey, err)
-	}
-
-	// Verify we wrote the expected amount
-	if bytesWritten != vm.ValueLength {
-		return 0, utils.WrapError(fmt.Sprintf("wrote %d bytes, expected %d", bytesWritten, vm.ValueLength), userKey, nil)
-	}
-
-	seg.size += needed
-	seg.numEntries++
-	seg.dataBytes += vm.ValueLength
-
-	zlog.Debug().
-		Str("key", userKey).
-		Int64("bytesWritten", bytesWritten).
-		Int64("segmentSize", seg.size).
-		Msg("successfully wrote entry to segment")
-
-	return startOffset, nil
-}
-
-func (sm *Manager) WriteEntry(seg *Segment, userKey string, f *os.File, vm *pb.ValueMessage) (int64, error) {
-	// Reset file cursor
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return 0, utils.WrapError("seek to start", userKey, err)
-	}
-
-	// Use the reader-based implementation
-	return sm.WriteEntryFromReader(seg, userKey, f, vm)
+	return seg.ReadEntry(userKey, offset, length, sm.fdCache)
 }
 
 // AcquireOpenSegmentWithReservation returns an open segment reserved for the caller
@@ -449,7 +347,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		}
 
 		// Check that header values are reasonable
-		if entry.ValueLength < 0 || len(entry.Key) < 0 {
+		if entry.ValueLength <= 0 || len(entry.Key) <= 0 {
 			if err := seg.file.Truncate(currentPos); err != nil {
 				return utils.WrapError("truncate invalid header", seg.path, err)
 			}
@@ -597,19 +495,6 @@ func (sm *Manager) Close() {
 	}
 
 	zlog.Info().Msg("segment manager closed")
-}
-
-// readCloserWithOnClose wraps a reader and calls the provided function when closed.
-type readCloserWithOnClose struct {
-	io.Reader
-	onClose func()
-}
-
-func (rc *readCloserWithOnClose) Close() error {
-	if rc.onClose != nil {
-		rc.onClose()
-	}
-	return nil
 }
 
 // RemoveSegment removes a segment from the manager's tracking
