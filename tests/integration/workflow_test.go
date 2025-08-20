@@ -589,6 +589,7 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 			FdCacheSize:        testConfig.FDCacheSize,
 			MaxDiskUsage:       testConfig.MaxDiskUsage,
 			CompactionInterval: testConfig.CompactionInterval,
+			CompactionThreads:  testConfig.CompactionThreads,
 		})
 
 		// Get the new storage instance

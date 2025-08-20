@@ -53,6 +53,7 @@ type CompactorConfig struct {
 	DeletionQueue           *deletion.Queue
 	MaxBytesPerCompactRound int64
 	Interval                time.Duration
+	CompactionThreads       int // Number of compaction threads
 	// Recompaction settings (optional)
 	EnableRecompaction bool
 	FragThreshold      float64
@@ -80,6 +81,7 @@ type Compactor struct {
 	deletionQueue           *deletion.Queue
 	maxBytesPerCompactRound int64
 	interval                time.Duration
+	compactionThreads       int
 	recompactor             *SegmentRecompactor
 
 	// background loop coordination
@@ -100,6 +102,7 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 		deletionQueue:           deletionQueue,
 		maxBytesPerCompactRound: maxBytes,
 		interval:                interval,
+		compactionThreads:       1,   // Default to single thread
 		recompactor:             nil, // Will be set with NewCompactorWithConfig
 		ctx:                     ctx,
 		cancel:                  cancel,
@@ -109,6 +112,13 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 // NewCompactorWithConfig creates a new compactor with configuration
 func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Default to 1 thread if not specified
+	threads := cfg.CompactionThreads
+	if threads <= 0 {
+		threads = 1
+	}
+
 	c := &Compactor{
 		fm:                      cfg.FileManager,
 		sm:                      cfg.SegmentManager,
@@ -117,6 +127,7 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 		deletionQueue:           cfg.DeletionQueue,
 		maxBytesPerCompactRound: cfg.MaxBytesPerCompactRound,
 		interval:                cfg.Interval,
+		compactionThreads:       threads,
 		ctx:                     ctx,
 		cancel:                  cancel,
 	}
@@ -131,9 +142,13 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 
 // Start launches background goroutines for file and segment compaction
 func (c *Compactor) Start() {
-	// Start file compaction loop
-	c.wg.Add(1)
-	go c.fileCompactionLoop()
+	// Start multiple file compaction workers
+	for i := 0; i < c.compactionThreads; i++ {
+		c.wg.Add(1)
+		go c.fileCompactionLoop(i)
+	}
+
+	zlog.Info().Int("threads", c.compactionThreads).Msg("compactor: started file compaction workers")
 
 	// Start segment recompaction loop if enabled
 	if c.recompactor != nil && c.recompactor.fragThreshold > 0 {
@@ -157,10 +172,10 @@ func (c *Compactor) Close() {
 }
 
 // fileCompactionLoop triggers file compaction on a timer until Close is called.
-func (c *Compactor) fileCompactionLoop() {
+func (c *Compactor) fileCompactionLoop(workerID int) {
 	defer c.wg.Done()
 
-	zlog.Info().Msg("compactor: starting file compaction loop")
+	zlog.Info().Int("worker", workerID).Msg("compactor: starting file compaction worker")
 
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -172,9 +187,9 @@ func (c *Compactor) fileCompactionLoop() {
 			if c.ctx.Err() != nil {
 				return
 			}
-			c.CompactFiles(c.ctx, c.maxBytesPerCompactRound)
+			c.CompactFiles(c.ctx, c.maxBytesPerCompactRound, workerID)
 		case <-c.ctx.Done():
-			zlog.Info().Msg("compactor: file compaction loop stopping")
+			zlog.Info().Int("worker", workerID).Msg("compactor: file compaction worker stopping")
 			return
 		}
 	}
@@ -221,8 +236,9 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 
 // CompactFiles scans the RocksDB file-index and migrates files into segments.
 // The context parameter allows for cancellation of the compaction process.
-func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
-	zlog.Info().Int64("maxBytes", maxBytes).Msg("compactor: starting file compaction")
+// The workerID is used to partition work across multiple workers.
+func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID int) {
+	zlog.Info().Int64("maxBytes", maxBytes).Int("worker", workerID).Msg("compactor: starting file compaction")
 
 	// RocksDB iterator setup
 	ro := grocksdb.NewDefaultReadOptions()
@@ -236,17 +252,20 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		bytesCopied int64
 	)
 
+	// Create a unique caller ID for this worker
+	workerCallerID := fmt.Sprintf("%s-%d", compactorCallerID, workerID)
+
 	// Acquire the initial open segment with reservation
-	seg, err := c.sm.AcquireOpenSegmentWithReservation(compactorCallerID, 0)
+	seg, err := c.sm.AcquireOpenSegmentWithReservation(workerCallerID, 0)
 	if err != nil {
-		zlog.Error().Err(err).Msg("compactor: acquire open segment")
+		zlog.Error().Err(err).Int("worker", workerID).Msg("compactor: acquire open segment")
 		return
 	}
 	// Use a closure to ensure we release the final segment, not the initial one
 	defer func() {
 		if seg != nil {
-			if err := seg.Release(compactorCallerID); err != nil {
-				zlog.Error().Err(err).Str("callerID", compactorCallerID).Msg("failed to release segment")
+			if err := seg.Release(workerCallerID); err != nil {
+				zlog.Error().Err(err).Str("callerID", workerCallerID).Msg("failed to release segment")
 			}
 		}
 	}()
@@ -261,6 +280,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		// Log progress every 100 iterations or every 10 seconds
 		if iterationCount%100 == 0 || time.Since(lastLogTime) > 10*time.Second {
 			zlog.Debug().
+				Int("worker", workerID).
 				Int("iterations", iterationCount).
 				Int("processed", processed).
 				Int64("bytesCopied", bytesCopied).
@@ -280,9 +300,19 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		// Process the compaction entry
 		userKey, filePath, _ := parseFileIndexRow(k, v)
 
+		// Skip entries not assigned to this worker (hash-based partitioning)
+		if c.compactionThreads > 1 {
+			// Use simple hash of user key to distribute work
+			hash := utils.HashString(userKey)
+			if int(hash%uint32(c.compactionThreads)) != workerID {
+				continue
+			}
+		}
+
 		// Log what we're about to process
 		if iterationCount <= 10 || iterationCount%100 == 0 {
 			zlog.Debug().
+				Int("worker", workerID).
 				Int("iteration", iterationCount).
 				Str("userKey", userKey).
 				Str("filePath", filePath).
@@ -337,7 +367,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		}
 
 		// Compact the entry
-		if err := c.compactEntry(ctx, entry, &seg, compactorCallerID, wb); err != nil {
+		if err := c.compactEntry(ctx, entry, &seg, workerCallerID, wb); err != nil {
 			if err == context.Canceled {
 				zlog.Info().Msg("compactor: compaction cancelled")
 				return
@@ -380,7 +410,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64) {
 		return
 	}
 
-	zlog.Info().Int("migrated", processed).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
+	zlog.Info().Int("worker", workerID).Int("migrated", processed).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
 }
 
 // parseFileIndexRow extracts userKey, filePath and size from RocksDB file-index

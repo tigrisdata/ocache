@@ -20,6 +20,7 @@ type IntegrationTestConfig struct {
 	CompactThreshold   int64         // Threshold for compaction (default 16MB)
 	SegmentSize        int64         // Maximum segment size (default 256MB)
 	CompactionInterval time.Duration // How often compaction runs
+	CompactionThreads  int           // Number of compaction threads
 	CleanupInterval    time.Duration // How often cleanup runs
 	MaxDiskUsage       int64         // Maximum disk usage for LRU eviction
 	FDCacheSize        int           // File descriptor cache size
@@ -32,6 +33,7 @@ func DefaultIntegrationTestConfig() IntegrationTestConfig {
 		CompactThreshold:   16 * 1024 * 1024,  // 16MB
 		SegmentSize:        256 * 1024 * 1024, // 256MB
 		CompactionInterval: 1 * time.Second,   // Fast for testing
+		CompactionThreads:  1,                 // Default to single thread
 		CleanupInterval:    1 * time.Second,   // Fast for testing
 		MaxDiskUsage:       0,                 // No limit by default
 		FDCacheSize:        100,
@@ -87,6 +89,7 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 		FdCacheSize:        config.FDCacheSize,
 		MaxDiskUsage:       config.MaxDiskUsage,
 		CompactionInterval: config.CompactionInterval,
+		CompactionThreads:  config.CompactionThreads,
 	})
 
 	s := storage.GetStorage()

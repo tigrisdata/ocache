@@ -49,6 +49,7 @@ const (
 	// Default compaction thresholds
 	DefaultMaxBytesPerCompactRound = 1 << 30 // 1GB
 	DefaultCompactionInterval      = 30 * time.Second
+	DefaultCompactionThreads       = 1 // Default to single thread for backwards compatibility
 
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
@@ -81,6 +82,7 @@ type StorageConfig struct {
 	FdCacheSize         int           // Size of the file descriptor cache
 	MaxDiskUsage        int64         // Maximum disk usage in bytes (0 = unlimited)
 	CompactionInterval  time.Duration // Compaction interval
+	CompactionThreads   int           // Number of compaction threads
 	FragThreshold       float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
 	DisableRecompaction bool          // Disable automatic segment recompaction
 }
@@ -331,10 +333,15 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		DeletionQueue:           deletionQueue,
 		MaxBytesPerCompactRound: DefaultMaxBytesPerCompactRound,
 		Interval:                DefaultCompactionInterval,
+		CompactionThreads:       DefaultCompactionThreads,
 	}
 
 	if config.CompactionInterval > 0 {
 		compactorConfig.Interval = config.CompactionInterval
+	}
+
+	if config.CompactionThreads > 0 {
+		compactorConfig.CompactionThreads = config.CompactionThreads
 	}
 
 	if !config.DisableRecompaction {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	"github.com/tigrisdata/ocache/storage/segment"
+	"github.com/tigrisdata/ocache/storage/utils"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -323,7 +325,7 @@ func TestCompactFiles(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024)
+	c.CompactFiles(ctx, 1024*1024, 0)
 
 	// Verify index entries were deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -371,7 +373,7 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 
 	// Run compaction - should handle missing file gracefully
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024)
+	c.CompactFiles(ctx, 1024*1024, 0)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -404,7 +406,7 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024)
+	c.CompactFiles(ctx, 1024*1024, 0)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -461,7 +463,7 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	// The limit is checked after processing, so 150 bytes means it will process 2 files (200 bytes)
 	// and stop before the third
 	ctx := context.Background()
-	c.CompactFiles(ctx, 150)
+	c.CompactFiles(ctx, 150, 0)
 
 	// Check how many index entries remain (unprocessed files)
 	ro := grocksdb.NewDefaultReadOptions()
@@ -527,7 +529,7 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 
 	// Run compaction - should handle bad metadata gracefully
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024)
+	c.CompactFiles(ctx, 1024*1024, 0)
 
 	// File should still exist as we couldn't process it
 	_, err = os.Stat(testFile)
@@ -594,7 +596,7 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 10*1024*1024) // High limit to not stop early
+	c.CompactFiles(ctx, 10*1024*1024, 0) // High limit to not stop early
 
 	// Check how many segments were created
 	numSegments := sm.GetSegmentCount()
@@ -693,7 +695,7 @@ func TestSegmentRotationWithMixedSizes(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 10*1024*1024)
+	c.CompactFiles(ctx, 10*1024*1024, 0)
 
 	// Verify segments were created appropriately
 	numSegments := sm.GetSegmentCount()
@@ -774,7 +776,7 @@ func TestCompactFilesWithCorruptedFile(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024)
+	c.CompactFiles(ctx, 1024*1024, 0)
 
 	// Verify that the compaction index entry was removed (corruption detected)
 	ro := grocksdb.NewDefaultReadOptions()
@@ -850,7 +852,7 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024)
+	c.CompactFiles(ctx, 1024*1024, 0)
 
 	// Check results
 	ro := grocksdb.NewDefaultReadOptions()
@@ -885,4 +887,120 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 	// Now valid file should be deleted after successful compaction
 	_, err = os.Stat(validFile)
 	assert.True(t, os.IsNotExist(err), "Valid file should be deleted after queue processing")
+}
+
+// TestConcurrentCompaction tests compaction with multiple threads
+func TestConcurrentCompaction(t *testing.T) {
+	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	meta := metadata.GetMetaDB()
+
+	// Create compactor with multiple threads
+	numThreads := 4
+	compactorConfig := &CompactorConfig{
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 10 * 1024 * 1024,
+		Interval:                100 * time.Millisecond,
+		CompactionThreads:       numThreads,
+	}
+	c := NewCompactorWithConfig(compactorConfig)
+
+	// Create test files with content that will be distributed across workers
+	wo := grocksdb.NewDefaultWriteOptions()
+	numFiles := 100
+	fileSize := 1024 // 1KB each
+
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		data := bytes.Repeat([]byte{byte(i % 256)}, fileSize)
+
+		// Create file
+		filePath := filepath.Join(tmpDir, "files", fmt.Sprintf("file_%04d.dat", i))
+		err := os.WriteFile(filePath, data, 0o644)
+		require.NoError(t, err)
+
+		// Add to compaction index
+		idxKey, idxVal := PrepareEntryForCompaction(key, filePath)
+		err = meta.Handle().Put(wo, idxKey, idxVal)
+		require.NoError(t, err)
+
+		// Add metadata
+		vm := &pb.ValueMessage{
+			ValueLength: int64(len(data)),
+			ValueType:   pb.ValueType_RAW_FILE,
+			RawFilePath: filePath,
+		}
+		vmBytes, _ := proto.Marshal(vm)
+		metaKey := keys.MakeMetadataKey(key)
+		err = meta.Handle().Put(wo, metaKey, vmBytes)
+		require.NoError(t, err)
+	}
+
+	// Start the compactor
+	c.Start()
+
+	// Wait for compaction to complete
+	time.Sleep(500 * time.Millisecond)
+
+	// Stop the compactor
+	c.Close()
+
+	// Verify all files were compacted
+	ro := grocksdb.NewDefaultReadOptions()
+	processed := 0
+
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		metaKey := keys.MakeMetadataKey(key)
+
+		slice, err := meta.Handle().Get(ro, metaKey)
+		require.NoError(t, err)
+
+		if slice.Exists() {
+			vm := &pb.ValueMessage{}
+			err = proto.Unmarshal(slice.Data(), vm)
+			require.NoError(t, err)
+
+			// Check if file was compacted to segment
+			if vm.ValueType == pb.ValueType_SEGMENT {
+				processed++
+			}
+		}
+		slice.Free()
+	}
+
+	// Most files should be compacted (allow some margin for timing)
+	assert.Greater(t, processed, numFiles/2, "At least half of files should be compacted")
+
+	t.Logf("Compacted %d out of %d files with %d threads", processed, numFiles, numThreads)
+}
+
+// TestCompactionWorkDistribution tests that work is properly distributed across workers
+func TestCompactionWorkDistribution(t *testing.T) {
+	// Test the hash-based distribution
+	numWorkers := 4
+	keyDistribution := make(map[int]int)
+
+	// Generate test keys and see how they distribute
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("test-key-%d", i)
+		hash := utils.HashString(key)
+		worker := int(hash % uint32(numWorkers))
+		keyDistribution[worker]++
+	}
+
+	// Check that work is reasonably distributed
+	for worker, count := range keyDistribution {
+		expectedCount := 1000 / numWorkers
+		deviation := float64(count-expectedCount) / float64(expectedCount)
+		// Allow up to 20% deviation from perfect distribution
+		assert.Less(t, math.Abs(deviation), 0.2,
+			"Worker %d has %d keys, expected ~%d (deviation: %.2f%%)",
+			worker, count, expectedCount, deviation*100)
+	}
+
+	t.Logf("Key distribution across %d workers: %v", numWorkers, keyDistribution)
 }

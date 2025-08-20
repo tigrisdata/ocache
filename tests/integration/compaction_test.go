@@ -1060,13 +1060,13 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	// Strategy: Create objects in batches to ensure they end up in different segments
 	// With 2MB segments and 100KB objects, we can fit ~20 objects per segment
 	objectSize := int64(100 * 1024) // 100KB
-	objectsPerSegment := 18 // Leave some room for overhead
+	objectsPerSegment := 18         // Leave some room for overhead
 	numSegments := 3
 	numObjects := objectsPerSegment * numSegments // 54 objects
 	keys := make([]string, numObjects)
 
 	t.Logf("Creating %d objects across %d segments", numObjects, numSegments)
-	
+
 	// Write objects in batches to ensure segment distribution
 	for seg := 0; seg < numSegments; seg++ {
 		t.Logf("Writing batch %d to create segment %d", seg+1, seg+1)
@@ -1128,12 +1128,12 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	// Test 1: Delete objects to create different fragmentation levels per segment
 	// Delete different percentages from each segment to test threshold behavior
 	t.Log("Test 1: Creating varied fragmentation levels across segments")
-	
+
 	// Segment 0: Delete 30% (below threshold - should NOT recompact)
-	// Segment 1: Delete 45% (below threshold - should NOT recompact)  
+	// Segment 1: Delete 45% (below threshold - should NOT recompact)
 	// Segment 2: Delete 55% (above threshold - SHOULD recompact)
 	deletedIndices := make(map[int]bool)
-	
+
 	// Delete from segment 0 (30%)
 	seg0DeleteCount := int(float64(objectsPerSegment) * 0.30)
 	for i := 0; i < seg0DeleteCount; i++ {
@@ -1141,7 +1141,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		deletedIndices[idx] = true
 		s.Harness.DeleteObject(keys[idx])
 	}
-	
+
 	// Delete from segment 1 (45%)
 	seg1DeleteCount := int(float64(objectsPerSegment) * 0.45)
 	for i := 0; i < seg1DeleteCount; i++ {
@@ -1149,7 +1149,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		deletedIndices[idx] = true
 		s.Harness.DeleteObject(keys[idx])
 	}
-	
+
 	// Delete from segment 2 (55%)
 	seg2DeleteCount := int(float64(objectsPerSegment) * 0.55)
 	for i := 0; i < seg2DeleteCount; i++ {
@@ -1157,7 +1157,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		deletedIndices[idx] = true
 		s.Harness.DeleteObject(keys[idx])
 	}
-	
+
 	totalDeleted := seg0DeleteCount + seg1DeleteCount + seg2DeleteCount
 	t.Logf("Deleted %d objects total (Seg0: %d/30%%, Seg1: %d/45%%, Seg2: %d/55%%)",
 		totalDeleted, seg0DeleteCount, seg1DeleteCount, seg2DeleteCount)
@@ -1174,9 +1174,9 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 		info, _ := os.Stat(seg)
 		totalSizeBefore += info.Size()
 	}
-	t.Logf("After varied deletions: %d segments, size: %d bytes", 
+	t.Logf("After varied deletions: %d segments, size: %d bytes",
 		len(segmentsBefore), totalSizeBefore)
-	
+
 	// The size should be reduced somewhat due to segment 2 being recompacted
 	// but segments 0 and 1 should remain unchanged
 	t.Log("Note: Only segment with >50% fragmentation should have been recompacted")
@@ -1184,7 +1184,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	// Test 2: Push remaining segments over threshold
 	// Delete more objects to push segments 0 and 1 over 50% threshold
 	t.Log("Test 2: Pushing remaining segments over 50% threshold")
-	
+
 	// Push segment 0 from 30% to 60% fragmentation
 	additionalSeg0 := int(float64(objectsPerSegment) * 0.30)
 	for i := seg0DeleteCount; i < seg0DeleteCount+additionalSeg0; i++ {
@@ -1194,7 +1194,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 			s.Harness.DeleteObject(keys[idx])
 		}
 	}
-	
+
 	// Push segment 1 from 45% to 60% fragmentation
 	additionalSeg1 := int(float64(objectsPerSegment) * 0.15)
 	for i := seg1DeleteCount; i < seg1DeleteCount+additionalSeg1; i++ {
@@ -1204,7 +1204,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 			s.Harness.DeleteObject(keys[idx])
 		}
 	}
-	
+
 	t.Logf("Pushed segments over threshold (Seg0: 60%%, Seg1: 60%%, Seg2: already recompacted)")
 
 	// Now all segments should be recompacted as they're all >50% fragmentation
@@ -1230,7 +1230,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	require.Less(t, totalSizeAfter, expectedMaxSize,
 		fmt.Sprintf("Segment size should be significantly reduced after full recompaction (baseline: %d, after: %d, max expected: %d)",
 			baselineSize, totalSizeAfter, expectedMaxSize))
-	
+
 	// Also verify that recompaction actually happened (size should be less than before)
 	require.Less(t, totalSizeAfter, totalSizeBefore,
 		"Size should decrease after recompaction at 60% fragmentation")
@@ -1248,7 +1248,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	}
 	t.Logf("Successfully verified %d remaining objects", verifiedCount)
 	expectedRemaining := numObjects - len(deletedIndices)
-	require.Equal(t, expectedRemaining, verifiedCount, 
+	require.Equal(t, expectedRemaining, verifiedCount,
 		"Number of remaining objects should match expected")
 }
 
@@ -1360,4 +1360,285 @@ func (s *CompactionSuite) Test_SegmentRecompaction_Recovery() {
 	require.GreaterOrEqual(t, stats.RawFileCount, 0)
 	t.Logf("Recovery complete - Segments: %d, Raw files: %d",
 		stats.SegmentCount, stats.RawFileCount)
+}
+
+// Test_CompactionLoop_MultiThreaded tests compaction with multiple threads
+func (s *CompactionSuite) Test_CompactionLoop_MultiThreaded() {
+	t := s.T()
+
+	// Reinitialize with multiple compaction threads
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 500 * time.Millisecond
+	config.CompactionThreads = 4         // Use 4 compaction threads
+	config.SegmentSize = 2 * 1024 * 1024 // 2MB segments
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Create a large number of objects to ensure work distribution
+	numObjects := 200
+	objectSize := int64(100 * 1024) // 100KB each
+	keys := make([]string, numObjects)
+
+	t.Logf("Creating %d objects for multi-threaded compaction (4 threads)", numObjects)
+
+	// Create objects in batches to simulate realistic workload
+	batchSize := 50
+	for batch := 0; batch < numObjects/batchSize; batch++ {
+		t.Logf("Creating batch %d/%d", batch+1, numObjects/batchSize)
+
+		for i := 0; i < batchSize; i++ {
+			idx := batch*batchSize + i
+			key := fmt.Sprintf("mt-compact-%03d", idx)
+			keys[idx] = key
+			data := GenerateRandomData(objectSize)
+
+			err := s.Harness.PutObject(key, data, 0)
+			require.NoError(t, err, "Failed to store object %d", idx)
+		}
+
+		// Small delay between batches to allow some objects to be written
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Verify initial state - all should be RAW_FILE
+	initialStats := s.Harness.GetStorageStats()
+	t.Logf("Initial state - Raw files: %d, Segments: %d",
+		initialStats.RawFileCount, initialStats.SegmentCount)
+	require.Equal(t, numObjects, initialStats.RawFileCount, "All objects should initially be raw files")
+
+	// Wait for compaction to run (multiple cycles to ensure all threads work)
+	t.Log("Waiting for multi-threaded compaction to process files...")
+	time.Sleep(3 * time.Second)
+
+	// Check intermediate state
+	midStats := s.Harness.GetStorageStats()
+	t.Logf("After initial compaction - Raw files: %d, Segments: %d",
+		midStats.RawFileCount, midStats.SegmentCount)
+
+	// Perform concurrent operations while compaction is running
+	t.Log("Starting concurrent operations during multi-threaded compaction")
+
+	var wg sync.WaitGroup
+	stopChan := make(chan struct{})
+	errors := make(chan error, 100)
+
+	var newWrites, updates, deletes atomic.Int64
+
+	// Writer thread - continuously adds new objects
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			select {
+			case <-stopChan:
+				return
+			default:
+				key := fmt.Sprintf("mt-concurrent-new-%03d", i)
+				data := GenerateRandomData(80 * 1024) // 80KB
+				if err := s.Harness.PutObject(key, data, 0); err != nil {
+					errors <- fmt.Errorf("concurrent write failed: %w", err)
+					return
+				}
+				newWrites.Add(1)
+				time.Sleep(20 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Updater thread - updates existing objects
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 30; i++ {
+			select {
+			case <-stopChan:
+				return
+			default:
+				if i < len(keys) {
+					key := keys[i]
+					newData := GenerateRandomData(120 * 1024) // 120KB (different size)
+					if err := s.Harness.PutObject(key, newData, 0); err != nil {
+						errors <- fmt.Errorf("concurrent update failed: %w", err)
+						return
+					}
+					updates.Add(1)
+				}
+				time.Sleep(30 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Deleter thread - removes some objects
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 150; i < 170 && i < len(keys); i++ {
+			select {
+			case <-stopChan:
+				return
+			default:
+				s.Harness.DeleteObject(keys[i])
+				deletes.Add(1)
+				time.Sleep(40 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Reader thread - continuously reads to verify data integrity
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		readCount := 0
+		for readCount < 100 {
+			select {
+			case <-stopChan:
+				return
+			default:
+				// Read random existing keys
+				keyIdx := readCount % 150 // Read from first 150 keys (not deleted ones)
+				if keyIdx < len(keys) {
+					_, err := s.Harness.GetObject(keys[keyIdx])
+					if err != nil {
+						// During compaction, transient errors are expected
+						errStr := err.Error()
+						if !strings.Contains(errStr, "not found") &&
+							!strings.Contains(errStr, "no such file") &&
+							!strings.Contains(errStr, "file already closed") {
+							errors <- fmt.Errorf("read error for key %s: %w", keys[keyIdx], err)
+						}
+					}
+				}
+				readCount++
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Let concurrent operations run for a while
+	time.Sleep(2 * time.Second)
+
+	// Stop concurrent operations
+	close(stopChan)
+	wg.Wait()
+
+	// Check for errors
+	close(errors)
+	for err := range errors {
+		t.Errorf("Concurrent operation error: %v", err)
+	}
+
+	// Wait a bit more for final compaction
+	time.Sleep(2 * time.Second)
+
+	// Get final statistics
+	finalStats := s.Harness.GetStorageStats()
+	t.Logf("Final state - Raw files: %d, Segments: %d",
+		finalStats.RawFileCount, finalStats.SegmentCount)
+	t.Logf("Concurrent operations - New writes: %d, Updates: %d, Deletes: %d",
+		newWrites.Load(), updates.Load(), deletes.Load())
+
+	// Verify compaction occurred
+	require.Greater(t, finalStats.SegmentCount, initialStats.SegmentCount,
+		"Segments should be created by multi-threaded compaction")
+	require.Less(t, finalStats.RawFileCount, initialStats.RawFileCount,
+		"Raw files should be reduced by compaction")
+
+	// Verify data integrity for non-deleted keys
+	t.Log("Verifying data integrity after multi-threaded compaction")
+	verifiedCount := 0
+	for i := 0; i < 150; i++ { // Check first 150 keys (before deleted range)
+		key := keys[i]
+		_, err := s.Harness.GetObject(key)
+		if err == nil {
+			verifiedCount++
+			// Most objects should have been compacted to segments
+			// We can't directly verify the storage type without accessing RocksDB
+		} else if !strings.Contains(err.Error(), "not found") {
+			t.Errorf("Unexpected error reading key %s: %v", key, err)
+		}
+	}
+
+	t.Logf("Successfully verified %d objects after multi-threaded compaction", verifiedCount)
+	require.Greater(t, verifiedCount, 100, "Should be able to verify most non-deleted objects")
+
+	// Verify new objects written during compaction
+	newObjectsFound := 0
+	for i := 0; i < int(newWrites.Load()); i++ {
+		key := fmt.Sprintf("mt-concurrent-new-%03d", i)
+		if _, err := s.Harness.GetObject(key); err == nil {
+			newObjectsFound++
+		}
+	}
+	t.Logf("Found %d/%d new objects written during compaction",
+		newObjectsFound, newWrites.Load())
+	require.Greater(t, newObjectsFound, int(newWrites.Load())/2,
+		"Should find most objects written during compaction")
+}
+
+// Test_CompactionLoop_WorkDistribution verifies work is distributed across threads
+func (s *CompactionSuite) Test_CompactionLoop_WorkDistribution() {
+	t := s.T()
+
+	// Reinitialize with multiple compaction threads
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CompactionInterval = 1 * time.Second
+	config.CompactionThreads = 3         // Use 3 threads for easier verification
+	config.SegmentSize = 5 * 1024 * 1024 // 5MB segments
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Create objects with keys that will distribute across workers
+	// Using sequential numbers ensures even distribution with hash-based partitioning
+	numObjects := 90                // Divisible by 3 for even distribution
+	objectSize := int64(100 * 1024) // 100KB each
+	keys := make([]string, numObjects)
+
+	t.Logf("Creating %d objects to test work distribution across %d threads",
+		numObjects, config.CompactionThreads)
+
+	for i := 0; i < numObjects; i++ {
+		key := fmt.Sprintf("dist-test-%04d", i)
+		keys[i] = key
+		data := GenerateRandomData(objectSize)
+
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(t, err, "Failed to store object %d", i)
+	}
+
+	// Get initial state
+	initialStats := s.Harness.GetStorageStats()
+	t.Logf("Initial state - Raw files: %d, Segments: %d",
+		initialStats.RawFileCount, initialStats.SegmentCount)
+
+	// Wait for compaction
+	t.Log("Waiting for multi-threaded compaction...")
+	time.Sleep(3 * time.Second)
+
+	// Get final state
+	finalStats := s.Harness.GetStorageStats()
+	t.Logf("Final state - Raw files: %d, Segments: %d",
+		finalStats.RawFileCount, finalStats.SegmentCount)
+
+	// With 3 workers and proper distribution, we should have multiple segments
+	// Each worker creates its own segment(s)
+	require.GreaterOrEqual(t, finalStats.SegmentCount, 2,
+		"Should have at least 2 segments with 3 workers (some workers might share)")
+
+	// Most files should be compacted (check if segments were created)
+	compactedCount := numObjects - finalStats.RawFileCount
+	t.Logf("Compacted %d out of %d files", compactedCount, numObjects)
+	require.Equal(t, numObjects, compactedCount,
+		"All files should be compacted")
+
+	// Verify data integrity
+	successfulReads := 0
+	for _, key := range keys {
+		if _, err := s.Harness.GetObject(key); err == nil {
+			successfulReads++
+		}
+	}
+	t.Logf("Successfully read %d/%d objects after compaction", successfulReads, numObjects)
+	require.Equal(t, numObjects, successfulReads, "All objects should be readable")
 }

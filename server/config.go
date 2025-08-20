@@ -19,6 +19,7 @@ type Config struct {
 	FdCacheSize        int           // Size of the file descriptor cache
 	MaxDiskUsage       int64         // Maximum disk usage in bytes (0 = unlimited)
 	CompactionInterval time.Duration // Compaction interval
+	CompactionThreads  int           // Number of compaction threads
 	FragThreshold      float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
 	RecompactDisable   bool          // Disable automatic segment recompaction
 }
@@ -42,6 +43,7 @@ func LoadConfig() {
 		FdCacheSize:        *fdCacheSize,
 		MaxDiskUsage:       *maxDiskUsage,
 		CompactionInterval: *compactionInterval,
+		CompactionThreads:  *compactionThreads,
 		FragThreshold:      *fragThreshold,
 		RecompactDisable:   *recompactDisable,
 	}
