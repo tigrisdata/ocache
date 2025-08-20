@@ -20,6 +20,7 @@ var (
 	compactThreshold   = flag.Int64("compact-threshold", stor.DefaultCompactThreshold, "Compaction threshold (bytes)")
 	segmentSize        = flag.Int64("segment-size", stor.DefaultSegmentSize, "Segment size (bytes)")
 	compactionInterval = flag.Duration("compaction-interval", stor.DefaultCompactionInterval, "Compaction interval")
+	compactionThreads  = flag.Int("compaction-threads", stor.DefaultCompactionThreads, "Number of compaction threads")
 	fragThreshold      = flag.Float64("fragmentation-threshold", stor.DefaultFragmentationThreshold, "Segment fragmentation threshold for recompaction (0.0-1.0)")
 	recompactDisable   = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
 
@@ -52,6 +53,7 @@ func RunServer() {
 		FdCacheSize:         AppConfig.FdCacheSize,
 		MaxDiskUsage:        AppConfig.MaxDiskUsage,
 		CompactionInterval:  AppConfig.CompactionInterval,
+		CompactionThreads:   AppConfig.CompactionThreads,
 		FragThreshold:       AppConfig.FragThreshold,
 		DisableRecompaction: AppConfig.RecompactDisable,
 	}

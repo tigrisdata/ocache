@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"hash/fnv"
+
 	"github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 
@@ -92,4 +94,11 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 	}
 
 	return nil
+}
+
+// HashString returns a simple hash of a string for partitioning work
+func HashString(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
 }
