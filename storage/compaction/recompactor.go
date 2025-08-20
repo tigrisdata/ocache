@@ -24,9 +24,6 @@ import (
 const (
 	// recompactorCallerIDPrefix is the prefix for the caller ID for the recompactor.
 	recompactorCallerIDPrefix = "recompactor-"
-
-	// minSegments is the minimum number of segments required for recompaction.
-	minSegmentsBeforeRecompaction = 3
 )
 
 // SegmentRecompactor handles recompaction of fragmented segments
@@ -36,16 +33,18 @@ type SegmentRecompactor struct {
 	deletionQueue *deletion.Queue
 	fragThreshold float64
 	minSegmentAge time.Duration
+	minSegments   int
 }
 
 // NewSegmentRecompactor creates a new segment recompactor
-func NewSegmentRecompactor(sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration) *SegmentRecompactor {
+func NewSegmentRecompactor(sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int) *SegmentRecompactor {
 	return &SegmentRecompactor{
 		sm:            sm,
 		meta:          metadata.GetMetaDB(),
 		deletionQueue: deletionQueue,
 		fragThreshold: fragThreshold,
 		minSegmentAge: minSegmentAge,
+		minSegments:   minSegments,
 	}
 }
 
@@ -66,7 +65,7 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 	// Safety check: Need enough segments to safely recompact
 	// In production, we need at least 3 segments (2 to skip + 1 to potentially recompact)
 	// But allow overriding for testing
-	minSegments := minSegmentsBeforeRecompaction
+	minSegments := sr.minSegments
 	if skipStr := os.Getenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT"); skipStr != "" {
 		if skip, err := strconv.Atoi(skipStr); err == nil && skip == 0 {
 			// If set in tests, allow recompaction with just 1 segment

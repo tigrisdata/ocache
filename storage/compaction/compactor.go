@@ -48,15 +48,16 @@ const (
 
 // CompactorConfig contains configuration for the compactor
 type CompactorConfig struct {
-	FileManager    *files.FileManager
-	SegmentManager *segment.Manager
-	DeletionQueue  *deletion.Queue
-	MaxBytes       int64
-	Interval       time.Duration
+	FileManager             *files.FileManager
+	SegmentManager          *segment.Manager
+	DeletionQueue           *deletion.Queue
+	MaxBytesPerCompactRound int64
+	Interval                time.Duration
 	// Recompaction settings (optional)
 	EnableRecompaction bool
 	FragThreshold      float64
 	MinSegmentAge      time.Duration
+	MinSegments        int
 }
 
 // ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
@@ -72,14 +73,14 @@ func (e *ErrFileSizeMismatch) Error() string {
 }
 
 type Compactor struct {
-	fm            *files.FileManager
-	sm            *segment.Manager
-	meta          *metadata.MetaDB
-	fdCache       *fd.FdCache
-	deletionQueue *deletion.Queue
-	maxBytes      int64
-	interval      time.Duration
-	recompactor   *SegmentRecompactor
+	fm                      *files.FileManager
+	sm                      *segment.Manager
+	meta                    *metadata.MetaDB
+	fdCache                 *fd.FdCache
+	deletionQueue           *deletion.Queue
+	maxBytesPerCompactRound int64
+	interval                time.Duration
+	recompactor             *SegmentRecompactor
 
 	// background loop coordination
 	cancel context.CancelFunc
@@ -92,16 +93,16 @@ type Compactor struct {
 func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *deletion.Queue, maxBytes int64, interval time.Duration) *Compactor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Compactor{
-		fm:            fm,
-		sm:            sm,
-		meta:          metadata.GetMetaDB(),
-		fdCache:       fd.GetFdCache(),
-		deletionQueue: deletionQueue,
-		maxBytes:      maxBytes,
-		interval:      interval,
-		recompactor:   nil, // Will be set with SetRecompactor
-		ctx:           ctx,
-		cancel:        cancel,
+		fm:                      fm,
+		sm:                      sm,
+		meta:                    metadata.GetMetaDB(),
+		fdCache:                 fd.GetFdCache(),
+		deletionQueue:           deletionQueue,
+		maxBytesPerCompactRound: maxBytes,
+		interval:                interval,
+		recompactor:             nil, // Will be set with NewCompactorWithConfig
+		ctx:                     ctx,
+		cancel:                  cancel,
 	}
 }
 
@@ -109,20 +110,20 @@ func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *del
 func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Compactor{
-		fm:            cfg.FileManager,
-		sm:            cfg.SegmentManager,
-		meta:          metadata.GetMetaDB(),
-		fdCache:       fd.GetFdCache(),
-		deletionQueue: cfg.DeletionQueue,
-		maxBytes:      cfg.MaxBytes,
-		interval:      cfg.Interval,
-		ctx:           ctx,
-		cancel:        cancel,
+		fm:                      cfg.FileManager,
+		sm:                      cfg.SegmentManager,
+		meta:                    metadata.GetMetaDB(),
+		fdCache:                 fd.GetFdCache(),
+		deletionQueue:           cfg.DeletionQueue,
+		maxBytesPerCompactRound: cfg.MaxBytesPerCompactRound,
+		interval:                cfg.Interval,
+		ctx:                     ctx,
+		cancel:                  cancel,
 	}
 
 	// Set up recompactor if configured
 	if cfg.EnableRecompaction && cfg.FragThreshold > 0 {
-		c.recompactor = NewSegmentRecompactor(cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge)
+		c.recompactor = NewSegmentRecompactor(cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge, cfg.MinSegments)
 	}
 
 	return c
@@ -155,28 +156,6 @@ func (c *Compactor) Close() {
 	}
 }
 
-// SetRecompactor sets up the segment recompactor with the given parameters
-// Deprecated: Use NewCompactorWithConfig instead to configure recompaction at creation time
-func (c *Compactor) SetRecompactor(fragThreshold float64, minSegmentAge time.Duration) {
-	c.recompactor = NewSegmentRecompactor(c.sm, c.deletionQueue, fragThreshold, minSegmentAge)
-}
-
-// StartRecompaction starts the segment recompaction loop if a recompactor is configured
-// This can be used to dynamically start recompaction after the compactor has been created
-func (c *Compactor) StartRecompaction(fragThreshold float64, minSegmentAge time.Duration) {
-	// Set up recompactor if not already configured
-	if c.recompactor == nil {
-		c.recompactor = NewSegmentRecompactor(c.sm, c.deletionQueue, fragThreshold, minSegmentAge)
-	}
-
-	// Start the recompaction loop
-	if c.recompactor != nil && c.recompactor.fragThreshold > 0 {
-		c.wg.Add(1)
-		go c.segmentRecompactionLoop()
-		zlog.Info().Float64("threshold", fragThreshold).Msg("Started segment recompaction")
-	}
-}
-
 // fileCompactionLoop triggers file compaction on a timer until Close is called.
 func (c *Compactor) fileCompactionLoop() {
 	defer c.wg.Done()
@@ -193,7 +172,7 @@ func (c *Compactor) fileCompactionLoop() {
 			if c.ctx.Err() != nil {
 				return
 			}
-			c.CompactFiles(c.ctx, c.maxBytes)
+			c.CompactFiles(c.ctx, c.maxBytesPerCompactRound)
 		case <-c.ctx.Done():
 			zlog.Info().Msg("compactor: file compaction loop stopping")
 			return

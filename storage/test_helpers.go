@@ -12,7 +12,20 @@ func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThresh
 	segmentSize int64, fdCacheSize int, maxDiskUsage int64,
 ) (*Storage, func()) {
 	dir := t.TempDir()
-	s, err := newStorage(dir, ttl, inlineThreshold, compactThreshold, segmentSize, fdCacheSize, maxDiskUsage)
+
+	config := &StorageConfig{
+		DiskPath:            dir,
+		TTL:                 ttl,
+		InlineThreshold:     inlineThreshold,
+		CompactThreshold:    compactThreshold,
+		SegmentSize:         segmentSize,
+		FdCacheSize:         fdCacheSize,
+		MaxDiskUsage:        maxDiskUsage,
+		CompactionInterval:  DefaultCompactionInterval,
+		FragThreshold:       DefaultFragmentationThreshold,
+		DisableRecompaction: true,
+	}
+	s, err := newStorageWithConfig(config)
 	require.NoError(t, err, "failed to create storage")
 
 	cleanup := func() {

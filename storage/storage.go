@@ -25,9 +25,30 @@ import (
 )
 
 const (
+	// Default disk path
+	DefaultDiskPath = "/var/cache"
+
+	// Default TTL (seconds) when no key-level TTL is set
+	DefaultTTL = 0
+
+	// Default inline threshold (bytes) for small objects that are inlined in RocksDB
+	DefaultInlineThreshold = 64 * 1024 // 64KB
+
+	// Default compact threshold (bytes) for objects that are compacted to segments
+	DefaultCompactThreshold = 16 * 1024 * 1024 // 16MB
+
+	// Default segment size (bytes)
+	DefaultSegmentSize = 256 * 1024 * 1024 // 256MB
+
+	// Default file descriptor cache size (entries)
+	DefaultFdCacheSize = 10000
+
+	// Default max disk usage (bytes)
+	DefaultMaxDiskUsage = 0
+
 	// Default compaction thresholds
-	DefaultCompactionMaxBytes     = 1 << 30 // 1GB
-	DefaultFileCompactionInterval = 1 * time.Minute
+	DefaultMaxBytesPerCompactRound = 1 << 30 // 1GB
+	DefaultCompactionInterval      = 30 * time.Second
 
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
@@ -40,23 +61,28 @@ const (
 	DeleteBatchSize = 1000 // Number of deletions to process per batch
 
 	// Default segment recompaction settings
-	DefaultFragmentationThreshold = 0.5            // Recompact when dead space exceeds 50%
-	MinSegmentAgeForRecompaction  = 2 * time.Hour  // Don't recompact segments younger than 2 hours (ensures they're cold)
-	DeleteProcessInterval         = time.Second    // Interval between batch processing
-	DeletePruneAge                = 24 * time.Hour // Age after which entries are pruned
+	DefaultRecompactionDisabled   = false
+	DefaultFragmentationThreshold = 0.5           // Recompact when dead space exceeds 50%
+	MinSegmentAgeForRecompaction  = 2 * time.Hour // Don't recompact segments younger than 2 hours (ensures they're cold)
+	MinSegmentsBeforeRecompaction = 3             // Minimum number of segments required for recompaction
+
+	// Default delete queue settings
+	DeleteProcessInterval = time.Second    // Interval between batch processing
+	DeletePruneAge        = 24 * time.Hour // Age after which entries are pruned
 )
 
 // StorageConfig holds all configuration parameters for initializing storage
 type StorageConfig struct {
-	DiskPath            string  // Directory for on-disk cache data
-	TTL                 int     // Default TTL when no key-level TTL is set (seconds)
-	InlineThreshold     int     // Threshold for small objects that are inlined in RocksDB (bytes)
-	CompactThreshold    int64   // Objects less than this size are compacted to segments (bytes)
-	SegmentSize         int64   // Segment size (bytes)
-	FdCacheSize         int     // Size of the file descriptor cache
-	MaxDiskUsage        int64   // Maximum disk usage in bytes (0 = unlimited)
-	FragThreshold       float64 // Fragmentation threshold for segment recompaction (0.0-1.0)
-	DisableRecompaction bool    // Disable automatic segment recompaction
+	DiskPath            string        // Directory for on-disk cache data
+	TTL                 int           // Default TTL when no key-level TTL is set (seconds)
+	InlineThreshold     int           // Threshold for small objects that are inlined in RocksDB (bytes)
+	CompactThreshold    int64         // Objects less than this size are compacted to segments (bytes)
+	SegmentSize         int64         // Segment size (bytes)
+	FdCacheSize         int           // Size of the file descriptor cache
+	MaxDiskUsage        int64         // Maximum disk usage in bytes (0 = unlimited)
+	CompactionInterval  time.Duration // Compaction interval
+	FragThreshold       float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
+	DisableRecompaction bool          // Disable automatic segment recompaction
 }
 
 // getCleanupInterval returns the cleanup interval, allowing tests to override via env var
@@ -67,16 +93,6 @@ func getCleanupInterval() time.Duration {
 		}
 	}
 	return DefaultTTLCleanupInterval
-}
-
-// getCompactionInterval returns the compaction interval, allowing tests to override via env var
-func getCompactionInterval() time.Duration {
-	if testInterval := os.Getenv("OCACHE_TEST_COMPACTION_INTERVAL"); testInterval != "" {
-		if d, err := time.ParseDuration(testInterval); err == nil {
-			return d
-		}
-	}
-	return DefaultFileCompactionInterval
 }
 
 // accessUpdate represents a single access time update request
@@ -264,22 +280,6 @@ func InitStorageWithConfig(config *StorageConfig) {
 	storage = s
 }
 
-// newStorage initializes RocksDB inside diskPath and returns a Storage instance
-// Deprecated: Use newStorageWithConfig instead
-func newStorage(diskPath string, ttl int, inlineThreshold int, compactThreshold int64, segmentSize int64, fdCacheSize int, maxDiskUsage int64) (*Storage, error) {
-	config := &StorageConfig{
-		DiskPath:            diskPath,
-		TTL:                 ttl,
-		InlineThreshold:     inlineThreshold,
-		CompactThreshold:    compactThreshold,
-		SegmentSize:         segmentSize,
-		FdCacheSize:         fdCacheSize,
-		MaxDiskUsage:        maxDiskUsage,
-		DisableRecompaction: true, // Keep old behavior - no recompaction by default
-	}
-	return newStorageWithConfig(config)
-}
-
 // newStorageWithConfig initializes RocksDB inside diskPath and returns a Storage instance
 func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Create the data directory if it doesn't exist
@@ -324,17 +324,17 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	})
 	deletionQueue.Start()
 
-	// Initialize and start background compactor that migrates raw files into segments.
-	compactionInterval := getCompactionInterval()
-
 	// Configure compactor with recompaction if enabled
-
 	compactorConfig := &compaction.CompactorConfig{
-		FileManager:    fileManager,
-		SegmentManager: segmentManager,
-		DeletionQueue:  deletionQueue,
-		MaxBytes:       DefaultCompactionMaxBytes,
-		Interval:       compactionInterval,
+		FileManager:             fileManager,
+		SegmentManager:          segmentManager,
+		DeletionQueue:           deletionQueue,
+		MaxBytesPerCompactRound: DefaultMaxBytesPerCompactRound,
+		Interval:                DefaultCompactionInterval,
+	}
+
+	if config.CompactionInterval > 0 {
+		compactorConfig.Interval = config.CompactionInterval
 	}
 
 	if !config.DisableRecompaction {
@@ -346,6 +346,7 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		compactorConfig.EnableRecompaction = true
 		compactorConfig.FragThreshold = fragThreshold
 		compactorConfig.MinSegmentAge = MinSegmentAgeForRecompaction
+		compactorConfig.MinSegments = MinSegmentsBeforeRecompaction
 
 		// Override min segment age for testing if env var is set
 		if testMinAge := os.Getenv("OCACHE_TEST_RECOMPACTION_MIN_AGE"); testMinAge != "" {
