@@ -12,6 +12,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	// accessBucketCleanupInterval is the interval at which we clean up old access buckets
+	accessBucketCleanupInterval = 24 * time.Hour
+
+	// accessBucketCleanupThreshold is the threshold at which we clean up old access buckets
+	accessBucketCleanupThreshold = 30 * 24 * time.Hour
+)
+
 // Cleaner is responsible for background TTL cleanup and LRU eviction
 type Cleaner struct {
 	storage      *Storage
@@ -80,12 +88,21 @@ func (c *Cleaner) cleanupLoop() {
 	c.calculateTotalSize()
 	c.initialized.Store(true)
 
+	// Track when we last cleaned up old buckets
+	lastBucketCleanup := time.Now()
+
 	for {
 		select {
 		case <-ticker.C:
 			c.cleanupExpiredKeys()
 			if c.maxDiskUsage > 0 {
 				c.enforceDiskLimit()
+
+				// Periodically clean up old access buckets (once a day)
+				if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+					c.cleanupOldBuckets(accessBucketCleanupThreshold)
+					lastBucketCleanup = time.Now()
+				}
 			}
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: background loop stopping")
@@ -137,9 +154,21 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := proto.Unmarshal(value, valueMsg); err != nil {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
-			// Also delete access index
-			accessKey := MakeAccessIndexKey(key)
-			batch.Delete(accessKey)
+			// Delete any bucketed access entry
+			it2 := c.storage.meta.Handle().NewIterator(ro)
+			prefix := []byte(keys.AccessBucketPrefix)
+			for it2.Seek(prefix); it2.ValidForPrefix(prefix); it2.Next() {
+				keyBytes2 := it2.Key().Data()
+				if originalKey, _, err := ParseBucketedAccessKey(keyBytes2); err == nil && originalKey == key {
+					batch.Delete(keyBytes2)
+					it2.Key().Free()
+					it2.Value().Free()
+					break
+				}
+				it2.Key().Free()
+				it2.Value().Free()
+			}
+			it2.Close()
 			cleaned++
 			it.Key().Free()
 			it.Value().Free()
@@ -152,9 +181,21 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
-			// Also delete access index
-			accessKey := MakeAccessIndexKey(key)
-			batch.Delete(accessKey)
+			// Delete any bucketed access entry
+			it2 := c.storage.meta.Handle().NewIterator(ro)
+			prefix := []byte(keys.AccessBucketPrefix)
+			for it2.Seek(prefix); it2.ValidForPrefix(prefix); it2.Next() {
+				keyBytes2 := it2.Key().Data()
+				if originalKey, _, err := ParseBucketedAccessKey(keyBytes2); err == nil && originalKey == key {
+					batch.Delete(keyBytes2)
+					it2.Key().Free()
+					it2.Value().Free()
+					break
+				}
+				it2.Key().Free()
+				it2.Value().Free()
+			}
+			it2.Close()
 			cleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
@@ -262,7 +303,7 @@ func (c *Cleaner) enforceDiskLimit() {
 		Int64("need_to_evict", needToEvict).
 		Msg("cleaner: enforcing disk usage limit with LRU eviction")
 
-	c.evictLRUKeys(needToEvict)
+	c.evictLRUKeysScalable(needToEvict)
 }
 
 // UpdateSize updates the tracked total size when keys are added/removed

@@ -13,8 +13,9 @@ const (
 	// Uses the same format as other internal keys (starting with !)
 	MetadataPrefix = "!meta/"
 
-	// AccessIndexPrefix is the prefix for last access time index entries
-	AccessIndexPrefix = "!access/"
+	// AccessBucketPrefix is the prefix for time-bucketed access index entries
+	// Format: !access_bucket/YYYYMMDDHH/timestamp_nano/key
+	AccessBucketPrefix = "!access_bucket/"
 
 	// CompactionIndexPrefix is the prefix for all compaction index entries in RocksDB
 	CompactionIndexPrefix = "!compact/"
