@@ -110,6 +110,10 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 		batch.Delete(metaKey)
 		batch.Delete(keyBytes)
 
+		// Delete secondary index entry
+		bucketIndexKey := MakeBucketIndexKey(originalKey)
+		batch.Delete(bucketIndexKey)
+
 		evicted += size
 		evictedCount++
 

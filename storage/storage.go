@@ -374,21 +374,18 @@ func (s *Storage) DeleteKey(key string) {
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
 	batch.Delete(metaKey)
-	// Delete any bucketed access entries
-	it := s.meta.Handle().NewIterator(ro)
-	prefix := []byte(keys.AccessBucketPrefix)
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		keyBytes := it.Key().Data()
-		if originalKey, _, err := ParseBucketedAccessKey(keyBytes); err == nil && originalKey == key {
-			batch.Delete(keyBytes)
-			it.Key().Free()
-			it.Value().Free()
-			break
-		}
-		it.Key().Free()
-		it.Value().Free()
+
+	// Use secondary index to find and delete the bucketed access entry
+	bucketIndexKey := MakeBucketIndexKey(key)
+	if slice, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
+		// Delete the bucketed entry
+		bucketKey := slice.Data()
+		batch.Delete(bucketKey)
+		slice.Free()
 	}
-	it.Close()
+	// Delete the secondary index entry
+	batch.Delete(bucketIndexKey)
+
 	s.meta.Handle().Write(wo, batch)
 }
 
@@ -574,6 +571,10 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		accessKey := MakeBucketedAccessKey(key, now)
 		accessVal := MakeBucketedAccessValue(bytesWritten)
 		batch.Put(accessKey, accessVal)
+
+		// Add secondary index entry
+		bucketIndexKey := MakeBucketIndexKey(key)
+		batch.Put(bucketIndexKey, accessKey)
 	}
 
 	return s.meta.Handle().Write(wo, batch)

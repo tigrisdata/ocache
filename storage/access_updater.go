@@ -139,24 +139,17 @@ func (a *accessUpdater) flushBatch(batch map[string]int64) {
 	defer writeBatch.Destroy()
 
 	for key, accessTime := range batch {
-		// Check if there's an existing bucketed entry and delete it
-		// We need to find and delete any existing entry for this key
-		it := a.storage.meta.Handle().NewIterator(ro)
-		prefix := []byte(keys.AccessBucketPrefix)
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			keyBytes := it.Key().Data()
-			if originalKey, _, err := ParseBucketedAccessKey(keyBytes); err == nil && originalKey == key {
-				writeBatch.Delete(keyBytes)
-				it.Key().Free()
-				it.Value().Free()
-				break
-			}
-			it.Key().Free()
-			it.Value().Free()
+		// Get the current bucket location from the secondary index
+		bucketIndexKey := MakeBucketIndexKey(key)
+		slice, err := a.storage.meta.Handle().Get(ro, bucketIndexKey)
+		if err == nil && slice.Exists() {
+			// Delete the old bucketed entry
+			oldBucketKey := slice.Data()
+			writeBatch.Delete(oldBucketKey)
+			slice.Free()
 		}
-		it.Close()
 
-		// Now add the new bucketed entry
+		// Create the new bucketed entry
 		accessTimeObj := time.Unix(accessTime, 0)
 		newKey := MakeBucketedAccessKey(key, accessTimeObj)
 
@@ -173,6 +166,9 @@ func (a *accessUpdater) flushBatch(batch map[string]int64) {
 
 		newVal := MakeBucketedAccessValue(size)
 		writeBatch.Put(newKey, newVal)
+
+		// Update the secondary index
+		writeBatch.Put(bucketIndexKey, newKey)
 	}
 
 	if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {

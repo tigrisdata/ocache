@@ -17,6 +17,10 @@ const (
 	// Format: !access_bucket/YYYYMMDDHH/timestamp_nano/key
 	AccessBucketPrefix = "!access_bucket/"
 
+	// BucketIndexPrefix is the prefix for the secondary index mapping keys to their bucket location
+	// Format: !bucket_index/<key> -> bucketed_key
+	BucketIndexPrefix = "!bucket_index/"
+
 	// CompactionIndexPrefix is the prefix for all compaction index entries in RocksDB
 	CompactionIndexPrefix = "!compact/"
 

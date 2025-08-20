@@ -73,19 +73,14 @@ func ParseBucketedAccessKey(bucketedKey []byte) (string, time.Time, error) {
 	}
 
 	timestampStr := remaining[:19]
-	nanos, err := fmt.Sscanf(timestampStr, "%d", new(int64))
-	if err != nil || nanos != 1 {
+	var timestamp int64
+	n, err := fmt.Sscanf(timestampStr, "%d", &timestamp)
+	if err != nil || n != 1 {
 		return "", time.Time{}, fmt.Errorf("invalid timestamp in bucketed key")
 	}
-
-	var timestamp int64
-	fmt.Sscanf(timestampStr, "%d", &timestamp)
 	accessTime := time.Unix(0, timestamp)
 
 	// Extract original key (everything after timestamp/)
-	if len(remaining) < 20 {
-		return "", time.Time{}, fmt.Errorf("invalid bucketed key: missing key")
-	}
 	originalKey := remaining[20:]
 
 	return originalKey, accessTime, nil
@@ -145,6 +140,12 @@ func GetNextBucketTime(current time.Time) time.Time {
 // GetPreviousBucketTime returns the start time of the previous bucket
 func GetPreviousBucketTime(current time.Time) time.Time {
 	return current.Truncate(BucketDuration).Add(-BucketDuration)
+}
+
+// MakeBucketIndexKey creates a secondary index key that maps a cache key to its current bucket location
+// Format: !bucket_index/<key>
+func MakeBucketIndexKey(key string) []byte {
+	return []byte(fmt.Sprintf("%s%s", keys.BucketIndexPrefix, key))
 }
 
 // CleanupOldBuckets returns a list of bucket prefixes older than the given duration
