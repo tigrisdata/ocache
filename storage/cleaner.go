@@ -164,6 +164,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 				if err := c.storage.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
 					zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to queue raw file for deletion")
 				}
+			case pb.ValueType_SEGMENT:
+				// Update delete index to track this deletion for future garbage collection
+				c.storage.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
 			}
 		}
 
