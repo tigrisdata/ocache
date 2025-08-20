@@ -156,7 +156,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
 			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := MakeBucketIndexKey(key)
+			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
 				bucketKey := slice.Data()
 				batch.Delete(bucketKey)
@@ -176,7 +176,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
 			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := MakeBucketIndexKey(key)
+			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
 				bucketKey := slice.Data()
 				batch.Delete(bucketKey)

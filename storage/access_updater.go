@@ -140,7 +140,7 @@ func (a *accessUpdater) flushBatch(batch map[string]int64) {
 
 	for key, accessTime := range batch {
 		// Get the current bucket location from the secondary index
-		bucketIndexKey := MakeBucketIndexKey(key)
+		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 		slice, err := a.storage.meta.Handle().Get(ro, bucketIndexKey)
 		if err == nil && slice.Exists() {
 			// Delete the old bucketed entry
@@ -151,7 +151,7 @@ func (a *accessUpdater) flushBatch(batch map[string]int64) {
 
 		// Create the new bucketed entry
 		accessTimeObj := time.Unix(accessTime, 0)
-		newKey := MakeBucketedAccessKey(key, accessTimeObj)
+		newKey := keys.MakeBucketedAccessKey(key, accessTimeObj)
 
 		// Get the size from metadata
 		var size int64

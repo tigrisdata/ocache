@@ -376,7 +376,7 @@ func (s *Storage) DeleteKey(key string) {
 	batch.Delete(metaKey)
 
 	// Use secondary index to find and delete the bucketed access entry
-	bucketIndexKey := MakeBucketIndexKey(key)
+	bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 	if slice, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
 		// Delete the bucketed entry
 		bucketKey := slice.Data()
@@ -568,12 +568,12 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Add access time index entry for LRU tracking only if max disk usage is set
 	if s.cleaner.maxDiskUsage > 0 {
 		now := time.Now()
-		accessKey := MakeBucketedAccessKey(key, now)
+		accessKey := keys.MakeBucketedAccessKey(key, now)
 		accessVal := MakeBucketedAccessValue(bytesWritten)
 		batch.Put(accessKey, accessVal)
 
 		// Add secondary index entry
-		bucketIndexKey := MakeBucketIndexKey(key)
+		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 		batch.Put(bucketIndexKey, accessKey)
 	}
 

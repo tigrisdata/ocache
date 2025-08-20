@@ -31,7 +31,7 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	prefix := GetOldestBucketPrefix()
+	prefix := GetOldestAccessBucketPrefix()
 	zlog.Info().
 		Int64("target_bytes", targetBytes).
 		Str("prefix", string(prefix)).
@@ -56,7 +56,7 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 		valueBytes := it.Value().Data()
 
 		// Parse the bucketed key to get the original key and access time
-		originalKey, accessTime, err := ParseBucketedAccessKey(keyBytes)
+		originalKey, accessTime, err := keys.ParseBucketedAccessKey(keyBytes)
 		if err != nil {
 			zlog.Debug().Err(err).Str("key", string(keyBytes)).Msg("cleaner: failed to parse bucketed key")
 			it.Key().Free()
@@ -111,7 +111,7 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 		batch.Delete(keyBytes)
 
 		// Delete secondary index entry
-		bucketIndexKey := MakeBucketIndexKey(originalKey)
+		bucketIndexKey := keys.MakeBucketedAccessIndexKey(originalKey)
 		batch.Delete(bucketIndexKey)
 
 		evicted += size
@@ -198,17 +198,17 @@ func (c *Cleaner) cleanupOldBuckets(olderThan time.Duration) {
 
 	// Calculate cutoff time
 	cutoff := time.Now().Add(-olderThan)
-	cutoffBucket := GetBucketKey(cutoff)
+	cutoffBucket := keys.GetBucketedAccessKey(cutoff)
 
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	prefix := GetOldestBucketPrefix()
+	prefix := GetOldestAccessBucketPrefix()
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		keyBytes := it.Key().Data()
 
 		// Extract bucket from key
-		bucket := ExtractBucketFromKey(keyBytes)
+		bucket := keys.ExtractAccessBucketFromKey(keyBytes)
 		if bucket == "" || bucket >= cutoffBucket {
 			// We've reached buckets that are not old enough
 			it.Key().Free()
