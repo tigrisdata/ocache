@@ -290,7 +290,7 @@ func (c *Cleaner) enforceDiskLimit() {
 		Int64("need_to_evict", needToEvict).
 		Msg("cleaner: enforcing disk usage limit with LRU eviction")
 
-	c.evictLRUKeysScalable(needToEvict)
+	c.evictLRUKeys(needToEvict)
 }
 
 // UpdateSize updates the tracked total size when keys are added/removed

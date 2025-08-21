@@ -569,8 +569,7 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	if s.cleaner.maxDiskUsage > 0 {
 		now := time.Now()
 		accessKey := keys.MakeBucketedAccessKey(key, now)
-		accessVal := MakeBucketedAccessValue(bytesWritten)
-		batch.Put(accessKey, accessVal)
+		batch.Put(accessKey, []byte{})
 
 		// Add secondary index entry
 		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)

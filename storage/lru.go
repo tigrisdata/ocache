@@ -10,9 +10,9 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// evictLRUKeysScalable evicts the least recently used keys using bucket iteration
+// evictLRUKeys evicts the least recently used keys using bucket iteration
 // This implementation is scalable to millions of keys as it doesn't load all keys into memory
-func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
+func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 	start := time.Now()
 
 	var evicted int64
@@ -53,25 +53,22 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 		}
 
 		keyBytes := it.Key().Data()
-		valueBytes := it.Value().Data()
 
 		// Parse the bucketed key to get the original key and access time
 		originalKey, accessTime, err := keys.ParseBucketedAccessKey(keyBytes)
 		if err != nil {
 			zlog.Debug().Err(err).Str("key", string(keyBytes)).Msg("cleaner: failed to parse bucketed key")
+
 			it.Key().Free()
 			it.Value().Free()
 			continue
 		}
 
-		// Parse the size from the value
-		size := ParseBucketedAccessValue(valueBytes)
 		processedKeys++
 
 		zlog.Debug().
 			Str("key", originalKey).
 			Time("last_access", accessTime).
-			Int64("size", size).
 			Int("processed", processedKeys).
 			Msg("cleaner: processing key for LRU eviction")
 
@@ -81,28 +78,40 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 		if err != nil || !slice.Exists() {
 			// Key doesn't exist in metadata, clean up the access entry
 			batch.Delete(keyBytes)
+
 			zlog.Debug().Str("key", originalKey).Msg("cleaner: removing orphaned access entry")
+
 			it.Key().Free()
 			it.Value().Free()
+
 			continue
 		}
 
 		// Parse the metadata
 		valueMsg := &pb.ValueMessage{}
 		if err := proto.Unmarshal(slice.Data(), valueMsg); err != nil {
+			// Failed to parse metadata, clean up the metadata and access entry
+			batch.Delete(metaKey)
+			batch.Delete(keyBytes)
+
+			zlog.Debug().Str("key", originalKey).Msg("cleaner: removing orphaned metadata and access entry during LRU eviction")
+
 			slice.Free()
 			it.Key().Free()
 			it.Value().Free()
+
 			continue
 		}
 		slice.Free()
 
-		// Check if the key is expired (shouldn't happen as cleanup runs first, but double-check)
+		// If the key is expired, we don't need to delete it as it will be deleted by the background cleaner
 		now := time.Now().Unix()
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			zlog.Debug().Str("key", originalKey).Msg("cleaner: skipping expired key in LRU")
+
 			it.Key().Free()
 			it.Value().Free()
+
 			continue
 		}
 
@@ -114,12 +123,12 @@ func (c *Cleaner) evictLRUKeysScalable(targetBytes int64) {
 		bucketIndexKey := keys.MakeBucketedAccessIndexKey(originalKey)
 		batch.Delete(bucketIndexKey)
 
-		evicted += size
+		evicted += valueMsg.ValueLength
 		evictedCount++
 
 		zlog.Debug().
 			Str("key", originalKey).
-			Int64("size", size).
+			Int64("size", valueMsg.ValueLength).
 			Int64("evicted_so_far", evicted).
 			Int("count", evictedCount).
 			Msg("cleaner: evicting key")

@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"encoding/binary"
 	"time"
 
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -16,22 +15,6 @@ const (
 // for scalable LRU eviction without loading all keys into memory
 type TimeBucketedAccessIndex struct {
 	// No state needed - all operations are stateless
-}
-
-// MakeBucketedAccessValue creates the value for a bucketed access entry
-// The value contains the size of the object (8 bytes)
-func MakeBucketedAccessValue(size int64) []byte {
-	val := make([]byte, 8)
-	binary.BigEndian.PutUint64(val, uint64(size))
-	return val
-}
-
-// ParseBucketedAccessValue extracts the size from a bucketed access value
-func ParseBucketedAccessValue(value []byte) int64 {
-	if len(value) != 8 {
-		return 0
-	}
-	return int64(binary.BigEndian.Uint64(value))
 }
 
 // GetOldestBucket returns the prefix for iterating the oldest bucket

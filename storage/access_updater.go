@@ -6,9 +6,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
-	"google.golang.org/protobuf/proto"
 )
 
 // accessUpdate represents a single access time update request
@@ -81,7 +79,7 @@ func (a *accessUpdater) run() {
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
 
-	batch := make(map[string]int64)
+	batch := make(map[string]accessUpdate)
 
 	for {
 		select {
@@ -95,14 +93,14 @@ func (a *accessUpdater) run() {
 
 		case update := <-a.updates:
 			// Only keep the latest access time for each key
-			batch[update.key] = update.time
+			batch[update.key] = update
 
 		case done := <-a.flush:
 			// Handle explicit flush request
 			a.collectUpdates(batch)
 			if len(batch) > 0 {
 				a.flushBatch(batch)
-				batch = make(map[string]int64)
+				batch = make(map[string]accessUpdate)
 			}
 			close(done) // Signal completion
 
@@ -110,18 +108,18 @@ func (a *accessUpdater) run() {
 			if len(batch) > 0 {
 				a.flushBatch(batch)
 				// Clear the batch
-				batch = make(map[string]int64)
+				batch = make(map[string]accessUpdate)
 			}
 		}
 	}
 }
 
 // collectUpdates drains all pending updates from the channel
-func (a *accessUpdater) collectUpdates(batch map[string]int64) {
+func (a *accessUpdater) collectUpdates(batch map[string]accessUpdate) {
 	for {
 		select {
 		case update := <-a.updates:
-			batch[update.key] = update.time
+			batch[update.key] = update
 		default:
 			return
 		}
@@ -129,7 +127,7 @@ func (a *accessUpdater) collectUpdates(batch map[string]int64) {
 }
 
 // flushBatch writes a batch of access updates to RocksDB
-func (a *accessUpdater) flushBatch(batch map[string]int64) {
+func (a *accessUpdater) flushBatch(batch map[string]accessUpdate) {
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 	ro := grocksdb.NewDefaultReadOptions()
@@ -138,7 +136,7 @@ func (a *accessUpdater) flushBatch(batch map[string]int64) {
 	writeBatch := grocksdb.NewWriteBatch()
 	defer writeBatch.Destroy()
 
-	for key, accessTime := range batch {
+	for key, update := range batch {
 		// Get the current bucket location from the secondary index
 		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 		slice, err := a.storage.meta.Handle().Get(ro, bucketIndexKey)
@@ -150,22 +148,10 @@ func (a *accessUpdater) flushBatch(batch map[string]int64) {
 		}
 
 		// Create the new bucketed entry
-		accessTimeObj := time.Unix(accessTime, 0)
+		accessTimeObj := time.Unix(update.time, 0)
 		newKey := keys.MakeBucketedAccessKey(key, accessTimeObj)
 
-		// Get the size from metadata
-		var size int64
-		metaKey := keys.MakeMetadataKey(key)
-		if slice, err := a.storage.meta.Handle().Get(ro, metaKey); err == nil && slice.Exists() {
-			valueMsg := &pb.ValueMessage{}
-			if err := proto.Unmarshal(slice.Data(), valueMsg); err == nil {
-				size = valueMsg.ValueLength
-			}
-			slice.Free()
-		}
-
-		newVal := MakeBucketedAccessValue(size)
-		writeBatch.Put(newKey, newVal)
+		writeBatch.Put(newKey, []byte{})
 
 		// Update the secondary index
 		writeBatch.Put(bucketIndexKey, newKey)
