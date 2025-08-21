@@ -53,9 +53,10 @@ const (
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
 
-	// Default access update buffer size and batch interval
-	DefaultAccessUpdateBufferSize = 10000
-	DefaultAccessUpdateInterval   = 100 * time.Millisecond
+	// Default access update buffer size, batch interval and delay
+	DefaultAccessUpdateBufferSize = 100000
+	DefaultAccessUpdateInterval   = 1 * time.Second
+	DefaultAccessUpdateDelay      = 5 * time.Minute
 
 	// Default queue config
 	DeleteBatchSize = 1000 // Number of deletions to process per batch
@@ -256,11 +257,12 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
 	if config.MaxDiskUsage > 0 {
-		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval)
+		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval, DefaultAccessUpdateDelay)
 		s.accessUpdater.Start()
 		zlog.Info().
 			Int("buffer_size", DefaultAccessUpdateBufferSize).
 			Dur("batch_interval", DefaultAccessUpdateInterval).
+			Dur("access_time_update_delay", DefaultAccessUpdateDelay).
 			Msg("storage: started async access updater for LRU tracking")
 	}
 

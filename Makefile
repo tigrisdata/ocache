@@ -195,16 +195,22 @@ TESTRUN ?=
 TESTFLAGS := $(if $(TEST),-run $(TEST),$(if $(TESTRUN),-run $(TESTRUN),))
 
 .PHONY: test
-test: test-server test-client
+test: test-server test-storage test-client
 
 .PHONY: test-all
-test-all: test-server test-client test-integration
+test-all: test-server test-storage test-client test-integration
 
 .PHONY: test-server
 test-server:
 	@echo "Running server tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
+
+.PHONY: test-storage
+test-storage:
+	@echo "Running storage tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
 
 .PHONY: test-client
 test-client:
