@@ -43,6 +43,7 @@ make bench                 # Run benchmarks
 ```bash
 make test                  # Run all unit tests (server + client)
 make test-server           # Server tests only
+make test-storage          # Storage tests only
 make test-client           # Client tests only
 make test-race             # Unit tests with race detector
 make test-coverage         # Generate coverage report
@@ -76,7 +77,7 @@ You can run specific tests using `TEST` (exact match) or `TESTRUN` (pattern matc
 ```bash
 # Run specific test by exact name
 make test TEST=TestCacheService_PutObjectAndGet
-make test-server TEST=TestStorage
+make test-storage TEST=TestStorage
 
 # Run tests matching a pattern
 make test TESTRUN=CacheService
