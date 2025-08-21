@@ -12,6 +12,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const (
+	// accessBucketCleanupInterval is the interval at which we clean up old access buckets
+	accessBucketCleanupInterval = 24 * time.Hour
+
+	// accessBucketCleanupThreshold is the threshold at which we clean up old access buckets
+	accessBucketCleanupThreshold = 30 * 24 * time.Hour
+)
+
 // Cleaner is responsible for background TTL cleanup and LRU eviction
 type Cleaner struct {
 	storage      *Storage
@@ -80,12 +88,22 @@ func (c *Cleaner) cleanupLoop() {
 	c.calculateTotalSize()
 	c.initialized.Store(true)
 
+	// Track when we last cleaned up old buckets
+	lastBucketCleanup := time.Now()
+
 	for {
 		select {
 		case <-ticker.C:
 			c.cleanupExpiredKeys()
 			if c.maxDiskUsage > 0 {
 				c.enforceDiskLimit()
+			}
+
+			// Periodically clean up old access buckets regardless of disk limits
+			// to prevent unbounded growth of the access index
+			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+				c.cleanupOldBuckets(accessBucketCleanupThreshold)
+				lastBucketCleanup = time.Now()
 			}
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: background loop stopping")
@@ -137,9 +155,14 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := proto.Unmarshal(value, valueMsg); err != nil {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
-			// Also delete access index
-			accessKey := MakeAccessIndexKey(key)
-			batch.Delete(accessKey)
+			// Use secondary index to delete bucketed access entry
+			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
+			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
+				bucketKey := slice.Data()
+				batch.Delete(bucketKey)
+				slice.Free()
+			}
+			batch.Delete(bucketIndexKey)
 			cleaned++
 			it.Key().Free()
 			it.Value().Free()
@@ -152,9 +175,14 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
-			// Also delete access index
-			accessKey := MakeAccessIndexKey(key)
-			batch.Delete(accessKey)
+			// Use secondary index to delete bucketed access entry
+			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
+			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
+				bucketKey := slice.Data()
+				batch.Delete(bucketKey)
+				slice.Free()
+			}
+			batch.Delete(bucketIndexKey)
 			cleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 

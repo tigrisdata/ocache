@@ -13,8 +13,16 @@ const (
 	// Uses the same format as other internal keys (starting with !)
 	MetadataPrefix = "!meta/"
 
-	// AccessIndexPrefix is the prefix for last access time index entries
-	AccessIndexPrefix = "!access/"
+	// AccessBucketPrefix is the prefix for time-bucketed access index entries
+	// Format: !access_bucket/YYYYMMDDHH/timestamp_nano/key
+	AccessBucketPrefix = "!access_bucket/"
+
+	// AccessBucketFormat is the time format for bucket keys (YYYYMMDDHH)
+	AccessBucketFormat = "2006010215"
+
+	// AccessBucketIndexPrefix is the prefix for the secondary index mapping keys to their bucket location
+	// Format: !bucket_index/<key> -> bucketed_key
+	AccessBucketIndexPrefix = "!access_bucket_index/"
 
 	// CompactionIndexPrefix is the prefix for all compaction index entries in RocksDB
 	CompactionIndexPrefix = "!compact/"
@@ -68,6 +76,10 @@ func MakeSyncKey(filepath string) []byte {
 	return []byte(key)
 }
 
+// ------------------------------
+// File sync keys
+// ------------------------------
+
 // ParseSyncKey extracts timestamp and filepath from a sync key
 func ParseSyncKey(key []byte) (int64, string, error) {
 	keyStr := string(key)
@@ -97,6 +109,10 @@ func ParseSyncKey(key []byte) (int64, string, error) {
 func IsSyncKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(SyncIndexPrefix))
 }
+
+// ------------------------------
+// Deletion queue keys
+// ------------------------------
 
 // MakeDeletionQueueKey creates a deletion queue key for a file
 // Format: !del/<timestamp>/<filepath>
@@ -151,4 +167,90 @@ func ExtractSegmentPath(deleteIndexKey []byte) string {
 // IsDeleteIndexKey checks if a key is a delete index entry
 func IsDeleteIndexKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(DeleteIndexPrefix))
+}
+
+// ------------------------------
+// LRU access keys
+// ------------------------------
+
+// GetBucketedAccessKey returns the bucket key for a given timestamp
+// Format: !access_bucket/YYYYMMDDHH/
+func GetBucketedAccessKey(timestamp time.Time) string {
+	return fmt.Sprintf("%s%s/", AccessBucketPrefix, timestamp.Format(AccessBucketFormat))
+}
+
+// MakeBucketedAccessKey creates a bucketed access index key
+// Format: !access_bucket/YYYYMMDDHH/timestamp_nano/key
+func MakeBucketedAccessKey(key string, accessTime time.Time) []byte {
+	bucket := GetBucketedAccessKey(accessTime)
+	// Use nanoseconds for precise ordering within bucket
+	nanos := accessTime.UnixNano()
+	return []byte(fmt.Sprintf("%s%019d/%s", bucket, nanos, key))
+}
+
+// MakeBucketedAccessIndexKey creates a secondary index key that maps a cache key to its current bucket location
+// Format: !bucket_index/<key>
+func MakeBucketedAccessIndexKey(key string) []byte {
+	return []byte(fmt.Sprintf("%s%s", AccessBucketIndexPrefix, key))
+}
+
+// IsBucketedAccessKey checks if a key is a bucketed access index key
+func IsBucketedAccessKey(key []byte) bool {
+	return len(key) >= len(AccessBucketPrefix) &&
+		string(key[:len(AccessBucketPrefix)]) == AccessBucketPrefix
+}
+
+// ParseBucketedAccessKey extracts components from a bucketed access key
+// Returns: original key, access time, error
+func ParseBucketedAccessKey(bucketedKey []byte) (string, time.Time, error) {
+	keyStr := string(bucketedKey)
+
+	// Expected format: !access_bucket/YYYYMMDDHH/timestamp_nano/key
+	prefixLen := len(AccessBucketPrefix)
+	if len(keyStr) < prefixLen {
+		return "", time.Time{}, fmt.Errorf("invalid bucketed key: too short")
+	}
+
+	// Skip prefix
+	remaining := keyStr[prefixLen:]
+
+	// Extract bucket (YYYYMMDDHH/)
+	if len(remaining) < 11 { // 10 digits + /
+		return "", time.Time{}, fmt.Errorf("invalid bucketed key: missing bucket")
+	}
+
+	// Skip bucket and slash
+	remaining = remaining[11:]
+
+	// Extract timestamp (19 digits + /)
+	if len(remaining) < 20 {
+		return "", time.Time{}, fmt.Errorf("invalid bucketed key: missing timestamp")
+	}
+
+	timestampStr := remaining[:19]
+	var timestamp int64
+	n, err := fmt.Sscanf(timestampStr, "%d", &timestamp)
+	if err != nil || n != 1 {
+		return "", time.Time{}, fmt.Errorf("invalid timestamp in bucketed key")
+	}
+	accessTime := time.Unix(0, timestamp)
+
+	// Extract original key (everything after timestamp/)
+	originalKey := remaining[20:]
+
+	return originalKey, accessTime, nil
+}
+
+// ExtractAccessBucketFromKey extracts just the bucket portion from a full key
+// Returns empty string if not a valid bucketed key
+func ExtractAccessBucketFromKey(key []byte) string {
+	keyStr := string(key)
+	prefixLen := len(AccessBucketPrefix)
+
+	if len(keyStr) < prefixLen+11 { // prefix + YYYYMMDDHH/
+		return ""
+	}
+
+	// Return prefix + bucket + /
+	return keyStr[:prefixLen+11]
 }

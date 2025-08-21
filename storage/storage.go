@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -95,141 +94,6 @@ func getCleanupInterval() time.Duration {
 		}
 	}
 	return DefaultTTLCleanupInterval
-}
-
-// accessUpdate represents a single access time update request
-type accessUpdate struct {
-	key  string
-	time int64
-}
-
-// accessUpdater handles asynchronous batched updates of access times for LRU tracking
-type accessUpdater struct {
-	updates  chan accessUpdate
-	done     chan struct{}
-	flush    chan chan struct{} // Channel to request flush with completion notification
-	storage  *Storage
-	interval time.Duration
-	wg       sync.WaitGroup
-}
-
-// newAccessUpdater creates a new access updater
-func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration) *accessUpdater {
-	return &accessUpdater{
-		updates:  make(chan accessUpdate, bufferSize),
-		done:     make(chan struct{}),
-		flush:    make(chan chan struct{}),
-		storage:  s,
-		interval: interval,
-	}
-}
-
-// Start begins the background goroutine for processing access updates
-func (a *accessUpdater) Start() {
-	a.wg.Add(1)
-	go func() {
-		defer a.wg.Done()
-		a.run()
-	}()
-}
-
-// Stop stops the access updater and waits for it to finish
-func (a *accessUpdater) Stop() {
-	close(a.done)
-	a.wg.Wait()
-}
-
-// Update queues an access time update (non-blocking)
-func (a *accessUpdater) Update(key string, accessTime int64) {
-	select {
-	case a.updates <- accessUpdate{key: key, time: accessTime}:
-		// Update queued successfully
-	default:
-		// Buffer full, drop the update (LRU tracking is best-effort)
-	}
-}
-
-// UpdateNow queues an access time update with current time (non-blocking)
-func (a *accessUpdater) UpdateNow(key string) {
-	a.Update(key, time.Now().Unix())
-}
-
-// Flush forces all pending updates to be written to RocksDB immediately
-// This is mainly useful for testing to ensure deterministic behavior
-func (a *accessUpdater) Flush() {
-	done := make(chan struct{})
-	a.flush <- done
-	<-done // Wait for flush to complete
-}
-
-// run is the main loop that processes batched updates
-func (a *accessUpdater) run() {
-	ticker := time.NewTicker(a.interval)
-	defer ticker.Stop()
-
-	batch := make(map[string]int64)
-
-	for {
-		select {
-		case <-a.done:
-			// Flush remaining updates before exiting
-			a.collectUpdates(batch)
-			if len(batch) > 0 {
-				a.flushBatch(batch)
-			}
-			return
-
-		case update := <-a.updates:
-			// Only keep the latest access time for each key
-			batch[update.key] = update.time
-
-		case done := <-a.flush:
-			// Handle explicit flush request
-			a.collectUpdates(batch)
-			if len(batch) > 0 {
-				a.flushBatch(batch)
-				batch = make(map[string]int64)
-			}
-			close(done) // Signal completion
-
-		case <-ticker.C:
-			if len(batch) > 0 {
-				a.flushBatch(batch)
-				// Clear the batch
-				batch = make(map[string]int64)
-			}
-		}
-	}
-}
-
-// collectUpdates drains all pending updates from the channel
-func (a *accessUpdater) collectUpdates(batch map[string]int64) {
-	for {
-		select {
-		case update := <-a.updates:
-			batch[update.key] = update.time
-		default:
-			return
-		}
-	}
-}
-
-// flushBatch writes a batch of access updates to RocksDB
-func (a *accessUpdater) flushBatch(batch map[string]int64) {
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-
-	writeBatch := grocksdb.NewWriteBatch()
-	defer writeBatch.Destroy()
-
-	for key, accessTime := range batch {
-		accessKey, accessVal := PrepareAccessEntry(key, accessTime)
-		writeBatch.Put(accessKey, accessVal)
-	}
-
-	if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
-		zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
-	}
 }
 
 // Storage wraps all RocksDB access and related logic
@@ -510,7 +374,18 @@ func (s *Storage) DeleteKey(key string) {
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
 	batch.Delete(metaKey)
-	batch.Delete(MakeAccessIndexKey(key))
+
+	// Use secondary index to find and delete the bucketed access entry
+	bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
+	if slice, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
+		// Delete the bucketed entry
+		bucketKey := slice.Data()
+		batch.Delete(bucketKey)
+		slice.Free()
+	}
+	// Delete the secondary index entry
+	batch.Delete(bucketIndexKey)
+
 	s.meta.Handle().Write(wo, batch)
 }
 
@@ -692,8 +567,13 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 
 	// Add access time index entry for LRU tracking only if max disk usage is set
 	if s.cleaner.maxDiskUsage > 0 {
-		accessKey, accessVal := PrepareAccessEntry(key, time.Now().Unix())
-		batch.Put(accessKey, accessVal)
+		now := time.Now()
+		accessKey := keys.MakeBucketedAccessKey(key, now)
+		batch.Put(accessKey, []byte{})
+
+		// Add secondary index entry
+		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
+		batch.Put(bucketIndexKey, accessKey)
 	}
 
 	return s.meta.Handle().Write(wo, batch)
