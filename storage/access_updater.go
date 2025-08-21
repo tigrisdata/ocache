@@ -34,7 +34,7 @@ type accessUpdater struct {
 func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration, delay time.Duration) *accessUpdater {
 	accessTimeLRU, err := lru.New[string, int64](bufferSize)
 	if err != nil {
-		zlog.Error().Err(err).Msg("accessUpdater: failed to create LRU cache")
+		zlog.Fatal().Err(err).Msg("accessUpdater: failed to create LRU cache")
 	}
 
 	return &accessUpdater{
@@ -83,13 +83,28 @@ func (a *accessUpdater) UpdateNow(key string) {
 	a.Update(key, time.Now().Unix())
 }
 
-// Flush forces all pending updates to be written to RocksDB immediately
-// This is mainly useful for testing to ensure deterministic behavior
+// Flush forces all pending updates to be written to RocksDB immediately.
+// It synchronizes with the background goroutine to ensure that all updates
+// currently buffered in the `updates` channel are processed and flushed in a
+// single, consistent batch. This avoids any races between the caller and the
+// background `run` goroutine both trying to drain the `updates` channel.
+//
+// Flush is mainly useful for tests to ensure deterministic behaviour.
 func (a *accessUpdater) Flush() {
-	zlog.Debug().Msg("accessUpdater: flushing")
+	zlog.Debug().Msg("accessUpdater: flushing (external request)")
 
-	a.collectUpdates()
-	a.flushBatch()
+	// Channel used to signal completion of the flush request.
+	done := make(chan struct{})
+
+	// Attempt to send the flush request. If the updater has already been
+	// stopped (i.e. `done` is closed), return immediately.
+	select {
+	case a.flush <- done:
+		// Wait until the background goroutine signals completion.
+		<-done
+	case <-a.done:
+		// The updater is shutting down; nothing to flush.
+	}
 }
 
 // run is the main loop that processes batched updates
@@ -100,8 +115,12 @@ func (a *accessUpdater) run() {
 	for {
 		select {
 		case <-a.done:
-			// Flush remaining updates before exiting
-			a.Flush()
+			// Flush remaining updates before exiting. We cannot use Flush() here
+			// because that would attempt to send on the `flush` channel which is
+			// serviced by this very goroutine. Instead, drain the channel and flush
+			// directly.
+			a.collectUpdates()
+			a.flushBatch()
 			return
 
 		case update := <-a.updates:
@@ -109,6 +128,12 @@ func (a *accessUpdater) run() {
 
 		case <-ticker.C:
 			a.flushBatch()
+
+		case doneCh := <-a.flush:
+			// Synchronously handle external flush request.
+			a.collectUpdates()
+			a.flushBatch()
+			close(doneCh)
 		}
 	}
 }

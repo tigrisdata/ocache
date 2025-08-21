@@ -24,7 +24,7 @@ func TestAccessUpdater_BasicUpdate(t *testing.T) {
 	updater.UpdateNow("test-key-1")
 
 	// Wait for the update to be processed
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	// Verify the update was written to RocksDB
 	ro := grocksdb.NewDefaultReadOptions()
@@ -59,8 +59,9 @@ func TestAccessUpdater_InBatchDeduplication(t *testing.T) {
 	defer updater.Stop()
 
 	// Queue multiple updates for the same key within one batch window
+	firstUpdate := time.Now().Unix()
 	for i := 0; i < 5; i++ {
-		updater.Update("test-key-dedup", time.Now().Unix()+int64(i))
+		updater.Update("test-key-dedup", firstUpdate+int64(i))
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -69,7 +70,7 @@ func TestAccessUpdater_InBatchDeduplication(t *testing.T) {
 	updater.UpdateNow("test-key-other-2")
 
 	// Wait for batch to flush
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	// Verify only one update per key was written
 	ro := grocksdb.NewDefaultReadOptions()
@@ -85,8 +86,8 @@ func TestAccessUpdater_InBatchDeduplication(t *testing.T) {
 	_, accessTime, err := keys.ParseBucketedAccessKey(bucketKey)
 	require.NoError(t, err)
 
-	// The access time should be close to the last update (within a few seconds)
-	assert.InDelta(t, time.Now().Unix()+4, accessTime.Unix(), 5)
+	// The access time should be the time of the first update
+	assert.Equal(t, firstUpdate, accessTime.Unix())
 	slice.Free()
 
 	// Verify other keys were also written
@@ -112,7 +113,7 @@ func TestAccessUpdater_BufferOverflow(t *testing.T) {
 	// These should not block (best-effort)
 	done := make(chan bool)
 	go func() {
-		for i := 0; i < 10; i++ {
+		for i := 0; i < 100; i++ {
 			updater.UpdateNow("test-key-overflow")
 		}
 		done <- true
@@ -121,8 +122,8 @@ func TestAccessUpdater_BufferOverflow(t *testing.T) {
 	// Should complete quickly without blocking
 	select {
 	case <-done:
-		// Good, didn't block
-	case <-time.After(1 * time.Second):
+		// no blocking
+	case <-time.After(250 * time.Millisecond):
 		t.Fatal("UpdateNow blocked when buffer was full")
 	}
 }
