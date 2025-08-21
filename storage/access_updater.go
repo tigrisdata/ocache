@@ -207,10 +207,11 @@ func (a *accessUpdater) flushBatch() {
 
 		// Flush the batch periodically to avoid writing a large batch at once
 		if writeBatch.Count() > 1000 {
+			cnt := writeBatch.Count()
 			if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
 				zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
 			} else {
-				zlog.Info().Msgf("accessUpdater: flushed batch of size %d", len(a.batch))
+				zlog.Info().Msgf("accessUpdater: flushed batch of size %d", cnt)
 			}
 
 			writeBatch.Clear()
@@ -219,10 +220,11 @@ func (a *accessUpdater) flushBatch() {
 
 	// Flush the remaining updates
 	if writeBatch.Count() > 0 {
+		cnt := writeBatch.Count()
 		if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
 			zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
 		} else {
-			zlog.Info().Msgf("accessUpdater: flushed batch of size %d", len(a.batch))
+			zlog.Info().Msgf("accessUpdater: flushed batch of size %d", cnt)
 		}
 	}
 
