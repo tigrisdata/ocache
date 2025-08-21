@@ -204,12 +204,26 @@ func (a *accessUpdater) flushBatch() {
 
 		// Update the secondary index
 		writeBatch.Put(bucketIndexKey, newKey)
+
+		// Flush the batch periodically to avoid writing a large batch at once
+		if writeBatch.Count() > 1000 {
+			if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
+				zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
+			} else {
+				zlog.Info().Msgf("accessUpdater: flushed batch of size %d", len(a.batch))
+			}
+
+			writeBatch.Clear()
+		}
 	}
 
-	if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
-		zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
-	} else {
-		zlog.Info().Msgf("accessUpdater: flushed batch of size %d", len(a.batch))
+	// Flush the remaining updates
+	if writeBatch.Count() > 0 {
+		if err := a.storage.meta.Handle().Write(wo, writeBatch); err != nil {
+			zlog.Error().Err(err).Msg("accessUpdater: failed to flush batch")
+		} else {
+			zlog.Info().Msgf("accessUpdater: flushed batch of size %d", len(a.batch))
+		}
 	}
 
 	// Clear the batch
