@@ -97,6 +97,16 @@ func getCleanupInterval() time.Duration {
 	return DefaultTTLCleanupInterval
 }
 
+// getAccessUpdateDelay returns the access update delay, allowing tests to override via env var
+func getAccessUpdateDelay() time.Duration {
+	if testDelay := os.Getenv("OCACHE_TEST_ACCESS_UPDATE_DELAY"); testDelay != "" {
+		if d, err := time.ParseDuration(testDelay); err == nil {
+			return d
+		}
+	}
+	return DefaultAccessUpdateDelay
+}
+
 // Storage wraps all RocksDB access and related logic
 // It provides methods to store, retrieve, delete, and list keys
 //
@@ -257,12 +267,13 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
 	if config.MaxDiskUsage > 0 {
-		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval, DefaultAccessUpdateDelay)
+		accessUpdateDelay := getAccessUpdateDelay()
+		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval, accessUpdateDelay)
 		s.accessUpdater.Start()
 		zlog.Info().
 			Int("buffer_size", DefaultAccessUpdateBufferSize).
 			Dur("batch_interval", DefaultAccessUpdateInterval).
-			Dur("access_time_update_delay", DefaultAccessUpdateDelay).
+			Dur("access_time_update_delay", accessUpdateDelay).
 			Msg("storage: started async access updater for LRU tracking")
 	}
 

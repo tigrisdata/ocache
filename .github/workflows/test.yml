@@ -124,6 +124,9 @@ jobs:
       - name: Run integration tests - Compaction
         run: STATIC_BUILD=true make test-integration-compaction
 
+      - name: Run integration tests - Cleaner
+        run: STATIC_BUILD=true make test-integration-cleaner
+
       - name: Run integration tests - Workflow
         run: STATIC_BUILD=true make test-integration-workflow
 
