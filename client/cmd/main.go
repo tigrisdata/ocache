@@ -63,10 +63,10 @@ Examples:
 	Run: func(cmd *cobra.Command, args []string) {
 		c := newClient()
 		defer c.Close()
-		
+
 		var value []byte
 		var err error
-		
+
 		if len(args) == 2 {
 			// Value provided as argument
 			value = []byte(args[1])
@@ -78,7 +78,7 @@ Examples:
 				os.Exit(1)
 			}
 		}
-		
+
 		err = c.Put(context.Background(), args[0], value, ttl)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Put failed: %v\n", err)

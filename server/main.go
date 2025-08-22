@@ -30,15 +30,19 @@ var (
 	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
 
-	port     = flag.Int("port", 9000, "Listen port")
-	httpPort = flag.Int("http-port", 9001, "HTTP port")
-	verbose  = flag.Bool("v", false, "Enable debug logging")
+	port           = flag.Int("port", 9000, "Listen port")
+	httpPort       = flag.Int("http-port", 9001, "HTTP port")
+	verbose        = flag.Bool("v", false, "Enable debug logging")
+	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
 )
 
 func configureLogger() {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	if AppConfig.Verbose {
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+
+		// Also enable request logging
+		AppConfig.RequestLogging = true
 	} else {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	}

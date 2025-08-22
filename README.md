@@ -69,14 +69,13 @@ curl -X DELETE "http://localhost:9001/v1/cache/mykey"
 
 Key configuration flags:
 
-| Flag              | Default    | Description                    |
-| ----------------- | ---------- | ------------------------------ |
-| `-port`           | 9000       | gRPC port                      |
-| `-http-port`      | 9001       | HTTP port                      |
-| `-disk`           | /var/cache | Storage directory              |
-| `-threshold`      | 65536      | Small object threshold (bytes) |
-| `-ttl`            | 0          | Default TTL (seconds)          |
-| `-max-disk-usage` | 0          | Max disk usage (0=unlimited)   |
+| Flag              | Default    | Description                  |
+| ----------------- | ---------- | ---------------------------- |
+| `-port`           | 9000       | gRPC port                    |
+| `-http-port`      | 9001       | HTTP port                    |
+| `-disk`           | /var/cache | Storage directory            |
+| `-ttl`            | 0          | Default global TTL (seconds) |
+| `-max-disk-usage` | 0          | Max disk usage (0=unlimited) |
 
 See [Configuration Guide](docs/configuration.md) for complete options.
 

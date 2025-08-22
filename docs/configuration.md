@@ -36,9 +36,10 @@ OCache can be configured through command-line flags when starting the server.
 
 ### Logging
 
-| Flag | Type | Default | Description                  |
-| ---- | ---- | ------- | ---------------------------- |
-| `-v` | bool | false   | Enable verbose/debug logging |
+| Flag               | Type | Default | Description                  |
+| ------------------ | ---- | ------- | ---------------------------- |
+| `-v`               | bool | false   | Enable verbose/debug logging |
+| `-request-logging` | bool | false   | Enable request logging       |
 
 ## Configuration Examples
 
