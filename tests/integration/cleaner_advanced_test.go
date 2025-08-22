@@ -2,7 +2,6 @@ package integration
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,11 +17,6 @@ import (
 func (s *CleanerSuite) Test_CleanerLoop_AutoTrigger() {
 	t := s.T()
 
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
-	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = 200 * time.Millisecond
@@ -89,16 +83,11 @@ func (s *CleanerSuite) Test_CleanerLoop_AutoTrigger() {
 func (s *CleanerSuite) Test_CleanerLoop_LRUEviction() {
 	t := s.T()
 
-	// Set short cleanup interval and access update delay for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	os.Setenv("OCACHE_TEST_ACCESS_UPDATE_DELAY", "100ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-	defer os.Unsetenv("OCACHE_TEST_ACCESS_UPDATE_DELAY")
-
 	// Re-create harness with low disk limit
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = 200 * time.Millisecond
+	config.AccessUpdateDelay = 100 * time.Millisecond
 	config.MaxDiskUsage = 100 * 1024 // 100KB limit
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
@@ -199,10 +188,6 @@ func (s *CleanerSuite) Test_CleanerLoop_LRUEviction() {
 // Test_CleanerLoop_ConcurrentOperations tests cleaner with concurrent read/write operations
 func (s *CleanerSuite) Test_CleanerLoop_ConcurrentOperations() {
 	t := s.T()
-
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
 
 	// Re-create harness with configuration
 	s.Harness.Cleanup()
@@ -368,10 +353,6 @@ func (s *CleanerSuite) Test_CleanerLoop_ConcurrentOperations() {
 func (s *CleanerSuite) Test_CleanerLoop_MixedWorkload() {
 	t := s.T()
 
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Re-create harness with configuration
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
@@ -523,10 +504,6 @@ func (s *CleanerSuite) Test_CleanerLoop_MixedWorkload() {
 func (s *CleanerSuite) Test_CleanerLoop_ErrorRecovery() {
 	t := s.T()
 
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Re-create harness
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
@@ -649,10 +626,6 @@ func (s *CleanerSuite) Test_CleanerLoop_ErrorRecovery() {
 func (s *CleanerSuite) Test_CleanerLoop_Performance() {
 	t := s.T()
 
-	// Set cleanup interval for performance testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "500ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Re-create harness with performance configuration
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
@@ -748,10 +721,6 @@ func (s *CleanerSuite) Test_CleanerLoop_Performance() {
 // based on access patterns and respects different object types
 func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 	t := s.T()
-
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
 
 	// Re-create harness with specific configuration
 	s.Harness.Cleanup()
@@ -855,16 +824,11 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 	t := s.T()
 
-	// Set short cleanup interval and access update delay for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "500ms")
-	os.Setenv("OCACHE_TEST_ACCESS_UPDATE_DELAY", "100ms") // Short delay for immediate access updates
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-	defer os.Unsetenv("OCACHE_TEST_ACCESS_UPDATE_DELAY")
-
 	// Re-create harness with larger disk limit to avoid premature eviction
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = 500 * time.Millisecond
+	config.AccessUpdateDelay = 100 * time.Millisecond
 	config.MaxDiskUsage = 150 * 1024 // 150KB limit (30 objects * 5KB = 150KB)
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
@@ -950,10 +914,6 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 func (s *CleanerSuite) Test_CleanerLoop_TTLPriority() {
 	t := s.T()
 
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Re-create harness with tight disk limit
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
@@ -1022,10 +982,6 @@ func (s *CleanerSuite) Test_CleanerLoop_TTLPriority() {
 // Test_CleanerLoop_SegmentedObjects tests cleaner behavior with compacted objects in segments
 func (s *CleanerSuite) Test_CleanerLoop_SegmentedObjects() {
 	t := s.T()
-
-	// Set cleanup and compaction intervals
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "500ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
 
 	// Re-create harness with compaction enabled
 	s.Harness.Cleanup()
@@ -1098,10 +1054,6 @@ func (s *CleanerSuite) Test_CleanerLoop_SegmentedObjects() {
 func (s *CleanerSuite) Test_CleanerLoop_ZeroTTL() {
 	t := s.T()
 
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Re-create harness
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
@@ -1142,10 +1094,6 @@ func (s *CleanerSuite) Test_CleanerLoop_ZeroTTL() {
 // Test_CleanerLoop_UpdatedTTL tests behavior when an object's TTL is updated
 func (s *CleanerSuite) Test_CleanerLoop_UpdatedTTL() {
 	t := s.T()
-
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
 
 	// Re-create harness
 	s.Harness.Cleanup()
@@ -1207,10 +1155,6 @@ func (s *CleanerSuite) Test_CleanerLoop_UpdatedTTL() {
 // Test_CleanerLoop_RapidPutDelete tests cleaner behavior with rapid put/delete operations
 func (s *CleanerSuite) Test_CleanerLoop_RapidPutDelete() {
 	t := s.T()
-
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
 
 	// Re-create harness
 	s.Harness.Cleanup()

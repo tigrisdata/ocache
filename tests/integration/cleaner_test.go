@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -12,10 +11,6 @@ import (
 
 // Test_Cleaner_Integration tests the cleaner with various scenarios
 func (s *CleanerSuite) Test_Cleaner_Integration() {
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Test 1: Add data with TTL and verify cleanup
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("ttl-%d", i)
@@ -117,10 +112,6 @@ func (s *CleanerSuite) Test_Cleaner_Integration() {
 
 // Test_Cleaner_TTLWithLRU tests the interaction between TTL and LRU
 func (s *CleanerSuite) Test_Cleaner_TTLWithLRU() {
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Add mix of TTL and non-TTL data
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("mixed-%d", i)
@@ -158,10 +149,6 @@ func (s *CleanerSuite) Test_Cleaner_TTLWithLRU() {
 
 // Test_Cleaner_DiskUsageLimit tests LRU eviction based on disk usage
 func (s *CleanerSuite) Test_Cleaner_DiskUsageLimit() {
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "200ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Fill storage beyond disk limit
 	// With 50KB limit and 2KB per object, we should have ~25 objects max
 	baseTime := time.Now().Unix()

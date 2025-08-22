@@ -229,10 +229,6 @@ type IntegrationTestConfig struct {
 }
 ```
 
-## Environment Variables
-
-- `OCACHE_TEST_CLEANUP_INTERVAL`: Override cleanup interval for tests
-
 ## Test Patterns
 
 ### Basic Test Flow

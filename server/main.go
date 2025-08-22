@@ -23,6 +23,7 @@ var (
 	compactionThreads  = flag.Int("compaction-threads", stor.DefaultCompactionThreads, "Number of compaction threads")
 	fragThreshold      = flag.Float64("fragmentation-threshold", stor.DefaultFragmentationThreshold, "Segment fragmentation threshold for recompaction (0.0-1.0)")
 	recompactDisable   = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
+	ttlCleanupInterval = flag.Duration("ttl-cleanup-interval", stor.DefaultTTLCleanupInterval, "Interval at which TTL keys are cleaned up")
 
 	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
@@ -56,6 +57,7 @@ func RunServer() {
 		CompactionThreads:   AppConfig.CompactionThreads,
 		FragThreshold:       AppConfig.FragThreshold,
 		DisableRecompaction: AppConfig.RecompactDisable,
+		CleanupInterval:     AppConfig.TTLCleanupInterval,
 	}
 	stor.InitStorageWithConfig(storageConfig)
 

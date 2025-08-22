@@ -168,8 +168,3 @@ make check                 # All checks (fmt, vet, test)
 **Code Formatting**
 
 - Format the code and fix linting issues before every code commit
-
-**Test environment overrides:**
-
-- `OCACHE_TEST_CLEANUP_INTERVAL` - Override cleanup interval
-- `OCACHE_TEST_ACCESS_UPDATE_DELAY` - Override access time update delay (default 5m, use shorter for tests)

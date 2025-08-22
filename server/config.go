@@ -22,6 +22,7 @@ type Config struct {
 	CompactionThreads  int           // Number of compaction threads
 	FragThreshold      float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
 	RecompactDisable   bool          // Disable automatic segment recompaction
+	TTLCleanupInterval time.Duration // TTL cleanup interval
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -46,5 +47,6 @@ func LoadConfig() {
 		CompactionThreads:  *compactionThreads,
 		FragThreshold:      *fragThreshold,
 		RecompactDisable:   *recompactDisable,
+		TTLCleanupInterval: *ttlCleanupInterval,
 	}
 }

@@ -12,10 +12,6 @@ import (
 )
 
 func TestTTLCleanup(t *testing.T) {
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "100ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Create temporary directory for test
 	tmpDir, err := os.MkdirTemp("", "cleaner-test-*")
 	require.NoError(t, err)
@@ -31,6 +27,7 @@ func TestTTLCleanup(t *testing.T) {
 		FdCacheSize:        100,
 		MaxDiskUsage:       0,
 		CompactionInterval: 100 * time.Millisecond,
+		CleanupInterval:    100 * time.Millisecond,
 	})
 	defer CloseStorage()
 
@@ -78,10 +75,6 @@ func TestTTLCleanup(t *testing.T) {
 }
 
 func TestLRUEviction(t *testing.T) {
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "100ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Create temporary directory for test
 	tmpDir, err := os.MkdirTemp("", "lru-test-*")
 	require.NoError(t, err)
@@ -98,6 +91,7 @@ func TestLRUEviction(t *testing.T) {
 		FdCacheSize:        100,
 		MaxDiskUsage:       maxDiskUsage,
 		CompactionInterval: 100 * time.Millisecond,
+		CleanupInterval:    100 * time.Millisecond,
 	})
 	defer CloseStorage()
 
@@ -187,10 +181,6 @@ func TestLRUEviction(t *testing.T) {
 }
 
 func TestDiskUsageTracking(t *testing.T) {
-	// Set short cleanup interval for testing
-	os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", "100ms")
-	defer os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
-
 	// Create temporary directory for test
 	tmpDir, err := os.MkdirTemp("", "disk-usage-test-*")
 	require.NoError(t, err)
@@ -206,6 +196,7 @@ func TestDiskUsageTracking(t *testing.T) {
 		FdCacheSize:        100,
 		MaxDiskUsage:       0,
 		CompactionInterval: 100 * time.Millisecond,
+		CleanupInterval:    100 * time.Millisecond,
 	})
 	defer CloseStorage()
 

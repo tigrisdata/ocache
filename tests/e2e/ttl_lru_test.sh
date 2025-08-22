@@ -23,10 +23,11 @@ echo "  - TTL cleanup: Enabled (every 5 seconds in test mode)"
 echo "  - Max disk usage: 10KB (with LRU eviction)"
 echo
 
-OCACHE_TEST_CLEANUP_INTERVAL=5s ./ocache \
+./ocache \
   -disk /tmp/ocache-demo \
   -threshold 100 \
   -max-disk-usage 10240 \
+  -ttl-cleanup-interval 5s \
   -v &
 
 SERVER_PID=$!
