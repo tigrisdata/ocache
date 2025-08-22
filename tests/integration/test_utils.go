@@ -22,6 +22,7 @@ type IntegrationTestConfig struct {
 	CompactionInterval time.Duration // How often compaction runs
 	CompactionThreads  int           // Number of compaction threads
 	CleanupInterval    time.Duration // How often cleanup runs
+	AccessUpdateDelay  time.Duration // How often access time is updated
 	MaxDiskUsage       int64         // Maximum disk usage for LRU eviction
 	FDCacheSize        int           // File descriptor cache size
 }
@@ -29,13 +30,14 @@ type IntegrationTestConfig struct {
 // DefaultIntegrationTestConfig returns default test configuration
 func DefaultIntegrationTestConfig() IntegrationTestConfig {
 	return IntegrationTestConfig{
-		InlineThreshold:    64 * 1024,         // 64KB
-		CompactThreshold:   16 * 1024 * 1024,  // 16MB
-		SegmentSize:        256 * 1024 * 1024, // 256MB
-		CompactionInterval: 1 * time.Second,   // Fast for testing
-		CompactionThreads:  1,                 // Default to single thread
-		CleanupInterval:    1 * time.Second,   // Fast for testing
-		MaxDiskUsage:       0,                 // No limit by default
+		InlineThreshold:    64 * 1024,              // 64KB
+		CompactThreshold:   16 * 1024 * 1024,       // 16MB
+		SegmentSize:        256 * 1024 * 1024,      // 256MB
+		CompactionInterval: 1 * time.Second,        // Fast for testing
+		CompactionThreads:  1,                      // Default to single thread
+		CleanupInterval:    1 * time.Second,        // Fast for testing
+		AccessUpdateDelay:  200 * time.Millisecond, // Default to 200ms for testing
+		MaxDiskUsage:       0,                      // No limit by default
 		FDCacheSize:        100,
 	}
 }
@@ -74,11 +76,6 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 	tmpDir, err := os.MkdirTemp("", "ocache-integration-test-*")
 	require.NoError(t, err)
 
-	// Set environment variables for test intervals
-	if config.CleanupInterval > 0 {
-		os.Setenv("OCACHE_TEST_CLEANUP_INTERVAL", config.CleanupInterval.String())
-	}
-
 	// Initialize storage
 	storage.InitStorageWithConfig(&storage.StorageConfig{
 		DiskPath:           tmpDir,
@@ -90,6 +87,8 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 		MaxDiskUsage:       config.MaxDiskUsage,
 		CompactionInterval: config.CompactionInterval,
 		CompactionThreads:  config.CompactionThreads,
+		CleanupInterval:    config.CleanupInterval,
+		AccessUpdateDelay:  config.AccessUpdateDelay,
 	})
 
 	s := storage.GetStorage()
@@ -108,7 +107,6 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 		close(h.stopMetrics)
 		storage.CloseStorage()
 		os.RemoveAll(tmpDir)
-		os.Unsetenv("OCACHE_TEST_CLEANUP_INTERVAL")
 	}
 
 	// Start metrics collection

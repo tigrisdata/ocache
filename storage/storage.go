@@ -85,16 +85,8 @@ type StorageConfig struct {
 	CompactionThreads   int           // Number of compaction threads
 	FragThreshold       float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
 	DisableRecompaction bool          // Disable automatic segment recompaction
-}
-
-// getCleanupInterval returns the cleanup interval, allowing tests to override via env var
-func getCleanupInterval() time.Duration {
-	if testInterval := os.Getenv("OCACHE_TEST_CLEANUP_INTERVAL"); testInterval != "" {
-		if d, err := time.ParseDuration(testInterval); err == nil {
-			return d
-		}
-	}
-	return DefaultTTLCleanupInterval
+	CleanupInterval     time.Duration // Cleanup interval
+	AccessUpdateDelay   time.Duration // Access update delay
 }
 
 // Storage wraps all RocksDB access and related logic
@@ -247,7 +239,10 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
-	cleanupInterval := getCleanupInterval()
+	cleanupInterval := DefaultTTLCleanupInterval
+	if config.CleanupInterval > 0 {
+		cleanupInterval = config.CleanupInterval
+	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
 	s.cleaner.Start()
 	zlog.Info().
@@ -257,12 +252,16 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
 	if config.MaxDiskUsage > 0 {
-		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval, DefaultAccessUpdateDelay)
+		accessUpdateDelay := DefaultAccessUpdateDelay
+		if config.AccessUpdateDelay > 0 {
+			accessUpdateDelay = config.AccessUpdateDelay
+		}
+		s.accessUpdater = newAccessUpdater(s, DefaultAccessUpdateBufferSize, DefaultAccessUpdateInterval, accessUpdateDelay)
 		s.accessUpdater.Start()
 		zlog.Info().
 			Int("buffer_size", DefaultAccessUpdateBufferSize).
 			Dur("batch_interval", DefaultAccessUpdateInterval).
-			Dur("access_time_update_delay", DefaultAccessUpdateDelay).
+			Dur("access_time_update_delay", accessUpdateDelay).
 			Msg("storage: started async access updater for LRU tracking")
 	}
 

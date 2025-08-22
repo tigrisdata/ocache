@@ -135,18 +135,6 @@ ocache/
 - **Integration Tests**: Test the storage layer directly without gRPC
 - **E2E Tests**: Test the complete system through its public APIs
 
-## Environment Variables
-
-Some test behaviors can be controlled via environment variables:
-
-```bash
-# Override cleanup interval for tests
-OCACHE_TEST_CLEANUP_INTERVAL=1s make test-integration
-
-# Run integration tests in short mode
-go test -short ./tests/integration/...
-```
-
 ## Continuous Integration
 
 For CI environments, use these targets:

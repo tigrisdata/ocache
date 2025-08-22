@@ -296,6 +296,12 @@ test-integration-compaction:
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Compaction) -timeout 300s ./...
 
+.PHONY: test-integration-cleaner
+test-integration-cleaner:
+	@echo "Running cleaner integration tests (TTL and LRU)..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Cleaner) -timeout 120s ./...
+
 .PHONY: test-integration-workflow
 test-integration-workflow:
 	@echo "Running workflow integration tests..."
@@ -388,6 +394,7 @@ help:
 	@echo "  test-integration-medium     - Run medium object integration tests"
 	@echo "  test-integration-large      - Run large object integration tests"
 	@echo "  test-integration-compaction - Run compaction integration tests"
+	@echo "  test-integration-cleaner    - Run cleaner integration tests (TTL and LRU)"
 	@echo "  test-integration-workflow   - Run cross-component integration tests"
 	@echo "  test-integration-race       - Run integration tests with race detector"
 	@echo "  test-integration-coverage   - Run integration tests with coverage"

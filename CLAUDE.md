@@ -58,6 +58,7 @@ make test-integration-small         # Small objects only (~10s)
 make test-integration-medium        # Medium objects (~60s)
 make test-integration-large         # Large objects (~120s)
 make test-integration-compaction     # Compaction
+make test-integration-cleaner       # TTL and LRU cleaner
 make test-integration-workflow      # Cross-component workflow
 make test-integration-race          # With race detector
 make test-integration-coverage      # With coverage
@@ -167,7 +168,3 @@ make check                 # All checks (fmt, vet, test)
 **Code Formatting**
 
 - Format the code and fix linting issues before every code commit
-
-**Test environment overrides:**
-
-- `OCACHE_TEST_CLEANUP_INTERVAL` - Override cleanup interval
