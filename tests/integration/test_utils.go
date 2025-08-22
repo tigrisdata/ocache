@@ -16,29 +16,33 @@ import (
 
 // IntegrationTestConfig holds configuration for Integration tests
 type IntegrationTestConfig struct {
-	InlineThreshold    int64         // Threshold for inline storage (default 64KB)
-	CompactThreshold   int64         // Threshold for compaction (default 16MB)
-	SegmentSize        int64         // Maximum segment size (default 256MB)
-	CompactionInterval time.Duration // How often compaction runs
-	CompactionThreads  int           // Number of compaction threads
-	CleanupInterval    time.Duration // How often cleanup runs
-	AccessUpdateDelay  time.Duration // How often access time is updated
-	MaxDiskUsage       int64         // Maximum disk usage for LRU eviction
-	FDCacheSize        int           // File descriptor cache size
+	InlineThreshold        int64         // Threshold for inline storage (default 64KB)
+	CompactThreshold       int64         // Threshold for compaction (default 16MB)
+	SegmentSize            int64         // Maximum segment size (default 256MB)
+	CompactionInterval     time.Duration // How often compaction runs
+	CompactionThreads      int           // Number of compaction threads
+	RecompactMinSegmentAge time.Duration // Minimum age for segment recompaction
+	RecompactMinSegments   int           // Minimum number of segments for recompaction
+	CleanupInterval        time.Duration // How often cleanup runs
+	AccessUpdateDelay      time.Duration // How often access time is updated
+	MaxDiskUsage           int64         // Maximum disk usage for LRU eviction
+	FDCacheSize            int           // File descriptor cache size
 }
 
 // DefaultIntegrationTestConfig returns default test configuration
 func DefaultIntegrationTestConfig() IntegrationTestConfig {
 	return IntegrationTestConfig{
-		InlineThreshold:    64 * 1024,              // 64KB
-		CompactThreshold:   16 * 1024 * 1024,       // 16MB
-		SegmentSize:        256 * 1024 * 1024,      // 256MB
-		CompactionInterval: 1 * time.Second,        // Fast for testing
-		CompactionThreads:  1,                      // Default to single thread
-		CleanupInterval:    1 * time.Second,        // Fast for testing
-		AccessUpdateDelay:  200 * time.Millisecond, // Default to 200ms for testing
-		MaxDiskUsage:       0,                      // No limit by default
-		FDCacheSize:        100,
+		InlineThreshold:        64 * 1024,              // 64KB
+		CompactThreshold:       16 * 1024 * 1024,       // 16MB
+		SegmentSize:            256 * 1024 * 1024,      // 256MB
+		CompactionInterval:     1 * time.Second,        // Fast for testing
+		CompactionThreads:      1,                      // Default to single thread
+		RecompactMinSegmentAge: 30 * time.Second,       // Default to 30 seconds
+		RecompactMinSegments:   2,                      // Default to 2 segments
+		CleanupInterval:        1 * time.Second,        // Fast for testing
+		AccessUpdateDelay:      200 * time.Millisecond, // Default to 200ms for testing
+		MaxDiskUsage:           0,                      // No limit by default
+		FDCacheSize:            100,
 	}
 }
 
@@ -87,6 +91,8 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 		MaxDiskUsage:       config.MaxDiskUsage,
 		CompactionInterval: config.CompactionInterval,
 		CompactionThreads:  config.CompactionThreads,
+		MinSegmentAge:      config.RecompactMinSegmentAge,
+		MinSegments:        config.RecompactMinSegments,
 		CleanupInterval:    config.CleanupInterval,
 		AccessUpdateDelay:  config.AccessUpdateDelay,
 	})

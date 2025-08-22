@@ -16,14 +16,16 @@ var (
 	diskPath = flag.String("disk", stor.DefaultDiskPath, "Directory for disk cache")
 	ttl      = flag.Int("ttl", stor.DefaultTTL, "Default global TTL in seconds when no key-level TTL is set")
 
-	inlineThreshold    = flag.Int("threshold", stor.DefaultInlineThreshold, "Small object threshold (bytes) that are inlined with metadata")
-	compactThreshold   = flag.Int64("compact-threshold", stor.DefaultCompactThreshold, "Compaction threshold (bytes)")
-	segmentSize        = flag.Int64("segment-size", stor.DefaultSegmentSize, "Segment size (bytes)")
-	compactionInterval = flag.Duration("compaction-interval", stor.DefaultCompactionInterval, "Compaction interval")
-	compactionThreads  = flag.Int("compaction-threads", stor.DefaultCompactionThreads, "Number of compaction threads")
-	fragThreshold      = flag.Float64("fragmentation-threshold", stor.DefaultFragmentationThreshold, "Segment fragmentation threshold for recompaction (0.0-1.0)")
-	recompactDisable   = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
-	ttlCleanupInterval = flag.Duration("ttl-cleanup-interval", stor.DefaultTTLCleanupInterval, "Interval at which TTL keys are cleaned up")
+	inlineThreshold        = flag.Int("threshold", stor.DefaultInlineThreshold, "Small object threshold (bytes) that are inlined with metadata")
+	compactThreshold       = flag.Int64("compact-threshold", stor.DefaultCompactThreshold, "Compaction threshold (bytes)")
+	segmentSize            = flag.Int64("segment-size", stor.DefaultSegmentSize, "Segment size (bytes)")
+	compactionInterval     = flag.Duration("compaction-interval", stor.DefaultCompactionInterval, "Compaction interval")
+	compactionThreads      = flag.Int("compaction-threads", stor.DefaultCompactionThreads, "Number of compaction threads")
+	fragThreshold          = flag.Float64("fragmentation-threshold", stor.DefaultFragmentationThreshold, "Segment fragmentation threshold for recompaction (0.0-1.0)")
+	recompactMinSegmentAge = flag.Duration("recompaction-min-segment-age", stor.DefaultMinSegmentAgeForRecompaction, "Minimum age for segment recompaction")
+	recompactMinSegments   = flag.Int("recompaction-min-segments", stor.DefaultMinSegmentsBeforeRecompaction, "Minimum number of segments for recompaction")
+	recompactDisable       = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
+	ttlCleanupInterval     = flag.Duration("ttl-cleanup-interval", stor.DefaultTTLCleanupInterval, "Interval at which TTL keys are cleaned up")
 
 	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
@@ -56,6 +58,8 @@ func RunServer() {
 		CompactionInterval:  AppConfig.CompactionInterval,
 		CompactionThreads:   AppConfig.CompactionThreads,
 		FragThreshold:       AppConfig.FragThreshold,
+		MinSegmentAge:       AppConfig.RecompactMinSegmentAge,
+		MinSegments:         AppConfig.RecompactMinSegments,
 		DisableRecompaction: AppConfig.RecompactDisable,
 		CleanupInterval:     AppConfig.TTLCleanupInterval,
 	}

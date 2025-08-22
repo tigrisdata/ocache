@@ -35,7 +35,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 	zlog.Info().
 		Int64("target_bytes", targetBytes).
 		Str("prefix", string(prefix)).
-		Msg("cleaner: starting scalable LRU eviction")
+		Msg("cleaner: starting LRU eviction")
 
 	// Iterate through all bucketed access entries from oldest to newest
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
@@ -188,7 +188,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 		Int64("target", targetBytes).
 		Int("keys_examined", processedKeys).
 		Dur("duration", time.Since(start)).
-		Msg("cleaner: scalable LRU eviction completed")
+		Msg("cleaner: LRU eviction completed")
 }
 
 // cleanupOldBuckets removes access entries from buckets older than the specified duration

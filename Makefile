@@ -198,7 +198,7 @@ TESTFLAGS := $(if $(TEST),-run $(TEST),$(if $(TESTRUN),-run $(TESTRUN),))
 test: test-server test-storage test-client
 
 .PHONY: test-all
-test-all: test-server test-storage test-client test-integration
+test-all: test-server test-storage test-client test-integration test-e2e
 
 .PHONY: test-server
 test-server:
@@ -243,8 +243,43 @@ test-coverage:
 
 .PHONY: test-e2e
 test-e2e: build build-cli
-	@echo "Running E2E tests..."
-	./tests/e2e/ttl_lru_test.sh
+	@echo "Running all E2E tests..."
+	@$(MAKE) test-e2e-concurrent
+	@$(MAKE) test-e2e-storage-layers
+	@$(MAKE) test-e2e-ttl
+	@$(MAKE) test-e2e-lru
+	@$(MAKE) test-e2e-compaction
+	@$(MAKE) test-e2e-recompaction
+
+.PHONY: test-e2e-concurrent
+test-e2e-concurrent: build build-cli
+	@echo "Running concurrent operations E2E test..."
+	./tests/e2e/concurrent_ops_test.sh
+
+.PHONY: test-e2e-storage-layers
+test-e2e-storage-layers: build build-cli
+	@echo "Running storage layers E2E test..."
+	./tests/e2e/storage_layers_test.sh
+
+.PHONY: test-e2e-ttl
+test-e2e-ttl: build build-cli
+	@echo "Running TTL functionality E2E test..."
+	./tests/e2e/ttl_cleaner_test.sh
+
+.PHONY: test-e2e-lru
+test-e2e-lru: build build-cli
+	@echo "Running LRU eviction E2E test..."
+	./tests/e2e/lru_eviction_test.sh
+
+.PHONY: test-e2e-compaction
+test-e2e-compaction: build build-cli
+	@echo "Running compaction E2E test..."
+	./tests/e2e/compaction_test.sh
+
+.PHONY: test-e2e-recompaction
+test-e2e-recompaction: build build-cli
+	@echo "Running recompaction E2E test..."
+	./tests/e2e/recompaction_test.sh
 
 .PHONY: test-integration
 test-integration:

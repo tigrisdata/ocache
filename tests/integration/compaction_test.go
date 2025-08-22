@@ -662,17 +662,13 @@ func (s *CompactionSuite) Test_CompactionLoop_Performance() {
 func (s *CompactionSuite) Test_SegmentRecompaction_BasicFragmentation() {
 	t := s.T()
 
-	// Override segment age requirement BEFORE creating storage
-	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
-	os.Setenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT", "0") // Don't skip any recent segments in tests
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT")
-
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
+	config.RecompactMinSegmentAge = 100 * time.Millisecond
+	config.RecompactMinSegments = 1
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
@@ -813,17 +809,13 @@ func (s *CompactionSuite) Test_SegmentRecompaction_BasicFragmentation() {
 func (s *CompactionSuite) Test_SegmentRecompaction_ConcurrentAccess() {
 	t := s.T()
 
-	// Override segment age requirement BEFORE creating storage
-	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
-	os.Setenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT", "0") // Don't skip any recent segments in tests
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT")
-
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
+	config.RecompactMinSegmentAge = 100 * time.Millisecond
+	config.RecompactMinSegments = 1
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
@@ -936,17 +928,13 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ConcurrentAccess() {
 func (s *CompactionSuite) Test_SegmentRecompaction_MultipleCompactors() {
 	t := s.T()
 
-	// Override segment age requirement BEFORE creating storage
-	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
-	os.Setenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT", "0") // Don't skip any recent segments in tests
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT")
-
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
+	config.RecompactMinSegmentAge = 100 * time.Millisecond
+	config.RecompactMinSegments = 1
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
@@ -1040,17 +1028,13 @@ func (s *CompactionSuite) Test_SegmentRecompaction_MultipleCompactors() {
 func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	t := s.T()
 
-	// Override segment age requirement BEFORE creating storage
-	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
-	os.Setenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT", "0") // Don't skip any recent segments in tests
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT")
-
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
+	config.RecompactMinSegmentAge = 100 * time.Millisecond
+	config.RecompactMinSegments = 1
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
@@ -1256,17 +1240,13 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 func (s *CompactionSuite) Test_SegmentRecompaction_Recovery() {
 	t := s.T()
 
-	// Override segment age requirement BEFORE creating storage
-	os.Setenv("OCACHE_TEST_RECOMPACTION_MIN_AGE", "100ms")
-	os.Setenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT", "0") // Don't skip any recent segments in tests
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_MIN_AGE")
-	defer os.Unsetenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT")
-
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
+	config.RecompactMinSegmentAge = 100 * time.Millisecond
+	config.RecompactMinSegments = 1
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
@@ -1372,6 +1352,8 @@ func (s *CompactionSuite) Test_CompactionLoop_MultiThreaded() {
 	config.CompactionInterval = 500 * time.Millisecond
 	config.CompactionThreads = 4         // Use 4 compaction threads
 	config.SegmentSize = 2 * 1024 * 1024 // 2MB segments
+	config.RecompactMinSegmentAge = 100 * time.Millisecond
+	config.RecompactMinSegments = 1
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
