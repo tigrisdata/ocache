@@ -42,8 +42,7 @@ echo "Creating objects to form initial segments..."
 
 # Create enough medium objects to trigger compaction
 for i in {1..10}; do
-    VALUE=$(head -c 80000 /dev/urandom | base64 | head -c 80000)
-    timeout 10 ./ocachecli put "segment-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 80000 /dev/urandom | base64 | head -c 80000 | timeout 10 ./ocachecli put "segment-key-${i}" 2>&1 || true
     echo "Added segment-key-${i} (80KB)"
 done
 
@@ -76,7 +75,7 @@ echo "Deleting keys to create fragmentation in segments..."
 
 # Delete 40% of keys to create fragmentation
 for i in 2 4 6 8; do
-    timeout 10 ./ocachecli delete "segment-key-${i}" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "segment-key-${i}" 2>&1 || true
     echo "Deleted segment-key-${i}"
 done
 
@@ -138,8 +137,7 @@ echo "Testing multiple cycles of fragmentation and recompaction..."
 # Add more keys
 echo "Adding new batch of keys..."
 for i in {11..20}; do
-    VALUE=$(head -c 75000 /dev/urandom | base64 | head -c 75000)
-    timeout 10 ./ocachecli put "cycle-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 75000 /dev/urandom | base64 | head -c 75000 | timeout 10 ./ocachecli put "cycle-key-${i}" 2>&1 || true
 done
 
 echo "Waiting for compaction..."
@@ -148,7 +146,7 @@ sleep 10
 # Create fragmentation in new keys
 echo "Creating fragmentation in new keys..."
 for i in 12 14 16 18; do
-    timeout 10 ./ocachecli delete "cycle-key-${i}" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "cycle-key-${i}" 2>&1 || true
 done
 
 echo "Waiting for recompaction..."
@@ -188,20 +186,18 @@ echo "Testing recompaction with key updates..."
 # Update some existing keys
 echo "Updating existing keys in segments..."
 for i in 3 5 7; do
-    NEW_VALUE=$(head -c 85000 /dev/urandom | base64 | head -c 85000)
-    timeout 10 ./ocachecli put "segment-key-${i}" "$NEW_VALUE" 2>&1 | grep -v "^$" || true
+    head -c 85000 /dev/urandom | base64 | head -c 85000 | timeout 10 ./ocachecli put "segment-key-${i}" 2>&1 || true
     echo "Updated segment-key-${i}"
 done
 
 # Add some new keys
 for i in {21..25}; do
-    VALUE=$(head -c 70000 /dev/urandom | base64 | head -c 70000)
-    timeout 10 ./ocachecli put "update-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 70000 /dev/urandom | base64 | head -c 70000 | timeout 10 ./ocachecli put "update-key-${i}" 2>&1 || true
 done
 
 # Delete some to create fragmentation
 for i in 21 23; do
-    timeout 10 ./ocachecli delete "update-key-${i}" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "update-key-${i}" 2>&1 || true
 done
 
 echo "Waiting for recompaction with updates..."
@@ -240,22 +236,20 @@ concurrent_ops() {
         timeout 10 ./ocachecli get "segment-key-$((RANDOM % 10 + 1))" >/dev/null 2>&1 || true
     done
     # Write operations
-    VALUE=$(head -c 60000 /dev/urandom | base64 | head -c 60000)
-    timeout 10 ./ocachecli put "concurrent-${id}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 60000 /dev/urandom | base64 | head -c 60000 | timeout 10 ./ocachecli put "concurrent-${id}" 2>&1 || true
 }
 
 # Create more fragmentation
 echo "Creating fragmentation for concurrent test..."
 for i in {26..35}; do
-    VALUE=$(head -c 80000 /dev/urandom | base64 | head -c 80000)
-    timeout 10 ./ocachecli put "frag-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 80000 /dev/urandom | base64 | head -c 80000 | timeout 10 ./ocachecli put "frag-key-${i}" 2>&1 || true
 done
 
 sleep 8
 
 # Delete half to create fragmentation
 for i in 26 28 30 32 34; do
-    timeout 10 ./ocachecli delete "frag-key-${i}" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "frag-key-${i}" 2>&1 || true
 done
 
 echo "Starting concurrent operations during recompaction window..."
@@ -394,8 +388,7 @@ echo "Testing recompaction with heavy fragmentation (>50%)..."
 # Create many keys
 echo "Creating 30 keys for heavy fragmentation test..."
 for i in {40..69}; do
-    VALUE=$(head -c 70000 /dev/urandom | base64 | head -c 70000)
-    timeout 10 ./ocachecli put "heavy-frag-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 70000 /dev/urandom | base64 | head -c 70000 | timeout 10 ./ocachecli put "heavy-frag-${i}" 2>&1 || true
 done
 
 echo "Waiting for initial compaction..."
@@ -404,7 +397,7 @@ sleep 10
 # Delete 60% of keys to create heavy fragmentation
 echo "Deleting 60% of keys to create heavy fragmentation..."
 for i in {40..57}; do
-    timeout 10 ./ocachecli delete "heavy-frag-${i}" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "heavy-frag-${i}" 2>&1 || true
 done
 
 echo "Heavy fragmentation created: 18 out of 30 keys deleted"

@@ -33,7 +33,7 @@ write_keys() {
     local prefix=$1
     local count=$2
     for i in $(seq 1 "$count"); do
-        ./ocachecli put "${prefix}-key-${i}" "value-${prefix}-${i}" 2>&1 | grep -v "^$" || true
+        ./ocachecli put "${prefix}-key-${i}" "value-${prefix}-${i}" 2>&1 || true
     done
 }
 
@@ -184,7 +184,7 @@ mixed_ops() {
     
     # Put some keys
     for i in {1..5}; do
-        timeout 5 ./ocachecli put "${base}-key-${i}" "value-${i}" 2>&1 | grep -v "^$" || true
+        timeout 5 ./ocachecli put "${base}-key-${i}" "value-${i}" 2>&1 || true
     done
     
     # Read some keys
@@ -194,12 +194,12 @@ mixed_ops() {
     
     # Delete some keys
     for i in {1..2}; do
-        timeout 5 ./ocachecli delete "${base}-key-${i}" 2>&1 | grep -v "^$" || true
+        timeout 5 ./ocachecli delete "${base}-key-${i}" 2>&1 || true
     done
     
     # Update remaining keys
     for i in {3..5}; do
-        timeout 5 ./ocachecli put "${base}-key-${i}" "updated-value-${i}" 2>&1 | grep -v "^$" || true
+        timeout 5 ./ocachecli put "${base}-key-${i}" "updated-value-${i}" 2>&1 || true
     done
 }
 
@@ -295,7 +295,7 @@ raw_test() {
         local value="consistency-test-${id}-${i}-${RANDOM}"
         
         # Write
-        if timeout 5 ./ocachecli put "$key" "$value" 2>&1 | grep -v "^$"; then
+        if timeout 5 ./ocachecli put "$key" "$value" 2>&1; then
             # Immediate read
             local read_value
             if read_value=$(timeout 5 ./ocachecli get "$key" 2>/dev/null); then
@@ -378,7 +378,7 @@ echo "Testing concurrent deletion of same keys..."
 # Create keys for deletion test
 echo "Creating keys for deletion test..."
 for i in {1..20}; do
-    timeout 5 ./ocachecli put "delete-test-${i}" "to-be-deleted-${i}" 2>&1 | grep -v "^$" || true
+    timeout 5 ./ocachecli put "delete-test-${i}" "to-be-deleted-${i}" 2>&1 || true
 done
 
 # Function to delete keys

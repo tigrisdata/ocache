@@ -38,8 +38,7 @@ echo "Creating medium objects (>64KB) that will be stored as raw files..."
 
 # Create 5 medium objects (100KB each) to trigger compaction
 for i in {1..5}; do
-    VALUE=$(head -c 100000 /dev/urandom | base64 | head -c 100000)
-    timeout 10 ./ocachecli put "compact-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 100000 /dev/urandom | base64 | head -c 100000 | timeout 10 ./ocachecli put "compact-key-${i}" 2>&1 || true
     echo "Added compact-key-${i} (100KB) as raw file"
 done
 
@@ -91,20 +90,18 @@ echo "Testing reads/writes/deletes while compaction is active..."
 # Add more files to trigger another compaction
 echo "Adding more raw files..."
 for i in {6..10}; do
-    VALUE=$(head -c 80000 /dev/urandom | base64 | head -c 80000)
-    timeout 10 ./ocachecli put "active-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 80000 /dev/urandom | base64 | head -c 80000 | timeout 10 ./ocachecli put "active-key-${i}" 2>&1 || true
 done
 
 # Perform operations while compaction might be running
 echo "Performing mixed operations during potential compaction..."
 
 # Update an existing key
-UPDATE_VALUE=$(head -c 90000 /dev/urandom | base64 | head -c 90000)
-timeout 10 ./ocachecli put "compact-key-2" "$UPDATE_VALUE" 2>&1 | grep -v "^$" || true
+head -c 90000 /dev/urandom | base64 | head -c 90000 | timeout 10 ./ocachecli put "compact-key-2" 2>&1 || true
 echo "Updated compact-key-2"
 
 # Delete a key
-timeout 10 ./ocachecli delete "compact-key-3" 2>&1 | grep -v "^$" || true
+timeout 10 ./ocachecli delete "compact-key-3" 2>&1 || true
 echo "Deleted compact-key-3"
 
 # Read keys
@@ -151,8 +148,7 @@ echo "Creating many files to test larger compaction scenarios..."
 
 # Create 20 medium files
 for i in {11..30}; do
-    VALUE=$(head -c 75000 /dev/urandom | base64 | head -c 75000)
-    timeout 10 ./ocachecli put "bulk-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 75000 /dev/urandom | base64 | head -c 75000 | timeout 10 ./ocachecli put "bulk-key-${i}" 2>&1 || true
     echo "Added bulk-key-${i} (75KB)"
 done
 
@@ -188,19 +184,17 @@ echo "Adding objects of various sizes..."
 # Small objects (should stay in RocksDB)
 for i in {1..5}; do
     VALUE=$(head -c 10000 /dev/urandom | base64 | head -c 10000)
-    timeout 10 ./ocachecli put "small-compact-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "small-compact-${i}" "$VALUE" 2>&1 || true
 done
 
 # Medium objects (raw files -> segments)
 for i in {1..5}; do
-    VALUE=$(head -c 70000 /dev/urandom | base64 | head -c 70000)
-    timeout 10 ./ocachecli put "medium-compact-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 70000 /dev/urandom | base64 | head -c 70000 | timeout 10 ./ocachecli put "medium-compact-${i}" 2>&1 || true
 done
 
 # Large objects (should stay as raw files if >16MB, but we'll use 500KB for testing)
 for i in {1..3}; do
-    VALUE=$(head -c 500000 /dev/urandom | base64 | head -c 500000)
-    timeout 10 ./ocachecli put "large-compact-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 500000 /dev/urandom | base64 | head -c 500000 | timeout 10 ./ocachecli put "large-compact-${i}" 2>&1 || true
 done
 
 echo "Waiting for compaction of mixed sizes..."
@@ -247,8 +241,7 @@ echo "Testing concurrent reads during active compaction..."
 # Add files to trigger compaction
 echo "Adding files to trigger compaction..."
 for i in {31..35}; do
-    VALUE=$(head -c 85000 /dev/urandom | base64 | head -c 85000)
-    timeout 10 ./ocachecli put "concurrent-compact-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    head -c 85000 /dev/urandom | base64 | head -c 85000 | timeout 10 ./ocachecli put "concurrent-compact-${i}" 2>&1 || true
 done
 
 # Function to continuously read keys

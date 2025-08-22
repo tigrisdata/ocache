@@ -84,8 +84,7 @@ SMALL_VALUE=$(head -c 1000 /dev/urandom | base64 | head -c 1000)
 timeout 10 ./ocachecli put "small-ttl" "$SMALL_VALUE" --ttl 8
 
 # Medium object with TTL (raw file)
-MEDIUM_VALUE=$(head -c 100000 /dev/urandom | base64 | head -c 100000)
-timeout 10 ./ocachecli put "medium-ttl" "$MEDIUM_VALUE" --ttl 8
+head -c 100000 /dev/urandom | base64 | head -c 100000 | timeout 10 ./ocachecli put "medium-ttl" --ttl 8
 
 echo "Added small and medium objects with 8-second TTL"
 echo

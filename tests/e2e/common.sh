@@ -233,7 +233,7 @@ generate_random_data() {
 ocache_cmd() {
     local timeout_sec="$1"
     shift
-    timeout "$timeout_sec" ./ocachecli "$@" 2>&1 | grep -v "^$" || true
+    timeout "$timeout_sec" ./ocachecli "$@" 2>&1 || true
 }
 
 # Check if a key exists
@@ -247,7 +247,7 @@ key_exists() {
 # Usage: delete_key <key_name>
 delete_key() {
     local key="$1"
-    timeout 10 ./ocachecli delete "$key" 2>&1 | grep -v "Key not found" | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "$key" 2>&1 | grep -v "Key not found" || true
 }
 
 # =============================================================================

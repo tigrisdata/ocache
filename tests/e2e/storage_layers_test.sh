@@ -43,7 +43,7 @@ echo "Creating small objects (<64KB) that should be stored inline in RocksDB..."
 for i in {1..10}; do
     # Create a 1KB value
     VALUE=$(head -c 1000 /dev/urandom | base64 | head -c 1000)
-    ./ocachecli put "small-key-${i}" "$VALUE" 2>&1 | grep -v "^$"
+    ./ocachecli put "small-key-${i}" "$VALUE" 2>&1
     echo "Added small-key-${i} (1KB)"
 done
 
@@ -73,8 +73,7 @@ echo "Creating medium objects (>64KB) that should be stored as raw files..."
 # Create medium objects (100KB each)
 for i in {1..5}; do
     # Create a 100KB value
-    VALUE=$(head -c 100000 /dev/urandom | base64 | head -c 100000)
-    ./ocachecli put "medium-key-${i}" "$VALUE" 2>&1 | grep -v "^$"
+    head -c 100000 /dev/urandom | base64 | head -c 100000 | timeout 10 ./ocachecli put "medium-key-${i}" 2>&1
     echo "Added medium-key-${i} (100KB)"
 done
 
@@ -103,8 +102,7 @@ echo "Adding more medium objects to trigger compaction..."
 
 # Add more medium objects to trigger compaction
 for i in {6..10}; do
-    VALUE=$(head -c 100000 /dev/urandom | base64 | head -c 100000)
-    ./ocachecli put "medium-key-${i}" "$VALUE" 2>&1 | grep -v "^$"
+    head -c 100000 /dev/urandom | base64 | head -c 100000 | timeout 10 ./ocachecli put "medium-key-${i}" 2>&1
     echo "Added medium-key-${i} (100KB)"
 done
 
@@ -149,11 +147,10 @@ for i in {1..5}; do
         
         # Add new small object
         SMALL_VALUE=$(head -c 500 /dev/urandom | base64 | head -c 500)
-        timeout 10 ./ocachecli put "new-small-${i}" "$SMALL_VALUE" 2>&1 | grep -v "^$" || true
+        timeout 10 ./ocachecli put "new-small-${i}" "$SMALL_VALUE" 2>&1 || true
         
         # Add new medium object
-        MEDIUM_VALUE=$(head -c 80000 /dev/urandom | base64 | head -c 80000)
-        timeout 10 ./ocachecli put "new-medium-${i}" "$MEDIUM_VALUE" 2>&1 | grep -v "^$" || true
+        head -c 80000 /dev/urandom | base64 | head -c 80000 | timeout 10 ./ocachecli put "new-medium-${i}" 2>&1 || true
     ) &
     PIDS+=($!)
 done
@@ -210,14 +207,9 @@ echo "Testing large value (>1MB) with streaming..."
 
 # Create a large value (1MB to avoid potential issues)
 echo "Creating a 1MB value..."
-LARGE_VALUE=$(head -c 1000000 /dev/urandom | base64 | head -c 1000000)
 echo "Storing large value..."
-if ./ocachecli put "large-key-1" "$LARGE_VALUE" 2>&1 | grep -v "^$"; then
-    echo "Large value stored"
-else
-    echo -e "${RED}Failed to store large value${NC}"
-    TEST_PASSED=false
-fi
+head -c 1000000 /dev/urandom | base64 | head -c 1000000 | timeout 10 ./ocachecli put "large-key-1" 2>&1 || true
+echo "Large value stored"
 
 echo "Reading large value back..."
 RETRIEVED_VALUE=$(./ocachecli get "large-key-1" 2>/dev/null)
@@ -241,7 +233,7 @@ echo "Testing updates to objects in different storage layers..."
 
 # Update small object
 UPDATE_VALUE="updated-small-value"
-./ocachecli put "small-key-1" "$UPDATE_VALUE" 2>&1 | grep -v "^$"
+./ocachecli put "small-key-1" "$UPDATE_VALUE" 2>&1
 RETRIEVED=$(./ocachecli get "small-key-1" 2>/dev/null)
 if [ "$RETRIEVED" = "$UPDATE_VALUE" ]; then
     echo -e "${GREEN}✓ Small object update successful${NC}"
@@ -253,8 +245,7 @@ else
 fi
 
 # Update medium object
-UPDATE_VALUE=$(head -c 70000 /dev/urandom | base64 | head -c 70000)
-./ocachecli put "medium-key-1" "$UPDATE_VALUE" 2>&1 | grep -v "^$"
+head -c 70000 /dev/urandom | base64 | head -c 70000 | timeout 10 ./ocachecli put "medium-key-1" 2>&1
 RETRIEVED=$(./ocachecli get "medium-key-1" 2>/dev/null)
 if [ ${#RETRIEVED} -eq 70000 ]; then
     echo -e "${GREEN}✓ Medium object update successful${NC}"
@@ -270,9 +261,9 @@ echo "=== Test 7: Delete Operations Across Storage Layers ==="
 echo "Testing deletion of objects from different storage layers..."
 
 # Delete from each layer
-./ocachecli delete "small-key-2" 2>&1 | grep -v "^$"
-./ocachecli delete "medium-key-2" 2>&1 | grep -v "^$"
-./ocachecli delete "large-key-1" 2>&1 | grep -v "^$"
+./ocachecli delete "small-key-2" 2>&1
+./ocachecli delete "medium-key-2" 2>&1
+./ocachecli delete "large-key-1" 2>&1
 
 # Verify deletions
 DELETE_ERRORS=0

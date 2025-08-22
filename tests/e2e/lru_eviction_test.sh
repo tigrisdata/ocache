@@ -37,7 +37,7 @@ echo "Adding keys to exceed disk usage limit..."
 # Add 20 keys, each ~3KB (total ~60KB, exceeds 50KB limit)
 for i in {1..20}; do
     VALUE=$(head -c 3000 /dev/urandom | base64 | head -c 3000)
-    timeout 10 ./ocachecli put "lru-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "lru-key-${i}" "$VALUE" 2>&1 || true
     echo "Added lru-key-${i} (3KB)"
     sleep 0.1
 done
@@ -66,14 +66,14 @@ echo "Testing that recently accessed keys are not evicted..."
 
 # Clear existing keys
 for i in {1..20}; do
-    timeout 10 ./ocachecli delete "lru-key-${i}" 2>&1 | grep -v "Key not found" | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "lru-key-${i}" 2>&1 | grep -v "Key not found" || true
 done
 
 # Add new keys
 echo "Adding 15 new keys..."
 for i in {1..15}; do
     VALUE=$(head -c 3500 /dev/urandom | base64 | head -c 3500)
-    timeout 10 ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 || true
     sleep 0.1
 done
 
@@ -88,7 +88,7 @@ echo
 echo "Adding 5 more keys to trigger eviction..."
 for i in {16..20}; do
     VALUE=$(head -c 3500 /dev/urandom | base64 | head -c 3500)
-    timeout 10 ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 || true
 done
 
 echo "Waiting for LRU eviction..."
@@ -132,28 +132,28 @@ echo "Testing LRU eviction with different object sizes..."
 
 # Clear existing keys
 timeout 10 ./ocachecli list | while read key; do
-    timeout 10 ./ocachecli delete "$key" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "$key" 2>&1 || true
 done
 
 # Add small objects
 echo "Adding small objects (1KB each)..."
 for i in {1..10}; do
     VALUE=$(head -c 1000 /dev/urandom | base64 | head -c 1000)
-    timeout 10 ./ocachecli put "small-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "small-${i}" "$VALUE" 2>&1 || true
 done
 
 # Add medium objects
 echo "Adding medium objects (5KB each)..."
 for i in {1..5}; do
     VALUE=$(head -c 5000 /dev/urandom | base64 | head -c 5000)
-    timeout 10 ./ocachecli put "medium-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "medium-${i}" "$VALUE" 2>&1 || true
 done
 
 # Add large objects to trigger eviction
 echo "Adding large objects (10KB each) to trigger eviction..."
 for i in {1..3}; do
     VALUE=$(head -c 10000 /dev/urandom | base64 | head -c 10000)
-    timeout 10 ./ocachecli put "large-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "large-${i}" "$VALUE" 2>&1 || true
 done
 
 echo "Waiting for eviction..."
@@ -188,7 +188,7 @@ continuous_writer() {
     local prefix=$1
     for i in {1..20}; do
         VALUE=$(head -c 2500 /dev/urandom | base64 | head -c 2500)
-        timeout 10 ./ocachecli put "${prefix}-continuous-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+        timeout 10 ./ocachecli put "${prefix}-continuous-${i}" "$VALUE" 2>&1 || true
         sleep 0.2
     done
 }
@@ -258,21 +258,21 @@ echo "Testing LRU eviction doesn't interfere with TTL..."
 
 # Clear cache
 timeout 10 ./ocachecli list | while read key; do
-    timeout 10 ./ocachecli delete "$key" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli delete "$key" 2>&1 || true
 done
 
 # Add TTL keys
 echo "Adding keys with TTL..."
 for i in {1..5}; do
     VALUE=$(head -c 5000 /dev/urandom | base64 | head -c 5000)
-    timeout 10 ./ocachecli put "ttl-lru-${i}" "$VALUE" --ttl 15 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "ttl-lru-${i}" "$VALUE" --ttl 15 2>&1 || true
 done
 
 # Add regular keys to trigger eviction
 echo "Adding regular keys to trigger eviction..."
 for i in {1..10}; do
     VALUE=$(head -c 5000 /dev/urandom | base64 | head -c 5000)
-    timeout 10 ./ocachecli put "regular-lru-${i}" "$VALUE" 2>&1 | grep -v "^$" || true
+    timeout 10 ./ocachecli put "regular-lru-${i}" "$VALUE" 2>&1 || true
 done
 
 echo "Waiting for eviction..."
