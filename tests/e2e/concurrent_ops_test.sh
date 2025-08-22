@@ -19,7 +19,7 @@ TEST_CONCURRENT_DELETES=""
 
 # Start the server
 echo "Starting OCache server..."
-start_server "concurrent" \
+start_server "concurrent" "true" \
   -disk /tmp/ocache-concurrent-test \
   -threshold 64000 \
   -ttl-cleanup-interval 10s \

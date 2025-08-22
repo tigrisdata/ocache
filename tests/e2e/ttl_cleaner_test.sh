@@ -25,7 +25,7 @@ echo "  - TTL cleanup interval: 5 seconds"
 echo "  - Testing various TTL scenarios"
 echo
 
-start_server "ttl" \
+start_server "ttl" "true" \
   -disk /tmp/ocache-ttl-test \
   -threshold 64000 \
   -ttl-cleanup-interval 5s \
@@ -35,11 +35,11 @@ echo "=== Test 1: Basic TTL Expiration ==="
 echo "Adding keys with different TTL values..."
 
 # Add keys with various TTL values
-timeout 10 timeout 10 ./ocachecli put "ttl-5sec" "Expires in 5 seconds" --ttl 5 || true
-timeout 10 timeout 10 ./ocachecli put "ttl-10sec" "Expires in 10 seconds" --ttl 10 || true
-timeout 10 timeout 10 ./ocachecli put "ttl-15sec" "Expires in 15 seconds" --ttl 15 || true
-timeout 10 timeout 10 ./ocachecli put "ttl-20sec" "Expires in 20 seconds" --ttl 20 || true
-timeout 10 timeout 10 ./ocachecli put "no-ttl" "Never expires" || true
+timeout 10 ./ocachecli put "ttl-5sec" "Expires in 5 seconds" --ttl 5 || true
+timeout 10 ./ocachecli put "ttl-10sec" "Expires in 10 seconds" --ttl 10 || true
+timeout 10 ./ocachecli put "ttl-15sec" "Expires in 15 seconds" --ttl 15 || true
+timeout 10 ./ocachecli put "ttl-20sec" "Expires in 20 seconds" --ttl 20 || true
+timeout 10 ./ocachecli put "no-ttl" "Never expires" || true
 
 echo "Keys added:"
 timeout 10 ./ocachecli list

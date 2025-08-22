@@ -24,7 +24,7 @@ echo "  - LRU cleanup interval: 5 seconds"
 echo "  - Testing LRU eviction behavior"
 echo
 
-start_server "lru" \
+start_server "lru" "true" \
   -disk /tmp/ocache-lru-test \
   -threshold 1000 \
   -max-disk-usage 51200 \
@@ -320,15 +320,12 @@ if kill -0 "$SERVER_PID" 2>/dev/null; then
 fi
 
 echo "Restarting server with same disk location..."
-./ocache \
+start_server "lru" "false" \
   -disk /tmp/ocache-lru-test \
   -threshold 1000 \
   -max-disk-usage 51200 \
   -ttl-cleanup-interval 5s \
-  -v &
-
-SERVER_PID=$!
-sleep 2
+  -v
 
 # Check persisted keys
 PERSISTED_COUNT=$(timeout 10 ./ocachecli list | wc -l || echo 0)

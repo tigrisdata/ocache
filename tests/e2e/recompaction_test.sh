@@ -27,7 +27,7 @@ echo "  - Compaction interval: 5 seconds"
 echo "  - Fragmentation threshold: 30%"
 echo
 
-start_server "recompaction" \
+start_server "recompaction" "true" \
   -disk /tmp/ocache-recompaction-test \
   -threshold 65536 \
   -compaction-interval 5s \
@@ -340,7 +340,7 @@ fi
 
 # Restart server
 echo "Restarting server..."
-./ocache \
+start_server "recompaction" "false" \
   -disk /tmp/ocache-recompaction-test \
   -threshold 65536 \
   -compaction-interval 5s \
@@ -348,10 +348,7 @@ echo "Restarting server..."
   -fragmentation-threshold 0.3 \
   -recompaction-min-segment-age 100ms \
   -recompaction-min-segments 1 \
-  -v &
-
-SERVER_PID=$!
-sleep 2
+  -v
 
 # Check keys after restart
 timeout 10 ./ocachecli list > /tmp/keys-after-restart.txt || true

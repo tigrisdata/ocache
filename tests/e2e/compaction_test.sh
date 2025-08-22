@@ -26,7 +26,7 @@ echo "  - Compaction interval: 5 seconds"
 echo "  - Target segment size: 1MB"
 echo
 
-start_server "compaction" \
+start_server "compaction" "true" \
   -disk /tmp/ocache-compaction-test \
   -threshold 65536 \
   -compaction-interval 5s \
@@ -321,14 +321,11 @@ wait "$SERVER_PID" 2>/dev/null
 
 # Restart server
 echo "Restarting server..."
-./ocache \
+start_server "compaction" "false" \
   -disk /tmp/ocache-compaction-test \
   -threshold 65536 \
   -compaction-interval 5s \
-  -v &
-
-SERVER_PID=$!
-sleep 2
+  -v
 
 # Check key count after restart
 KEY_COUNT_AFTER=$(timeout 10 ./ocachecli list | wc -l)

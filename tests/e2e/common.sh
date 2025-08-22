@@ -42,7 +42,9 @@ check_binaries() {
 # Usage: start_server <test_name> <server_args...>
 start_server() {
     local test_name="$1"
-    shift
+    local cleanup="$2"
+    
+    shift 2
     local server_args="$*"
     
     local test_dir="/tmp/ocache-${test_name}-test"
@@ -51,7 +53,9 @@ start_server() {
     echo "Starting OCache server for ${test_name} test..."
     
     # Cleanup any previous test data
-    rm -rf "$test_dir"
+    if [ "$cleanup" = "true" ]; then
+        rm -rf "$test_dir"
+    fi
     
     # Start server
     ./ocache $server_args &

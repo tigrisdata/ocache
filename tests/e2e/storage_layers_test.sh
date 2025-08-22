@@ -30,7 +30,7 @@ echo "  - Medium objects (64KB-16MB): Raw files, eligible for compaction"
 echo "  - Large objects (>16MB): Permanent raw files"
 echo
 
-start_server "storage" \
+start_server "storage" "true" \
   -disk /tmp/ocache-storage-test \
   -threshold 65536 \
   -compaction-interval 5s \

@@ -343,13 +343,7 @@ func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segm
 		return false, "has open file handle"
 	}
 
-	// Check 3: Skip the most recent segments (even if closed)
-	// to avoid interfering with segments that might have just been finalized
-	if sr.minSegments > 0 && segmentIndex >= totalSegments-sr.minSegments {
-		return false, fmt.Sprintf("too recent (one of last %d segments)", sr.minSegments)
-	}
-
-	// Check 4: Verify segment age based on timestamp
+	// Check 3: Verify segment age based on timestamp
 	base := filepath.Base(seg.Path())
 	var timestamp int64
 	// Try parsing the segment name format
