@@ -44,7 +44,7 @@ func TestStorage_DeleteIndex_SegmentDeletion(t *testing.T) {
 	s.DeleteKey(key)
 
 	// Verify the key is deleted
-	_, found, err := s.Get(key)
+	_, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err)
 	assert.False(t, found)
 
@@ -137,7 +137,7 @@ func TestStorage_DeleteIndex_RawFileDeletion(t *testing.T) {
 	s.DeleteKey(key)
 
 	// Verify the key is deleted
-	_, found, err := s.Get(key)
+	_, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err)
 	assert.False(t, found)
 
@@ -163,7 +163,7 @@ func TestStorage_DeleteIndex_InlineDeletion(t *testing.T) {
 	s.DeleteKey(key)
 
 	// Verify the key is deleted
-	_, found, err := s.Get(key)
+	_, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err)
 	assert.False(t, found)
 

@@ -18,7 +18,7 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(value), 0)
 	assert.NoError(t, err, "Put failed")
 
-	r, found, err := s.Get(key)
+	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed")
 	assert.True(t, found, "Get did not find key")
 	got, err := io.ReadAll(r)
@@ -29,7 +29,7 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 	}
 
 	s.DeleteKey(key)
-	_, found, err = s.Get(key)
+	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get after delete failed")
 	assert.False(t, found, "expected key to be deleted")
 }
@@ -42,7 +42,7 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(value), 0)
 	assert.NoError(t, err, "Put failed")
 
-	r, found, err := s.Get(key)
+	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed")
 	assert.True(t, found, "Get did not find key")
 	got, err := io.ReadAll(r)
@@ -53,7 +53,7 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 	}
 
 	s.DeleteKey(key)
-	_, found, err = s.Get(key)
+	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get after delete failed")
 	assert.False(t, found, "expected key to be deleted")
 }
@@ -81,7 +81,7 @@ func TestStorage_PutGet_TTL(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(value), 1) // 1 second TTL
 	assert.NoError(t, err, "Put failed")
 
-	r, found, err := s.Get(key)
+	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed (before expiry)")
 	assert.True(t, found, "Get did not find key (before expiry)")
 	got, err := io.ReadAll(r)
@@ -91,7 +91,7 @@ func TestStorage_PutGet_TTL(t *testing.T) {
 	t.Log("Waiting for TTL to expire...")
 	time.Sleep(2 * time.Second)
 
-	_, found, err = s.Get(key)
+	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed (after expiry)")
 	assert.False(t, found, "expected key to be expired and deleted")
 }
@@ -152,4 +152,324 @@ func TestStorage_ListKeys_WithExpiredKeys(t *testing.T) {
 		assert.Contains(t, keys, expected, "should contain permanent key %s", expected)
 	}
 	assert.NotContains(t, keys, "expired", "should not contain expired key")
+}
+
+// TestStorage_Get_ByteRange_SmallObject tests byte-range requests for inline (small) objects
+func TestStorage_Get_ByteRange_SmallObject(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1024*1024)
+	defer cleanup()
+
+	key := "byterangekey"
+	data := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+
+	// Store the data
+	err := s.Put(key, bytes.NewReader(data), 0)
+	assert.NoError(t, err, "Put failed")
+
+	testCases := []struct {
+		name     string
+		start    int64
+		end      int64
+		expected string
+	}{
+		{
+			name:     "Full read (0, 0)",
+			start:    0,
+			end:      0,
+			expected: "0123456789abcdefghijklmnopqrstuvwxyz",
+		},
+		{
+			name:     "Read first 10 bytes",
+			start:    0,
+			end:      10,
+			expected: "0123456789",
+		},
+		{
+			name:     "Read middle 10 bytes",
+			start:    10,
+			end:      20,
+			expected: "abcdefghij",
+		},
+		{
+			name:     "Read last 10 bytes",
+			start:    26,
+			end:      36,
+			expected: "qrstuvwxyz",
+		},
+		{
+			name:     "Read from offset to end",
+			start:    20,
+			end:      0,
+			expected: "klmnopqrstuvwxyz",
+		},
+		{
+			name:     "Single byte at start",
+			start:    0,
+			end:      1,
+			expected: "0",
+		},
+		{
+			name:     "Single byte in middle",
+			start:    15,
+			end:      16,
+			expected: "f",
+		},
+		{
+			name:     "Single byte at end",
+			start:    35,
+			end:      36,
+			expected: "z",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, found, err := s.Get(key, tc.start, tc.end)
+			assert.NoError(t, err, "Get failed")
+			assert.True(t, found, "Key not found")
+
+			got, err := io.ReadAll(r)
+			assert.NoError(t, err, "ReadAll failed")
+			assert.Equal(t, tc.expected, string(got), "Byte range read returned wrong data")
+
+			if closer, ok := r.(io.Closer); ok {
+				closer.Close()
+			}
+		})
+	}
+}
+
+// TestStorage_Get_ByteRange_LargeObject tests byte-range requests for file-based (large) objects
+func TestStorage_Get_ByteRange_LargeObject(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 8, 4096, 16*1024*1024, 1000, 1024*1024) // low threshold to force file storage
+	defer cleanup()
+
+	key := "largebyterangekey"
+	// Create a large repeating pattern for testing
+	pattern := []byte("0123456789")
+	data := bytes.Repeat(pattern, 100) // 1000 bytes total
+
+	// Store the data
+	err := s.Put(key, bytes.NewReader(data), 0)
+	assert.NoError(t, err, "Put failed")
+
+	testCases := []struct {
+		name     string
+		start    int64
+		end      int64
+		expected string
+	}{
+		{
+			name:     "Read first pattern",
+			start:    0,
+			end:      10,
+			expected: "0123456789",
+		},
+		{
+			name:     "Read across pattern boundary",
+			start:    5,
+			end:      15,
+			expected: "5678901234",
+		},
+		{
+			name:     "Read middle section",
+			start:    500,
+			end:      510,
+			expected: "0123456789",
+		},
+		{
+			name:     "Read last 10 bytes",
+			start:    990,
+			end:      1000,
+			expected: "0123456789",
+		},
+		{
+			name:     "Read from offset to end",
+			start:    995,
+			end:      0,
+			expected: "56789",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, found, err := s.Get(key, tc.start, tc.end)
+			assert.NoError(t, err, "Get failed")
+			assert.True(t, found, "Key not found")
+
+			got, err := io.ReadAll(r)
+			assert.NoError(t, err, "ReadAll failed")
+			assert.Equal(t, tc.expected, string(got), "Byte range read returned wrong data")
+
+			if closer, ok := r.(io.Closer); ok {
+				closer.Close()
+			}
+		})
+	}
+}
+
+// TestStorage_Get_ByteRange_EdgeCases tests edge cases and error conditions
+func TestStorage_Get_ByteRange_EdgeCases(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1024*1024)
+	defer cleanup()
+
+	key := "edgekey"
+	data := []byte("0123456789")
+
+	// Store the data
+	err := s.Put(key, bytes.NewReader(data), 0)
+	assert.NoError(t, err, "Put failed")
+
+	testCases := []struct {
+		name     string
+		start    int64
+		end      int64
+		expected string
+		desc     string
+	}{
+		{
+			name:     "Start beyond data length",
+			start:    100,
+			end:      0,
+			expected: "",
+			desc:     "Should return empty when start is beyond data",
+		},
+		{
+			name:     "End beyond data length",
+			start:    5,
+			end:      100,
+			expected: "56789",
+			desc:     "Should read until actual end of data",
+		},
+		{
+			name:     "Start and end beyond data",
+			start:    100,
+			end:      200,
+			expected: "",
+			desc:     "Should return empty when range is beyond data",
+		},
+		{
+			name:     "End equals start",
+			start:    5,
+			end:      5,
+			expected: "",
+			desc:     "Should return empty when end equals start",
+		},
+		{
+			name:     "End less than start",
+			start:    10,
+			end:      5,
+			expected: "",
+			desc:     "Should return empty when end < start",
+		},
+		{
+			name:     "Zero-length range at start",
+			start:    0,
+			end:      0,
+			expected: "0123456789",
+			desc:     "Should return full data when both are 0",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, found, err := s.Get(key, tc.start, tc.end)
+			assert.NoError(t, err, "Get failed")
+			assert.True(t, found, "Key not found")
+
+			got, err := io.ReadAll(r)
+			assert.NoError(t, err, "ReadAll failed")
+			assert.Equal(t, tc.expected, string(got), tc.desc)
+
+			if closer, ok := r.(io.Closer); ok {
+				closer.Close()
+			}
+		})
+	}
+}
+
+// TestStorage_Get_ByteRange_MultipleReads tests multiple concurrent byte-range reads
+func TestStorage_Get_ByteRange_MultipleReads(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1024*1024)
+	defer cleanup()
+
+	key := "multireadkey"
+	data := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+
+	// Store the data
+	err := s.Put(key, bytes.NewReader(data), 0)
+	assert.NoError(t, err, "Put failed")
+
+	// Get multiple readers with different ranges
+	r1, found1, err1 := s.Get(key, 0, 10)
+	assert.NoError(t, err1, "First Get failed")
+	assert.True(t, found1, "First Get: key not found")
+
+	r2, found2, err2 := s.Get(key, 10, 20)
+	assert.NoError(t, err2, "Second Get failed")
+	assert.True(t, found2, "Second Get: key not found")
+
+	r3, found3, err3 := s.Get(key, 20, 0)
+	assert.NoError(t, err3, "Third Get failed")
+	assert.True(t, found3, "Third Get: key not found")
+
+	// Read from all readers
+	got1, _ := io.ReadAll(r1)
+	got2, _ := io.ReadAll(r2)
+	got3, _ := io.ReadAll(r3)
+
+	assert.Equal(t, "0123456789", string(got1), "First reader wrong data")
+	assert.Equal(t, "abcdefghij", string(got2), "Second reader wrong data")
+	assert.Equal(t, "klmnopqrstuvwxyz", string(got3), "Third reader wrong data")
+
+	// Close all readers
+	if closer, ok := r1.(io.Closer); ok {
+		closer.Close()
+	}
+	if closer, ok := r2.(io.Closer); ok {
+		closer.Close()
+	}
+	if closer, ok := r3.(io.Closer); ok {
+		closer.Close()
+	}
+}
+
+// TestStorage_Get_ByteRange_PartialReads tests reading in chunks with byte ranges
+func TestStorage_Get_ByteRange_PartialReads(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1024*1024)
+	defer cleanup()
+
+	key := "partialkey"
+	data := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
+
+	// Store the data
+	err := s.Put(key, bytes.NewReader(data), 0)
+	assert.NoError(t, err, "Put failed")
+
+	// Get a reader for a specific range
+	r, found, err := s.Get(key, 10, 30)
+	assert.NoError(t, err, "Get failed")
+	assert.True(t, found, "Key not found")
+	defer func() {
+		if closer, ok := r.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
+	// Read in small chunks
+	buf := make([]byte, 5)
+	var result []byte
+
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			result = append(result, buf[:n]...)
+		}
+		if err == io.EOF {
+			break
+		}
+		assert.NoError(t, err, "Read failed")
+	}
+
+	assert.Equal(t, "abcdefghijklmnopqrst", string(result), "Partial reads returned wrong data")
 }

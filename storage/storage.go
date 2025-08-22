@@ -391,7 +391,8 @@ func (s *Storage) DeleteKey(key string) {
 }
 
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
-func (s *Storage) Get(key string) (io.Reader, bool, error) {
+// Supports byte-range requests via start and end parameters (0 means no limit)
+func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
 
@@ -429,16 +430,20 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		s.accessUpdater.UpdateNow(key)
 	}
 
+	var reader io.Reader
+
 	switch valueMsg.ValueType {
 	case pb.ValueType_INLINE:
-		return bytes.NewReader(valueMsg.Data), true, nil
+		reader = bytes.NewReader(valueMsg.Data)
 	case pb.ValueType_SEGMENT:
 		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
 			return nil, false, err
 		} else if r != nil {
-			return r, true, nil
+			reader = r
+		} else {
+			return nil, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
 		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
@@ -446,7 +451,9 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 			s.DeleteKey(key)
 			return nil, false, err
 		} else if r != nil {
-			return r, true, nil
+			reader = r
+		} else {
+			return nil, false, nil
 		}
 	default:
 		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type")
@@ -454,7 +461,90 @@ func (s *Storage) Get(key string) (io.Reader, bool, error) {
 		return nil, false, nil
 	}
 
-	return nil, false, nil
+	// Apply byte-range if specified
+	if start > 0 || (end > 0 && end > start) {
+		reader = s.applyByteRange(reader, start, end)
+	}
+
+	return reader, true, nil
+}
+
+// applyByteRange wraps the reader to support byte-range requests
+func (s *Storage) applyByteRange(r io.Reader, start, end int64) io.Reader {
+	// Create a wrapper that will handle seeking and limiting
+	return &byteRangeReader{
+		reader: r,
+		start:  start,
+		end:    end,
+		pos:    0,
+		seeked: false,
+	}
+}
+
+// byteRangeReader wraps an io.Reader to provide byte-range support
+type byteRangeReader struct {
+	reader io.Reader
+	start  int64
+	end    int64
+	pos    int64
+	seeked bool
+}
+
+// Read implements io.Reader with byte-range support
+func (br *byteRangeReader) Read(p []byte) (n int, err error) {
+	// Seek to start position if not already done
+	if !br.seeked && br.start > 0 {
+		if seeker, ok := br.reader.(io.Seeker); ok {
+			_, err = seeker.Seek(br.start, io.SeekStart)
+			if err != nil {
+				return 0, err
+			}
+			br.pos = br.start
+		} else {
+			// If not seekable, read and discard up to start
+			buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
+			defer release()
+			toSkip := br.start
+			for toSkip > 0 {
+				readLen := int64(len(buf))
+				if readLen > toSkip {
+					readLen = toSkip
+				}
+				readN, err := br.reader.Read(buf[:readLen])
+				if readN > 0 {
+					toSkip -= int64(readN)
+					br.pos += int64(readN)
+				}
+				if err != nil {
+					return 0, err
+				}
+			}
+		}
+		br.seeked = true
+	}
+
+	// Apply end limit if specified
+	if br.end > 0 && br.pos >= br.end {
+		return 0, io.EOF
+	}
+
+	// Limit read size if we have an end boundary
+	if br.end > 0 && br.pos+int64(len(p)) > br.end {
+		p = p[:br.end-br.pos]
+	}
+
+	// Read from underlying reader
+	n, err = br.reader.Read(p)
+	br.pos += int64(n)
+	return n, err
+}
+
+// Close implements io.Closer
+func (br *byteRangeReader) Close() error {
+	if closer, ok := br.reader.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
 
 // Put streams the body into spillWriter, stores metadata, and handles TTL

@@ -75,7 +75,7 @@ func (s *CleanerSuite) Test_Cleaner_Integration() {
 	// Check recent keys (should mostly exist)
 	for i := 90; i < 100; i++ {
 		key := fmt.Sprintf("lru-%d", i)
-		reader, found, err := s.Harness.Storage.Get(key)
+		reader, found, err := s.Harness.Storage.Get(key, 0, 0)
 		require.NoError(s.T(), err)
 		if found {
 			recentKeysFound++
@@ -89,7 +89,7 @@ func (s *CleanerSuite) Test_Cleaner_Integration() {
 	// Check old keys (should mostly be evicted)
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("lru-%d", i)
-		reader, found, err := s.Harness.Storage.Get(key)
+		reader, found, err := s.Harness.Storage.Get(key, 0, 0)
 		require.NoError(s.T(), err)
 		if found {
 			oldKeysFound++

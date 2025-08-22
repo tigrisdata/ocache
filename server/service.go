@@ -89,11 +89,8 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 // Streaming Get for large values with byte-range support
 func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	zlog.Debug().Str("key", req.Key).Int64("start", req.Start).Int64("end", req.End).Msg("gRPC Get called")
-	key := req.Key
-	start := req.Start
-	end := req.End
 
-	r, found, err := stor.GetStorage().Get(key)
+	r, found, err := stor.GetStorage().Get(req.Key, req.Start, req.End)
 	if err != nil {
 		return err
 	}
@@ -106,56 +103,14 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		defer closer.Close()
 	}
 
-	// Seek to start if possible
-	if start > 0 {
-		buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
-		defer release()
-		if seeker, ok := r.(io.Seeker); ok {
-			_, err := seeker.Seek(start, io.SeekStart)
-			if err != nil {
-				return err
-			}
-		} else {
-			// If not seekable, read and discard up to start
-			toSkip := start
-			for toSkip > 0 {
-				n := int64(len(buf))
-				if n > toSkip {
-					n = toSkip
-				}
-				readN, err := r.Read(buf[:n])
-				if readN > 0 {
-					toSkip -= int64(readN)
-				}
-				if err != nil {
-					return err
-				}
-			}
-		}
-	}
-
+	// Stream the data in chunks
 	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
 	defer release()
-	var toRead int64 = -1
-	if end > 0 && end > start {
-		toRead = end - start
-	}
 	for {
 		readN, err := r.Read(buf)
 		if readN > 0 {
-			chunk := buf[:readN]
-			if toRead >= 0 {
-				if int64(readN) > toRead {
-					chunk = chunk[:toRead]
-					readN = int(toRead)
-				}
-				toRead -= int64(readN)
-			}
-			if err := stream.Send(&pb.GetResponse{Data: chunk}); err != nil {
+			if err := stream.Send(&pb.GetResponse{Data: buf[:readN]}); err != nil {
 				return err
-			}
-			if toRead == 0 {
-				break
 			}
 		}
 		if err == io.EOF {
