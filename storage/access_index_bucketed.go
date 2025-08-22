@@ -12,7 +12,7 @@ const (
 )
 
 // TimeBucketedAccessIndex manages access times using time-bucketed keys
-// for scalable LRU eviction without loading all keys into memory
+// for LRU eviction without loading all keys into memory
 type TimeBucketedAccessIndex struct {
 	// No state needed - all operations are stateless
 }

@@ -62,10 +62,10 @@ const (
 	DeleteBatchSize = 1000 // Number of deletions to process per batch
 
 	// Default segment recompaction settings
-	DefaultRecompactionDisabled   = false
-	DefaultFragmentationThreshold = 0.5           // Recompact when dead space exceeds 50%
-	MinSegmentAgeForRecompaction  = 2 * time.Hour // Don't recompact segments younger than 2 hours (ensures they're cold)
-	MinSegmentsBeforeRecompaction = 3             // Minimum number of segments required for recompaction
+	DefaultRecompactionDisabled          = false
+	DefaultFragmentationThreshold        = 0.5           // Recompact when dead space exceeds 50%
+	DefaultMinSegmentAgeForRecompaction  = 2 * time.Hour // Don't recompact segments younger than 2 hours (ensures they're cold)
+	DefaultMinSegmentsBeforeRecompaction = 2             // Minimum number of segments required for recompaction
 
 	// Default delete queue settings
 	DeleteProcessInterval = time.Second    // Interval between batch processing
@@ -84,6 +84,8 @@ type StorageConfig struct {
 	CompactionInterval  time.Duration // Compaction interval
 	CompactionThreads   int           // Number of compaction threads
 	FragThreshold       float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
+	MinSegmentAge       time.Duration // Minimum age for segment recompaction
+	MinSegments         int           // Minimum number of segments for recompaction
 	DisableRecompaction bool          // Disable automatic segment recompaction
 	CleanupInterval     time.Duration // Cleanup interval
 	AccessUpdateDelay   time.Duration // Access update delay
@@ -202,25 +204,23 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	if !config.DisableRecompaction {
-		fragThreshold := config.FragThreshold
-		if fragThreshold <= 0 || fragThreshold > 1 {
-			fragThreshold = DefaultFragmentationThreshold
+		compactorConfig.FragThreshold = config.FragThreshold
+		if config.FragThreshold <= 0 || config.FragThreshold > 1 {
+			compactorConfig.FragThreshold = DefaultFragmentationThreshold
 		}
 
 		compactorConfig.EnableRecompaction = true
-		compactorConfig.FragThreshold = fragThreshold
-		compactorConfig.MinSegmentAge = MinSegmentAgeForRecompaction
-		compactorConfig.MinSegments = MinSegmentsBeforeRecompaction
-
-		// Override min segment age for testing if env var is set
-		if testMinAge := os.Getenv("OCACHE_TEST_RECOMPACTION_MIN_AGE"); testMinAge != "" {
-			if duration, err := time.ParseDuration(testMinAge); err == nil {
-				compactorConfig.MinSegmentAge = duration
-				zlog.Info().Dur("min_age", duration).Msg("Using test override for minimum segment age")
-			}
+		compactorConfig.MinSegments = config.MinSegments
+		if config.MinSegments <= 0 {
+			compactorConfig.MinSegments = DefaultMinSegmentsBeforeRecompaction
 		}
 
-		zlog.Info().Float64("threshold", fragThreshold).Msg("Segment recompaction enabled")
+		compactorConfig.MinSegmentAge = config.MinSegmentAge
+		if config.MinSegmentAge <= 0 {
+			compactorConfig.MinSegmentAge = DefaultMinSegmentAgeForRecompaction
+		}
+
+		zlog.Info().Float64("threshold", compactorConfig.FragThreshold).Msg("Segment recompaction enabled")
 	}
 
 	compactor := compaction.NewCompactorWithConfig(compactorConfig)

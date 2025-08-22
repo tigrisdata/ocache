@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -48,13 +49,37 @@ func newClient() *cacheclient.Client {
 }
 
 var putCmd = &cobra.Command{
-	Use:   "put <key> <value>",
-	Short: "Put a value in the cache",
-	Args:  cobra.ExactArgs(2),
+	Use:   "put <key> [value]",
+	Short: "Put a value in the cache (reads from stdin if value not provided)",
+	Long: `Put a value in the cache. The value can be provided as an argument or via stdin.
+Examples:
+  # Provide value as argument
+  ocachecli put mykey "my value"
+  
+  # Read value from stdin
+  echo "my value" | ocachecli put mykey
+  cat file.txt | ocachecli put mykey`,
+	Args: cobra.RangeArgs(1, 2),
 	Run: func(cmd *cobra.Command, args []string) {
 		c := newClient()
 		defer c.Close()
-		err := c.Put(context.Background(), args[0], []byte(args[1]), ttl)
+		
+		var value []byte
+		var err error
+		
+		if len(args) == 2 {
+			// Value provided as argument
+			value = []byte(args[1])
+		} else {
+			// Read value from stdin
+			value, err = io.ReadAll(os.Stdin)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to read from stdin: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		
+		err = c.Put(context.Background(), args[0], value, ttl)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Put failed: %v\n", err)
 			os.Exit(1)
@@ -80,9 +105,10 @@ var getCmd = &cobra.Command{
 }
 
 var delCmd = &cobra.Command{
-	Use:   "del <key>",
-	Short: "Delete a key from the cache",
-	Args:  cobra.ExactArgs(1),
+	Use:     "del <key>",
+	Aliases: []string{"delete"},
+	Short:   "Delete a key from the cache",
+	Args:    cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		c := newClient()
 		defer c.Close()

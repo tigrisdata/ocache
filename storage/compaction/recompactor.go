@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -63,17 +62,8 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 	}
 
 	// Safety check: Need enough segments to safely recompact
-	// In production, we need at least 3 segments (2 to skip + 1 to potentially recompact)
-	// But allow overriding for testing
-	minSegments := sr.minSegments
-	if skipStr := os.Getenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT"); skipStr != "" {
-		if skip, err := strconv.Atoi(skipStr); err == nil && skip == 0 {
-			// If set in tests, allow recompaction with just 1 segment
-			minSegments = 1
-		}
-	}
-	if totalSegments < minSegments {
-		zlog.Debug().Int("segmentCount", totalSegments).Int("minRequired", minSegments).
+	if totalSegments < sr.minSegments {
+		zlog.Debug().Int("segmentCount", totalSegments).Int("minRequired", sr.minSegments).
 			Msg("recompactor: too few segments to safely recompact")
 		return nil
 	}
@@ -353,20 +343,7 @@ func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segm
 		return false, "has open file handle"
 	}
 
-	// Check 3: Skip the most recent segments (even if closed)
-	// to avoid interfering with segments that might have just been finalized
-	skipRecentCount := 2
-	// Allow overriding for testing
-	if skipStr := os.Getenv("OCACHE_TEST_RECOMPACTION_SKIP_RECENT"); skipStr != "" {
-		if skip, err := strconv.Atoi(skipStr); err == nil && skip >= 0 {
-			skipRecentCount = skip
-		}
-	}
-	if skipRecentCount > 0 && segmentIndex >= totalSegments-skipRecentCount {
-		return false, fmt.Sprintf("too recent (one of last %d segments)", skipRecentCount)
-	}
-
-	// Check 4: Verify segment age based on timestamp
+	// Check 3: Verify segment age based on timestamp
 	base := filepath.Base(seg.Path())
 	var timestamp int64
 	// Try parsing the segment name format
