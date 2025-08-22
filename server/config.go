@@ -25,6 +25,7 @@ type Config struct {
 	RecompactMinSegments   int           // Minimum number of segments for recompaction
 	RecompactDisable       bool          // Disable automatic segment recompaction
 	TTLCleanupInterval     time.Duration // TTL cleanup interval
+	RequestLogging         bool          // Enable request logging
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -52,5 +53,6 @@ func LoadConfig() {
 		RecompactMinSegments:   *recompactMinSegments,
 		RecompactDisable:       *recompactDisable,
 		TTLCleanupInterval:     *ttlCleanupInterval,
+		RequestLogging:         *requestLogging,
 	}
 }

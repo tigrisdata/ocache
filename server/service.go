@@ -254,10 +254,16 @@ func grpcStreamLoggingInterceptor(
 }
 
 func startGRPCServer() {
-	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(grpcLoggingInterceptor),
-		grpc.StreamInterceptor(grpcStreamLoggingInterceptor),
-	)
+	// If request logging is enabled, add the interceptors to the gRPC server
+	var opts []grpc.ServerOption
+	if AppConfig.RequestLogging {
+		opts = append(opts,
+			grpc.UnaryInterceptor(grpcLoggingInterceptor),
+			grpc.StreamInterceptor(grpcStreamLoggingInterceptor),
+		)
+	}
+
+	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterCacheServiceServer(grpcServer, &cacheService{})
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", AppConfig.Port))
