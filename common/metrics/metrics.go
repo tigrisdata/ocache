@@ -17,8 +17,8 @@ var (
 
 	RPCDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "ocache_rpc_duration_seconds",
-			Help:    "RPC request duration in seconds",
+			Name:    "ocache_rpc_duration_ms",
+			Help:    "RPC request duration in milliseconds",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"method"},
@@ -35,8 +35,8 @@ var (
 
 	StorageOperationDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "ocache_storage_operation_duration_seconds",
-			Help:    "Storage operation duration in seconds",
+			Name:    "ocache_storage_operation_duration_ms",
+			Help:    "Storage operation duration in milliseconds",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"operation", "storage_type"},
@@ -103,8 +103,8 @@ var (
 
 	CompactionDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "ocache_compaction_duration_seconds",
-			Help:    "Compaction duration in seconds",
+			Name:    "ocache_compaction_duration_ms",
+			Help:    "Compaction duration in milliseconds",
 			Buckets: prometheus.DefBuckets,
 		},
 	)
@@ -134,8 +134,8 @@ var (
 
 	CleanerDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "ocache_cleaner_duration_seconds",
-			Help:    "Cleaner run duration in seconds",
+			Name:    "ocache_cleaner_duration_ms",
+			Help:    "Cleaner run duration in milliseconds",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"type"},
@@ -297,8 +297,8 @@ var (
 
 	RecoveryDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
-			Name:    "ocache_recovery_duration_seconds",
-			Help:    "Recovery duration in seconds",
+			Name:    "ocache_recovery_duration_ms",
+			Help:    "Recovery duration in milliseconds",
 			Buckets: prometheus.DefBuckets,
 		},
 	)
@@ -323,24 +323,6 @@ var (
 			Name: "ocache_cache_misses_total",
 			Help: "Total number of cache misses",
 		},
-	)
-
-	// RocksDB specific metrics
-	RocksDBOperations = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ocache_rocksdb_operations_total",
-			Help: "Total number of RocksDB operations",
-		},
-		[]string{"operation", "status"},
-	)
-
-	RocksDBOperationDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "ocache_rocksdb_operation_duration_seconds",
-			Help:    "RocksDB operation duration in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"operation"},
 	)
 )
 

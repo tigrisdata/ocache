@@ -308,7 +308,7 @@ func (s *Storage) ListKeys() ([]string, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(time.Since(start).Seconds())
+		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	ro := grocksdb.NewDefaultReadOptions()
@@ -358,7 +358,7 @@ func (s *Storage) DeleteKey(key string) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("delete", storageType).Observe(time.Since(start).Seconds())
+		metrics.StorageOperationDuration.WithLabelValues("delete", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	// Get the value to track size changes and file cleanup
@@ -427,7 +427,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	storageType := "unknown"
 	startTime := time.Now()
 	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(time.Since(startTime).Seconds())
+		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
@@ -600,7 +600,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("put", storageType).Observe(time.Since(start).Seconds())
+		metrics.StorageOperationDuration.WithLabelValues("put", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	// We need to read at most threshold+1 bytes to decide if the value is "large".

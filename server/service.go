@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/server/metrics"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 
@@ -33,7 +33,7 @@ type cacheService struct {
 func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	start := time.Now()
 	defer func() {
-		metrics.RPCDuration.WithLabelValues("Put").Observe(time.Since(start).Seconds())
+		metrics.RPCDuration.WithLabelValues("Put").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	zlog.Debug().Msg("gRPC Put called")
@@ -96,7 +96,7 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	start := time.Now()
 	defer func() {
-		metrics.RPCDuration.WithLabelValues("PutObject").Observe(time.Since(start).Seconds())
+		metrics.RPCDuration.WithLabelValues("PutObject").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	zlog.Debug().Str("key", req.Key).Int64("ttl", req.TtlSeconds).Int("data_len", len(req.Data)).Msg("PutObject called (unary for REST)")
@@ -118,7 +118,7 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	startTime := time.Now()
 	defer func() {
-		metrics.RPCDuration.WithLabelValues("Get").Observe(time.Since(startTime).Seconds())
+		metrics.RPCDuration.WithLabelValues("Get").Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
 
 	zlog.Debug().Str("key", req.Key).Int64("start", req.Start).Int64("end", req.End).Msg("gRPC Get called")
@@ -171,7 +171,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	start := time.Now()
 	defer func() {
-		metrics.RPCDuration.WithLabelValues("Delete").Observe(time.Since(start).Seconds())
+		metrics.RPCDuration.WithLabelValues("Delete").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	zlog.Debug().Str("key", req.Key).Msg("gRPC Delete called")
@@ -188,7 +188,7 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
 	start := time.Now()
 	defer func() {
-		metrics.RPCDuration.WithLabelValues("List").Observe(time.Since(start).Seconds())
+		metrics.RPCDuration.WithLabelValues("List").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	zlog.Debug().Msg("gRPC List called")

@@ -9,7 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
-	"github.com/tigrisdata/ocache/server/metrics"
+	"github.com/tigrisdata/ocache/common/metrics"
 	stor "github.com/tigrisdata/ocache/storage"
 )
 
