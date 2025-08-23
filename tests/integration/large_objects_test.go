@@ -185,7 +185,7 @@ func (s *LargeObjectSuite) Test_LargeObject_Streaming() {
 
 	// Test 1: Chunked reading
 	s.T().Log("Testing chunked reading...")
-	reader, exists, err := s.Harness.Storage.Get(key)
+	reader, exists, err := s.Harness.Storage.Get(key, 0, 0)
 	require.NoError(s.T(), err)
 	require.True(s.T(), exists)
 
@@ -231,7 +231,7 @@ func (s *LargeObjectSuite) Test_LargeObject_Streaming() {
 		go func(readerID int) {
 			defer wg.Done()
 
-			reader, exists, err := s.Harness.Storage.Get(key)
+			reader, exists, err := s.Harness.Storage.Get(key, 0, 0)
 			if err != nil {
 				errors <- fmt.Errorf("reader %d: failed to get: %v", readerID, err)
 				return
@@ -338,7 +338,7 @@ func (s *LargeObjectSuite) Test_LargeObject_MixedSizes() {
 
 			// For very large objects, just verify we can read the header
 			t.Logf("Verifying %s can be read...", tc.key)
-			reader, exists, err := s.Harness.Storage.Get(tc.key)
+			reader, exists, err := s.Harness.Storage.Get(tc.key, 0, 0)
 			require.NoError(t, err)
 			require.True(t, exists)
 
