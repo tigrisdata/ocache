@@ -10,10 +10,12 @@ import (
 	"time"
 
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/metrics"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
@@ -29,12 +31,21 @@ type cacheService struct {
 
 // Streaming Put for large values
 func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
+	start := time.Now()
+	defer func() {
+		metrics.RPCDuration.WithLabelValues("Put").Observe(time.Since(start).Seconds())
+	}()
+
 	zlog.Debug().Msg("gRPC Put called")
+	metrics.StreamsActive.Inc()
+	defer metrics.StreamsActive.Dec()
 	var key string
 	var ttl int
+	var err error
 	pr, pw := io.Pipe()
 	first := true
 	errCh := make(chan error, 1)
+	dataSize := int64(0)
 
 	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
 	go func() {
@@ -43,60 +54,98 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 
 	// Read chunks from the stream and write to the pipe
 	for {
-		chunk, err := stream.Recv()
+		var chunk *pb.PutRequest
+		chunk, err = stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			pw.CloseWithError(err)
 			<-errCh // wait for storage.Put to finish
-			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+			break
 		}
 		if first {
 			key = chunk.Key
 			ttl = int(chunk.TtlSeconds)
 			first = false
 		}
+		dataSize += int64(len(chunk.Data))
 		if len(chunk.Data) > 0 {
-			if _, err := pw.Write(chunk.Data); err != nil {
+			if _, err = pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
 				<-errCh // wait for storage.Put to finish
-				return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+				break
 			}
 		}
 	}
 	pw.Close()
-	err := <-errCh // wait for storage.Put to finish
-	if err != nil {
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+
+	gErr := <-errCh // wait for storage.Put to finish
+	if err != nil || gErr != nil {
+		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		if gErr != nil {
+			errMsg = gErr.Error()
+		}
+
+		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: errMsg})
 	}
+	metrics.RPCRequests.WithLabelValues("Put", "success").Inc()
+	metrics.ObjectSize.WithLabelValues("Put").Observe(float64(dataSize))
 	return stream.SendAndClose(&pb.PutResponse{Success: true})
 }
 
 // PutObject implements the unary REST/HTTP endpoint for cache put
 func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.RPCDuration.WithLabelValues("PutObject").Observe(time.Since(start).Seconds())
+	}()
+
 	zlog.Debug().Str("key", req.Key).Int64("ttl", req.TtlSeconds).Int("data_len", len(req.Data)).Msg("PutObject called (unary for REST)")
 	if req.Key == "" {
+		metrics.RPCRequests.WithLabelValues("PutObject", "invalid").Inc()
 		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
 	}
 	// Use the same logic as the streaming Put, but for a single chunk
 	if err := stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds)); err != nil {
+		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "PutObject").Inc()
 		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
 	}
+	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
+	metrics.ObjectSize.WithLabelValues("PutObject").Observe(float64(len(req.Data)))
 	return &pb.PutResponse{Success: true}, nil
 }
 
 // Streaming Get for large values with byte-range support
 func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
+	startTime := time.Now()
+	defer func() {
+		metrics.RPCDuration.WithLabelValues("Get").Observe(time.Since(startTime).Seconds())
+	}()
+
 	zlog.Debug().Str("key", req.Key).Int64("start", req.Start).Int64("end", req.End).Msg("gRPC Get called")
+	metrics.StreamsActive.Inc()
+	defer metrics.StreamsActive.Dec()
 
 	r, found, err := stor.GetStorage().Get(req.Key, req.Start, req.End)
 	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "Get").Inc()
 		return err
 	}
 	if !found {
+		metrics.RPCRequests.WithLabelValues("Get", "not_found").Inc()
+		metrics.CacheMisses.Inc()
 		return status.Error(codes.NotFound, "key not found")
 	}
+	metrics.CacheHits.Inc()
 
 	// Ensure the reader is closed to release any file locks
 	if closer, ok := r.(io.Closer); ok {
@@ -110,41 +159,70 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		readN, err := r.Read(buf)
 		if readN > 0 {
 			if err := stream.Send(&pb.GetResponse{Data: buf[:readN]}); err != nil {
+				metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
+				metrics.Errors.WithLabelValues("grpc", "Get").Inc()
 				return err
 			}
+			metrics.StreamBytesTransferred.WithLabelValues("download").Add(float64(readN))
+			if err := stream.Send(&pb.GetResponse{Data: chunk}); err != nil {
+				metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
+				metrics.Errors.WithLabelValues("grpc", "Get").Inc()
+				return err
+			}
+			metrics.StreamBytesTransferred.WithLabelValues("download").Add(float64(readN))
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
+			metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
+			metrics.Errors.WithLabelValues("grpc", "Get").Inc()
 			return err
 		}
 	}
+	metrics.RPCRequests.WithLabelValues("Get", "success").Inc()
 	return nil
 }
 
 // Delete implementation
 func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.RPCDuration.WithLabelValues("Delete").Observe(time.Since(start).Seconds())
+	}()
+
 	zlog.Debug().Str("key", req.Key).Msg("gRPC Delete called")
 	if req.Key == "" {
+		metrics.RPCRequests.WithLabelValues("Delete", "invalid").Inc()
 		return &pb.DeleteResponse{Success: false, Error: "missing key"}, nil
 	}
 	stor.GetStorage().DeleteKey(req.Key)
+	metrics.RPCRequests.WithLabelValues("Delete", "success").Inc()
 	return &pb.DeleteResponse{Success: true}, nil
 }
 
 // Streaming List implementation
 func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
+	start := time.Now()
+	defer func() {
+		metrics.RPCDuration.WithLabelValues("List").Observe(time.Since(start).Seconds())
+	}()
+
 	zlog.Debug().Msg("gRPC List called")
 	keys, err := stor.GetStorage().ListKeys()
 	if err != nil {
+		metrics.RPCRequests.WithLabelValues("List", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "List").Inc()
 		return err
 	}
 	for _, key := range keys {
 		if err := stream.Send(&pb.ListResponse{Keys: []string{key}}); err != nil {
+			metrics.RPCRequests.WithLabelValues("List", "error").Inc()
+			metrics.Errors.WithLabelValues("grpc", "List").Inc()
 			return err
 		}
 	}
+	metrics.RPCRequests.WithLabelValues("List", "success").Inc()
 	return nil
 }
 
@@ -241,6 +319,12 @@ func startGRPCGatewayServer(grpcAddr string, gatewayPort int) {
 	if err := pb.RegisterCacheServiceHandlerFromEndpoint(ctx, gwMux, grpcAddr, opts); err != nil {
 		zlog.Fatal().Err(err).Msg("failed to register grpc-gateway handler")
 	}
+
+	// Add Prometheus metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
+	zlog.Info().Msg("Prometheus metrics available at /metrics")
+
+	// Handle all other routes with the gRPC gateway
 	mux.Handle("/", gwMux)
 
 	zlog.Info().Msgf("Starting grpc-gateway HTTP server on :%d", gatewayPort)
