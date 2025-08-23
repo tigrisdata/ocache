@@ -70,7 +70,7 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 			first = false
 		}
 		if len(chunk.Data) > 0 {
-			if _, err = pw.Write(chunk.Data); err != nil {
+			if _, err := pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
 				<-errCh // wait for storage.Put to finish
 

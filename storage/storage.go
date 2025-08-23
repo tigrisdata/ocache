@@ -376,9 +376,11 @@ func (s *Storage) DeleteKey(key string) {
 	defer slice.Free()
 
 	// Parse value to get size and file info
+	dataSize := int64(0)
 	valueMsg := &pb.ValueMessage{}
 	if err := proto.Unmarshal(slice.Data(), valueMsg); err == nil {
 		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
+		dataSize = valueMsg.ValueLength
 		// Notify cleaner about size reduction
 		s.notifyDelete(valueMsg.ValueLength)
 
@@ -395,9 +397,10 @@ func (s *Storage) DeleteKey(key string) {
 		}
 	}
 
-	// Delete key and its access index in a single batch
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
+
+	// Delete key and its access index in a single batch
 	batch.Delete(metaKey)
 
 	// Use secondary index to find and delete the bucketed access entry
@@ -417,7 +420,7 @@ func (s *Storage) DeleteKey(key string) {
 		metrics.Errors.WithLabelValues("rocksdb", "delete").Inc()
 	} else {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
-		metrics.ObjectSize.WithLabelValues("delete").Observe(float64(valueMsg.ValueLength))
+		metrics.ObjectSize.WithLabelValues("delete").Observe(float64(dataSize))
 	}
 }
 
