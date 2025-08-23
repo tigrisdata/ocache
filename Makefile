@@ -201,25 +201,25 @@ test: test-server test-storage test-client
 test-all: test-server test-storage test-client test-integration test-e2e
 
 .PHONY: test-server
-test-server:
+test-server: proto
 	@echo "Running server tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
 
 .PHONY: test-storage
-test-storage:
+test-storage: proto
 	@echo "Running storage tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
 
 .PHONY: test-client
-test-client:
+test-client: proto
 	@echo "Running client tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd client && go test -v -timeout 30s $(TESTFLAGS) ./...
 
 .PHONY: test-race
-test-race:
+test-race: proto
 	@echo "Running race tests for server..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 60s $(TESTFLAGS) ./...
@@ -227,7 +227,7 @@ test-race:
 	@cd client && go test -race -v -timeout 30s $(TESTFLAGS) ./...
 
 .PHONY: test-coverage
-test-coverage:
+test-coverage: proto
 	@echo "Running coverage tests for server..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../coverage-server.out -timeout 60s $(TESTFLAGS) ./...
@@ -282,25 +282,25 @@ test-e2e-recompaction: build build-cli
 	./tests/e2e/recompaction_test.sh
 
 .PHONY: test-integration
-test-integration:
+test-integration: proto
 	@echo "Running integration tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 300s $(TESTFLAGS) ./...
 
 .PHONY: test-integration-short
-test-integration-short:
+test-integration-short: proto
 	@echo "Running integration tests (short mode)..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -short -timeout 30s $(TESTFLAGS) ./...
 
 .PHONY: test-integration-race
-test-integration-race:
+test-integration-race: proto
 	@echo "Running integration tests with race detector..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 180s $(TESTFLAGS) ./...
 
 .PHONY: test-integration-coverage
-test-integration-coverage:
+test-integration-coverage: proto
 	@echo "Running integration tests with coverage..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../../coverage-integration.out -timeout 300s $(TESTFLAGS) ./...
