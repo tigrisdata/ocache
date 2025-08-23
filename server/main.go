@@ -9,6 +9,7 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	stor "github.com/tigrisdata/ocache/storage"
 )
 
@@ -50,6 +51,10 @@ func configureLogger() {
 }
 
 func RunServer() {
+	// Initialize Prometheus metrics
+	metrics.Init()
+	zlog.Info().Msg("Prometheus metrics initialized")
+
 	// Create storage config from AppConfig
 	storageConfig := &stor.StorageConfig{
 		DiskPath:            AppConfig.DiskPath,

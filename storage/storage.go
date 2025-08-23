@@ -9,6 +9,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/protobuf/proto"
 
@@ -304,6 +305,12 @@ func CloseStorage() {
 // ListKeys returns all non-expired keys in the RocksDB instance
 // Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
 func (s *Storage) ListKeys() ([]string, error) {
+	storageType := "unknown"
+	start := time.Now()
+	defer func() {
+		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	ro := grocksdb.NewDefaultReadOptions()
 	// Use prefix iteration to only scan metadata keys
 	ro.SetPrefixSameAsStart(true)
@@ -336,34 +343,53 @@ func (s *Storage) ListKeys() ([]string, error) {
 		it.Value().Free()
 	}
 	if err := it.Err(); err != nil {
+		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
+
 		return nil, err
 	}
+
+	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
 	return keyList, nil
 }
 
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) {
+	storageType := "unknown"
+	start := time.Now()
+	defer func() {
+		metrics.StorageOperationDuration.WithLabelValues("delete", storageType).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	// Get the value to track size changes and file cleanup
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
 	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil || !slice.Exists() {
+		if err != nil {
+			metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
+		} else {
+			metrics.StorageOperations.WithLabelValues("delete", storageType, "not_found").Inc()
+		}
 		return // Key doesn't exist, nothing to delete
 	}
 	defer slice.Free()
 
 	// Parse value to get size and file info
+	dataSize := int64(0)
 	valueMsg := &pb.ValueMessage{}
 	if err := proto.Unmarshal(slice.Data(), valueMsg); err == nil {
+		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
+		dataSize = valueMsg.ValueLength
 		// Notify cleaner about size reduction
 		s.notifyDelete(valueMsg.ValueLength)
 
 		// Clean up files if necessary
 		switch valueMsg.ValueType {
 		case pb.ValueType_RAW_FILE:
-			if err := s.fileManager.Remove(valueMsg.RawFilePath); err != nil {
+			if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
 				zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).
-					Msg("storage.DeleteKey: failed to remove raw file")
+					Msg("storage.DeleteKey: failed to add raw file to deletion queue")
 			}
 		case pb.ValueType_SEGMENT:
 			// Update delete index to track this deletion for future garbage collection
@@ -371,9 +397,10 @@ func (s *Storage) DeleteKey(key string) {
 		}
 	}
 
-	// Delete key and its access index in a single batch
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
+
+	// Delete key and its access index in a single batch
 	batch.Delete(metaKey)
 
 	// Use secondary index to find and delete the bucketed access entry
@@ -387,22 +414,37 @@ func (s *Storage) DeleteKey(key string) {
 	// Delete the secondary index entry
 	batch.Delete(bucketIndexKey)
 
-	s.meta.Handle().Write(wo, batch)
+	err = s.meta.Handle().Write(wo, batch)
+	if err != nil {
+		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "delete").Inc()
+	} else {
+		metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
+		metrics.ObjectSize.WithLabelValues("delete").Observe(float64(dataSize))
+	}
 }
 
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
 // Supports byte-range requests via start and end parameters (0 means no limit)
 func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
+	storageType := "unknown"
+	startTime := time.Now()
+	defer func() {
+		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
+	}()
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
 
 	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil {
+		metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
 		return nil, false, err
 	}
 	defer slice.Free()
 	if !slice.Exists() {
+		metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
 		zlog.Debug().Str("key", key).Msg("storage.Get: not found in DB")
 		return nil, false, nil
 	}
@@ -431,12 +473,15 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	}
 
 	var reader io.Reader
+	storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
 
 	switch valueMsg.ValueType {
 	case pb.ValueType_INLINE:
 		reader = bytes.NewReader(valueMsg.Data)
 	case pb.ValueType_SEGMENT:
 		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
+			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
 			return nil, false, err
@@ -447,6 +492,8 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		}
 	case pb.ValueType_RAW_FILE:
 		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
+			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
 			s.DeleteKey(key)
 			return nil, false, err
@@ -460,6 +507,10 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		s.DeleteKey(key)
 		return nil, false, nil
 	}
+
+	metrics.StorageOperations.WithLabelValues("get", storageType, "success").Inc()
+	metrics.StorageBytes.WithLabelValues("get", storageType).Add(float64(valueMsg.ValueLength))
+	metrics.ObjectSize.WithLabelValues("get").Observe(float64(valueMsg.ValueLength))
 
 	// Apply byte-range if specified
 	if start > 0 || (end > 0 && end > start) {
@@ -549,6 +600,12 @@ func (br *byteRangeReader) Close() error {
 
 // Put streams the body into spillWriter, stores metadata, and handles TTL
 func (s *Storage) Put(key string, body io.Reader, ttl int) error {
+	storageType := "unknown"
+	start := time.Now()
+	defer func() {
+		metrics.StorageOperationDuration.WithLabelValues("put", storageType).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	// We need to read at most threshold+1 bytes to decide if the value is "large".
 	// Allocate a buffer exactly that size to avoid the short-buffer error.
 	firstReadSize := s.inlineThreshold + 1
@@ -557,11 +614,14 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	}
 	firstChunk, release := bufferpool.AcquireBuffer(firstReadSize)
 	defer release()
+	metrics.BufferPoolAllocations.Inc()
 
 	// Read up to firstReadSize bytes. io.ReadFull returns ErrUnexpectedEOF when the
 	// value is smaller than firstReadSize – that is fine, we still get the bytes read.
 	n, err := io.ReadFull(body, firstChunk)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("io", "put").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
 		return err
 	}
@@ -576,10 +636,13 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	// Large value path: we managed to read more than threshold bytes, which means
 	// the value length exceeds the small-value threshold.
 	if n > s.inlineThreshold {
+		storageType = "raw_file"
 		// Combine the bytes we already read with the remaining reader and write via the segment manager
 		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
 		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, multiReader)
 		if err != nil {
+			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues("file", "put").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
 			return err
 		}
@@ -598,13 +661,20 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		}
 		err = s.putLow(key, val, filePath, bytesWritten)
 		if err == nil {
+			metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
+			metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(bytesWritten))
+			metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
 			s.notifyPut(bytesWritten)
+		} else {
+			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
 		}
 		return err
 	}
 
 	// Small value: we have read the entire value into firstChunk[:n]
 	smallValue := firstChunk[:n]
+	storageType = "inline"
 
 	// We don't need to store the checksum for small values because
 	// we are relying on RocksDB to verify the integrity of the data.
@@ -621,7 +691,13 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	}
 	err = s.putLow(key, val, "", int64(n))
 	if err == nil {
+		metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
+		metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(n))
+		metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
 		s.notifyPut(int64(n))
+	} else {
+		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
 	}
 	return err
 }
