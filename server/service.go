@@ -41,7 +41,6 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	defer metrics.StreamsActive.Dec()
 	var key string
 	var ttl int
-	var err error
 	pr, pw := io.Pipe()
 	first := true
 	errCh := make(chan error, 1)
@@ -54,15 +53,17 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 
 	// Read chunks from the stream and write to the pipe
 	for {
-		var chunk *pb.PutRequest
-		chunk, err = stream.Recv()
+		chunk, err := stream.Recv()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
 			pw.CloseWithError(err)
 			<-errCh // wait for storage.Put to finish
-			break
+
+			metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
+			metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 		}
 		if first {
 			key = chunk.Key
@@ -74,26 +75,20 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 			if _, err = pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
 				<-errCh // wait for storage.Put to finish
-				break
+
+				metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
+				metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+				return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 			}
 		}
 	}
 	pw.Close()
 
-	gErr := <-errCh // wait for storage.Put to finish
-	if err != nil || gErr != nil {
+	err := <-errCh // wait for storage.Put to finish
+	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-
-		errMsg := ""
-		if err != nil {
-			errMsg = err.Error()
-		}
-		if gErr != nil {
-			errMsg = gErr.Error()
-		}
-
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: errMsg})
+		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 	}
 	metrics.RPCRequests.WithLabelValues("Put", "success").Inc()
 	metrics.ObjectSize.WithLabelValues("Put").Observe(float64(dataSize))
@@ -142,10 +137,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	}
 	if !found {
 		metrics.RPCRequests.WithLabelValues("Get", "not_found").Inc()
-		metrics.CacheMisses.Inc()
 		return status.Error(codes.NotFound, "key not found")
 	}
-	metrics.CacheHits.Inc()
 
 	// Ensure the reader is closed to release any file locks
 	if closer, ok := r.(io.Closer); ok {
@@ -155,6 +148,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	// Stream the data in chunks
 	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
 	defer release()
+	dataSize := int64(0)
 	for {
 		readN, err := r.Read(buf)
 		if readN > 0 {
@@ -164,12 +158,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 				return err
 			}
 			metrics.StreamBytesTransferred.WithLabelValues("download").Add(float64(readN))
-			if err := stream.Send(&pb.GetResponse{Data: chunk}); err != nil {
-				metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
-				metrics.Errors.WithLabelValues("grpc", "Get").Inc()
-				return err
-			}
-			metrics.StreamBytesTransferred.WithLabelValues("download").Add(float64(readN))
+			dataSize += int64(readN)
 		}
 		if err == io.EOF {
 			break
@@ -181,6 +170,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		}
 	}
 	metrics.RPCRequests.WithLabelValues("Get", "success").Inc()
+	metrics.ObjectSize.WithLabelValues("Get").Observe(float64(dataSize))
 	return nil
 }
 

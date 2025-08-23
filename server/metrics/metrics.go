@@ -24,23 +24,6 @@ var (
 		[]string{"method"},
 	)
 
-	HTTPRequests = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ocache_http_requests_total",
-			Help: "Total number of HTTP requests",
-		},
-		[]string{"method", "path", "status"},
-	)
-
-	HTTPDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "ocache_http_duration_seconds",
-			Help:    "HTTP request duration in seconds",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"method", "path"},
-	)
-
 	// Storage Metrics
 	StorageOperations = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -84,47 +67,6 @@ var (
 				268435456,  // 256MB
 				1073741824, // 1GB
 			},
-		},
-		[]string{"operation"},
-	)
-
-	// Cache Metrics
-	CacheHits = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ocache_cache_hits_total",
-			Help: "Total number of cache hits",
-		},
-	)
-
-	CacheMisses = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "ocache_cache_misses_total",
-			Help: "Total number of cache misses",
-		},
-	)
-
-	CacheEvictions = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ocache_cache_evictions_total",
-			Help: "Total number of cache evictions",
-		},
-		[]string{"reason"},
-	)
-
-	// RocksDB Metrics
-	RocksDBOperations = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "ocache_rocksdb_operations_total",
-			Help: "Total number of RocksDB operations",
-		},
-		[]string{"operation", "status"},
-	)
-
-	RocksDBOperationDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "ocache_rocksdb_operation_duration_seconds",
-			Help:    "RocksDB operation duration in seconds",
-			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"operation"},
 	)
@@ -232,13 +174,6 @@ var (
 	)
 
 	// LRU Metrics
-	LRUSize = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "ocache_lru_size",
-			Help: "Current LRU cache size",
-		},
-	)
-
 	LRUEvictions = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "ocache_lru_evictions_total",

@@ -305,6 +305,12 @@ func CloseStorage() {
 // ListKeys returns all non-expired keys in the RocksDB instance
 // Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
 func (s *Storage) ListKeys() ([]string, error) {
+	storageType := "unknown"
+	start := time.Now()
+	defer func() {
+		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(time.Since(start).Seconds())
+	}()
+
 	ro := grocksdb.NewDefaultReadOptions()
 	// Use prefix iteration to only scan metadata keys
 	ro.SetPrefixSameAsStart(true)
@@ -337,8 +343,13 @@ func (s *Storage) ListKeys() ([]string, error) {
 		it.Value().Free()
 	}
 	if err := it.Err(); err != nil {
+		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
+
 		return nil, err
 	}
+
+	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
 	return keyList, nil
 }
 
@@ -353,20 +364,15 @@ func (s *Storage) DeleteKey(key string) {
 	// Get the value to track size changes and file cleanup
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
-	rocksStart := time.Now()
 	slice, err := s.meta.Handle().Get(ro, metaKey)
-	metrics.RocksDBOperationDuration.WithLabelValues("get").Observe(time.Since(rocksStart).Seconds())
 	if err != nil || !slice.Exists() {
 		if err != nil {
 			metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
-			metrics.RocksDBOperations.WithLabelValues("get", "error").Inc()
 		} else {
 			metrics.StorageOperations.WithLabelValues("delete", storageType, "not_found").Inc()
-			metrics.RocksDBOperations.WithLabelValues("get", "not_found").Inc()
 		}
 		return // Key doesn't exist, nothing to delete
 	}
-	metrics.RocksDBOperations.WithLabelValues("get", "success").Inc()
 	defer slice.Free()
 
 	// Parse value to get size and file info
@@ -405,47 +411,39 @@ func (s *Storage) DeleteKey(key string) {
 	// Delete the secondary index entry
 	batch.Delete(bucketIndexKey)
 
-	rocksWriteStart := time.Now()
 	err = s.meta.Handle().Write(wo, batch)
-	metrics.RocksDBOperationDuration.WithLabelValues("delete").Observe(time.Since(rocksWriteStart).Seconds())
 	if err != nil {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
-		metrics.RocksDBOperations.WithLabelValues("delete", "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "delete").Inc()
 	} else {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
-		metrics.RocksDBOperations.WithLabelValues("delete", "success").Inc()
 	}
 }
 
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
 // Supports byte-range requests via start and end parameters (0 means no limit)
 func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
+	storageType := "unknown"
 	startTime := time.Now()
 	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("get", "mixed").Observe(time.Since(startTime).Seconds())
+		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(time.Since(startTime).Seconds())
 	}()
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
 
-	rocksStart := time.Now()
 	slice, err := s.meta.Handle().Get(ro, metaKey)
-	metrics.RocksDBOperationDuration.WithLabelValues("get").Observe(time.Since(rocksStart).Seconds())
 	if err != nil {
-		metrics.StorageOperations.WithLabelValues("get", "mixed", "error").Inc()
-		metrics.RocksDBOperations.WithLabelValues("get", "error").Inc()
+		metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
 		return nil, false, err
 	}
 	defer slice.Free()
 	if !slice.Exists() {
-		metrics.StorageOperations.WithLabelValues("get", "mixed", "not_found").Inc()
-		metrics.RocksDBOperations.WithLabelValues("get", "not_found").Inc()
+		metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
 		zlog.Debug().Str("key", key).Msg("storage.Get: not found in DB")
 		return nil, false, nil
 	}
-	metrics.RocksDBOperations.WithLabelValues("get", "success").Inc()
 	v := slice.Data()
 
 	// Try to decode as proto ValueMessage
@@ -471,36 +469,31 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	}
 
 	var reader io.Reader
+	storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
 
 	switch valueMsg.ValueType {
 	case pb.ValueType_INLINE:
-		metrics.StorageOperations.WithLabelValues("get", "inline", "success").Inc()
-		metrics.StorageBytes.WithLabelValues("get", "inline").Add(float64(len(valueMsg.Data)))
 		reader = bytes.NewReader(valueMsg.Data)
 	case pb.ValueType_SEGMENT:
 		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
-			metrics.StorageOperations.WithLabelValues("get", "segment", "error").Inc()
-			metrics.Errors.WithLabelValues("segment", "get").Inc()
+			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
 			return nil, false, err
 		} else if r != nil {
-			metrics.StorageOperations.WithLabelValues("get", "segment", "success").Inc()
-			metrics.StorageBytes.WithLabelValues("get", "segment").Add(float64(valueMsg.ValueLength))
 			reader = r
 		} else {
 			return nil, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
 		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
-			metrics.StorageOperations.WithLabelValues("get", "raw_file", "error").Inc()
-			metrics.Errors.WithLabelValues("file", "get").Inc()
+			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
 			s.DeleteKey(key)
 			return nil, false, err
 		} else if r != nil {
-			metrics.StorageOperations.WithLabelValues("get", "raw_file", "success").Inc()
-			metrics.StorageBytes.WithLabelValues("get", "raw_file").Add(float64(valueMsg.ValueLength))
 			reader = r
 		} else {
 			return nil, false, nil
@@ -510,6 +503,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		s.DeleteKey(key)
 		return nil, false, nil
 	}
+
+	metrics.StorageOperations.WithLabelValues("get", storageType, "success").Inc()
+	metrics.StorageBytes.WithLabelValues("get", storageType).Add(float64(valueMsg.ValueLength))
 
 	// Apply byte-range if specified
 	if start > 0 || (end > 0 && end > start) {
@@ -624,9 +620,6 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
 		return err
 	}
-
-	// Record object size distribution
-	metrics.ObjectSize.WithLabelValues("put").Observe(float64(n))
 
 	// Determine expiry timestamp if TTL is specified
 	var expiry int64
