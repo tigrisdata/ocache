@@ -836,18 +836,20 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 	// Create objects with initial access pattern
 	numObjects := 20
 	keys := make([]string, numObjects)
-	baseTime := time.Now().Unix()
+	// Use a base time that's at least 3 hours in the past to ensure clear separation
+	baseTime := time.Now().Add(-3 * time.Hour).Unix()
 
 	t.Log("Creating objects with initial access pattern")
 	for i := 0; i < numObjects; i++ {
-		key := fmt.Sprintf("access-pattern-%d", i)
+		key := fmt.Sprintf("access-pattern-%02d", i) // Use zero-padding for consistent sorting
 		keys[i] = key
 		data := GenerateRandomData(5 * 1024) // 5KB each
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
 
 		// Initially, lower indices have older access times
-		s.Harness.SetAccessTime(key, baseTime-int64(numObjects-i)*100)
+		// Space them out by 10 seconds each to ensure clear ordering
+		s.Harness.SetAccessTime(key, baseTime+int64(i)*10)
 	}
 	s.Harness.FlushAccessUpdates()
 
@@ -859,13 +861,16 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 
 	// Update access pattern - make middle keys (10-14) recent by accessing them
 	t.Log("Phase 1: Updating access patterns - accessing middle keys")
-	newTime := time.Now().Unix()
+	// Use a time far enough in the future to ensure different bucket (at least 1 hour later)
+	// This ensures the updated keys will be in a different access bucket
+	newTime := time.Now().Add(2 * time.Hour).Unix()
 	for i := 10; i < 15; i++ {
 		// Access the keys (this should update their access time)
 		_, err := s.Harness.GetObject(keys[i])
 		require.NoError(t, err)
-		// Explicitly set very recent access time
-		s.Harness.SetAccessTime(keys[i], newTime+int64(i))
+		// Explicitly set very recent access time with proper spacing
+		// Add seconds to ensure ordering within the new bucket
+		s.Harness.SetAccessTime(keys[i], newTime+int64(i*10))
 	}
 	s.Harness.FlushAccessUpdates()
 
@@ -873,7 +878,7 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 	t.Log("Phase 2: Adding more objects to trigger eviction")
 	newKeys := []string{}
 	for i := 0; i < 15; i++ {
-		key := fmt.Sprintf("access-pattern-new-%d", i)
+		key := fmt.Sprintf("access-pattern-new-%02d", i) // Use zero-padding for consistent sorting
 		newKeys = append(newKeys, key)
 		data := GenerateRandomData(5 * 1024) // 5KB each
 		err := s.Harness.PutObject(key, data, 0)
@@ -905,9 +910,10 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 	t.Logf("Access pattern results - Recently accessed retained: %d/5, Old keys evicted: %d/10",
 		recentlyAccessedRetained, oldKeysEvicted)
 
-	// Very lenient requirements due to timing and eviction policies
-	require.GreaterOrEqual(t, recentlyAccessedRetained, 1, "At least one recently accessed key should be retained")
-	require.GreaterOrEqual(t, oldKeysEvicted, 2, "Some old keys should be evicted")
+	// With proper bucket separation, we should see clear LRU behavior
+	// Keys 10-14 have access times 2+ hours newer, so they should be retained
+	require.GreaterOrEqual(t, recentlyAccessedRetained, 3, "Most recently accessed keys should be retained")
+	require.GreaterOrEqual(t, oldKeysEvicted, 5, "Most old keys should be evicted")
 }
 
 // Test_CleanerLoop_TTLPriority tests that TTL cleanup has priority over LRU eviction
