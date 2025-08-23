@@ -8,8 +8,8 @@ require (
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
+	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/server v0.0.0-00010101000000-000000000000
 	golang.org/x/sys v0.33.0
 	google.golang.org/protobuf v1.36.6
 )
@@ -40,4 +40,4 @@ require (
 // We want to import the local modules
 replace github.com/tigrisdata/ocache/proto => ../proto
 
-replace github.com/tigrisdata/ocache/server => ../server
+replace github.com/tigrisdata/ocache/common => ../common
