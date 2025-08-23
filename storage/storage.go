@@ -417,6 +417,7 @@ func (s *Storage) DeleteKey(key string) {
 		metrics.Errors.WithLabelValues("rocksdb", "delete").Inc()
 	} else {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
+		metrics.ObjectSize.WithLabelValues("delete").Observe(float64(valueMsg.ValueLength))
 	}
 }
 
@@ -506,6 +507,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 
 	metrics.StorageOperations.WithLabelValues("get", storageType, "success").Inc()
 	metrics.StorageBytes.WithLabelValues("get", storageType).Add(float64(valueMsg.ValueLength))
+	metrics.ObjectSize.WithLabelValues("get").Observe(float64(valueMsg.ValueLength))
 
 	// Apply byte-range if specified
 	if start > 0 || (end > 0 && end > start) {
@@ -658,6 +660,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		if err == nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 			metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(bytesWritten))
+			metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
 			s.notifyPut(bytesWritten)
 		} else {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
@@ -687,6 +690,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	if err == nil {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 		metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(n))
+		metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
 		s.notifyPut(int64(n))
 	} else {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()

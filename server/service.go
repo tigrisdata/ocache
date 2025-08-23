@@ -44,7 +44,6 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	pr, pw := io.Pipe()
 	first := true
 	errCh := make(chan error, 1)
-	dataSize := int64(0)
 
 	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
 	go func() {
@@ -70,7 +69,6 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 			ttl = int(chunk.TtlSeconds)
 			first = false
 		}
-		dataSize += int64(len(chunk.Data))
 		if len(chunk.Data) > 0 {
 			if _, err = pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
@@ -91,7 +89,6 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 	}
 	metrics.RPCRequests.WithLabelValues("Put", "success").Inc()
-	metrics.ObjectSize.WithLabelValues("Put").Observe(float64(dataSize))
 	return stream.SendAndClose(&pb.PutResponse{Success: true})
 }
 
@@ -114,7 +111,6 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
 	}
 	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
-	metrics.ObjectSize.WithLabelValues("PutObject").Observe(float64(len(req.Data)))
 	return &pb.PutResponse{Success: true}, nil
 }
 
@@ -148,7 +144,6 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	// Stream the data in chunks
 	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
 	defer release()
-	dataSize := int64(0)
 	for {
 		readN, err := r.Read(buf)
 		if readN > 0 {
@@ -158,7 +153,6 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 				return err
 			}
 			metrics.StreamBytesTransferred.WithLabelValues("download").Add(float64(readN))
-			dataSize += int64(readN)
 		}
 		if err == io.EOF {
 			break
@@ -170,7 +164,6 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		}
 	}
 	metrics.RPCRequests.WithLabelValues("Get", "success").Inc()
-	metrics.ObjectSize.WithLabelValues("Get").Observe(float64(dataSize))
 	return nil
 }
 
