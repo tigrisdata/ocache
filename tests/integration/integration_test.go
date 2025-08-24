@@ -21,24 +21,38 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestIntegration_SmallObjects runs the small object test suite
+// TestIntegration_Objects runs the consolidated objects test suite
+// This replaces the separate small, medium, and large object test suites
+func TestIntegration_Objects(t *testing.T) {
+	t.Run("ObjectsSuite", func(t *testing.T) {
+		TestIntegrationObjects(t)
+	})
+}
+
+// Legacy test functions kept for backward compatibility
+// These all run the same consolidated ObjectsSuite
+
+// TestIntegration_SmallObjects runs the small object tests (legacy)
+// Deprecated: Use TestIntegration_Objects instead
 func TestIntegration_SmallObjects(t *testing.T) {
 	t.Run("SmallObjectSuite", func(t *testing.T) {
-		TestIntegrationSmallObjects(t)
+		TestIntegrationObjects(t)
 	})
 }
 
-// TestIntegration_MediumObjects runs the medium object test suite
+// TestIntegration_MediumObjects runs the medium object tests (legacy)
+// Deprecated: Use TestIntegration_Objects instead
 func TestIntegration_MediumObjects(t *testing.T) {
 	t.Run("MediumObjectSuite", func(t *testing.T) {
-		TestIntegrationMediumObjects(t)
+		TestIntegrationObjects(t)
 	})
 }
 
-// TestIntegration_LargeObjects runs the large object test suite
+// TestIntegration_LargeObjects runs the large object tests (legacy)
+// Deprecated: Use TestIntegration_Objects instead
 func TestIntegration_LargeObjects(t *testing.T) {
 	t.Run("LargeObjectSuite", func(t *testing.T) {
-		TestIntegrationLargeObjects(t)
+		TestIntegrationObjects(t)
 	})
 }
 
