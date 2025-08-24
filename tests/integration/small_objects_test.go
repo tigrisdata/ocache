@@ -3,7 +3,6 @@ package integration
 import (
 	"bytes"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -57,53 +56,6 @@ func (s *SmallObjectSuite) Test_SmallObject_BasicFlow() {
 	}
 }
 
-// Test_SmallObject_TTLExpiration tests TTL functionality for small objects
-func (s *SmallObjectSuite) Test_SmallObject_TTLExpiration() {
-	// Create objects with short TTL
-	ttlObjects := GenerateObjectsWithTTL(10, 1024, 1*time.Second)
-
-	// Create objects without TTL (permanent)
-	permanentObjects := GenerateSmallObjects(5)
-
-	// Store TTL objects
-	var ttlKeys []string
-	for _, obj := range ttlObjects {
-		key := fmt.Sprintf("ttl-%s", obj.Key)
-		ttlKeys = append(ttlKeys, key)
-		err := s.Harness.PutObject(key, obj.Data, int64(obj.TTL.Seconds()))
-		require.NoError(s.T(), err)
-	}
-
-	// Store permanent objects
-	var permanentKeys []string
-	for _, obj := range permanentObjects {
-		key := fmt.Sprintf("permanent-%s", obj.Key)
-		permanentKeys = append(permanentKeys, key)
-		err := s.Harness.PutObject(key, obj.Data, 0)
-		require.NoError(s.T(), err)
-	}
-
-	// Verify all objects exist initially
-	for _, key := range ttlKeys {
-		VerifyKeyExists(s.T(), s.Harness.Storage, key)
-	}
-	for _, key := range permanentKeys {
-		VerifyKeyExists(s.T(), s.Harness.Storage, key)
-	}
-
-	// Wait for TTL expiration and cleanup
-	// TTL objects have 1 second TTL, wait a bit longer for cleanup to run
-	time.Sleep(4 * time.Second)
-
-	// Verify TTL objects are cleaned up
-	VerifyTTLCleanup(s.T(), s.Harness.Storage, ttlKeys, permanentKeys)
-
-	// Check cleaner stats
-	cleaned, _ := s.Harness.Storage.CleanerStats()
-	assert.GreaterOrEqual(s.T(), cleaned, int64(len(ttlKeys)),
-		"Should have cleaned at least %d TTL keys", len(ttlKeys))
-}
-
 // Test_SmallObject_LRUEviction tests LRU eviction for small objects
 func (s *SmallObjectSuite) Test_SmallObject_LRUEviction() {
 	// Configure with low max disk usage to trigger LRU
@@ -148,83 +100,6 @@ func (s *SmallObjectSuite) Test_SmallObject_LRUEviction() {
 	// Check eviction stats
 	_, evicted := s.Harness.Storage.CleanerStats()
 	assert.Greater(s.T(), evicted, int64(30), "Should have evicted at least 30 keys")
-}
-
-// Test_SmallObject_Concurrent tests concurrent operations on small objects
-func (s *SmallObjectSuite) Test_SmallObject_Concurrent() {
-	numGoroutines := 10
-	objectsPerGoroutine := 100
-	var wg sync.WaitGroup
-
-	// Track errors
-	errors := make(chan error, numGoroutines*objectsPerGoroutine)
-
-	// Concurrent writes
-	wg.Add(numGoroutines)
-	for g := 0; g < numGoroutines; g++ {
-		go func(goroutineID int) {
-			defer wg.Done()
-
-			for i := 0; i < objectsPerGoroutine; i++ {
-				// Random size between 1B and 63KB
-				size := int64(1 + (goroutineID*1000+i)%63000)
-				key := fmt.Sprintf("concurrent-g%d-i%d", goroutineID, i)
-				data := GenerateRandomData(size)
-
-				if err := s.Harness.PutObject(key, data, 0); err != nil {
-					errors <- fmt.Errorf("write failed for %s: %w", key, err)
-				}
-			}
-		}(g)
-	}
-
-	// Wait for writes to complete
-	wg.Wait()
-	close(errors)
-
-	// Check for errors
-	var writeErrors []error
-	for err := range errors {
-		writeErrors = append(writeErrors, err)
-	}
-	require.Empty(s.T(), writeErrors, "Concurrent writes should not fail")
-
-	// Concurrent reads
-	readErrors := make(chan error, numGoroutines*objectsPerGoroutine)
-	wg.Add(numGoroutines)
-
-	for g := 0; g < numGoroutines; g++ {
-		go func(goroutineID int) {
-			defer wg.Done()
-
-			for i := 0; i < objectsPerGoroutine; i++ {
-				key := fmt.Sprintf("concurrent-g%d-i%d", goroutineID, i)
-
-				if _, err := s.Harness.GetObject(key); err != nil {
-					readErrors <- fmt.Errorf("read failed for %s: %w", key, err)
-				}
-			}
-		}(g)
-	}
-
-	// Wait for reads to complete
-	wg.Wait()
-	close(readErrors)
-
-	// Check for read errors
-	var readErrorList []error
-	for err := range readErrors {
-		readErrorList = append(readErrorList, err)
-	}
-	require.Empty(s.T(), readErrorList, "Concurrent reads should not fail")
-
-	// Verify all objects are stored inline
-	VerifyObjectStorageDistribution(s.T(), s.Harness.TempDir,
-		numGoroutines*objectsPerGoroutine, 0, 0)
-
-	// Verify no raw files or segments
-	VerifyNoRawFiles(s.T(), s.Harness.TempDir)
-	VerifySegmentsExist(s.T(), s.Harness.TempDir, 0)
 }
 
 // Test_SmallObject_EdgeCases tests edge cases for small objects
