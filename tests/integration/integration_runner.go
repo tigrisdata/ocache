@@ -38,7 +38,6 @@ func (s *IntegrationTestSuite) TearDownTest() {
 }
 
 // ObjectsSuite tests all object sizes (small, medium, large)
-// Consolidates the previous SmallObjectSuite, MediumObjectSuite, and LargeObjectSuite
 type ObjectsSuite struct {
 	IntegrationTestSuite
 }
@@ -52,27 +51,6 @@ func (s *ObjectsSuite) SetupTest() {
 	config.CompactionInterval = 1 * time.Second
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
-}
-
-// Legacy suite types kept for backward compatibility
-// These now all use the same consolidated ObjectsSuite implementation
-
-// SmallObjectSuite tests small objects (< 64KB)
-// Deprecated: Use ObjectsSuite instead
-type SmallObjectSuite struct {
-	ObjectsSuite
-}
-
-// MediumObjectSuite tests medium objects (64KB - 16MB)
-// Deprecated: Use ObjectsSuite instead
-type MediumObjectSuite struct {
-	ObjectsSuite
-}
-
-// LargeObjectSuite tests large objects (> 16MB)
-// Deprecated: Use ObjectsSuite instead
-type LargeObjectSuite struct {
-	ObjectsSuite
 }
 
 // CleanerSuite tests cleaner functionality (TTL and LRU)
@@ -139,19 +117,6 @@ func (s *StressSuite) SetupTest() {
 // TestIntegrationObjects runs the consolidated objects test suite
 func TestIntegrationObjects(t *testing.T) {
 	suite.Run(t, new(ObjectsSuite))
-}
-
-// Legacy test runners for backward compatibility
-func TestIntegrationSmallObjects(t *testing.T) {
-	suite.Run(t, new(SmallObjectSuite))
-}
-
-func TestIntegrationMediumObjects(t *testing.T) {
-	suite.Run(t, new(MediumObjectSuite))
-}
-
-func TestIntegrationLargeObjects(t *testing.T) {
-	suite.Run(t, new(LargeObjectSuite))
 }
 
 func TestIntegrationCleaner(t *testing.T) {
