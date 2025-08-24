@@ -21,24 +21,10 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestIntegration_SmallObjects runs the small object test suite
-func TestIntegration_SmallObjects(t *testing.T) {
-	t.Run("SmallObjectSuite", func(t *testing.T) {
-		TestIntegrationSmallObjects(t)
-	})
-}
-
-// TestIntegration_MediumObjects runs the medium object test suite
-func TestIntegration_MediumObjects(t *testing.T) {
-	t.Run("MediumObjectSuite", func(t *testing.T) {
-		TestIntegrationMediumObjects(t)
-	})
-}
-
-// TestIntegration_LargeObjects runs the large object test suite
-func TestIntegration_LargeObjects(t *testing.T) {
-	t.Run("LargeObjectSuite", func(t *testing.T) {
-		TestIntegrationLargeObjects(t)
+// TestIntegration_Objects runs the consolidated objects test suite
+func TestIntegration_Objects(t *testing.T) {
+	t.Run("ObjectsSuite", func(t *testing.T) {
+		TestIntegrationObjects(t)
 	})
 }
 

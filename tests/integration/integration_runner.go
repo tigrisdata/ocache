@@ -37,45 +37,18 @@ func (s *IntegrationTestSuite) TearDownTest() {
 	}
 }
 
-// SmallObjectSuite tests small objects (< 64KB)
-type SmallObjectSuite struct {
+// ObjectsSuite tests all object sizes (small, medium, large)
+type ObjectsSuite struct {
 	IntegrationTestSuite
 }
 
-// SetupTest sets up for small object tests
-func (s *SmallObjectSuite) SetupTest() {
-	config := DefaultIntegrationTestConfig()
-	config.InlineThreshold = 64 * 1024 // 64KB
-	s.Config = config
-	s.Harness = NewIntegrationTestHarness(s.T(), config)
-}
-
-// MediumObjectSuite tests medium objects (64KB - 16MB)
-type MediumObjectSuite struct {
-	IntegrationTestSuite
-}
-
-// SetupTest sets up for medium object tests
-func (s *MediumObjectSuite) SetupTest() {
-	config := DefaultIntegrationTestConfig()
-	config.InlineThreshold = 64 * 1024         // 64KB
-	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
-	config.CompactionInterval = 1 * time.Second
-	s.Config = config
-	s.Harness = NewIntegrationTestHarness(s.T(), config)
-}
-
-// LargeObjectSuite tests large objects (> 16MB)
-type LargeObjectSuite struct {
-	IntegrationTestSuite
-}
-
-// SetupTest sets up for large object tests
-func (s *LargeObjectSuite) SetupTest() {
+// SetupTest sets up for object tests
+func (s *ObjectsSuite) SetupTest() {
 	config := DefaultIntegrationTestConfig()
 	config.InlineThreshold = 64 * 1024         // 64KB
 	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
 	config.SegmentSize = 256 * 1024 * 1024     // 256MB
+	config.CompactionInterval = 1 * time.Second
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
 }
@@ -140,16 +113,10 @@ func (s *StressSuite) SetupTest() {
 }
 
 // Test suite runners
-func TestIntegrationSmallObjects(t *testing.T) {
-	suite.Run(t, new(SmallObjectSuite))
-}
 
-func TestIntegrationMediumObjects(t *testing.T) {
-	suite.Run(t, new(MediumObjectSuite))
-}
-
-func TestIntegrationLargeObjects(t *testing.T) {
-	suite.Run(t, new(LargeObjectSuite))
+// TestIntegrationObjects runs the consolidated objects test suite
+func TestIntegrationObjects(t *testing.T) {
+	suite.Run(t, new(ObjectsSuite))
 }
 
 func TestIntegrationCleaner(t *testing.T) {
@@ -173,9 +140,7 @@ func TestIntegrationStress(t *testing.T) {
 
 // Helper function to run all Integration tests
 func RunAllIntegrationTests(t *testing.T) {
-	t.Run("SmallObjects", TestIntegrationSmallObjects)
-	t.Run("MediumObjects", TestIntegrationMediumObjects)
-	t.Run("LargeObjects", TestIntegrationLargeObjects)
+	t.Run("Objects", TestIntegrationObjects) // Consolidated objects tests
 	t.Run("Cleaner", TestIntegrationCleaner)
 	t.Run("Compaction", TestIntegrationCompaction)
 	t.Run("Workflows", TestIntegrationWorkflow)
