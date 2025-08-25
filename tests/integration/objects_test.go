@@ -109,7 +109,7 @@ func (s *ObjectsSuite) Test_Objects_LRUEviction() {
 		{Key: "lru-medium-new-3", Size: 70 * 1024, AccessTime: baseTime - 8, ShouldEvict: false},
 	}
 
-	RunLRUTests(s.T(), s.Harness, 500*1024, testCases)
+	RunLRUTests(s.T(), s.Harness, 300*1024, testCases)
 
 	// Verify eviction stats
 	_, evicted := s.Harness.Storage.CleanerStats()
@@ -260,9 +260,9 @@ func (s *ObjectsSuite) Test_Objects_MixedTTL() {
 		// Different TTLs for different sizes
 		{"ttl-small-1s", 10 * 1024, 1},
 		{"ttl-small-2s", 20 * 1024, 2},
-		{"ttl-medium-2s", 100 * 1024, 2},
-		{"ttl-medium-3s", 500 * 1024, 3},
-		{"ttl-large-3s", 20 * 1024 * 1024, 3},
+		{"ttl-medium-3s", 100 * 1024, 3},
+		{"ttl-medium-5s", 500 * 1024, 5},
+		{"ttl-large-5s", 20 * 1024 * 1024, 5},
 
 		// No TTL (permanent)
 		{"perm-small", 10 * 1024, 0},
@@ -278,18 +278,18 @@ func (s *ObjectsSuite) Test_Objects_MixedTTL() {
 	}
 
 	// Wait for shortest TTL to expire plus cleanup interval
-	time.Sleep(2500 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 
 	// Check 1s TTL objects (should be expired)
 	_, err := s.Harness.GetObject("ttl-small-1s")
 	assert.Error(s.T(), err, "1s TTL object should be expired")
 
-	// Check 3s TTL objects (should still exist) - don't check 2s as it's on the boundary
-	_, err = s.Harness.GetObject("ttl-large-3s")
-	assert.NoError(s.T(), err, "3s TTL object should still exist")
+	// Check 5s TTL objects (should still exist)
+	_, err = s.Harness.GetObject("ttl-large-5s")
+	assert.NoError(s.T(), err, "5s TTL object should still exist")
 
 	// Wait for all TTLs to expire
-	time.Sleep(3 * time.Second)
+	time.Sleep(4 * time.Second)
 
 	// Check all TTL objects are expired
 	for _, tc := range testCases {

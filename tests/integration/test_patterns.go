@@ -68,7 +68,7 @@ func (p *MixedWorkloadPattern) Execute(t *testing.T, h *IntegrationTestHarness) 
 					readKey := fmt.Sprintf("mixed-%d-%d", workerID, i-1)
 					_, err := h.GetObject(readKey)
 					// Ignore not found errors
-					if err != nil && err.Error() != "object not found" {
+					if err != nil && !IsNotFoundError(err) {
 						errors <- fmt.Errorf("read failed: %w", err)
 					}
 				case 2: // Delete
@@ -266,15 +266,15 @@ type BatchTestRunner struct {
 
 func (r *BatchTestRunner) Run(t *testing.T, h *IntegrationTestHarness) {
 	if r.Parallel {
-		var wg sync.WaitGroup
+		// Use t.Run for parallel test execution to avoid race conditions
+		// as testing.T is not thread-safe
 		for _, pattern := range r.Patterns {
-			wg.Add(1)
-			go func(p TestPattern) {
-				defer wg.Done()
-				RunTestPattern(t, h, p)
-			}(pattern)
+			pattern := pattern // capture loop variable
+			t.Run(pattern.Name(), func(t *testing.T) {
+				t.Parallel()
+				RunTestPattern(t, h, pattern)
+			})
 		}
-		wg.Wait()
 	} else {
 		for _, pattern := range r.Patterns {
 			RunTestPattern(t, h, pattern)

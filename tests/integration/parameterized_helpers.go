@@ -1,7 +1,10 @@
 package integration
 
 import (
+	"errors"
 	"fmt"
+	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +12,20 @@ import (
 	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
 )
+
+// Common error types for testing
+var (
+	ErrKeyNotFound = errors.New("key not found")
+)
+
+// IsNotFoundError checks if an error indicates a key was not found
+func IsNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for our sentinel error or string pattern
+	return errors.Is(err, ErrKeyNotFound) || strings.Contains(err.Error(), "not found")
+}
 
 // TestCase represents a parameterized test case
 type TestCase struct {
@@ -126,18 +143,19 @@ func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config Concurren
 
 	// Generate operations
 	go func() {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		for i := 0; i < config.NumOperations; i++ {
 			op := operation{}
 			
 			// Determine operation type based on weights
-			rand := i % 100
-			if rand < config.ReadWeight {
+			randVal := r.Intn(100)
+			if randVal < config.ReadWeight {
 				op.opType = "read"
 				op.key = fmt.Sprintf("concurrent-key-%d", i%10) // Reuse some keys
-			} else if rand < config.ReadWeight+config.WriteWeight {
+			} else if randVal < config.ReadWeight+config.WriteWeight {
 				op.opType = "write"
 				op.key = fmt.Sprintf("concurrent-key-%d", i)
-				size := config.ObjectSizeMin + int64(i)%(config.ObjectSizeMax-config.ObjectSizeMin)
+				size := config.ObjectSizeMin + int64(r.Intn(int(config.ObjectSizeMax-config.ObjectSizeMin)))
 				op.data = GenerateRandomData(size)
 			} else {
 				op.opType = "delete"
@@ -158,7 +176,7 @@ func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config Concurren
 				case "read":
 					_, err = h.GetObject(op.key)
 					// Ignore not found errors for reads
-					if err != nil && err.Error() == "object not found" {
+					if IsNotFoundError(err) {
 						err = nil
 					}
 				case "write":
