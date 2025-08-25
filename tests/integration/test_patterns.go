@@ -59,20 +59,36 @@ func (p *MixedWorkloadPattern) Execute(t *testing.T, h *IntegrationTestHarness) 
 				case 0: // Write
 					size := p.ObjectSizes[i%len(p.ObjectSizes)]
 					data := GenerateRandomData(size)
-					ttl := p.TTLRange[0] + int64(i)%(p.TTLRange[1]-p.TTLRange[0]+1)
+					// Handle edge case where TTLRange[0] equals TTLRange[1]
+					var ttl int64
+					if p.TTLRange[1] > p.TTLRange[0] {
+						ttl = p.TTLRange[0] + int64(i)%(p.TTLRange[1]-p.TTLRange[0]+1)
+					} else {
+						ttl = p.TTLRange[0]
+					}
 					err := h.PutObject(key, data, ttl)
 					if err != nil {
 						errors <- fmt.Errorf("write failed: %w", err)
 					}
 				case 1: // Read
-					readKey := fmt.Sprintf("mixed-%d-%d", workerID, i-1)
+					// Ensure we don't generate negative indices
+					readIdx := i - 1
+					if readIdx < 0 {
+						readIdx = 0
+					}
+					readKey := fmt.Sprintf("mixed-%d-%d", workerID, readIdx)
 					_, err := h.GetObject(readKey)
 					// Ignore not found errors
 					if err != nil && !IsNotFoundError(err) {
 						errors <- fmt.Errorf("read failed: %w", err)
 					}
 				case 2: // Delete
-					deleteKey := fmt.Sprintf("mixed-%d-%d", workerID, i-2)
+					// Ensure we don't generate negative indices
+					deleteIdx := i - 2
+					if deleteIdx < 0 {
+						deleteIdx = 0
+					}
+					deleteKey := fmt.Sprintf("mixed-%d-%d", workerID, deleteIdx)
 					err := h.DeleteObject(deleteKey)
 					if err != nil {
 						errors <- fmt.Errorf("delete failed: %w", err)
@@ -266,12 +282,14 @@ type BatchTestRunner struct {
 
 func (r *BatchTestRunner) Run(t *testing.T, h *IntegrationTestHarness) {
 	if r.Parallel {
-		// Use t.Run for parallel test execution to avoid race conditions
-		// as testing.T is not thread-safe
+		// WARNING: The shared IntegrationTestHarness is not thread-safe.
+		// Parallel tests would need separate harness instances to avoid race conditions.
+		// For safety, we run tests sequentially even when Parallel is requested.
+		t.Logf("WARNING: BatchTestRunner parallel mode disabled - shared harness is not thread-safe")
 		for _, pattern := range r.Patterns {
 			pattern := pattern // capture loop variable
 			t.Run(pattern.Name(), func(t *testing.T) {
-				t.Parallel()
+				// Do NOT call t.Parallel() here - harness is shared
 				RunTestPattern(t, h, pattern)
 			})
 		}

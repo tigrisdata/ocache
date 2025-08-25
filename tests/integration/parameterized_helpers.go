@@ -155,7 +155,13 @@ func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config Concurren
 			} else if randVal < config.ReadWeight+config.WriteWeight {
 				op.opType = "write"
 				op.key = fmt.Sprintf("concurrent-key-%d", i)
-				size := config.ObjectSizeMin + int64(r.Intn(int(config.ObjectSizeMax-config.ObjectSizeMin)))
+				// Handle edge case where min equals max
+				var size int64
+				if config.ObjectSizeMax > config.ObjectSizeMin {
+					size = config.ObjectSizeMin + int64(r.Intn(int(config.ObjectSizeMax-config.ObjectSizeMin)))
+				} else {
+					size = config.ObjectSizeMin
+				}
 				op.data = GenerateRandomData(size)
 			} else {
 				op.opType = "delete"
