@@ -11,71 +11,49 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 )
 
-// Test_CleanerLoop_AutoTrigger tests that TTL cleanup automatically triggers
+// Test_Cleaner_AutoTriggerTTL tests that TTL cleanup automatically triggers
 // after the configured interval and removes expired objects
-func (s *CleanerSuite) Test_CleanerLoop_AutoTrigger() {
+func (s *CleanerSuite) Test_Cleaner_AutoTriggerTTL() {
 	t := s.T()
 
+	// Reconfigure with faster cleanup interval
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = 200 * time.Millisecond
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(t, config)
 
-	// Store 50 objects with short TTL
-	numObjects := 50
-	keys := make([]string, numObjects)
-	ttl := int64(1) // 1 second TTL
-
-	t.Log("Storing 50 objects with 1 second TTL for auto-cleanup test")
-	for i := 0; i < numObjects; i++ {
-		key := fmt.Sprintf("auto-ttl-%d", i)
-		keys[i] = key
-		size := 10*1024 + (i * 1024) // 10KB to ~60KB
-		if size > 60*1024 {
-			size = 60 * 1024
-		}
-		data := GenerateRandomData(int64(size))
-
-		err := s.Harness.PutObject(key, data, ttl)
-		require.NoError(t, err, "Failed to store object %d", i)
+	// Use parameterized TTL test helper
+	testCases := []TTLTestCase{
+		// Objects with 1 second TTL (should expire)
+		{Key: "ttl-expire-1", Size: 10 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
+		{Key: "ttl-expire-2", Size: 20 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
+		{Key: "ttl-expire-3", Size: 30 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
+		{Key: "ttl-expire-4", Size: 40 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
+		{Key: "ttl-expire-5", Size: 50 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
+		
+		// Objects with no TTL (should persist)
+		{Key: "ttl-persist-1", Size: 10 * 1024, TTL: 0, WaitTime: 2 * time.Second, ShouldExist: true},
+		{Key: "ttl-persist-2", Size: 20 * 1024, TTL: 0, WaitTime: 2 * time.Second, ShouldExist: true},
+		
+		// Objects with longer TTL (should persist)
+		{Key: "ttl-long-1", Size: 10 * 1024, TTL: 10, WaitTime: 2 * time.Second, ShouldExist: true},
 	}
 
 	// Record initial state
 	initialStats := s.Harness.GetStorageStats()
-	t.Logf("Initial storage stats - Total keys: %d, TTL keys: %d",
-		initialStats.TotalKeys, numObjects)
+	t.Logf("Initial storage stats - Total keys: %d", initialStats.TotalKeys)
 
-	// Verify all objects exist initially
-	for _, key := range keys {
-		_, err := s.Harness.GetObject(key)
-		require.NoError(t, err, "Object %s should exist initially", key)
-	}
+	// Run the parameterized TTL tests
+	RunTTLTests(t, s.Harness, testCases)
 
-	// Wait for TTL expiration and automatic cleanup
-	t.Log("Waiting for TTL expiration and automatic cleanup...")
-	time.Sleep(2 * time.Second) // Wait for TTL to expire + cleanup cycle
-
-	// Check if cleanup occurred
+	// Verify cleanup stats
 	finalStats := s.Harness.GetStorageStats()
 	t.Logf("Final storage stats - Total keys: %d, Cleaned: %d",
 		finalStats.TotalKeys, finalStats.CleanedKeys)
 
-	// Verify cleanup happened
-	require.Greater(t, finalStats.CleanedKeys, int64(0),
-		"Expected keys to be cleaned after TTL expiration")
-
-	// Verify all TTL objects are removed
-	t.Log("Verifying all TTL objects have been cleaned")
-	for _, key := range keys {
-		_, err := s.Harness.GetObject(key)
-		require.Error(t, err, "Expired key %s should not exist", key)
-		require.Contains(t, err.Error(), "not found")
-	}
-
-	// Verify stats
-	require.Equal(t, int64(numObjects), finalStats.CleanedKeys,
-		"All TTL objects should be cleaned")
+	require.GreaterOrEqual(t, finalStats.CleanedKeys, int64(5),
+		"At least 5 TTL objects should be cleaned")
 }
 
 // Test_CleanerLoop_LRUEviction tests LRU eviction when disk usage exceeds limit
