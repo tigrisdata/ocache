@@ -200,14 +200,18 @@ func (p *TTLExpirationPattern) Verify(t *testing.T, h *IntegrationTestHarness) {
 		_, err := h.GetObject(obj.Key)
 		
 		// Calculate if object should be expired
-		// Add buffer for cleanup interval (typically 1 second)
+		// Use the actual cleanup interval from the harness configuration
 		// Objects are expired if: TTL > 0 AND (TTL + cleanup_interval) < WaitTime
-		cleanupBuffer := int64(1) // 1 second cleanup interval buffer
+		cleanupBuffer := int64(h.Config.CleanupInterval.Seconds())
+		if cleanupBuffer == 0 {
+			// Default to 1 second if not configured
+			cleanupBuffer = 1
+		}
 		
 		if obj.TTL > 0 && (obj.TTL + cleanupBuffer) < int64(p.WaitTime.Seconds()) {
 			// Object should definitely be expired
-			assert.Error(t, err, "Object %s with TTL %d should be expired after waiting %v", 
-				obj.Key, obj.TTL, p.WaitTime)
+			assert.Error(t, err, "Object %s with TTL %d should be expired after waiting %v (cleanup interval: %v)", 
+				obj.Key, obj.TTL, p.WaitTime, h.Config.CleanupInterval)
 		} else if obj.TTL == 0 || obj.TTL > int64(p.WaitTime.Seconds()) {
 			// Object should definitely still exist
 			// TTL == 0 means no expiration, or TTL > WaitTime means not expired yet
@@ -217,8 +221,8 @@ func (p *TTLExpirationPattern) Verify(t *testing.T, h *IntegrationTestHarness) {
 			// Object is in the boundary zone where it might or might not be expired
 			// This happens when TTL is very close to WaitTime
 			// We skip verification for these boundary cases
-			t.Logf("Skipping verification for %s (TTL=%d, WaitTime=%v) - boundary case", 
-				obj.Key, obj.TTL, p.WaitTime)
+			t.Logf("Skipping verification for %s (TTL=%d, WaitTime=%v, CleanupInterval=%v) - boundary case", 
+				obj.Key, obj.TTL, p.WaitTime, h.Config.CleanupInterval)
 		}
 	}
 }

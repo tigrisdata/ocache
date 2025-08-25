@@ -38,11 +38,25 @@ func (s *ObjectsSuite) Test_Objects_BasicFlow() {
 		key := fmt.Sprintf("object-%s", tc.Name)
 		data := GenerateRandomData(tc.Size)
 
-		// Use the standard operations helper
-		StandardObjectOperations(t, h, key, data, 0)
+		// Store the object
+		err := h.PutObject(key, data, 0)
+		require.NoError(t, err, "Failed to put object with key %s", key)
 
-		// Additional verification for storage type
+		// Verify storage type while object exists
 		VerifyStorageType(t, h.TempDir, key, tc.ExpectedType)
+
+		// Retrieve and verify
+		retrieved, err := h.GetObject(key)
+		require.NoError(t, err, "Failed to get object with key %s", key)
+		VerifyDataIntegrity(t, data, retrieved)
+
+		// Delete the object
+		err = h.DeleteObject(key)
+		require.NoError(t, err, "Failed to delete object with key %s", key)
+
+		// Verify deletion
+		_, err = h.GetObject(key)
+		require.Error(t, err, "Object with key %s should not exist after deletion", key)
 	})
 }
 
