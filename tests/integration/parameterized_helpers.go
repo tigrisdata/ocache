@@ -86,33 +86,46 @@ func RunParameterizedTest(t *testing.T, testName string, cases []TestCase) {
 }
 
 // RunObjectSizeTests runs parameterized tests for object size operations
-func RunObjectSizeTests(t *testing.T, harness *IntegrationTestHarness, cases []ObjectSizeTestCase, 
-	operation func(t *testing.T, h *IntegrationTestHarness, tc ObjectSizeTestCase)) {
-	
+func RunObjectSizeTests(t *testing.T, harness *IntegrationTestHarness, cases []ObjectSizeTestCase,
+	operation func(t *testing.T, h *IntegrationTestHarness, tc ObjectSizeTestCase),
+) {
 	for _, tc := range cases {
-		// Don't create nested t.Run when called from suite context
-		operation(t, harness, tc)
+		t.Run(tc.Name, func(t *testing.T) {
+			operation(t, harness, tc)
+		})
 	}
 }
 
-// StandardObjectOperations performs standard put/get/delete operations on an object
-func StandardObjectOperations(t *testing.T, h *IntegrationTestHarness, key string, data []byte, ttl int64) {
-	// Store the object
-	err := h.PutObject(key, data, ttl)
-	require.NoError(t, err, "Failed to put object with key %s", key)
+// ObjectOperationSteps provides granular control over object operations
+type ObjectOperationSteps struct {
+	Key  string
+	Data []byte
+	TTL  int64
+}
 
-	// Retrieve and verify
-	retrieved, err := h.GetObject(key)
-	require.NoError(t, err, "Failed to get object with key %s", key)
-	VerifyDataIntegrity(t, data, retrieved)
+// PutObject stores the object
+func (ops *ObjectOperationSteps) PutObject(t *testing.T, h *IntegrationTestHarness) {
+	err := h.PutObject(ops.Key, ops.Data, ops.TTL)
+	require.NoError(t, err, "Failed to put object with key %s", ops.Key)
+}
 
-	// Delete the object
-	err = h.DeleteObject(key)
-	require.NoError(t, err, "Failed to delete object with key %s", key)
+// GetAndVerify retrieves the object and verifies data integrity
+func (ops *ObjectOperationSteps) GetAndVerify(t *testing.T, h *IntegrationTestHarness) {
+	retrieved, err := h.GetObject(ops.Key)
+	require.NoError(t, err, "Failed to get object with key %s", ops.Key)
+	VerifyDataIntegrity(t, ops.Data, retrieved)
+}
 
-	// Verify deletion
-	_, err = h.GetObject(key)
-	require.Error(t, err, "Object with key %s should not exist after deletion", key)
+// DeleteObject removes the object
+func (ops *ObjectOperationSteps) DeleteObject(t *testing.T, h *IntegrationTestHarness) {
+	err := h.DeleteObject(ops.Key)
+	require.NoError(t, err, "Failed to delete object with key %s", ops.Key)
+}
+
+// VerifyDeleted confirms the object no longer exists
+func (ops *ObjectOperationSteps) VerifyDeleted(t *testing.T, h *IntegrationTestHarness) {
+	_, err := h.GetObject(ops.Key)
+	require.Error(t, err, "Object with key %s should not exist after deletion", ops.Key)
 }
 
 // ConcurrentTestConfig defines configuration for concurrent tests
@@ -129,7 +142,7 @@ type ConcurrentTestConfig struct {
 
 // RunConcurrentTest runs a parameterized concurrent test
 func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config ConcurrentTestConfig) {
-	require.Equal(t, 100, config.ReadWeight+config.WriteWeight+config.DeleteWeight, 
+	require.Equal(t, 100, config.ReadWeight+config.WriteWeight+config.DeleteWeight,
 		"Operation weights must sum to 100")
 
 	type operation struct {
@@ -146,7 +159,7 @@ func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config Concurren
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		for i := 0; i < config.NumOperations; i++ {
 			op := operation{}
-			
+
 			// Determine operation type based on weights
 			randVal := r.Intn(100)
 			if randVal < config.ReadWeight {
@@ -167,7 +180,7 @@ func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config Concurren
 				op.opType = "delete"
 				op.key = fmt.Sprintf("concurrent-key-%d", i%10) // Delete some existing keys
 			}
-			
+
 			operations <- op
 		}
 		close(operations)
@@ -208,7 +221,7 @@ func RunConcurrentTest(t *testing.T, h *IntegrationTestHarness, config Concurren
 		}
 	}
 
-	assert.Greater(t, successCount, config.NumOperations*8/10, 
+	assert.Greater(t, successCount, config.NumOperations*8/10,
 		"At least 80%% of operations should succeed: %d/%d", successCount, config.NumOperations)
 }
 
@@ -252,11 +265,11 @@ func RunTTLTests(t *testing.T, h *IntegrationTestHarness, cases []TTLTestCase) {
 	}
 }
 
-// LRUTestCase represents an LRU eviction test scenario  
+// LRUTestCase represents an LRU eviction test scenario
 type LRUTestCase struct {
-	Key        string
-	Size       int64
-	AccessTime int64 // Unix timestamp
+	Key         string
+	Size        int64
+	AccessTime  int64 // Unix timestamp
 	ShouldEvict bool
 }
 
@@ -269,7 +282,7 @@ func RunLRUTests(t *testing.T, h *IntegrationTestHarness, maxDiskUsage int64, ca
 		data := GenerateRandomData(tc.Size)
 		err := h.PutObject(tc.Key, data, 0)
 		require.NoError(t, err, "Failed to store object %s", tc.Key)
-		
+
 		// Set access time
 		h.SetAccessTime(tc.Key, tc.AccessTime)
 	}
@@ -383,7 +396,7 @@ func RunCompactionTests(t *testing.T, h *IntegrationTestHarness, cases []Compact
 		if tc.ExpectSegments {
 			VerifySegmentsExist(t, h.TempDir, 1)
 		}
-		
+
 		if !tc.ExpectRawFiles {
 			// Check that raw files have been compacted
 			// Note: This is a simplified check
