@@ -43,11 +43,13 @@ func putBuffer(buf []byte) {
 }
 
 func getLargeBuffer(size int) []byte {
-	buf := largeBufferPool.Get().([]byte)
-	if cap(buf) < size {
-		return make([]byte, size)
+	if v := largeBufferPool.Get(); v != nil {
+		buf := v.([]byte)
+		if cap(buf) >= size {
+			return buf[:size]
+		}
 	}
-	return buf[:size]
+	return make([]byte, size)
 }
 
 func putLargeBuffer(buf []byte) {
