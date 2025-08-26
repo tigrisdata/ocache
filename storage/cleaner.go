@@ -7,6 +7,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"google.golang.org/protobuf/proto"
@@ -116,6 +117,10 @@ func (c *Cleaner) cleanupLoop() {
 func (c *Cleaner) cleanupExpiredKeys() {
 	start := time.Now()
 	cleaned := 0
+	var bytesFreed int64
+
+	// Track cleaner run
+	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
 
 	ro := grocksdb.NewDefaultReadOptions()
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -186,6 +191,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			cleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
+			// Track bytes freed
+			bytesFreed += valueMsg.ValueLength
+
 			// Queue associated files for deletion
 			switch valueMsg.ValueType {
 			case pb.ValueType_RAW_FILE:
@@ -227,14 +235,22 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 	c.cleanedKeys.Add(int64(cleaned))
 
+	// Record metrics
+	duration := time.Since(start)
+	metrics.CleanerDuration.WithLabelValues("ttl").Observe(float64(duration.Milliseconds()))
+	metrics.CleanerKeysDeleted.WithLabelValues("ttl", "expired").Add(float64(cleaned))
+	metrics.CleanerBytesFreed.WithLabelValues("ttl").Add(float64(bytesFreed))
+
 	zlog.Info().
 		Int("cleaned", cleaned).
-		Dur("duration", time.Since(start)).
+		Int64("bytes_freed", bytesFreed).
+		Dur("duration", duration).
 		Msg("cleaner: TTL cleanup completed")
 }
 
 // calculateTotalSize calculates the total size of stored data
 func (c *Cleaner) calculateTotalSize() {
+	start := time.Now()
 	var totalSize int64
 
 	ro := grocksdb.NewDefaultReadOptions()
@@ -271,11 +287,22 @@ func (c *Cleaner) calculateTotalSize() {
 	}
 
 	c.totalSize.Store(totalSize)
-	zlog.Info().Int64("total_size", totalSize).Msg("cleaner: calculated total storage size")
+
+	// Update disk usage metrics
+	metrics.DiskUsageBytes.WithLabelValues("total").Set(float64(totalSize))
+	if c.maxDiskUsage > 0 {
+		metrics.DiskUsageRatio.Set(float64(totalSize) / float64(c.maxDiskUsage))
+	}
+
+	zlog.Info().
+		Int64("total_size", totalSize).
+		Dur("duration", time.Since(start)).
+		Msg("cleaner: calculated total storage size")
 }
 
 // enforceDiskLimit evicts keys if disk usage exceeds the limit
 func (c *Cleaner) enforceDiskLimit() {
+	start := time.Now()
 	currentSize := c.totalSize.Load()
 	if currentSize <= c.maxDiskUsage {
 		return
@@ -284,13 +311,21 @@ func (c *Cleaner) enforceDiskLimit() {
 	targetSize := int64(float64(c.maxDiskUsage) * 0.9) // Target 90% of max
 	needToEvict := currentSize - targetSize
 
+	// Track LRU eviction run
+	metrics.CleanerRuns.WithLabelValues("lru").Inc()
+
 	zlog.Info().
 		Int64("current", currentSize).
 		Int64("max", c.maxDiskUsage).
 		Int64("need_to_evict", needToEvict).
 		Msg("cleaner: enforcing disk usage limit with LRU eviction")
 
-	c.evictLRUKeys(needToEvict)
+	evicted := c.evictLRUKeys(needToEvict)
+
+	// Record metrics
+	duration := time.Since(start)
+	metrics.CleanerDuration.WithLabelValues("lru").Observe(float64(duration.Milliseconds()))
+	metrics.LRUEvictions.Add(float64(evicted))
 }
 
 // UpdateSize updates the tracked total size when keys are added/removed

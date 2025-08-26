@@ -11,6 +11,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/fd"
@@ -238,7 +239,11 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 // The context parameter allows for cancellation of the compaction process.
 // The workerID is used to partition work across multiple workers.
 func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID int) {
+	start := time.Now()
 	zlog.Info().Int64("maxBytes", maxBytes).Int("worker", workerID).Msg("compactor: starting file compaction")
+
+	// Track compaction run
+	metrics.CompactionRuns.Inc()
 
 	// RocksDB iterator setup
 	ro := grocksdb.NewDefaultReadOptions()
@@ -410,7 +415,13 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID i
 		return
 	}
 
-	zlog.Info().Int("worker", workerID).Int("migrated", processed).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
+	// Record compaction metrics
+	duration := time.Since(start)
+	metrics.CompactionDuration.Observe(float64(duration.Milliseconds()))
+	metrics.CompactionFilesCompacted.Add(float64(processed))
+	metrics.CompactionBytesCompacted.Add(float64(bytesCopied))
+
+	zlog.Info().Int("worker", workerID).Int("migrated", processed).Dur("duration", duration).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
 }
 
 // parseFileIndexRow extracts userKey, filePath and size from RocksDB file-index

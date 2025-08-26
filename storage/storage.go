@@ -614,7 +614,6 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	}
 	firstChunk, release := bufferpool.AcquireBuffer(firstReadSize)
 	defer release()
-	metrics.BufferPoolAllocations.Inc()
 
 	// Read up to firstReadSize bytes. io.ReadFull returns ErrUnexpectedEOF when the
 	// value is smaller than firstReadSize – that is fine, we still get the bytes read.

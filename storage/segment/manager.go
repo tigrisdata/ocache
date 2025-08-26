@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/utils"
@@ -154,10 +155,12 @@ func (sm *Manager) ReleaseAllSegments(callerID string) error {
 // FinalizeSegment writes a footer to the segment file and closes it so that no
 // further writes are possible.
 func (sm *Manager) FinalizeSegment(seg *Segment) error {
+	start := time.Now()
 	zlog.Info().Str("path", seg.path).Msg("finalizing segment")
 
 	// First finalize the segment under its lock
 	if err := seg.Finalize(); err != nil {
+		metrics.StorageOperations.WithLabelValues("finalize", "segment", "error").Inc()
 		return err
 	}
 
@@ -174,6 +177,10 @@ func (sm *Manager) FinalizeSegment(seg *Segment) error {
 	sm.mu.Unlock()
 
 	zlog.Info().Str("path", seg.path).Msg("finished finalizing segment")
+
+	// Track finalization metrics
+	metrics.StorageOperations.WithLabelValues("finalize", "segment", "success").Inc()
+	metrics.StorageOperationDuration.WithLabelValues("finalize", "segment").Observe(float64(time.Since(start).Milliseconds()))
 
 	return nil
 }
@@ -301,6 +308,15 @@ func (sm *Manager) loadSegments() error {
 			sm.openSegments = append(sm.openSegments, seg)
 		}
 	}
+
+	// Initialize segment metrics
+	segmentCount := len(sm.segments)
+	var totalSize int64
+	for _, s := range sm.segments {
+		totalSize += s.size
+	}
+	metrics.SegmentCount.Set(float64(segmentCount))
+	metrics.SegmentSize.Set(float64(totalSize))
 
 	return nil
 }
