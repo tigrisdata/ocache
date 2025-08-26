@@ -42,6 +42,18 @@ func putBuffer(buf []byte) {
 	bufferPool.Put(buf)
 }
 
+func getLargeBuffer(size int) []byte {
+	buf := largeBufferPool.Get().([]byte)
+	if cap(buf) < size {
+		return make([]byte, size)
+	}
+	return buf[:size]
+}
+
+func putLargeBuffer(buf []byte) {
+	largeBufferPool.Put(buf)
+}
+
 // AcquireBuffer returns a buffer of at least `size` bytes from the pool, or
 // allocates a new one if needed. The returned slice has length equal to `size`
 // (callers can reslice as needed). The returned function must be called to
@@ -63,22 +75,9 @@ func AcquireBuffer(size int) ([]byte, func()) {
 		}
 	}
 
-	if v := largeBufferPool.Get(); v != nil {
-		buf := v.([]byte)
-		if cap(buf) >= size {
-			return buf[:size], func() {
-				largeBufferPool.Put(buf)
-				// Track release
-				metrics.BufferPoolReleases.Inc()
-				newSize := atomic.AddInt64(&activeBuffers, -1)
-				metrics.BufferPoolSize.Set(float64(newSize))
-			}
-		}
-	}
-
-	buf := make([]byte, size)
+	buf := getLargeBuffer(size)
 	return buf, func() {
-		putBuffer(buf)
+		putLargeBuffer(buf)
 		// Track release
 		metrics.BufferPoolReleases.Inc()
 		newSize := atomic.AddInt64(&activeBuffers, -1)

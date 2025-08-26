@@ -179,8 +179,8 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		// Not cached due to capacity limit, remove from entries map
 		// but return the entry for this caller to use
 		fc.entries.Delete(path)
-		// Track eviction due to capacity
-		metrics.FDCacheEvictions.Inc()
+		// Track not cached count due to capacity
+		metrics.FDCacheNotCached.Inc()
 	}
 
 	return entry, nil

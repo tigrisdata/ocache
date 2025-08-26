@@ -6,6 +6,38 @@ import (
 )
 
 var (
+	// Histogram buckets milliseconds
+	fastOpsBuckets = []float64{
+		0.5,   // 500μs
+		1,     // 1ms
+		2.5,   // 2.5ms
+		5,     // 5ms
+		10,    // 10ms
+		25,    // 25ms
+		50,    // 50ms
+		100,   // 100ms
+		250,   // 250ms
+		500,   // 500ms
+		1000,  // 1s
+		2500,  // 2.5s
+		5000,  // 5s
+		10000, // 10s
+	}
+	longOpsBuckets = []float64{
+		100,    // 100ms
+		250,    // 250ms
+		500,    // 500ms
+		1000,   // 1s
+		2500,   // 2.5s
+		5000,   // 5s
+		10000,  // 10s
+		30000,  // 30s
+		60000,  // 1m
+		120000, // 2m
+		300000, // 5m
+		600000, // 10m
+	}
+
 	// API Metrics
 	RPCRequests = promauto.NewCounterVec(
 		prometheus.CounterOpts{
@@ -19,7 +51,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "ocache_rpc_duration_ms",
 			Help:    "RPC request duration in milliseconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: fastOpsBuckets,
 		},
 		[]string{"method"},
 	)
@@ -37,7 +69,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "ocache_storage_operation_duration_ms",
 			Help:    "Storage operation duration in milliseconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: fastOpsBuckets,
 		},
 		[]string{"operation", "storage_type"},
 	)
@@ -105,7 +137,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "ocache_compaction_duration_ms",
 			Help:    "Compaction duration in milliseconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: longOpsBuckets,
 		},
 	)
 
@@ -136,7 +168,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "ocache_cleaner_duration_ms",
 			Help:    "Cleaner run duration in milliseconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: longOpsBuckets,
 		},
 		[]string{"type"},
 	)
@@ -207,6 +239,13 @@ var (
 		prometheus.CounterOpts{
 			Name: "ocache_fd_cache_evictions_total",
 			Help: "Total number of file descriptor cache evictions",
+		},
+	)
+
+	FDCacheNotCached = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_fd_cache_not_cached_total",
+			Help: "Total number of file descriptor cache not cached",
 		},
 	)
 
@@ -299,7 +338,7 @@ var (
 		prometheus.HistogramOpts{
 			Name:    "ocache_recovery_duration_ms",
 			Help:    "Recovery duration in milliseconds",
-			Buckets: prometheus.DefBuckets,
+			Buckets: longOpsBuckets,
 		},
 	)
 
