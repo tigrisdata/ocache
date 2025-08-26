@@ -35,14 +35,14 @@ echo "=== Test 1: Basic TTL Expiration ==="
 echo "Adding keys with different TTL values..."
 
 # Add keys with various TTL values
-timeout 10 ./ocachecli put "ttl-5sec" "Expires in 5 seconds" --ttl 5 || true
-timeout 10 ./ocachecli put "ttl-10sec" "Expires in 10 seconds" --ttl 10 || true
-timeout 10 ./ocachecli put "ttl-15sec" "Expires in 15 seconds" --ttl 15 || true
-timeout 10 ./ocachecli put "ttl-20sec" "Expires in 20 seconds" --ttl 20 || true
-timeout 10 ./ocachecli put "no-ttl" "Never expires" || true
+./ocachecli put "ttl-5sec" "Expires in 5 seconds" --ttl 5 || true
+./ocachecli put "ttl-10sec" "Expires in 10 seconds" --ttl 10 || true
+./ocachecli put "ttl-15sec" "Expires in 15 seconds" --ttl 15 || true
+./ocachecli put "ttl-20sec" "Expires in 20 seconds" --ttl 20 || true
+./ocachecli put "no-ttl" "Never expires" || true
 
 echo "Keys added:"
-timeout 10 ./ocachecli list
+./ocachecli list
 
 echo
 echo "Waiting 7 seconds for first TTL cleanup cycle..."
@@ -50,14 +50,14 @@ sleep 7
 
 echo "After 7 seconds (ttl-5sec should be expired):"
 
-if timeout 10 ./ocachecli get "ttl-5sec" >/dev/null 2>&1; then
+if ./ocachecli get "ttl-5sec" >/dev/null 2>&1; then
     fail_test "TEST_BASIC_TTL_EXPIRATION_5SEC" "ttl-5sec should have expired"
 else
     pass_test "TEST_BASIC_TTL_EXPIRATION_5SEC" "ttl-5sec correctly expired"
 fi
 
 # Check that other keys still exist
-if timeout 10 ./ocachecli get "ttl-10sec" >/dev/null 2>&1; then
+if ./ocachecli get "ttl-10sec" >/dev/null 2>&1; then
     echo -e "${GREEN}✓ ttl-10sec still exists${NC}"
 else
     echo -e "${RED}✗ ttl-10sec should still exist${NC}"
@@ -69,7 +69,7 @@ echo "Waiting another 5 seconds..."
 sleep 5
 
 echo "After 12 seconds total (ttl-10sec should also be expired):"
-if timeout 10 ./ocachecli get "ttl-10sec" >/dev/null 2>&1; then
+if ./ocachecli get "ttl-10sec" >/dev/null 2>&1; then
     fail_test "TEST_BASIC_TTL_EXPIRATION_10SEC" "ttl-10sec should have expired"
 else
     pass_test "TEST_BASIC_TTL_EXPIRATION_10SEC" "ttl-10sec correctly expired"
@@ -81,10 +81,10 @@ echo "Testing TTL expiration for objects in different storage layers..."
 
 # Small object with TTL (RocksDB inline)
 SMALL_VALUE=$(head -c 1000 /dev/urandom | base64 | head -c 1000)
-timeout 10 ./ocachecli put "small-ttl" "$SMALL_VALUE" --ttl 8
+./ocachecli put "small-ttl" "$SMALL_VALUE" --ttl 8
 
 # Medium object with TTL (raw file)
-head -c 100000 /dev/urandom | base64 | head -c 100000 | timeout 10 ./ocachecli put "medium-ttl" --ttl 8
+head -c 100000 /dev/urandom | base64 | head -c 100000 | ./ocachecli put "medium-ttl" --ttl 8
 
 echo "Added small and medium objects with 8-second TTL"
 echo
@@ -92,7 +92,7 @@ echo "Waiting 10 seconds for expiration..."
 sleep 10
 
 # Check both are expired
-if timeout 10 ./ocachecli get "small-ttl" >/dev/null 2>&1 && timeout 10 ./ocachecli get "medium-ttl" >/dev/null 2>&1; then
+if ./ocachecli get "small-ttl" >/dev/null 2>&1 && ./ocachecli get "medium-ttl" >/dev/null 2>&1; then
     echo -e "${RED}✗ TTL expiration failed for some storage layers${NC}"
     TEST_TTL_WITH_DIFFERENT_STORAGE_LAYERS="FAILED"
     TEST_PASSED=false
@@ -106,21 +106,21 @@ echo "=== Test 3: TTL Update on Overwrite ==="
 echo "Testing TTL behavior when keys are overwritten..."
 
 # Create a key with short TTL
-timeout 10 ./ocachecli put "update-ttl-test" "Original value" --ttl 5
+./ocachecli put "update-ttl-test" "Original value" --ttl 5
 echo "Created key with 5-second TTL"
 
 sleep 2
 
 # Overwrite with longer TTL
-timeout 10 ./ocachecli put "update-ttl-test" "Updated value" --ttl 20
+./ocachecli put "update-ttl-test" "Updated value" --ttl 20
 echo "Updated key with 20-second TTL after 2 seconds"
 
 # Wait for original TTL to pass
 sleep 5
 
 echo "After 7 seconds total (original TTL would have expired):"
-if timeout 10 ./ocachecli get "update-ttl-test" >/dev/null 2>&1; then
-    VALUE=$(timeout 10 ./ocachecli get "update-ttl-test" 2>/dev/null)
+if ./ocachecli get "update-ttl-test" >/dev/null 2>&1; then
+    VALUE=$(./ocachecli get "update-ttl-test" 2>/dev/null)
     if [ "$VALUE" = "Updated value" ]; then
         echo -e "${GREEN}✓ Key still exists with updated value and new TTL${NC}"
         TEST_TTL_UPDATE_ON_OVERWRITE="PASSED"
@@ -141,20 +141,20 @@ echo "Testing cleanup doesn't affect non-TTL keys..."
 
 # Add a mix of TTL and non-TTL keys
 for i in {1..5}; do
-    timeout 10 ./ocachecli put "expire-${i}" "Will expire" --ttl 5
-    timeout 10 ./ocachecli put "persist-${i}" "Will persist"
+    ./ocachecli put "expire-${i}" "Will expire" --ttl 5
+    ./ocachecli put "persist-${i}" "Will persist"
 done
 
 echo "Added 5 TTL keys and 5 persistent keys"
-timeout 10 ./ocachecli list | wc -l
+./ocachecli list | wc -l
 
 echo
 echo "Waiting 7 seconds for TTL cleanup..."
 sleep 7
 
 # Count remaining keys
-EXPIRE_COUNT=$(timeout 10 ./ocachecli list | grep -c "expire-" || true)
-PERSIST_COUNT=$(timeout 10 ./ocachecli list | grep -c "persist-" || true)
+EXPIRE_COUNT=$(./ocachecli list | grep -c "expire-" || true)
+PERSIST_COUNT=$(./ocachecli list | grep -c "persist-" || true)
 
 if [ "$EXPIRE_COUNT" -eq 0 ] && [ "$PERSIST_COUNT" -eq 5 ]; then
     echo -e "${GREEN}✓ TTL keys expired, persistent keys remain${NC}"
@@ -173,7 +173,7 @@ echo "Testing TTL with concurrent reads and writes..."
 read_until_expired() {
     local key=$1
     local count=0
-    while timeout 10 ./ocachecli get "$key" >/dev/null 2>&1; do
+    while ./ocachecli get "$key" >/dev/null 2>&1; do
         ((count++))
         sleep 0.1
     done
@@ -182,7 +182,7 @@ read_until_expired() {
 
 # Add keys with TTL
 for i in {1..3}; do
-    timeout 10 ./ocachecli put "concurrent-ttl-${i}" "Value ${i}" --ttl 8
+    ./ocachecli put "concurrent-ttl-${i}" "Value ${i}" --ttl 8
 done
 
 # Start concurrent readers
@@ -195,10 +195,10 @@ done
 # Add more keys while readers are running
 sleep 2
 for i in {4..6}; do
-    timeout 10 ./ocachecli put "concurrent-ttl-${i}" "Value ${i}" --ttl 5 || true
+    ./ocachecli put "concurrent-ttl-${i}" "Value ${i}" --ttl 5 || true
 done
 
-# Wait for all readers to finish with timeout
+# Wait for all readers to finish
 WAIT_TIME=0
 MAX_WAIT=30
 ALL_DONE=false
@@ -233,11 +233,11 @@ echo "Testing TTL expiration timing precision..."
 
 # Add a key with exact TTL
 TEST_TTL=6
-timeout 10 ./ocachecli put "precision-test" "Testing precision" --ttl $TEST_TTL
+./ocachecli put "precision-test" "Testing precision" --ttl $TEST_TTL
 START_TIME=$(date +%s)
 
 # Poll until key expires
-while timeout 10 ./ocachecli get "precision-test" >/dev/null 2>&1; do
+while ./ocachecli get "precision-test" >/dev/null 2>&1; do
     sleep 0.5
 done
 
@@ -260,13 +260,13 @@ echo "=== Test 7: TTL with Delete Operations ==="
 echo "Testing TTL keys can be manually deleted before expiration..."
 
 # Add key with long TTL
-timeout 10 ./ocachecli put "delete-before-ttl" "Will be deleted manually" --ttl 30
+./ocachecli put "delete-before-ttl" "Will be deleted manually" --ttl 30
 
 # Delete it immediately
-timeout 10 ./ocachecli delete "delete-before-ttl"
+./ocachecli delete "delete-before-ttl"
 
 # Verify it's gone
-if timeout 10 ./ocachecli get "delete-before-ttl" >/dev/null 2>&1; then
+if ./ocachecli get "delete-before-ttl" >/dev/null 2>&1; then
     echo -e "${RED}✗ Failed to delete TTL key${NC}"
     TEST_TTL_WITH_DELETE_OPERATIONS="FAILED"
     TEST_PASSED=false

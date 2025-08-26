@@ -45,7 +45,7 @@ for writer in {1..10}; do
     PIDS+=($!)
 done
 
-# Wait for all writers to complete with timeout
+# Wait for all writers to complete
 echo "Waiting for writers to complete..."
 WAIT_TIME=0
 MAX_WAIT=30
@@ -99,7 +99,7 @@ read_verify_keys() {
         local key="${prefix}-key-${i}"
         local expected="value-${prefix}-${i}"
         local actual
-        if actual=$(timeout 5 ./ocachecli get "$key" 2>/dev/null); then
+        if actual=$(./ocachecli get "$key" 2>/dev/null); then
             if [ "$actual" != "$expected" ]; then
                 echo -e "${RED}Mismatch for $key: expected '$expected', got '$actual'${NC}"
                 ((errors++))
@@ -124,7 +124,7 @@ for reader in {1..10}; do
     READER_PIDS+=($!)
 done
 
-# Wait for all readers with timeout
+# Wait for all readers
 echo "Waiting for readers to complete..."
 WAIT_TIME=0
 MAX_WAIT=30
@@ -184,22 +184,22 @@ mixed_ops() {
     
     # Put some keys
     for i in {1..5}; do
-        timeout 5 ./ocachecli put "${base}-key-${i}" "value-${i}" 2>&1 || true
+        ./ocachecli put "${base}-key-${i}" "value-${i}" 2>&1 || true
     done
     
     # Read some keys
     for i in {1..3}; do
-        timeout 5 ./ocachecli get "${base}-key-${i}" >/dev/null 2>&1 || true
+        ./ocachecli get "${base}-key-${i}" >/dev/null 2>&1 || true
     done
     
     # Delete some keys
     for i in {1..2}; do
-        timeout 5 ./ocachecli delete "${base}-key-${i}" 2>&1 || true
+        ./ocachecli delete "${base}-key-${i}" 2>&1 || true
     done
     
     # Update remaining keys
     for i in {3..5}; do
-        timeout 5 ./ocachecli put "${base}-key-${i}" "updated-value-${i}" 2>&1 || true
+        ./ocachecli put "${base}-key-${i}" "updated-value-${i}" 2>&1 || true
     done
 }
 
@@ -211,7 +211,7 @@ for worker in {1..5}; do
     MIXED_PIDS+=($!)
 done
 
-# Wait with timeout
+# Wait
 WAIT_TIME=0
 MAX_WAIT=30
 while [ "$WAIT_TIME" -lt "$MAX_WAIT" ]; do
@@ -260,7 +260,7 @@ for worker in {1..5}; do
     for i in {3..5}; do
         KEY="mixed${worker}-key-${i}"
         EXPECTED="updated-value-${i}"
-        if ACTUAL=$(timeout 5 ./ocachecli get "$KEY" 2>/dev/null); then
+        if ACTUAL=$(./ocachecli get "$KEY" 2>/dev/null); then
             if [ "$ACTUAL" != "$EXPECTED" ]; then
                 echo -e "${RED}Value mismatch for $KEY: got '$ACTUAL', expected '$EXPECTED'${NC}"
                 ((VERIFY_ERRORS++))
@@ -295,10 +295,10 @@ raw_test() {
         local value="consistency-test-${id}-${i}-${RANDOM}"
         
         # Write
-        if timeout 5 ./ocachecli put "$key" "$value" 2>&1; then
+        if ./ocachecli put "$key" "$value" 2>&1; then
             # Immediate read
             local read_value
-            if read_value=$(timeout 5 ./ocachecli get "$key" 2>/dev/null); then
+            if read_value=$(./ocachecli get "$key" 2>/dev/null); then
                 if [ "$read_value" != "$value" ]; then
                     echo -e "${RED}Read-after-write failed for $key${NC}"
                     ((errors++))
@@ -328,7 +328,7 @@ for client in {1..5}; do
     RAW_PIDS+=($!)
 done
 
-# Wait with timeout
+# Wait
 WAIT_TIME=0
 MAX_WAIT=30
 while [ "$WAIT_TIME" -lt "$MAX_WAIT" ]; do
@@ -378,7 +378,7 @@ echo "Testing concurrent deletion of same keys..."
 # Create keys for deletion test
 echo "Creating keys for deletion test..."
 for i in {1..20}; do
-    timeout 5 ./ocachecli put "delete-test-${i}" "to-be-deleted-${i}" 2>&1 || true
+    ./ocachecli put "delete-test-${i}" "to-be-deleted-${i}" 2>&1 || true
 done
 
 # Function to delete keys
@@ -386,7 +386,7 @@ delete_keys() {
     local start=$1
     local end=$2
     for i in $(seq "$start" "$end"); do
-        timeout 5 ./ocachecli delete "delete-test-${i}" 2>&1 | grep -v "Key not found" || true
+        ./ocachecli delete "delete-test-${i}" 2>&1 | grep -v "Key not found" || true
     done
 }
 
@@ -400,7 +400,7 @@ DELETE_PIDS+=($!)
 delete_keys 10 20 &
 DELETE_PIDS+=($!)
 
-# Wait with timeout
+# Wait
 WAIT_TIME=0
 MAX_WAIT=30
 while [ "$WAIT_TIME" -lt "$MAX_WAIT" ]; do

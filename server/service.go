@@ -39,10 +39,24 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	zlog.Debug().Msg("gRPC Put called")
 	metrics.StreamsActive.Inc()
 	defer metrics.StreamsActive.Dec()
-	var key string
-	var ttl int
+
+	// Read the first chunk to get key and ttl
+	firstChunk, err := stream.Recv()
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+	}
+
+	key := firstChunk.Key
+	ttl := int(firstChunk.TtlSeconds)
+
+	if key == "" {
+		metrics.RPCRequests.WithLabelValues("Put", "invalid").Inc()
+		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: "missing key"})
+	}
+
 	pr, pw := io.Pipe()
-	first := true
 	errCh := make(chan error, 1)
 
 	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
@@ -50,7 +64,19 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 		errCh <- stor.GetStorage().Put(key, pr, ttl)
 	}()
 
-	// Read chunks from the stream and write to the pipe
+	// Write the first chunk's data if any
+	if len(firstChunk.Data) > 0 {
+		if _, err := pw.Write(firstChunk.Data); err != nil {
+			pw.CloseWithError(err)
+			<-errCh // wait for storage.Put to finish
+			metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
+			metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+		}
+		metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(firstChunk.Data)))
+	}
+
+	// Read remaining chunks from the stream and write to the pipe
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
@@ -64,11 +90,6 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 			metrics.Errors.WithLabelValues("grpc", "Put").Inc()
 			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 		}
-		if first {
-			key = chunk.Key
-			ttl = int(chunk.TtlSeconds)
-			first = false
-		}
 		if len(chunk.Data) > 0 {
 			if _, err := pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
@@ -78,16 +99,19 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 				metrics.Errors.WithLabelValues("grpc", "Put").Inc()
 				return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 			}
+			metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(chunk.Data)))
 		}
 	}
 	pw.Close()
 
-	err := <-errCh // wait for storage.Put to finish
+	err = <-errCh // wait for storage.Put to finish
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
 		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 	}
+
+	zlog.Debug().Str("key", key).Msg("Streaming put completed successfully")
 	metrics.RPCRequests.WithLabelValues("Put", "success").Inc()
 	return stream.SendAndClose(&pb.PutResponse{Success: true})
 }

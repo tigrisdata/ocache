@@ -45,16 +45,16 @@ func (p *MixedWorkloadPattern) Setup(t *testing.T, h *IntegrationTestHarness) {
 func (p *MixedWorkloadPattern) Execute(t *testing.T, h *IntegrationTestHarness) {
 	var wg sync.WaitGroup
 	errors := make(chan error, p.NumOperations)
-	
+
 	for w := 0; w < p.NumWorkers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			
+
 			for i := 0; i < p.NumOperations/p.NumWorkers; i++ {
 				op := i % 3
 				key := fmt.Sprintf("mixed-%d-%d", workerID, i)
-				
+
 				switch op {
 				case 0: // Write
 					size := p.ObjectSizes[i%len(p.ObjectSizes)]
@@ -97,17 +97,17 @@ func (p *MixedWorkloadPattern) Execute(t *testing.T, h *IntegrationTestHarness) 
 			}
 		}(w)
 	}
-	
+
 	wg.Wait()
 	close(errors)
-	
+
 	// Check for errors
 	errorCount := 0
 	for err := range errors {
 		errorCount++
 		t.Logf("Operation error: %v", err)
 	}
-	
+
 	assert.Less(t, errorCount, p.NumOperations/10, "Less than 10%% of operations should fail")
 }
 
@@ -123,10 +123,10 @@ func (p *MixedWorkloadPattern) Cleanup(t *testing.T, h *IntegrationTestHarness) 
 
 // CompactionPattern tests compaction behavior
 type CompactionPattern struct {
-	NumObjects        int
-	ObjectSize        int64
-	CompactionDelay   time.Duration
-	ExpectedSegments  int
+	NumObjects       int
+	ObjectSize       int64
+	CompactionDelay  time.Duration
+	ExpectedSegments int
 }
 
 func (p *CompactionPattern) Name() string {
@@ -153,7 +153,7 @@ func (p *CompactionPattern) Verify(t *testing.T, h *IntegrationTestHarness) {
 	if p.ExpectedSegments > 0 {
 		VerifySegmentsExist(t, h.TempDir, p.ExpectedSegments)
 	}
-	
+
 	// Verify all objects are still accessible
 	for i := 0; i < p.NumObjects; i++ {
 		key := fmt.Sprintf("compact-%d", i)
@@ -198,7 +198,7 @@ func (p *TTLExpirationPattern) Verify(t *testing.T, h *IntegrationTestHarness) {
 	// Verify expired and non-expired objects
 	for _, obj := range p.Objects {
 		_, err := h.GetObject(obj.Key)
-		
+
 		// Calculate if object should be expired
 		// Use the actual cleanup interval from the harness configuration
 		// Objects are expired if: TTL > 0 AND (TTL + cleanup_interval) < WaitTime
@@ -207,21 +207,21 @@ func (p *TTLExpirationPattern) Verify(t *testing.T, h *IntegrationTestHarness) {
 			// Default to 1 second if not configured
 			cleanupBuffer = 1
 		}
-		
-		if obj.TTL > 0 && (obj.TTL + cleanupBuffer) < int64(p.WaitTime.Seconds()) {
+
+		if obj.TTL > 0 && (obj.TTL+cleanupBuffer) < int64(p.WaitTime.Seconds()) {
 			// Object should definitely be expired
-			assert.Error(t, err, "Object %s with TTL %d should be expired after waiting %v (cleanup interval: %v)", 
+			assert.Error(t, err, "Object %s with TTL %d should be expired after waiting %v (cleanup interval: %v)",
 				obj.Key, obj.TTL, p.WaitTime, h.Config.CleanupInterval)
 		} else if obj.TTL == 0 || obj.TTL > int64(p.WaitTime.Seconds()) {
 			// Object should definitely still exist
 			// TTL == 0 means no expiration, or TTL > WaitTime means not expired yet
-			assert.NoError(t, err, "Object %s with TTL %d should still exist after waiting %v", 
+			assert.NoError(t, err, "Object %s with TTL %d should still exist after waiting %v",
 				obj.Key, obj.TTL, p.WaitTime)
 		} else {
 			// Object is in the boundary zone where it might or might not be expired
 			// This happens when TTL is very close to WaitTime
 			// We skip verification for these boundary cases
-			t.Logf("Skipping verification for %s (TTL=%d, WaitTime=%v, CleanupInterval=%v) - boundary case", 
+			t.Logf("Skipping verification for %s (TTL=%d, WaitTime=%v, CleanupInterval=%v) - boundary case",
 				obj.Key, obj.TTL, p.WaitTime, h.Config.CleanupInterval)
 		}
 	}
@@ -233,10 +233,10 @@ func (p *TTLExpirationPattern) Cleanup(t *testing.T, h *IntegrationTestHarness) 
 
 // StreamingPattern tests streaming operations
 type StreamingPattern struct {
-	ObjectSize   int64
-	ChunkSize    int
-	NumChunks    int
-	Concurrent   bool
+	ObjectSize int64
+	ChunkSize  int
+	NumChunks  int
+	Concurrent bool
 }
 
 func (p *StreamingPattern) Name() string {
@@ -267,12 +267,12 @@ func (p *StreamingPattern) Execute(t *testing.T, h *IntegrationTestHarness) {
 
 func (p *StreamingPattern) executeStreamingWrite(t *testing.T, h *IntegrationTestHarness, key string) {
 	data := GenerateRandomData(p.ObjectSize)
-	
+
 	// Simulate streaming write (store in chunks)
 	// For now, just use regular PutObject as streaming is not implemented in harness
 	err := h.PutObject(key, data, 0)
 	require.NoError(t, err)
-	
+
 	// Verify streaming read
 	VerifyStreamingRead(t, h.Storage, key, p.ObjectSize)
 }
@@ -381,9 +381,9 @@ func (m *PerformanceMetrics) Report(t *testing.T) {
 
 // CommonTestScenarios provides pre-configured test scenarios
 var CommonTestScenarios = struct {
-	SmallObjects   []ObjectSizeTestCase
-	MediumObjects  []ObjectSizeTestCase
-	LargeObjects   []ObjectSizeTestCase
+	SmallObjects    []ObjectSizeTestCase
+	MediumObjects   []ObjectSizeTestCase
+	LargeObjects    []ObjectSizeTestCase
 	BoundaryObjects []ObjectSizeTestCase
 }{
 	SmallObjects: []ObjectSizeTestCase{

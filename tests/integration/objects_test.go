@@ -108,7 +108,7 @@ func (s *ObjectsSuite) Test_Objects_UpdateExisting() {
 func (s *ObjectsSuite) Test_Objects_LRUEviction() {
 	// Reconfigure with low disk limit
 	s.Harness.Cleanup()
-	s.Config.MaxDiskUsage = 300 * 1024 // 300KB limit - lower to ensure eviction triggers
+	s.Config.MaxDiskUsage = 300 * 1024                // 300KB limit - lower to ensure eviction triggers
 	s.Config.CleanupInterval = 500 * time.Millisecond // Faster cleanup for testing
 	s.Harness = NewIntegrationTestHarness(s.T(), s.Config)
 
@@ -267,7 +267,7 @@ func (s *ObjectsSuite) Test_Objects_MixedTTL() {
 	s.Harness.Cleanup()
 	s.Config = DefaultIntegrationTestConfig()
 	s.Harness = NewIntegrationTestHarness(s.T(), s.Config)
-	
+
 	testCases := []struct {
 		key  string
 		size int64

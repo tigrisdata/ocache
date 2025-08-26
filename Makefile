@@ -250,6 +250,7 @@ test-e2e: build build-cli
 	@$(MAKE) test-e2e-lru
 	@$(MAKE) test-e2e-compaction
 	@$(MAKE) test-e2e-recompaction
+	@$(MAKE) test-e2e-data-validation
 
 .PHONY: test-e2e-concurrent
 test-e2e-concurrent: build build-cli
@@ -280,6 +281,11 @@ test-e2e-compaction: build build-cli
 test-e2e-recompaction: build build-cli
 	@echo "Running recompaction E2E test..."
 	./tests/e2e/recompaction_test.sh
+
+.PHONY: test-e2e-data-validation
+test-e2e-data-validation: build build-cli
+	@echo "Running comprehensive data validation E2E test..."
+	./tests/e2e/data_validation_test.sh
 
 .PHONY: test-integration
 test-integration: proto

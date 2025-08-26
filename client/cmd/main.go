@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"time"
 
@@ -64,22 +63,16 @@ Examples:
 		c := newClient()
 		defer c.Close()
 
-		var value []byte
 		var err error
 
 		if len(args) == 2 {
-			// Value provided as argument
-			value = []byte(args[1])
+			// Value provided as argument - use regular Put for small values
+			err = c.Put(context.Background(), args[0], []byte(args[1]), ttl)
 		} else {
-			// Read value from stdin
-			value, err = io.ReadAll(os.Stdin)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to read from stdin: %v\n", err)
-				os.Exit(1)
-			}
+			// Read value from stdin - use streaming to avoid loading all into memory
+			err = c.PutStream(context.Background(), args[0], os.Stdin, ttl)
 		}
 
-		err = c.Put(context.Background(), args[0], value, ttl)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Put failed: %v\n", err)
 			os.Exit(1)
@@ -95,12 +88,13 @@ var getCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		c := newClient()
 		defer c.Close()
-		val, err := c.Get(context.Background(), args[0])
+		// Use streaming to output directly to stdout without loading into memory
+		err := c.GetStream(context.Background(), args[0], os.Stdout)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Get failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println(string(val))
+		// Note: No need to print newline as data is written directly to stdout
 	},
 }
 
