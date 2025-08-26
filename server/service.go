@@ -303,6 +303,11 @@ func startGRPCServer() {
 		)
 	}
 
+	opts = append(opts,
+		grpc.MaxRecvMsgSize(128*1024*1024), // 128MB - match client send limit
+		grpc.MaxSendMsgSize(128*1024*1024), // 128MB - match client recv limit
+	)
+
 	grpcServer := grpc.NewServer(opts...)
 	pb.RegisterCacheServiceServer(grpcServer, &cacheService{})
 

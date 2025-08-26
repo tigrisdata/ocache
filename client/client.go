@@ -20,8 +20,8 @@ func New(addr string, opts ...grpc.DialOption) (*Client, error) {
 	}
 	// Set max message sizes for streaming
 	opts = append(opts, grpc.WithDefaultCallOptions(
-		grpc.MaxCallRecvMsgSize(100*1024*1024), // 100MB
-		grpc.MaxCallSendMsgSize(100*1024*1024), // 100MB
+		grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB
+		grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB
 	))
 	conn, err := grpc.Dial(addr, opts...)
 	if err != nil {
