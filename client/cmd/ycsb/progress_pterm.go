@@ -281,6 +281,16 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 		WithMargin(1)
 	title.Println("BENCHMARK RESULTS")
 
+	// Determine streaming mode
+	var streamingMode string
+	if cfg.ForceStreaming {
+		streamingMode = "Forced Streaming"
+	} else if cfg.ValueSize > StreamingThreshold {
+		streamingMode = fmt.Sprintf("Auto Streaming (size %d > 4MB)", cfg.ValueSize)
+	} else {
+		streamingMode = "Standard (non-streaming)"
+	}
+
 	// Create summary table
 	summaryTable := pterm.TableData{
 		{"Metric", "Value"},
@@ -289,6 +299,8 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 		{"Total Errors", fmt.Sprintf("%d", result.Errors)},
 		{"Error Rate", fmt.Sprintf("%.2f%%", float64(result.Errors)/float64(cfg.NumOps)*100)},
 		{"Throughput", fmt.Sprintf("%.2f ops/s", float64(cfg.NumOps)/result.Duration.Seconds())},
+		{"Streaming Mode", streamingMode},
+		{"Value Size", fmt.Sprintf("%d bytes", cfg.ValueSize)},
 	}
 
 	pterm.DefaultTable.

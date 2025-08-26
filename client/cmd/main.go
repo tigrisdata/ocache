@@ -29,13 +29,14 @@ var (
 	addr string
 	ttl  int64
 
-	numKeys     int
-	valueSize   int
-	numOps      int
-	concurrency int
-	workload    string
-	seed        int64
-	noProgress  bool
+	numKeys        int
+	valueSize      int
+	numOps         int
+	concurrency    int
+	workload       string
+	seed           int64
+	noProgress     bool
+	forceStreaming bool
 )
 
 func newClient() *cacheclient.Client {
@@ -137,14 +138,15 @@ var benchCmd = &cobra.Command{
 	Short: "Run a YCSB-style benchmark against the cache service",
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg := ycsb.YCSBConfig{
-			Addr:        addr,
-			NumKeys:     numKeys,
-			ValueSize:   valueSize,
-			NumOps:      numOps,
-			Concurrency: concurrency,
-			Workload:    workload,
-			Seed:        seed,
-			NoProgress:  noProgress,
+			Addr:           addr,
+			NumKeys:        numKeys,
+			ValueSize:      valueSize,
+			NumOps:         numOps,
+			Concurrency:    concurrency,
+			Workload:       workload,
+			Seed:           seed,
+			NoProgress:     noProgress,
+			ForceStreaming: forceStreaming,
 		}
 		_, err := ycsb.RunYCSB(cfg)
 		if err != nil {
@@ -164,4 +166,5 @@ func init() {
 	benchCmd.Flags().StringVar(&workload, "workload", "A", "Workload type or custom mix (e.g. A, B, read=70,update=30)")
 	benchCmd.Flags().Int64Var(&seed, "seed", time.Now().UnixNano(), "Random seed")
 	benchCmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress output during benchmark")
+	benchCmd.Flags().BoolVar(&forceStreaming, "force-streaming", false, "Force streaming for all operations regardless of size")
 }
