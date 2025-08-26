@@ -10,6 +10,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
@@ -92,6 +93,9 @@ func (q *Queue) Add(filepath string) error {
 		return err
 	}
 
+	// Increment added counter
+	metrics.DeletionQueueAdded.Inc()
+
 	zlog.Debug().
 		Str("filepath", filepath).
 		Msg("deletion queue: added entry")
@@ -130,6 +134,10 @@ func (q *Queue) processingLoop() {
 // ProcessBatch processes a batch of deletion requests
 func (q *Queue) ProcessBatch() {
 	startTime := time.Now()
+	defer func() {
+		// Record batch duration in milliseconds
+		metrics.DeletionQueueBatchDuration.Observe(float64(time.Since(startTime).Milliseconds()))
+	}()
 	seen := make(map[string][]byte) // filepath -> earliest queue key
 
 	// Scan and deduplicate
@@ -190,9 +198,13 @@ func (q *Queue) ProcessBatch() {
 			batch.Delete(queueKey)
 			successful++
 			q.processed++
+			// Increment processed counter
+			metrics.DeletionQueueProcessed.Inc()
 		} else {
 			failed++
 			q.failed++
+			// Increment failed counter
+			metrics.DeletionQueueFailed.Inc()
 		}
 	}
 
@@ -290,6 +302,8 @@ func (q *Queue) pruneOldEntries() {
 			batch.Delete(bytes.Clone(keyData))
 			pruned++
 			q.pruned++
+			// Increment pruned counter
+			metrics.DeletionQueuePruned.Inc()
 
 			_, filepath, _ := keys.ParseDeletionQueueKey(keyData)
 			zlog.Warn().
@@ -352,6 +366,9 @@ func (q *Queue) GetQueueDepth() int64 {
 // logQueueDepth logs the current queue depth and stats
 func (q *Queue) logQueueDepth() {
 	depth := q.GetQueueDepth()
+
+	// Update queue depth gauge metric
+	metrics.DeletionQueueDepth.Set(float64(depth))
 
 	// Always log if there are items in the queue, or periodically log stats
 	if depth > 0 {
