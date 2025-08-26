@@ -1,8 +1,10 @@
 package ycsb
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"slices"
 	"strings"
@@ -21,6 +23,9 @@ const (
 	OpUpdate
 	OpNum
 )
+
+// StreamingThreshold defines the size threshold (4MB) above which streaming is automatically used
+const StreamingThreshold = 4 * 1024 * 1024 // 4MB
 
 var opNames = []string{"read", "update"}
 
@@ -71,14 +76,15 @@ func ParseWorkload(s string) (WorkloadSpec, error) {
 }
 
 type YCSBConfig struct {
-	Addr        string // Address of the cache service (host:port)
-	NumKeys     int    // Number of unique keys to use in the benchmark
-	ValueSize   int    // Size of each value in bytes
-	NumOps      int    // Total number of operations to perform
-	Concurrency int    // Number of concurrent workers
-	Workload    string // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
-	Seed        int64  // Seed for random number generation (for reproducibility)
-	NoProgress  bool   // Disable progress output during benchmark
+	Addr           string // Address of the cache service (host:port)
+	NumKeys        int    // Number of unique keys to use in the benchmark
+	ValueSize      int    // Size of each value in bytes
+	NumOps         int    // Total number of operations to perform
+	Concurrency    int    // Number of concurrent workers
+	Workload       string // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
+	Seed           int64  // Seed for random number generation (for reproducibility)
+	NoProgress     bool   // Disable progress output during benchmark
+	ForceStreaming bool   // Force streaming for all operations regardless of size
 }
 
 type Result struct {
@@ -165,7 +171,12 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 		k := hashKey(i)
 		val := generateValue(rng, cfg.ValueSize)
 		err := pool.Execute(ctx, func(ctx context.Context, c *cacheclient.Client) error {
-			return c.Put(ctx, k, val, 0)
+			useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+			if useStreaming {
+				return c.PutStream(ctx, k, bytes.NewReader(val), 0)
+			} else {
+				return c.Put(ctx, k, val, 0)
+			}
 		})
 		if err != nil {
 			atomic.AddInt32(&preloadErrors, 1)
@@ -393,12 +404,26 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 
 				// Use context with timeout for individual operations
 				opCtx, opCancel := context.WithTimeout(ctx, 5*time.Second)
+
+				// Determine if streaming should be used
+				useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+
 				switch op {
 				case OpRead:
-					_, opErr = c.Get(opCtx, k)
+					if useStreaming {
+						// Use streaming for reads, discard output for benchmarking
+						opErr = c.GetStream(opCtx, k, io.Discard)
+					} else {
+						_, opErr = c.Get(opCtx, k)
+					}
 				case OpUpdate:
 					val := generateValue(localRng, cfg.ValueSize)
-					opErr = c.Put(opCtx, k, val, 0)
+					if useStreaming {
+						// Use streaming for writes
+						opErr = c.PutStream(opCtx, k, bytes.NewReader(val), 0)
+					} else {
+						opErr = c.Put(opCtx, k, val, 0)
+					}
 				}
 				opCancel()
 				latency := time.Since(start)
