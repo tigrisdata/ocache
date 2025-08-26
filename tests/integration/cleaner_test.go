@@ -31,11 +31,11 @@ func (s *CleanerSuite) Test_Cleaner_AutoTriggerTTL() {
 		{Key: "ttl-expire-3", Size: 30 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
 		{Key: "ttl-expire-4", Size: 40 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
 		{Key: "ttl-expire-5", Size: 50 * 1024, TTL: 1, WaitTime: 2 * time.Second, ShouldExist: false},
-		
+
 		// Objects with no TTL (should persist)
 		{Key: "ttl-persist-1", Size: 10 * 1024, TTL: 0, WaitTime: 2 * time.Second, ShouldExist: true},
 		{Key: "ttl-persist-2", Size: 20 * 1024, TTL: 0, WaitTime: 2 * time.Second, ShouldExist: true},
-		
+
 		// Objects with longer TTL (should persist)
 		{Key: "ttl-long-1", Size: 10 * 1024, TTL: 10, WaitTime: 2 * time.Second, ShouldExist: true},
 	}

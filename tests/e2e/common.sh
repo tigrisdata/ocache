@@ -228,6 +228,118 @@ generate_random_data() {
     head -c "$size" /dev/urandom | base64 | head -c "$size"
 }
 
+# Generate checksum for data (using md5 for portability)
+# Usage: generate_checksum <data>
+generate_checksum() {
+    local data="$1"
+    if command -v md5sum >/dev/null 2>&1; then
+        printf "%s" "$data" | md5sum | awk '{print $1}'
+    elif command -v md5 >/dev/null 2>&1; then
+        printf "%s" "$data" | md5 -r | awk '{print $1}'
+    else
+        echo "ERROR: Neither md5sum nor md5 found"
+        return 1
+    fi
+}
+
+# Verify data matches expected checksum
+# Usage: verify_checksum <data> <expected_checksum>
+verify_checksum() {
+    local data="$1"
+    local expected="$2"
+    local actual
+    
+    actual=$(generate_checksum "$data")
+    if [ "$actual" = "$expected" ]; then
+        return 0
+    else
+        echo "Checksum mismatch: expected $expected, got $actual"
+        return 1
+    fi
+}
+
+# Store test data with checksum for later verification
+# Usage: store_test_data <key> <data> <checksum_file>
+store_test_data() {
+    local key="$1"
+    local data="$2"
+    local checksum_file="$3"
+    
+    local checksum
+    checksum=$(generate_checksum "$data")
+    
+    # Remove any existing entry for this key before adding the new one
+    if [ -f "$checksum_file" ]; then
+        grep -v "^${key}:" "$checksum_file" > "${checksum_file}.tmp" 2>/dev/null || true
+        mv "${checksum_file}.tmp" "$checksum_file"
+    fi
+    
+    # Add the new checksum
+    echo "${key}:${checksum}" >> "$checksum_file"
+}
+
+# Verify stored data integrity
+# Usage: verify_stored_data <key> <checksum_file>
+verify_stored_data() {
+    local key="$1"
+    local checksum_file="$2"
+    
+    # Get expected checksum
+    local expected_checksum
+    expected_checksum=$(grep "^${key}:" "$checksum_file" 2>/dev/null | cut -d: -f2)
+    
+    if [ -z "$expected_checksum" ]; then
+        echo "No checksum found for key: $key"
+        return 1
+    fi
+    
+    # Get actual data
+    local actual_data
+    actual_data=$(./ocachecli get "$key" 2>/dev/null)
+    
+    if [ -z "$actual_data" ]; then
+        echo "Failed to retrieve data for key: $key"
+        return 1
+    fi
+    
+    # Verify checksum
+    if verify_checksum "$actual_data" "$expected_checksum"; then
+        return 0
+    else
+        echo "Data integrity check failed for key: $key"
+        return 1
+    fi
+}
+
+# Generate deterministic test data (for reproducible testing)
+# Usage: generate_deterministic_data <seed> <size>
+generate_deterministic_data() {
+    local seed="$1"
+    local size="$2"
+    
+    # Use seed to generate reproducible data
+    yes "${seed}" | head -c "$size" | base64 | head -c "$size"
+}
+
+# Verify data content matches expected value
+# Usage: verify_data_content <key> <expected_value>
+verify_data_content() {
+    local key="$1"
+    local expected="$2"
+    
+    local actual
+    actual=$(./ocachecli get "$key" 2>/dev/null)
+    
+    if [ "$actual" = "$expected" ]; then
+        return 0
+    else
+        echo "Content mismatch for key $key"
+        echo "Expected: ${expected:0:50}..." 
+        echo "Actual: ${actual:0:50}..."
+        return 1
+    fi
+}
+
 # Execute ocachecli command with timeout and error handling
 # Usage: ocache_cmd <timeout_seconds> <command> [args...]
 ocache_cmd() {
@@ -270,7 +382,7 @@ cleanup_common() {
     done
     
     # Clean up any temp files
-    rm -f /tmp/ocache-*-errors-* /tmp/keys-*.txt
+    rm -f /tmp/ocache-*-errors-* /tmp/keys-*.txt /tmp/checksums-*.txt
 }
 
 # Set up trap to cleanup on exit

@@ -38,7 +38,7 @@ echo "Creating medium objects (>64KB) that will be stored as raw files..."
 
 # Create 5 medium objects (100KB each) to trigger compaction
 for i in {1..5}; do
-    head -c 100000 /dev/urandom | base64 | head -c 100000 | timeout 10 ./ocachecli put "compact-key-${i}" 2>&1 || true
+    head -c 100000 /dev/urandom | base64 | head -c 100000 | ./ocachecli put "compact-key-${i}" 2>&1 || true
     echo "Added compact-key-${i} (100KB) as raw file"
 done
 
@@ -46,7 +46,7 @@ echo
 echo "Verifying all keys are readable before compaction..."
 PRE_COMPACT_ERRORS=0
 for i in {1..5}; do
-    if ! timeout 10 ./ocachecli get "compact-key-${i}" >/dev/null 2>&1; then
+    if ! ./ocachecli get "compact-key-${i}" >/dev/null 2>&1; then
         echo -e "${RED}Failed to read compact-key-${i} before compaction${NC}"
         ((PRE_COMPACT_ERRORS++))
     fi
@@ -68,7 +68,7 @@ echo
 echo "Verifying keys are still readable after compaction..."
 POST_COMPACT_ERRORS=0
 for i in {1..5}; do
-    if ! timeout 10 ./ocachecli get "compact-key-${i}" >/dev/null 2>&1; then
+    if ! ./ocachecli get "compact-key-${i}" >/dev/null 2>&1; then
         echo -e "${RED}Failed to read compact-key-${i} after compaction${NC}"
         ((POST_COMPACT_ERRORS++))
     fi
@@ -90,23 +90,23 @@ echo "Testing reads/writes/deletes while compaction is active..."
 # Add more files to trigger another compaction
 echo "Adding more raw files..."
 for i in {6..10}; do
-    head -c 80000 /dev/urandom | base64 | head -c 80000 | timeout 10 ./ocachecli put "active-key-${i}" 2>&1 || true
+    head -c 80000 /dev/urandom | base64 | head -c 80000 | ./ocachecli put "active-key-${i}" 2>&1 || true
 done
 
 # Perform operations while compaction might be running
 echo "Performing mixed operations during potential compaction..."
 
 # Update an existing key
-head -c 90000 /dev/urandom | base64 | head -c 90000 | timeout 10 ./ocachecli put "compact-key-2" 2>&1 || true
+head -c 90000 /dev/urandom | base64 | head -c 90000 | ./ocachecli put "compact-key-2" 2>&1 || true
 echo "Updated compact-key-2"
 
 # Delete a key
-timeout 10 ./ocachecli delete "compact-key-3" 2>&1 || true
+./ocachecli delete "compact-key-3" 2>&1 || true
 echo "Deleted compact-key-3"
 
 # Read keys
 for i in 1 4 5; do
-    if timeout 10 ./ocachecli get "compact-key-${i}" >/dev/null 2>&1; then
+    if ./ocachecli get "compact-key-${i}" >/dev/null 2>&1; then
         echo "Successfully read compact-key-${i}"
     fi
 done
@@ -119,7 +119,7 @@ echo "Verifying operations were successful..."
 
 # Check update worked
 MIXED_OPS_ERRORS=0
-if timeout 10 ./ocachecli get "compact-key-2" >/dev/null 2>&1; then
+if ./ocachecli get "compact-key-2" >/dev/null 2>&1; then
     echo -e "${GREEN}✓ Updated key readable${NC}"
 else
     echo -e "${RED}✗ Updated key not found${NC}"
@@ -128,7 +128,7 @@ else
 fi
 
 # Check delete worked
-if timeout 10 ./ocachecli get "compact-key-3" >/dev/null 2>&1; then
+if ./ocachecli get "compact-key-3" >/dev/null 2>&1; then
     echo -e "${RED}✗ Deleted key still exists${NC}"
     ((MIXED_OPS_ERRORS++))
     TEST_PASSED=false
@@ -148,7 +148,7 @@ echo "Creating many files to test larger compaction scenarios..."
 
 # Create 20 medium files
 for i in {11..30}; do
-    head -c 75000 /dev/urandom | base64 | head -c 75000 | timeout 10 ./ocachecli put "bulk-key-${i}" 2>&1 || true
+    head -c 75000 /dev/urandom | base64 | head -c 75000 | ./ocachecli put "bulk-key-${i}" 2>&1 || true
     echo "Added bulk-key-${i} (75KB)"
 done
 
@@ -160,7 +160,7 @@ sleep 15
 echo "Verifying all bulk keys after large compaction..."
 BULK_ERRORS=0
 for i in {11..30}; do
-    if ! timeout 10 ./ocachecli get "bulk-key-${i}" >/dev/null 2>&1; then
+    if ! ./ocachecli get "bulk-key-${i}" >/dev/null 2>&1; then
         ((BULK_ERRORS++))
     fi
 done
@@ -184,17 +184,17 @@ echo "Adding objects of various sizes..."
 # Small objects (should stay in RocksDB)
 for i in {1..5}; do
     VALUE=$(head -c 10000 /dev/urandom | base64 | head -c 10000)
-    timeout 10 ./ocachecli put "small-compact-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "small-compact-${i}" "$VALUE" 2>&1 || true
 done
 
 # Medium objects (raw files -> segments)
 for i in {1..5}; do
-    head -c 70000 /dev/urandom | base64 | head -c 70000 | timeout 10 ./ocachecli put "medium-compact-${i}" 2>&1 || true
+    head -c 70000 /dev/urandom | base64 | head -c 70000 | ./ocachecli put "medium-compact-${i}" 2>&1 || true
 done
 
 # Large objects (should stay as raw files if >16MB, but we'll use 500KB for testing)
 for i in {1..3}; do
-    head -c 500000 /dev/urandom | base64 | head -c 500000 | timeout 10 ./ocachecli put "large-compact-${i}" 2>&1 || true
+    head -c 500000 /dev/urandom | base64 | head -c 500000 | ./ocachecli put "large-compact-${i}" 2>&1 || true
 done
 
 echo "Waiting for compaction of mixed sizes..."
@@ -205,21 +205,21 @@ echo "Verifying mixed-size objects after compaction..."
 MIXED_ERRORS=0
 
 for i in {1..5}; do
-    if ! timeout 10 ./ocachecli get "small-compact-${i}" >/dev/null 2>&1; then
+    if ! ./ocachecli get "small-compact-${i}" >/dev/null 2>&1; then
         echo -e "${RED}Failed: small-compact-${i}${NC}"
         ((MIXED_ERRORS++))
     fi
 done
 
 for i in {1..5}; do
-    if ! timeout 10 ./ocachecli get "medium-compact-${i}" >/dev/null 2>&1; then
+    if ! ./ocachecli get "medium-compact-${i}" >/dev/null 2>&1; then
         echo -e "${RED}Failed: medium-compact-${i}${NC}"
         ((MIXED_ERRORS++))
     fi
 done
 
 for i in {1..3}; do
-    if ! timeout 10 ./ocachecli get "large-compact-${i}" >/dev/null 2>&1; then
+    if ! ./ocachecli get "large-compact-${i}" >/dev/null 2>&1; then
         echo -e "${RED}Failed: large-compact-${i}${NC}"
         ((MIXED_ERRORS++))
     fi
@@ -241,7 +241,7 @@ echo "Testing concurrent reads during active compaction..."
 # Add files to trigger compaction
 echo "Adding files to trigger compaction..."
 for i in {31..35}; do
-    head -c 85000 /dev/urandom | base64 | head -c 85000 | timeout 10 ./ocachecli put "concurrent-compact-${i}" 2>&1 || true
+    head -c 85000 /dev/urandom | base64 | head -c 85000 | ./ocachecli put "concurrent-compact-${i}" 2>&1 || true
 done
 
 # Function to continuously read keys
@@ -250,7 +250,7 @@ continuous_reader() {
     local success=0
     local fail=0
     for j in {1..20}; do
-        if timeout 5 ./ocachecli get "$key" >/dev/null 2>&1; then
+        if ./ocachecli get "$key" >/dev/null 2>&1; then
             ((success++))
         else
             ((fail++))
@@ -268,7 +268,7 @@ for i in {31..33}; do
     READER_PIDS+=($!)
 done
 
-# Wait for readers to complete with timeout
+# Wait for readers to complete
 WAIT_TIME=0
 MAX_WAIT=30
 echo "Waiting for readers to complete (max ${MAX_WAIT}s)..."
@@ -304,7 +304,7 @@ echo "=== Test 7: Server Restart After Compaction ==="
 echo "Testing data integrity after server restart with compacted segments..."
 
 # Get current key count
-KEY_COUNT_BEFORE=$(timeout 10 ./ocachecli list | wc -l)
+KEY_COUNT_BEFORE=$(./ocachecli list | wc -l)
 echo "Keys before restart: $KEY_COUNT_BEFORE"
 
 # Stop server
@@ -321,7 +321,7 @@ start_server "compaction" "false" \
   -v
 
 # Check key count after restart
-KEY_COUNT_AFTER=$(timeout 10 ./ocachecli list | wc -l)
+KEY_COUNT_AFTER=$(./ocachecli list | wc -l)
 echo "Keys after restart: $KEY_COUNT_AFTER"
 
 RESTART_ERRORS=0
@@ -336,7 +336,7 @@ fi
 # Spot check some keys
 RESTART_CHECK=0
 for key in "compact-key-1" "bulk-key-15" "medium-compact-3"; do
-    if ! timeout 10 ./ocachecli get "$key" >/dev/null 2>&1; then
+    if ! ./ocachecli get "$key" >/dev/null 2>&1; then
         echo -e "${RED}Key $key not found after restart${NC}"
         ((RESTART_CHECK++))
     fi

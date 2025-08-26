@@ -2,6 +2,7 @@ package cacheclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	pb "github.com/tigrisdata/ocache/proto"
@@ -17,6 +18,11 @@ func New(addr string, opts ...grpc.DialOption) (*Client, error) {
 	if len(opts) == 0 {
 		opts = append(opts, grpc.WithInsecure())
 	}
+	// Set max message sizes for streaming
+	opts = append(opts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB
+		grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB
+	))
 	conn, err := grpc.Dial(addr, opts...)
 	if err != nil {
 		return nil, err
@@ -43,8 +49,11 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 	if err != nil {
 		return err
 	}
+
 	buf := make([]byte, 64*1024) // 64KB chunks
 	first := true
+	totalBytes := 0
+
 	for {
 		n, err := r.Read(buf)
 		if n > 0 {
@@ -54,9 +63,10 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 				req.TtlSeconds = ttlSeconds
 				first = false
 			}
-			if err := stream.Send(req); err != nil {
-				return err
+			if sendErr := stream.Send(req); sendErr != nil {
+				return sendErr
 			}
+			totalBytes += n
 		}
 		if err == io.EOF {
 			break
@@ -65,8 +75,15 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 			return err
 		}
 	}
-	_, err = stream.CloseAndRecv()
-	return err
+
+	resp, err := stream.CloseAndRecv()
+	if err != nil {
+		return err
+	}
+	if resp != nil && !resp.Success {
+		return fmt.Errorf("put failed: %s", resp.Error)
+	}
+	return nil
 }
 
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {

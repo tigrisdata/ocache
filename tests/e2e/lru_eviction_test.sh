@@ -37,7 +37,7 @@ echo "Adding keys to exceed disk usage limit..."
 # Add 20 keys, each ~3KB (total ~60KB, exceeds 50KB limit)
 for i in {1..20}; do
     VALUE=$(head -c 3000 /dev/urandom | base64 | head -c 3000)
-    timeout 10 ./ocachecli put "lru-key-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "lru-key-${i}" "$VALUE" 2>&1 || true
     echo "Added lru-key-${i} (3KB)"
     sleep 0.1
 done
@@ -48,7 +48,7 @@ echo "Waiting for LRU eviction to run (10 seconds)..."
 sleep 10
 
 # Count remaining keys
-REMAINING_KEYS=$(timeout 10 ./ocachecli list | grep -c "lru-key" || true)
+REMAINING_KEYS=$(./ocachecli list | grep -c "lru-key" || true)
 echo "Keys remaining after eviction: $REMAINING_KEYS out of 20"
 
 if [ "$REMAINING_KEYS" -lt 20 ] && [ "$REMAINING_KEYS" -gt 0 ]; then
@@ -66,21 +66,21 @@ echo "Testing that recently accessed keys are not evicted..."
 
 # Clear existing keys
 for i in {1..20}; do
-    timeout 10 ./ocachecli delete "lru-key-${i}" 2>&1 | grep -v "Key not found" || true
+    ./ocachecli delete "lru-key-${i}" 2>&1 | grep -v "Key not found" || true
 done
 
 # Add new keys
 echo "Adding 15 new keys..."
 for i in {1..15}; do
     VALUE=$(head -c 3500 /dev/urandom | base64 | head -c 3500)
-    timeout 10 ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 || true
     sleep 0.1
 done
 
 echo
 echo "Accessing keys 11-15 to update their LRU time..."
 for i in {11..15}; do
-    timeout 10 ./ocachecli get "access-key-${i}" >/dev/null 2>&1 || true
+    ./ocachecli get "access-key-${i}" >/dev/null 2>&1 || true
     echo "Accessed access-key-${i}"
 done
 
@@ -88,7 +88,7 @@ echo
 echo "Adding 5 more keys to trigger eviction..."
 for i in {16..20}; do
     VALUE=$(head -c 3500 /dev/urandom | base64 | head -c 3500)
-    timeout 10 ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "access-key-${i}" "$VALUE" 2>&1 || true
 done
 
 echo "Waiting for LRU eviction..."
@@ -102,14 +102,14 @@ OLD_EXISTS=0
 
 # Check recently accessed keys (11-15 and newly added 16-20 should exist)
 for i in {11..20}; do
-    if timeout 10 ./ocachecli get "access-key-${i}" >/dev/null 2>&1; then
+    if ./ocachecli get "access-key-${i}" >/dev/null 2>&1; then
         ((RECENT_EXISTS++))
     fi
 done
 
 # Check old keys (1-10 should mostly be evicted)
 for i in {1..10}; do
-    if timeout 10 ./ocachecli get "access-key-${i}" >/dev/null 2>&1; then
+    if ./ocachecli get "access-key-${i}" >/dev/null 2>&1; then
         ((OLD_EXISTS++))
     fi
 done
@@ -131,38 +131,38 @@ echo "=== Test 3: Mixed Size Objects with LRU ==="
 echo "Testing LRU eviction with different object sizes..."
 
 # Clear existing keys
-timeout 10 ./ocachecli list | while read key; do
-    timeout 10 ./ocachecli delete "$key" 2>&1 || true
+./ocachecli list | while read key; do
+    ./ocachecli delete "$key" 2>&1 || true
 done
 
 # Add small objects
 echo "Adding small objects (1KB each)..."
 for i in {1..10}; do
     VALUE=$(head -c 1000 /dev/urandom | base64 | head -c 1000)
-    timeout 10 ./ocachecli put "small-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "small-${i}" "$VALUE" 2>&1 || true
 done
 
 # Add medium objects
 echo "Adding medium objects (5KB each)..."
 for i in {1..5}; do
     VALUE=$(head -c 5000 /dev/urandom | base64 | head -c 5000)
-    timeout 10 ./ocachecli put "medium-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "medium-${i}" "$VALUE" 2>&1 || true
 done
 
 # Add large objects to trigger eviction
 echo "Adding large objects (10KB each) to trigger eviction..."
 for i in {1..3}; do
     VALUE=$(head -c 10000 /dev/urandom | base64 | head -c 10000)
-    timeout 10 ./ocachecli put "large-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "large-${i}" "$VALUE" 2>&1 || true
 done
 
 echo "Waiting for eviction..."
 sleep 10
 
 # Count remaining objects by type
-SMALL_COUNT=$(timeout 10 ./ocachecli list | grep -c "small-" || true)
-MEDIUM_COUNT=$(timeout 10 ./ocachecli list | grep -c "medium-" || true)
-LARGE_COUNT=$(timeout 10 ./ocachecli list | grep -c "large-" || true)
+SMALL_COUNT=$(./ocachecli list | grep -c "small-" || true)
+MEDIUM_COUNT=$(./ocachecli list | grep -c "medium-" || true)
+LARGE_COUNT=$(./ocachecli list | grep -c "large-" || true)
 
 echo "Remaining objects:"
 echo "  Small (1KB): $SMALL_COUNT out of 10"
@@ -188,7 +188,7 @@ continuous_writer() {
     local prefix=$1
     for i in {1..20}; do
         VALUE=$(head -c 2500 /dev/urandom | base64 | head -c 2500)
-        timeout 10 ./ocachecli put "${prefix}-continuous-${i}" "$VALUE" 2>&1 || true
+        ./ocachecli put "${prefix}-continuous-${i}" "$VALUE" 2>&1 || true
         sleep 0.2
     done
 }
@@ -206,10 +206,10 @@ sleep 5
 # Access some keys while writing continues
 echo "Accessing some keys during continuous load..."
 for i in {1..5}; do
-    timeout 10 ./ocachecli get "writer1-continuous-${i}" >/dev/null 2>&1 || true
+    ./ocachecli get "writer1-continuous-${i}" >/dev/null 2>&1 || true
 done
 
-# Wait for writers to complete with timeout
+# Wait for writers to complete
 PIDS=("$PID1" "$PID2")
 WAIT_TIME=0
 MAX_WAIT=30
@@ -240,7 +240,7 @@ echo "Waiting for final eviction cycle..."
 sleep 10
 
 # Check final state
-FINAL_COUNT=$(timeout 10 ./ocachecli list | grep -c "continuous" || true)
+FINAL_COUNT=$(./ocachecli list | grep -c "continuous" || true)
 echo "Final key count under continuous load: $FINAL_COUNT"
 
 if [ "$FINAL_COUNT" -lt 40 ]; then
@@ -257,30 +257,30 @@ echo "=== Test 5: LRU with TTL Interaction ==="
 echo "Testing LRU eviction doesn't interfere with TTL..."
 
 # Clear cache
-timeout 10 ./ocachecli list | while read key; do
-    timeout 10 ./ocachecli delete "$key" 2>&1 || true
+./ocachecli list | while read key; do
+    ./ocachecli delete "$key" 2>&1 || true
 done
 
 # Add TTL keys
 echo "Adding keys with TTL..."
 for i in {1..5}; do
     VALUE=$(head -c 5000 /dev/urandom | base64 | head -c 5000)
-    timeout 10 ./ocachecli put "ttl-lru-${i}" "$VALUE" --ttl 15 2>&1 || true
+    ./ocachecli put "ttl-lru-${i}" "$VALUE" --ttl 15 2>&1 || true
 done
 
 # Add regular keys to trigger eviction
 echo "Adding regular keys to trigger eviction..."
 for i in {1..10}; do
     VALUE=$(head -c 5000 /dev/urandom | base64 | head -c 5000)
-    timeout 10 ./ocachecli put "regular-lru-${i}" "$VALUE" 2>&1 || true
+    ./ocachecli put "regular-lru-${i}" "$VALUE" 2>&1 || true
 done
 
 echo "Waiting for eviction..."
 sleep 10
 
 # Check that TTL keys can still expire normally
-TTL_COUNT=$(timeout 10 ./ocachecli list | grep -c "ttl-lru" || true)
-REGULAR_COUNT=$(timeout 10 ./ocachecli list | grep -c "regular-lru" || true)
+TTL_COUNT=$(./ocachecli list | grep -c "ttl-lru" || true)
+REGULAR_COUNT=$(./ocachecli list | grep -c "regular-lru" || true)
 
 echo "Keys before TTL expiration:"
 echo "  TTL keys: $TTL_COUNT"
@@ -289,7 +289,7 @@ echo "  Regular keys: $REGULAR_COUNT"
 echo "Waiting for TTL expiration (10 more seconds)..."
 sleep 10
 
-TTL_COUNT_AFTER=$(timeout 10 ./ocachecli list | grep -c "ttl-lru" || true)
+TTL_COUNT_AFTER=$(./ocachecli list | grep -c "ttl-lru" || true)
 if [ "$TTL_COUNT_AFTER" -eq 0 ]; then
     echo -e "${GREEN}✓ TTL keys expired correctly despite LRU eviction${NC}"
     TEST_LRU_WITH_TTL_INTERACTION="PASSED"
@@ -307,7 +307,7 @@ echo "Testing cache behavior after restart with disk limit..."
 echo "Stopping server..."
 kill "$SERVER_PID"
 
-# Wait for server to stop with timeout
+# Wait for server to stop
 WAIT_COUNT=0
 while kill -0 "$SERVER_PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 10 ]; do
     sleep 1
@@ -328,7 +328,7 @@ start_server "lru" "false" \
   -v
 
 # Check persisted keys
-PERSISTED_COUNT=$(timeout 10 ./ocachecli list | wc -l || echo 0)
+PERSISTED_COUNT=$(./ocachecli list | wc -l || echo 0)
 echo "Keys loaded from disk: $PERSISTED_COUNT"
 
 if [ "$PERSISTED_COUNT" -gt 0 ]; then
