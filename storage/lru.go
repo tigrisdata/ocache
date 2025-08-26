@@ -5,6 +5,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"google.golang.org/protobuf/proto"
@@ -12,7 +13,8 @@ import (
 
 // evictLRUKeys evicts the least recently used keys using bucket iteration
 // This implementation is scalable to millions of keys as it doesn't load all keys into memory
-func (c *Cleaner) evictLRUKeys(targetBytes int64) {
+// Returns the number of keys evicted
+func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 	start := time.Now()
 
 	var evicted int64
@@ -43,7 +45,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 		select {
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: LRU eviction interrupted by shutdown")
-			return
+			return evictedCount
 		default:
 		}
 
@@ -153,7 +155,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 			select {
 			case <-c.closeCh:
 				zlog.Info().Msg("cleaner: LRU eviction interrupted by shutdown")
-				return
+				return evictedCount
 			default:
 			}
 
@@ -182,6 +184,10 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 	c.evictedKeys.Add(int64(evictedCount))
 	c.totalSize.Add(-evicted)
 
+	// Record metrics
+	metrics.CleanerKeysDeleted.WithLabelValues("lru", "disk_limit").Add(float64(evictedCount))
+	metrics.CleanerBytesFreed.WithLabelValues("lru").Add(float64(evicted))
+
 	zlog.Info().
 		Int("count", evictedCount).
 		Int64("bytes", evicted).
@@ -189,6 +195,8 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) {
 		Int("keys_examined", processedKeys).
 		Dur("duration", time.Since(start)).
 		Msg("cleaner: LRU eviction completed")
+
+	return evictedCount
 }
 
 // cleanupOldBuckets removes access entries from buckets older than the specified duration

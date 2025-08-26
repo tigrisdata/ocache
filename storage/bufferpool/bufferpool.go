@@ -1,6 +1,11 @@
 package bufferpool
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+
+	"github.com/tigrisdata/ocache/common/metrics"
+)
 
 // bufferPool is used to reduce allocations
 var (
@@ -18,6 +23,9 @@ var (
 	// The slices taken from this pool always have their capacity preserved; callers
 	// may reslice to their desired length.
 	largeBufferPool = sync.Pool{}
+
+	// Track active buffer allocations
+	activeBuffers int64
 )
 
 // getBuffer returns a buffer of defaultBufferSize length from the pool, or allocates a new one if needed
@@ -29,7 +37,7 @@ func getBuffer() []byte {
 	return buf[:defaultBufferSize]
 }
 
-// PutBuffer returns a buffer to the pool
+// putBuffer returns a buffer to the pool
 func putBuffer(buf []byte) {
 	bufferPool.Put(buf)
 }
@@ -39,18 +47,41 @@ func putBuffer(buf []byte) {
 // (callers can reslice as needed). The returned function must be called to
 // release the buffer back to the pool.
 func AcquireBuffer(size int) ([]byte, func()) {
+	// Track allocation
+	metrics.BufferPoolAllocations.Inc()
+	newSize := atomic.AddInt64(&activeBuffers, 1)
+	metrics.BufferPoolSize.Set(float64(newSize))
+
 	if size <= defaultBufferSize {
 		buf := getBuffer()
-		return buf[:size], func() { putBuffer(buf) }
+		return buf[:size], func() {
+			putBuffer(buf)
+			// Track release
+			metrics.BufferPoolReleases.Inc()
+			newSize := atomic.AddInt64(&activeBuffers, -1)
+			metrics.BufferPoolSize.Set(float64(newSize))
+		}
 	}
 
 	if v := largeBufferPool.Get(); v != nil {
 		buf := v.([]byte)
 		if cap(buf) >= size {
-			return buf[:size], func() { largeBufferPool.Put(buf) }
+			return buf[:size], func() {
+				largeBufferPool.Put(buf)
+				// Track release
+				metrics.BufferPoolReleases.Inc()
+				newSize := atomic.AddInt64(&activeBuffers, -1)
+				metrics.BufferPoolSize.Set(float64(newSize))
+			}
 		}
 	}
 
 	buf := make([]byte, size)
-	return buf, func() { putBuffer(buf) }
+	return buf, func() {
+		putBuffer(buf)
+		// Track release
+		metrics.BufferPoolReleases.Inc()
+		newSize := atomic.AddInt64(&activeBuffers, -1)
+		metrics.BufferPoolSize.Set(float64(newSize))
+	}
 }

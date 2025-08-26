@@ -7,6 +7,7 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/keys"
 )
 
@@ -73,8 +74,10 @@ func (a *accessUpdater) Update(key string, accessTime int64) {
 	select {
 	case a.updates <- accessUpdate{key: key, time: accessTime}:
 		// Update queued successfully
+		metrics.LRUAccessUpdates.Inc()
 	default:
 		// Buffer full, drop the update (LRU tracking is best-effort)
+		metrics.Errors.WithLabelValues("access_updater", "buffer_full").Inc()
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/utils"
 )
 
@@ -82,6 +83,9 @@ func NewFdCache(capacity int) *FdCache {
 		capacity: capacity,
 	}
 
+	// Initialize cache size metric
+	metrics.FDCacheSize.Set(0)
+
 	return fdCache
 }
 
@@ -105,10 +109,15 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 			atomic.AddInt32(&e.refs, -1)
 			return nil, utils.WrapError("failed to open raw file", path, nil)
 		}
+		// Track cache hit
+		metrics.FDCacheHits.Inc()
 		return e, nil
 	}
 
 	// Slow-path: need to open the file.
+	// Track cache miss
+	metrics.FDCacheMisses.Inc()
+
 	// Check if we're at capacity before creating a new entry
 	atCapacity := fc.capacity > 0 && atomic.LoadInt32(&fc.size) >= int32(fc.capacity)
 
@@ -137,6 +146,8 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 			atomic.AddInt32(&existing.refs, -1)
 			return nil, utils.WrapError("failed to open raw file", path, nil)
 		}
+		// Track as cache hit since another goroutine opened it for us
+		metrics.FDCacheHits.Inc()
 		return existing, nil
 	}
 
@@ -161,11 +172,15 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 
 	// Track size only if we're actually caching this entry
 	if entry.cached {
-		atomic.AddInt32(&fc.size, 1)
+		newSize := atomic.AddInt32(&fc.size, 1)
+		// Update cache size metric
+		metrics.FDCacheSize.Set(float64(newSize))
 	} else {
 		// Not cached due to capacity limit, remove from entries map
 		// but return the entry for this caller to use
 		fc.entries.Delete(path)
+		// Track eviction due to capacity
+		metrics.FDCacheEvictions.Inc()
 	}
 
 	return entry, nil
@@ -186,7 +201,9 @@ func (fc *FdCache) Release(path string, e *FileEntry) {
 				if e.f != nil {
 					_ = e.f.Close()
 				}
-				atomic.AddInt32(&fc.size, -1)
+				newSize := atomic.AddInt32(&fc.size, -1)
+				// Update cache size metric
+				metrics.FDCacheSize.Set(float64(newSize))
 			} else {
 				// Either already removed or replaced by another goroutine
 				// Just close the file if it's ready
@@ -219,7 +236,11 @@ func (fc *FdCache) Remove(path string) {
 			if e.f != nil {
 				_ = e.f.Close()
 			}
-			atomic.AddInt32(&fc.size, -1)
+			newSize := atomic.AddInt32(&fc.size, -1)
+			// Track forced eviction
+			metrics.FDCacheEvictions.Inc()
+			// Update cache size metric
+			metrics.FDCacheSize.Set(float64(newSize))
 		}
 	}
 }
