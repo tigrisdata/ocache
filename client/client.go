@@ -71,11 +71,6 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 				first = false
 			}
 
-			// Check context before sending
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
 			if sendErr := stream.Send(req); sendErr != nil {
 				return sendErr
 			}
