@@ -10,6 +10,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
@@ -56,6 +57,9 @@ func (r *RecoveryManager) RecoverOnStartup() error {
 	zlog.Info().Msg("files.recovery: starting startup recovery")
 	startTime := time.Now()
 
+	// Increment recovery runs counter
+	metrics.RecoveryRuns.Inc()
+
 	var stats *RecoveryStats
 	var err error
 
@@ -70,6 +74,12 @@ func (r *RecoveryManager) RecoverOnStartup() error {
 	}
 
 	stats.Duration = time.Since(startTime)
+
+	// Record recovery duration in milliseconds
+	metrics.RecoveryDuration.Observe(float64(stats.Duration.Milliseconds()))
+
+	// Record recovered keys metric (valid entries that were recovered)
+	metrics.RecoveryKeysRecovered.Add(float64(stats.Valid))
 
 	zlog.Info().
 		Int("total", stats.Total).

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -52,6 +53,14 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 	zlog.Info().
 		Float64("threshold", sr.fragThreshold).
 		Msg("recompactor: starting segment recompaction scan")
+
+	// Increment recompaction runs counter
+	metrics.RecompactionRuns.Inc()
+	startTime := time.Now()
+	defer func() {
+		// Record recompaction duration in milliseconds
+		metrics.RecompactionDuration.Observe(float64(time.Since(startTime).Milliseconds()))
+	}()
 
 	// Get all segments
 	segments := sr.sm.GetSegments()
@@ -122,6 +131,8 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 			continue
 		}
 
+		// Increment segments counter
+		metrics.RecompactionSegments.Inc()
 		recompactedCount++
 	}
 
@@ -216,6 +227,10 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 
 		copiedEntries++
 		copiedBytes += entry.ValueLength
+
+		// Update metrics
+		metrics.RecompactionEntriesCopied.Inc()
+		metrics.RecompactionBytesCopied.Add(float64(entry.ValueLength))
 	}
 
 	// If no live entries were copied, abandon the new segment but still delete the old one
@@ -257,6 +272,14 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	if err := sr.removeDeleteIndex(oldSeg.Path()); err != nil {
 		zlog.Error().Err(err).Str("segment", oldSeg.Path()).
 			Msg("recompactor: failed to remove delete index")
+	}
+
+	// Calculate bytes freed (assuming old segment will be deleted)
+	if oldSegInfo, err := os.Stat(oldSeg.Path()); err == nil {
+		bytesFreed := oldSegInfo.Size() - copiedBytes
+		if bytesFreed > 0 {
+			metrics.RecompactionBytesFreed.Add(float64(bytesFreed))
+		}
 	}
 
 	zlog.Info().

@@ -363,6 +363,94 @@ var (
 			Help: "Total number of cache misses",
 		},
 	)
+
+	// Deletion Queue Metrics
+	DeletionQueueAdded = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_deletion_queue_added_total",
+			Help: "Total number of files added to deletion queue",
+		},
+	)
+
+	DeletionQueueProcessed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_deletion_queue_processed_total",
+			Help: "Total number of files successfully deleted from queue",
+		},
+	)
+
+	DeletionQueueFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_deletion_queue_failed_total",
+			Help: "Total number of failed deletion attempts",
+		},
+	)
+
+	DeletionQueuePruned = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_deletion_queue_pruned_total",
+			Help: "Total number of old entries pruned from queue",
+		},
+	)
+
+	DeletionQueueDepth = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_deletion_queue_depth",
+			Help: "Current number of files pending deletion",
+		},
+	)
+
+	DeletionQueueBatchDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "ocache_deletion_queue_batch_duration_ms",
+			Help:    "Deletion queue batch processing duration in milliseconds",
+			Buckets: longOpsBuckets,
+		},
+	)
+
+	// Recompaction Metrics
+	RecompactionRuns = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_recompaction_runs_total",
+			Help: "Total number of recompaction runs",
+		},
+	)
+
+	RecompactionSegments = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_recompaction_segments_total",
+			Help: "Total number of segments recompacted",
+		},
+	)
+
+	RecompactionDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "ocache_recompaction_duration_ms",
+			Help:    "Recompaction duration in milliseconds",
+			Buckets: longOpsBuckets,
+		},
+	)
+
+	RecompactionEntriesCopied = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_recompaction_entries_copied_total",
+			Help: "Total number of entries copied during recompaction",
+		},
+	)
+
+	RecompactionBytesCopied = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_recompaction_bytes_copied_total",
+			Help: "Total bytes copied during recompaction",
+		},
+	)
+
+	RecompactionBytesFreed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_recompaction_bytes_freed_total",
+			Help: "Total bytes freed by recompaction",
+		},
+	)
 )
 
 // Init initializes the metrics package
