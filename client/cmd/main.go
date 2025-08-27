@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -49,6 +51,22 @@ func newClient() *cacheclient.Client {
 	return c
 }
 
+// createContext creates a context that is cancelled on interrupt signal
+func createContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Set up signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		cancel()
+	}()
+
+	return ctx, cancel
+}
+
 var putCmd = &cobra.Command{
 	Use:   "put <key> [value]",
 	Short: "Put a value in the cache (reads from stdin if value not provided)",
@@ -62,6 +80,9 @@ Examples:
   cat file.txt | ocachecli put mykey`,
 	Args: cobra.RangeArgs(1, 2),
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx, cancel := createContext()
+		defer cancel()
+
 		c := newClient()
 		defer c.Close()
 
@@ -69,14 +90,18 @@ Examples:
 
 		if len(args) == 2 {
 			// Value provided as argument - use regular Put for small values
-			err = c.Put(context.Background(), args[0], []byte(args[1]), ttl)
+			err = c.Put(ctx, args[0], []byte(args[1]), ttl)
 		} else {
 			// Read value from stdin - use streaming to avoid loading all into memory
-			err = c.PutStream(context.Background(), args[0], os.Stdin, ttl)
+			err = c.PutStream(ctx, args[0], os.Stdin, ttl)
 		}
 
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Put failed: %v\n", err)
+			if err == context.Canceled {
+				fmt.Fprintf(os.Stderr, "Put cancelled\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "Put failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 		fmt.Println("OK")
@@ -88,12 +113,19 @@ var getCmd = &cobra.Command{
 	Short: "Get a value from the cache",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx, cancel := createContext()
+		defer cancel()
+
 		c := newClient()
 		defer c.Close()
 		// Use streaming to output directly to stdout without loading into memory
-		err := c.GetStream(context.Background(), args[0], os.Stdout)
+		err := c.GetStream(ctx, args[0], os.Stdout)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Get failed: %v\n", err)
+			if err == context.Canceled {
+				fmt.Fprintf(os.Stderr, "Get cancelled\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "Get failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 		// Note: No need to print newline as data is written directly to stdout
@@ -106,11 +138,18 @@ var delCmd = &cobra.Command{
 	Short:   "Delete a key from the cache",
 	Args:    cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx, cancel := createContext()
+		defer cancel()
+
 		c := newClient()
 		defer c.Close()
-		err := c.Delete(context.Background(), args[0])
+		err := c.Delete(ctx, args[0])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Delete failed: %v\n", err)
+			if err == context.Canceled {
+				fmt.Fprintf(os.Stderr, "Delete cancelled\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "Delete failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 		fmt.Println("OK")
@@ -121,11 +160,18 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all keys in the cache",
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx, cancel := createContext()
+		defer cancel()
+
 		c := newClient()
 		defer c.Close()
-		keys, err := c.List(context.Background(), listPrefix)
+		keys, err := c.List(ctx, listPrefix)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "List failed: %v\n", err)
+			if err == context.Canceled {
+				fmt.Fprintf(os.Stderr, "List cancelled\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "List failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 		for _, k := range keys {
@@ -138,6 +184,9 @@ var benchCmd = &cobra.Command{
 	Use:   "bench",
 	Short: "Run a YCSB-style benchmark against the cache service",
 	Run: func(cmd *cobra.Command, args []string) {
+		ctx, cancel := createContext()
+		defer cancel()
+
 		cfg := ycsb.YCSBConfig{
 			Addr:           addr,
 			NumKeys:        numKeys,
@@ -149,9 +198,13 @@ var benchCmd = &cobra.Command{
 			NoProgress:     noProgress,
 			ForceStreaming: forceStreaming,
 		}
-		_, err := ycsb.RunYCSB(cfg)
+		_, err := ycsb.RunYCSBWithContext(ctx, cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Benchmark failed: %v\n", err)
+			if err == context.Canceled {
+				fmt.Fprintf(os.Stderr, "Benchmark cancelled\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "Benchmark failed: %v\n", err)
+			}
 			os.Exit(1)
 		}
 	},

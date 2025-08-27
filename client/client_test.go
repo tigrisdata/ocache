@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 )
@@ -96,60 +98,145 @@ func (m *mockListStream) Recv() (*pb.ListResponse, error) {
 }
 
 func TestClient_Put(t *testing.T) {
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{}
 	c := &Client{client: mock}
-	err := c.Put(context.Background(), "key", []byte("data"), 0)
+	err := c.Put(ctx, "key", []byte("data"), 0)
 	assert.NoError(t, err)
 	assert.True(t, mock.putObjectCalled)
 }
 
 func TestClient_PutStream(t *testing.T) {
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{}
 	c := &Client{client: mock}
 	data := []byte("streamed data")
-	err := c.PutStream(context.Background(), "key", bytes.NewReader(data), 0)
+	err := c.PutStream(ctx, "key", bytes.NewReader(data), 0)
 	assert.NoError(t, err)
 	assert.Greater(t, len(mock.putStreamData), 0)
 }
 
 func TestClient_Get(t *testing.T) {
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{getData: [][]byte{[]byte("foo"), []byte("bar")}}
 	c := &Client{client: mock}
-	result, err := c.Get(context.Background(), "key")
+	result, err := c.Get(ctx, "key")
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("foobar"), result)
 }
 
 func TestClient_GetStream(t *testing.T) {
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{getData: [][]byte{[]byte("foo"), []byte("bar")}}
 	c := &Client{client: mock}
 	var buf bytes.Buffer
-	err := c.GetStream(context.Background(), "key", &buf)
+	err := c.GetStream(ctx, "key", &buf)
 	assert.NoError(t, err)
 	assert.Equal(t, "foobar", buf.String())
 }
 
 func TestClient_Delete(t *testing.T) {
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{}
 	c := &Client{client: mock}
-	err := c.Delete(context.Background(), "key")
+	err := c.Delete(ctx, "key")
 	assert.NoError(t, err)
 	assert.True(t, mock.deleteCalled)
 }
 
 func TestClient_List(t *testing.T) {
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{listKeys: []string{"a", "b", "c"}}
 	c := &Client{client: mock}
-	keys, err := c.List(context.Background(), "")
+	keys, err := c.List(ctx, "")
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"a", "b", "c"}, keys)
 }
 
 func TestClient_ListWithPrefix(t *testing.T) {
 	// Test that the prefix is correctly passed to the request
+	ctx := context.TODO()
 	mock := &mockCacheServiceClient{listKeys: []string{"user:a", "user:b"}}
 	c := &Client{client: mock}
-	keys, err := c.List(context.Background(), "user:")
+	keys, err := c.List(ctx, "user:")
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"user:a", "user:b"}, keys)
+}
+
+// Test context cancellation handling
+func TestClient_ContextCancellation(t *testing.T) {
+	t.Run("PutStream cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		mock := &mockCacheServiceClient{}
+		c := &Client{client: mock}
+
+		// Create a reader that will block
+		pr, pw := io.Pipe()
+		defer pr.Close()
+		defer pw.Close()
+
+		// Cancel context immediately
+		cancel()
+
+		// Should return context error
+		err := c.PutStream(ctx, "key", pr, 0)
+		require.Error(t, err)
+		assert.Equal(t, context.Canceled, err)
+	})
+
+	t.Run("Get cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel immediately
+		cancel()
+
+		mock := &mockCacheServiceClient{getData: [][]byte{[]byte("foo"), []byte("bar")}}
+		c := &Client{client: mock}
+
+		_, err := c.Get(ctx, "key")
+		require.Error(t, err)
+		assert.Equal(t, context.Canceled, err)
+	})
+
+	t.Run("GetStream cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel immediately
+		cancel()
+
+		mock := &mockCacheServiceClient{getData: [][]byte{[]byte("foo"), []byte("bar")}}
+		c := &Client{client: mock}
+
+		var buf bytes.Buffer
+		err := c.GetStream(ctx, "key", &buf)
+		require.Error(t, err)
+		assert.Equal(t, context.Canceled, err)
+	})
+
+	t.Run("List cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Cancel immediately
+		cancel()
+
+		mock := &mockCacheServiceClient{listKeys: []string{"a", "b", "c"}}
+		c := &Client{client: mock}
+
+		_, err := c.List(ctx, "")
+		require.Error(t, err)
+		assert.Equal(t, context.Canceled, err)
+	})
+}
+
+// Test context timeout handling
+func TestClient_ContextTimeout(t *testing.T) {
+	t.Run("operation with timeout", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		mock := &mockCacheServiceClient{getData: [][]byte{[]byte("foo")}}
+		c := &Client{client: mock}
+
+		// This should succeed as mock operations are instant
+		result, err := c.Get(ctx, "key")
+		assert.NoError(t, err)
+		assert.Equal(t, []byte("foo"), result)
+	})
 }
