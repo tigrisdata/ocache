@@ -169,20 +169,17 @@ func TestConnectionPool_List(t *testing.T) {
 	assert.ElementsMatch(t, []string{"key1", "key2", "key3"}, keys)
 }
 
-func TestConnectionPool_Execute_BackwardCompatibility(t *testing.T) {
-	ctx := context.TODO()
+func TestConnectionPool_GetClient_Advanced(t *testing.T) {
 	pool := mockPoolForTesting(2)
 
-	// Test that Execute still works for backward compatibility
-	executed := false
-	err := pool.Execute(ctx, func(ctx context.Context, client *Client) error {
-		executed = true
-		assert.NotNil(t, client)
-		return nil
-	})
+	// Test that GetClient can still be used for advanced cases
+	client := pool.GetClient()
+	assert.NotNil(t, client)
 
+	// Verify we can use the client directly
+	ctx := context.TODO()
+	err := client.Put(ctx, "key", []byte("value"), 0)
 	assert.NoError(t, err)
-	assert.True(t, executed)
 }
 
 func TestConnectionPool_ConcurrentAccess(t *testing.T) {

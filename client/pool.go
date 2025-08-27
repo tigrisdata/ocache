@@ -45,8 +45,8 @@ func NewConnectionPool(addr string, size int, opts ...grpc.DialOption) (*Connect
 }
 
 // GetClient returns a client from the pool using round-robin selection.
-// Deprecated: This method is exposed for advanced use cases. For normal operations,
-// use the direct methods (Put, Get, Delete, List) instead.
+// This method is exposed for advanced use cases where you need direct access to a client.
+// For normal operations, use the direct methods (Put, Get, Delete, List) instead.
 func (p *ConnectionPool) GetClient() *Client {
 	p.mu.Lock()
 	client := p.clients[p.index]
@@ -70,14 +70,6 @@ func (p *ConnectionPool) Close() error {
 		}
 	}
 	return firstErr
-}
-
-// Execute runs a function with a client from the pool.
-// Deprecated: Use the direct methods (Put, Get, Delete, List) instead for better usability.
-// This method is kept for backward compatibility.
-func (p *ConnectionPool) Execute(ctx context.Context, fn func(context.Context, *Client) error) error {
-	client := p.GetClient()
-	return fn(ctx, client)
 }
 
 // Put stores a key-value pair in the cache using a client from the pool.

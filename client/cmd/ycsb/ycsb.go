@@ -170,14 +170,15 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 
 		k := hashKey(i)
 		val := generateValue(rng, cfg.ValueSize)
-		err := pool.Execute(ctx, func(ctx context.Context, c *cacheclient.Client) error {
-			useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
-			if useStreaming {
-				return c.PutStream(ctx, k, bytes.NewReader(val), 0)
-			} else {
-				return c.Put(ctx, k, val, 0)
-			}
-		})
+
+		var err error
+		useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+		if useStreaming {
+			err = pool.PutStream(ctx, k, bytes.NewReader(val), 0)
+		} else {
+			err = pool.Put(ctx, k, val, 0)
+		}
+
 		if err != nil {
 			atomic.AddInt32(&preloadErrors, 1)
 			select {
