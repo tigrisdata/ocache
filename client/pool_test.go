@@ -89,7 +89,7 @@ func TestConnectionPool_Put(t *testing.T) {
 
 	// Verify that one of the clients was used
 	mock := pool.clients[0].client.(*mockCacheServiceClient)
-	assert.True(t, mock.putObjectCalled)
+	assert.True(t, mock.getPutObjectCalled())
 }
 
 func TestConnectionPool_PutStream(t *testing.T) {
@@ -102,7 +102,7 @@ func TestConnectionPool_PutStream(t *testing.T) {
 
 	// Verify that streaming was used
 	mock := pool.clients[0].client.(*mockCacheServiceClient)
-	assert.Greater(t, len(mock.putStreamData), 0)
+	assert.Greater(t, mock.getPutStreamDataLen(), 0)
 }
 
 func TestConnectionPool_GetData(t *testing.T) {
@@ -149,7 +149,7 @@ func TestConnectionPool_Delete(t *testing.T) {
 
 	// Verify delete was called
 	mock := pool.clients[0].client.(*mockCacheServiceClient)
-	assert.True(t, mock.deleteCalled)
+	assert.True(t, mock.getDeleteCalled())
 }
 
 func TestConnectionPool_List(t *testing.T) {

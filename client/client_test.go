@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 type mockCacheServiceClient struct {
 	pb.CacheServiceClient
+	mu              sync.Mutex
 	putObjectCalled bool
 	putStreamData   [][]byte
 	getData         [][]byte
@@ -22,9 +24,30 @@ type mockCacheServiceClient struct {
 	listKeys        []string
 }
 
+// Thread-safe getters for test assertions
+func (m *mockCacheServiceClient) getPutObjectCalled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.putObjectCalled
+}
+
+func (m *mockCacheServiceClient) getPutStreamDataLen() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.putStreamData)
+}
+
+func (m *mockCacheServiceClient) getDeleteCalled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.deleteCalled
+}
+
 func (m *mockCacheServiceClient) PutObject(ctx context.Context, req *pb.PutRequest, opts ...grpc.CallOption) (*pb.PutResponse, error) {
+	m.mu.Lock()
 	m.putObjectCalled = true
 	m.putStreamData = [][]byte{req.Data}
+	m.mu.Unlock()
 	return &pb.PutResponse{Success: true}, nil
 }
 
@@ -46,7 +69,9 @@ type mockPutStream struct {
 }
 
 func (m *mockPutStream) Send(req *pb.PutRequest) error {
+	m.mock.mu.Lock()
 	m.mock.putStreamData = append(m.mock.putStreamData, req.Data)
+	m.mock.mu.Unlock()
 	if m.first == false && req.Key != "" {
 		m.key = req.Key
 		m.ttl = req.TtlSeconds
@@ -88,7 +113,9 @@ func (m *mockGetStream) Recv() (*pb.GetResponse, error) {
 }
 
 func (m *mockCacheServiceClient) Delete(ctx context.Context, req *pb.DeleteRequest, opts ...grpc.CallOption) (*pb.DeleteResponse, error) {
+	m.mu.Lock()
 	m.deleteCalled = true
+	m.mu.Unlock()
 	return &pb.DeleteResponse{Success: true}, nil
 }
 
@@ -126,7 +153,7 @@ func TestClient_Put(t *testing.T) {
 	c := &Client{client: mock}
 	err := c.Put(ctx, "key", []byte("data"), 0)
 	assert.NoError(t, err)
-	assert.True(t, mock.putObjectCalled)
+	assert.True(t, mock.getPutObjectCalled())
 }
 
 func TestClient_PutStream(t *testing.T) {
@@ -136,7 +163,7 @@ func TestClient_PutStream(t *testing.T) {
 	data := []byte("streamed data")
 	err := c.PutStream(ctx, "key", bytes.NewReader(data), 0)
 	assert.NoError(t, err)
-	assert.Greater(t, len(mock.putStreamData), 0)
+	assert.Greater(t, mock.getPutStreamDataLen(), 0)
 }
 
 func TestClient_Get(t *testing.T) {
@@ -164,7 +191,7 @@ func TestClient_Delete(t *testing.T) {
 	c := &Client{client: mock}
 	err := c.Delete(ctx, "key")
 	assert.NoError(t, err)
-	assert.True(t, mock.deleteCalled)
+	assert.True(t, mock.getDeleteCalled())
 }
 
 func TestClient_List(t *testing.T) {
