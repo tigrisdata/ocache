@@ -215,8 +215,8 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 		metrics.RPCDuration.WithLabelValues("List").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	zlog.Debug().Msg("gRPC List called")
-	keys, err := stor.GetStorage().ListKeys()
+	zlog.Debug().Str("prefix", req.Prefix).Msg("gRPC List called")
+	keys, err := stor.GetStorage().ListKeys(req.Prefix)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("List", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "List").Inc()

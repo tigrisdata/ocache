@@ -23,6 +23,9 @@ func setupTestStorage(t *testing.T) {
 		FragThreshold:      0.5,
 		CompactionInterval: 100 * time.Millisecond,
 	})
+	t.Cleanup(func() {
+		stor.CloseStorage()
+	})
 }
 
 func TestCacheService_PutObjectAndGet(t *testing.T) {
@@ -92,6 +95,79 @@ func TestCacheService_List(t *testing.T) {
 	}
 	for _, k := range keys {
 		assert.Contains(t, found, k)
+	}
+}
+
+func TestCacheService_ListWithPrefix(t *testing.T) {
+	setupTestStorage(t)
+	svc := &cacheService{}
+	ctx := context.Background()
+
+	// Create test keys with different prefixes
+	testKeys := []struct {
+		key   string
+		value string
+	}{
+		{"user:alice", "alice"},
+		{"user:bob", "bob"},
+		{"user:charlie", "charlie"},
+		{"session:123", "session123"},
+		{"session:456", "session456"},
+		{"cache:temp", "temp"},
+		{"other", "other"},
+	}
+
+	// Put all test keys
+	for _, tk := range testKeys {
+		_, err := svc.PutObject(ctx, &pb.PutRequest{Key: tk.key, Data: []byte(tk.value), TtlSeconds: 0})
+		assert.NoError(t, err)
+	}
+
+	// Test cases with different prefixes
+	testCases := []struct {
+		name     string
+		prefix   string
+		expected []string
+	}{
+		{
+			name:     "user prefix",
+			prefix:   "user:",
+			expected: []string{"user:alice", "user:bob", "user:charlie"},
+		},
+		{
+			name:     "session prefix",
+			prefix:   "session:",
+			expected: []string{"session:123", "session:456"},
+		},
+		{
+			name:     "cache prefix",
+			prefix:   "cache:",
+			expected: []string{"cache:temp"},
+		},
+		{
+			name:     "empty prefix returns all",
+			prefix:   "",
+			expected: []string{"user:alice", "user:bob", "user:charlie", "session:123", "session:456", "cache:temp", "other"},
+		},
+		{
+			name:     "non-existent prefix",
+			prefix:   "notfound:",
+			expected: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := &mockListServer{responses: []*pb.ListResponse{}}
+			err := svc.List(&pb.ListRequest{Prefix: tc.prefix}, stream)
+			assert.NoError(t, err)
+
+			var found []string
+			for _, resp := range stream.responses {
+				found = append(found, resp.Keys...)
+			}
+			assert.ElementsMatch(t, tc.expected, found, "unexpected keys for prefix %q", tc.prefix)
+		})
 	}
 }
 

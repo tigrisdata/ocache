@@ -931,7 +931,7 @@ func (s *CleanerSuite) Test_Cleaner_DiskUsageLimit() {
 	time.Sleep(3 * time.Second)
 
 	// Count remaining keys
-	keys, err := s.Harness.Storage.ListKeys()
+	keys, err := s.Harness.Storage.ListKeys("")
 	require.NoError(s.T(), err)
 
 	diskKeysFound := 0

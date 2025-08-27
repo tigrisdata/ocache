@@ -133,8 +133,8 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	return err
 }
 
-func (c *Client) List(ctx context.Context) ([]string, error) {
-	stream, err := c.client.List(ctx, &pb.ListRequest{})
+func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
+	stream, err := c.client.List(ctx, &pb.ListRequest{Prefix: prefix})
 	if err != nil {
 		return nil, err
 	}
