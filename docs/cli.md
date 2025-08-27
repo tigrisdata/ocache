@@ -19,7 +19,7 @@ go build -o ocachecli ./client/cmd/
 ## Basic Usage
 
 ```bash
-./ocachecli [global options] command [command options] [arguments...]
+ocachecli [global options] command [command options] [arguments...]
 ```
 
 ### Global Options
@@ -137,22 +137,22 @@ nc -zv localhost 9000
 ./ocache -v
 
 # Try with explicit IPv4
-./ocachecli --addr 127.0.0.1:9000 list
+ocachecli --addr 127.0.0.1:9000 list
 ```
 
 ### Performance Issues
 
 ```bash
 # Run baseline benchmark
-./ocachecli bench --num-ops 1000
+ocachecli bench --num-ops 1000
 
 # Test with different concurrency
-./ocachecli bench --concurrency 1
-./ocachecli bench --concurrency 32
+ocachecli bench --concurrency 1
+ocachecli bench --concurrency 32
 
 # Test with different value sizes
-./ocachecli bench --value-size 10
-./ocachecli bench --value-size 100000
+ocachecli bench --value-size 10
+ocachecli bench --value-size 100000
 ```
 
 ## See Also

@@ -3,7 +3,7 @@
 Run performance benchmarks against the cache service.
 
 ```bash
-./ocachecli bench [options]
+ocachecli bench [options]
 ```
 
 **Options:**
@@ -37,22 +37,22 @@ Then, run the benchmark:
 
 ```bash
 # Run default benchmark (Workload A)
-./ocachecli bench
+ocachecli bench
 
 # Run read-heavy benchmark with more operations
-./ocachecli bench --workload B --num-ops 100000
+ocachecli bench --workload B --num-ops 100000
 
 # Run with custom workload mix
-./ocachecli bench --workload "read=70,update=30"
+ocachecli bench --workload "read=70,update=30"
 
 # High concurrency test
-./ocachecli bench --concurrency 50 --num-keys 10000
+ocachecli bench --concurrency 50 --num-keys 10000
 
 # Large value test
-./ocachecli bench --value-size 1000000 --num-ops 1000
+ocachecli bench --value-size 1000000 --num-ops 1000
 
 # Comprehensive benchmark
-./ocachecli bench \
+ocachecli bench \
   --workload B \
   --concurrency 16 \
   --num-keys 5000 \
@@ -65,13 +65,13 @@ Then, run the benchmark:
 ```bash
 # Run all three sizes sequentially to test cache behavior across object sizes
 echo "=== Testing 100 byte objects ==="
-./ocachecli bench --value-size 100 --num-ops 10000 --workload A
+ocachecli bench --value-size 100 --num-ops 10000 --workload A
 
 echo "=== Testing 100 KB objects ==="
-./ocachecli bench --value-size 100000 --num-ops 10000 --workload B
+ocachecli bench --value-size 100000 --num-ops 10000 --workload B
 
 echo "=== Testing 1 MB objects ==="
-./ocachecli bench --value-size 1000000 --num-ops 10000 --workload C
+ocachecli bench --value-size 1000000 --num-ops 10000 --workload C
 ```
 
 **Output:**
