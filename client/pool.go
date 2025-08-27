@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 )
@@ -13,8 +13,7 @@ import (
 type ConnectionPool struct {
 	clients []*Client
 	size    int
-	mu      sync.Mutex
-	index   int
+	index   atomic.Uint64
 }
 
 // NewConnectionPool creates a new connection pool with the specified size.
@@ -48,10 +47,10 @@ func NewConnectionPool(addr string, size int, opts ...grpc.DialOption) (*Connect
 // This method is exposed for advanced use cases where you need direct access to a client.
 // For normal operations, use the direct methods (Put, Get, Delete, List) instead.
 func (p *ConnectionPool) GetClient() *Client {
-	p.mu.Lock()
-	client := p.clients[p.index]
-	p.index = (p.index + 1) % p.size
-	p.mu.Unlock()
+	// Atomic increment and get the index
+	idx := p.index.Add(1) - 1
+	// Use modulo to wrap around
+	client := p.clients[idx%uint64(p.size)]
 	return client
 }
 
