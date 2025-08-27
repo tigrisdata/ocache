@@ -37,6 +37,7 @@ var (
 	seed           int64
 	noProgress     bool
 	forceStreaming bool
+	listPrefix     string
 )
 
 func newClient() *cacheclient.Client {
@@ -122,7 +123,7 @@ var listCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		c := newClient()
 		defer c.Close()
-		keys, err := c.List(context.Background())
+		keys, err := c.List(context.Background(), listPrefix)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "List failed: %v\n", err)
 			os.Exit(1)
@@ -159,6 +160,7 @@ var benchCmd = &cobra.Command{
 func init() {
 	rootCmd.PersistentFlags().StringVar(&addr, "addr", "localhost:9000", "Cache server address")
 	putCmd.Flags().Int64Var(&ttl, "ttl", 0, "TTL for the key in seconds (0 = no expiry)")
+	listCmd.Flags().StringVar(&listPrefix, "prefix", "", "Optional prefix to filter keys")
 	benchCmd.Flags().IntVar(&numKeys, "num-keys", 1000, "Number of unique keys")
 	benchCmd.Flags().IntVar(&valueSize, "value-size", 100, "Value size in bytes")
 	benchCmd.Flags().IntVar(&numOps, "num-ops", 10000, "Total number of operations")

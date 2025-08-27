@@ -52,7 +52,7 @@ func TestTTLCleanup(t *testing.T) {
 	}
 
 	// Verify all keys exist
-	keys, err := s.ListKeys()
+	keys, err := s.ListKeys("")
 	require.NoError(t, err)
 	assert.Equal(t, 10, len(keys))
 
@@ -60,7 +60,7 @@ func TestTTLCleanup(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Check that expired keys are gone
-	keys, err = s.ListKeys()
+	keys, err = s.ListKeys("")
 	require.NoError(t, err)
 	assert.Equal(t, 5, len(keys))
 
@@ -132,7 +132,7 @@ func TestLRUEviction(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	// Check remaining keys
-	keys, err := s.ListKeys()
+	keys, err := s.ListKeys("")
 	require.NoError(t, err)
 
 	// With 1KB limit and 15 keys of 100 bytes each (1500 bytes total),

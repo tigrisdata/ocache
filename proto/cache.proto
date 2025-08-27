@@ -61,7 +61,9 @@ message DeleteResponse {
   string error  = 2;
 }
 
-message ListRequest {}
+message ListRequest {
+  string prefix = 1; // Optional prefix to filter keys
+}
 
 message ListResponse {
   repeated string keys = 1;

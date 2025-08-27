@@ -302,9 +302,9 @@ func CloseStorage() {
 	metadata.CloseMetaDB()
 }
 
-// ListKeys returns all non-expired keys in the RocksDB instance
+// ListKeys returns all non-expired keys in the RocksDB instance that match the given prefix
 // Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
-func (s *Storage) ListKeys() ([]string, error) {
+func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -318,9 +318,18 @@ func (s *Storage) ListKeys() ([]string, error) {
 	defer it.Close()
 
 	var keyList []string
-	prefix := []byte(keys.MetadataPrefix)
 
-	// Seek to the metadata prefix to start iteration
+	// Construct the prefix for RocksDB iteration
+	var prefix []byte
+	if userPrefix != "" {
+		// Combine metadata prefix with user-provided prefix for efficient iteration
+		prefix = keys.MakeMetadataKey(userPrefix)
+	} else {
+		// Use just the metadata prefix to get all keys
+		prefix = []byte(keys.MetadataPrefix)
+	}
+
+	// Seek to the constructed prefix to start iteration
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		k := it.Key().Data()
 		v := it.Value().Data()

@@ -218,7 +218,7 @@ func VerifyTTLCleanup(t *testing.T, storage *storage.Storage, expiredKeys []stri
 
 // VerifyLRUEviction verifies that LRU eviction is working correctly
 func VerifyLRUEviction(t *testing.T, storage *storage.Storage, maxKeys int) {
-	keys, err := storage.ListKeys()
+	keys, err := storage.ListKeys("")
 	require.NoError(t, err)
 
 	assert.LessOrEqual(t, len(keys), maxKeys,

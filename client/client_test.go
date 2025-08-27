@@ -140,7 +140,16 @@ func TestClient_Delete(t *testing.T) {
 func TestClient_List(t *testing.T) {
 	mock := &mockCacheServiceClient{listKeys: []string{"a", "b", "c"}}
 	c := &Client{client: mock}
-	keys, err := c.List(context.Background())
+	keys, err := c.List(context.Background(), "")
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, []string{"a", "b", "c"}, keys)
+}
+
+func TestClient_ListWithPrefix(t *testing.T) {
+	// Test that the prefix is correctly passed to the request
+	mock := &mockCacheServiceClient{listKeys: []string{"user:a", "user:b"}}
+	c := &Client{client: mock}
+	keys, err := c.List(context.Background(), "user:")
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{"user:a", "user:b"}, keys)
 }

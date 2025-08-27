@@ -296,7 +296,7 @@ func (h *IntegrationTestHarness) GetStorageStats() StorageStats {
 	stats := StorageStats{}
 
 	// Get list of keys
-	keys, err := h.Storage.ListKeys()
+	keys, err := h.Storage.ListKeys("")
 	if err == nil {
 		stats.TotalKeys = len(keys)
 

@@ -66,7 +66,7 @@ func TestStorage_ListKeys(t *testing.T) {
 		err := s.Put(k, bytes.NewReader([]byte(k)), 0)
 		assert.NoError(t, err, "Put failed")
 	}
-	foundKeys, err := s.ListKeys()
+	foundKeys, err := s.ListKeys("")
 	assert.NoError(t, err, "ListKeys failed")
 	for _, k := range keys {
 		assert.Contains(t, foundKeys, k, "key %q not found in ListKeys", k)
@@ -115,7 +115,7 @@ func TestStorage_ListKeys_WithInternalKeys(t *testing.T) {
 	s.meta.Handle().Put(wo, []byte("!compact/00000000000000000001|user1"), []byte("/path"))
 
 	// ListKeys should only return user keys
-	keys, err := s.ListKeys()
+	keys, err := s.ListKeys("")
 	assert.NoError(t, err, "ListKeys failed")
 	assert.Equal(t, len(userKeys), len(keys), "should return only user keys")
 
@@ -144,7 +144,7 @@ func TestStorage_ListKeys_WithExpiredKeys(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// ListKeys should only return non-expired keys
-	keys, err := s.ListKeys()
+	keys, err := s.ListKeys("")
 	assert.NoError(t, err, "ListKeys failed")
 	assert.Equal(t, len(permanentKeys), len(keys), "should return only non-expired keys")
 
@@ -152,6 +152,86 @@ func TestStorage_ListKeys_WithExpiredKeys(t *testing.T) {
 		assert.Contains(t, keys, expected, "should contain permanent key %s", expected)
 	}
 	assert.NotContains(t, keys, "expired", "should not contain expired key")
+}
+
+func TestStorage_ListKeys_WithPrefix(t *testing.T) {
+	// Test that ListKeys correctly filters by prefix using RocksDB prefix iteration
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Add keys with different prefixes
+	testKeys := map[string]string{
+		"user:alice":    "alice_data",
+		"user:bob":      "bob_data",
+		"user:charlie":  "charlie_data",
+		"session:123":   "session_data",
+		"session:456":   "session_data",
+		"cache:temp":    "temp_data",
+		"cache:persist": "persist_data",
+		"noprefix":      "no_prefix_data",
+	}
+
+	// Put all test keys
+	for key, value := range testKeys {
+		err := s.Put(key, bytes.NewReader([]byte(value)), 0)
+		assert.NoError(t, err, "Put failed for %s", key)
+	}
+
+	// Test different prefix scenarios
+	testCases := []struct {
+		name     string
+		prefix   string
+		expected []string
+	}{
+		{
+			name:     "user prefix",
+			prefix:   "user:",
+			expected: []string{"user:alice", "user:bob", "user:charlie"},
+		},
+		{
+			name:     "session prefix",
+			prefix:   "session:",
+			expected: []string{"session:123", "session:456"},
+		},
+		{
+			name:     "cache prefix",
+			prefix:   "cache:",
+			expected: []string{"cache:temp", "cache:persist"},
+		},
+		{
+			name:     "partial prefix user",
+			prefix:   "user",
+			expected: []string{"user:alice", "user:bob", "user:charlie"},
+		},
+		{
+			name:     "single char prefix",
+			prefix:   "u",
+			expected: []string{"user:alice", "user:bob", "user:charlie"},
+		},
+		{
+			name:     "non-existent prefix",
+			prefix:   "notfound:",
+			expected: []string{},
+		},
+		{
+			name:     "empty prefix returns all",
+			prefix:   "",
+			expected: []string{"user:alice", "user:bob", "user:charlie", "session:123", "session:456", "cache:temp", "cache:persist", "noprefix"},
+		},
+		{
+			name:     "specific key as prefix",
+			prefix:   "user:alice",
+			expected: []string{"user:alice"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			keys, err := s.ListKeys(tc.prefix)
+			assert.NoError(t, err, "ListKeys failed for prefix %q", tc.prefix)
+			assert.ElementsMatch(t, tc.expected, keys, "unexpected keys for prefix %q", tc.prefix)
+		})
+	}
 }
 
 // TestStorage_Get_ByteRange_SmallObject tests byte-range requests for inline (small) objects
