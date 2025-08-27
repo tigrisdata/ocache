@@ -55,6 +55,13 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 	totalBytes := 0
 
 	for {
+		// Check for context cancellation before reading
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		n, err := r.Read(buf)
 		if n > 0 {
 			req := &pb.PutRequest{Data: buf[:n]}
@@ -63,6 +70,7 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 				req.TtlSeconds = ttlSeconds
 				first = false
 			}
+
 			if sendErr := stream.Send(req); sendErr != nil {
 				return sendErr
 			}
@@ -94,6 +102,13 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	}
 	var result []byte
 	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		resp, err := stream.Recv()
 		if err == io.EOF {
 			break
@@ -114,6 +129,13 @@ func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
 		return err
 	}
 	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		resp, err := stream.Recv()
 		if err == io.EOF {
 			break
@@ -140,6 +162,13 @@ func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 	}
 	var keys []string
 	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		resp, err := stream.Recv()
 		if err == io.EOF {
 			break
