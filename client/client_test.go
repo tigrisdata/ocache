@@ -29,12 +29,17 @@ func (m *mockCacheServiceClient) PutObject(ctx context.Context, req *pb.PutReque
 }
 
 func (m *mockCacheServiceClient) Put(ctx context.Context, opts ...grpc.CallOption) (pb.CacheService_PutClient, error) {
-	return &mockPutStream{mock: m}, nil
+	// Check if context is already cancelled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return &mockPutStream{mock: m, ctx: ctx}, nil
 }
 
 type mockPutStream struct {
 	grpc.ClientStream
 	mock  *mockCacheServiceClient
+	ctx   context.Context
 	first bool
 	key   string
 	ttl   int64
@@ -55,16 +60,25 @@ func (m *mockPutStream) CloseAndRecv() (*pb.PutResponse, error) {
 }
 
 func (m *mockCacheServiceClient) Get(ctx context.Context, req *pb.GetRequest, opts ...grpc.CallOption) (pb.CacheService_GetClient, error) {
-	return &mockGetStream{data: m.getData}, nil
+	// Check if context is already cancelled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return &mockGetStream{ctx: ctx, data: m.getData}, nil
 }
 
 type mockGetStream struct {
 	grpc.ClientStream
+	ctx  context.Context
 	data [][]byte
 	idx  int
 }
 
 func (m *mockGetStream) Recv() (*pb.GetResponse, error) {
+	// Check context before returning data
+	if m.ctx.Err() != nil {
+		return nil, m.ctx.Err()
+	}
 	if m.idx >= len(m.data) {
 		return nil, io.EOF
 	}
@@ -79,16 +93,25 @@ func (m *mockCacheServiceClient) Delete(ctx context.Context, req *pb.DeleteReque
 }
 
 func (m *mockCacheServiceClient) List(ctx context.Context, req *pb.ListRequest, opts ...grpc.CallOption) (pb.CacheService_ListClient, error) {
-	return &mockListStream{keys: m.listKeys}, nil
+	// Check if context is already cancelled
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return &mockListStream{ctx: ctx, keys: m.listKeys}, nil
 }
 
 type mockListStream struct {
 	grpc.ClientStream
+	ctx  context.Context
 	keys []string
 	idx  int
 }
 
 func (m *mockListStream) Recv() (*pb.ListResponse, error) {
+	// Check context before returning data
+	if m.ctx.Err() != nil {
+		return nil, m.ctx.Err()
+	}
 	if m.idx >= len(m.keys) {
 		return nil, io.EOF
 	}

@@ -54,10 +54,6 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 	first := true
 	totalBytes := 0
 
-	// Create a channel to signal completion
-	doneCh := make(chan struct{})
-	defer close(doneCh)
-
 	for {
 		// Check for context cancellation before reading
 		select {
