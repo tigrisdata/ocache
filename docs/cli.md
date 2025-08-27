@@ -4,22 +4,22 @@ The OCache CLI client (`ocachecli`) provides a command-line interface for intera
 
 ## Installation
 
-### Building from Source
+### Using Makefile
+
+```bash
+make build-cli
+```
+
+### Building using go build
 
 ```bash
 go build -o ocachecli ./client/cmd/
 ```
 
-### Using Makefile
-
-```bash
-make cli
-```
-
 ## Basic Usage
 
 ```bash
-./ocachecli [global options] command [command options] [arguments...]
+ocachecli [global options] command [command options] [arguments...]
 ```
 
 ### Global Options
@@ -28,135 +28,86 @@ make cli
 - `--help, -h`: Show help message
 - `--version, -v`: Show version information
 
-## Commands
+### Commands
 
-### put - Store a value
-
-Store a key-value pair in the cache.
+#### put - Store a value
 
 ```bash
-./ocachecli put <key> <value>
+ocachecli put <key> <value> [options]
+```
+
+**Options:**
+
+- `--ttl`: Time-to-live in seconds
+
+**Examples:**
+
+```bash
+# Store simple string
+ocachecli put mykey "hello world"
+
+# Store with TTL
+ocachecli put session "data" --ttl 3600
+
+# Store from stdin
+echo "piped data" | ocachecli put pipekey
+```
+
+#### get - Retrieve a value
+
+```bash
+ocachecli get <key> [options]
 ```
 
 **Examples:**
 
 ```bash
-# Store a simple string
-./ocachecli put mykey "hello world"
+# Get and display value
+ocachecli get mykey
 
-# Store with custom server address
-./ocachecli --addr cache.example.com:9000 put config "{'timeout': 30}"
-
-# Store JSON data
-./ocachecli put user:123 '{"name": "John", "age": 30}'
+# Get and pipe to another command
+ocachecli get data | jq .
 ```
 
-### get - Retrieve a value
-
-Retrieve a value by its key.
+#### delete - Remove a key
 
 ```bash
-./ocachecli get <key>
-```
-
-**Examples:**
-
-```bash
-# Get a value
-./ocachecli get mykey
-
-# Get from specific server
-./ocachecli --addr cache.example.com:9000 get mykey
-```
-
-**Output:**
-
-- Returns the stored value if found
-- Returns error message if key doesn't exist
-
-### del - Delete a key
-
-Remove a key-value pair from the cache.
-
-```bash
-./ocachecli del <key>
+ocachecli del <key>
 ```
 
 **Examples:**
 
 ```bash
 # Delete a key
-./ocachecli del mykey
+ocachecli del old-data
 
-# Delete from specific server
-./ocachecli --addr cache.example.com:9000 del old-data
+# Delete multiple keys
+for key in key1 key2 key3; do
+  ocachecli del $key
+done
 ```
 
-### list - List all keys
-
-List all keys currently stored in the cache.
+#### list - List keys
 
 ```bash
-./ocachecli list
+ocachecli list [options]
 ```
+
+**Options:**
+
+- `--prefix`: Filter by prefix
 
 **Examples:**
 
 ```bash
 # List all keys
-./ocachecli list
+ocachecli list
 
-# List from specific server
-./ocachecli --addr cache.example.com:9000 list
-```
+# List with prefix
+ocachecli list --prefix user:
 
-**Output:**
-
-- Returns a list of all cache keys
-- Empty list if no keys exist
-
-## Advanced Usage
-
-### Connecting to Remote Servers
-
-```bash
-# Connect to production cache
-./ocachecli --addr prod-cache.example.com:9000 get important-data
-
-# Connect to staging environment
-./ocachecli --addr staging-cache.example.com:9000 list
-```
-
-### Scripting Examples
-
-#### Bulk Load Data
-
-```bash
-#!/bin/bash
-# Load data from a file
-while IFS='=' read -r key value; do
-  ./ocachecli put "$key" "$value"
-done < data.txt
-```
-
-#### Cache Warming
-
-```bash
-#!/bin/bash
-# Warm cache with common keys
-keys=("config" "user:prefs" "app:settings")
-for key in "${keys[@]}"; do
-  ./ocachecli get "$key" > /dev/null 2>&1
-done
-```
-
-#### Monitor Cache Size
-
-```bash
-#!/bin/bash
-# Count number of keys
-count=$(./ocachecli list | wc -l)
-echo "Cache contains $count keys"
+# Count keys
+ocachecli list | wc -l
 ```
 
 ## Error Handling
@@ -174,13 +125,6 @@ Common error messages:
 - `key not found`: Attempting to get a non-existent key
 - `invalid argument`: Malformed command or options
 
-## Performance Tips
-
-1. **Batch Operations**: For bulk operations, consider using the gRPC API directly for better performance
-2. **Connection Reuse**: The CLI creates a new connection for each operation; use the client library for persistent connections
-3. **Benchmarking**: Use appropriate workload patterns that match your use case
-4. **Value Size**: Test with realistic value sizes for accurate benchmarks
-
 ## Troubleshooting
 
 ### Connection Issues
@@ -193,26 +137,26 @@ nc -zv localhost 9000
 ./ocache -v
 
 # Try with explicit IPv4
-./ocachecli --addr 127.0.0.1:9000 list
+ocachecli --addr 127.0.0.1:9000 list
 ```
 
 ### Performance Issues
 
 ```bash
 # Run baseline benchmark
-./ocachecli bench --num-ops 1000
+ocachecli bench --num-ops 1000
 
 # Test with different concurrency
-./ocachecli bench --concurrency 1
-./ocachecli bench --concurrency 32
+ocachecli bench --concurrency 1
+ocachecli bench --concurrency 32
 
 # Test with different value sizes
-./ocachecli bench --value-size 10
-./ocachecli bench --value-size 100000
+ocachecli bench --value-size 10
+ocachecli bench --value-size 100000
 ```
 
 ## See Also
 
-- [API Reference](api.md) - Detailed API documentation
+- [Client Documentation](client.md) - Complete client documentation including Go library
+- [HTTP API Reference](http_api.md) - HTTP REST API documentation
 - [Configuration](configuration.md) - Server configuration options
-- [Development Guide](development.md) - Building and contributing
