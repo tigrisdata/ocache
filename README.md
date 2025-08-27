@@ -30,7 +30,8 @@ make all
 ## Documentation
 
 - [Installation Guide](docs/installation.md) - Build options and dependencies
-- [API Reference](docs/api.md) - HTTP REST and gRPC APIs
+- [Client Documentation](docs/client.md) - Go client library and CLI
+- [HTTP API Reference](docs/http_api.md) - HTTP REST API
 - [CLI Client](docs/cli.md) - Command-line client usage
 - [Configuration](docs/configuration.md) - Server flags and tuning
 - [Testing Guide](docs/testing.md) - Running and writing tests

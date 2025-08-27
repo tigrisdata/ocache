@@ -13,6 +13,8 @@ Run performance benchmarks against the cache service.
 - `--num-ops value`: Total number of operations (default: 10000)
 - `--value-size value`: Value size in bytes (default: 100)
 - `--workload value`: Workload type or custom mix (default: "A")
+- `--force-streaming`: Force streaming for all operations regardless of size
+- `--no-progress`: Disable progress output during benchmark
 
 **Workload Types:**
 
@@ -61,28 +63,6 @@ Then, run the benchmark:
 **Benchmark Examples by Object Size:**
 
 ```bash
-# Small objects (100 bytes)
-./ocachecli bench \
-  --value-size 100 \
-  --num-keys 10000 \
-  --num-ops 100000 \
-  --workload A
-
-# Medium objects (100 KB)
-./ocachecli bench \
-  --value-size 100000 \
-  --num-keys 1000 \
-  --num-ops 10000 \
-  --workload B
-
-# Large objects (1 MB)
-./ocachecli bench \
-  --value-size 1000000 \
-  --num-keys 1000 \
-  --num-ops 10000 \
-  --workload C
-
-# Mixed workload benchmark suite
 # Run all three sizes sequentially to test cache behavior across object sizes
 echo "=== Testing 100 byte objects ==="
 ./ocachecli bench --value-size 100 --num-ops 10000 --workload A
@@ -92,34 +72,6 @@ echo "=== Testing 100 KB objects ==="
 
 echo "=== Testing 1 MB objects ==="
 ./ocachecli bench --value-size 1000000 --num-ops 10000 --workload C
-```
-
-**Performance Tuning Examples:**
-
-```bash
-# Small objects with high concurrency
-./ocachecli bench \
-  --value-size 100 \
-  --num-keys 100000 \
-  --num-ops 1000000 \
-  --workload B \
-  --concurrency 32
-
-# Large objects with sequential access
-./ocachecli bench \
-  --value-size 1000000 \
-  --num-keys 1000 \
-  --num-ops 10000 \
-  --workload B \
-  --concurrency 8
-
-# Medium objects with mixed read/write
-./ocachecli bench \
-  --value-size 100000 \
-  --num-keys 1000 \
-  --num-ops 10000 \
-  --workload A \
-  --concurrency 8
 ```
 
 **Output:**
