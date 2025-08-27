@@ -3,6 +3,7 @@ package cacheclient
 import (
 	"context"
 	"fmt"
+	"io"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -43,8 +44,10 @@ func NewConnectionPool(addr string, size int, opts ...grpc.DialOption) (*Connect
 	return pool, nil
 }
 
-// Get returns a client from the pool using round-robin selection.
-func (p *ConnectionPool) Get() *Client {
+// GetClient returns a client from the pool using round-robin selection.
+// Deprecated: This method is exposed for advanced use cases. For normal operations,
+// use the direct methods (Put, Get, Delete, List) instead.
+func (p *ConnectionPool) GetClient() *Client {
 	p.mu.Lock()
 	client := p.clients[p.index]
 	p.index = (p.index + 1) % p.size
@@ -70,7 +73,47 @@ func (p *ConnectionPool) Close() error {
 }
 
 // Execute runs a function with a client from the pool.
+// Deprecated: Use the direct methods (Put, Get, Delete, List) instead for better usability.
+// This method is kept for backward compatibility.
 func (p *ConnectionPool) Execute(ctx context.Context, fn func(context.Context, *Client) error) error {
-	client := p.Get()
+	client := p.GetClient()
 	return fn(ctx, client)
+}
+
+// Put stores a key-value pair in the cache using a client from the pool.
+func (p *ConnectionPool) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
+	client := p.GetClient()
+	return client.Put(ctx, key, data, ttlSeconds)
+}
+
+// PutStream streams data from an io.Reader to the cache service using a client from the pool.
+// This is efficient for large values.
+func (p *ConnectionPool) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	client := p.GetClient()
+	return client.PutStream(ctx, key, r, ttlSeconds)
+}
+
+// Get retrieves a value from the cache using a client from the pool.
+func (p *ConnectionPool) Get(ctx context.Context, key string) ([]byte, error) {
+	client := p.GetClient()
+	return client.Get(ctx, key)
+}
+
+// GetStream streams a value directly to the provided writer using a client from the pool.
+// This is efficient for large values.
+func (p *ConnectionPool) GetStream(ctx context.Context, key string, w io.Writer) error {
+	client := p.GetClient()
+	return client.GetStream(ctx, key, w)
+}
+
+// Delete removes a key from the cache using a client from the pool.
+func (p *ConnectionPool) Delete(ctx context.Context, key string) error {
+	client := p.GetClient()
+	return client.Delete(ctx, key)
+}
+
+// List returns all keys matching the given prefix using a client from the pool.
+func (p *ConnectionPool) List(ctx context.Context, prefix string) ([]string, error) {
+	client := p.GetClient()
+	return client.List(ctx, prefix)
 }
