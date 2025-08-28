@@ -1,8 +1,6 @@
 package files
 
 import (
-	"errors"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -10,14 +8,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/fd"
-	"github.com/tigrisdata/ocache/storage/utils"
 
 	zlog "github.com/rs/zerolog/log"
 )
-
-// ErrFileLocked is returned when a file cannot be removed because it's locked for reading
-var ErrFileLocked = errors.New("file is locked for reading")
 
 // fileReadCloser wraps a Reader and closes the underlying file while
 // releasing the per-file read lock when Close is invoked.
@@ -48,7 +43,7 @@ func NewFileManager(basePath string) (*FileManager, error) {
 
 	// Create the files directory if it doesn't exist
 	if err := os.MkdirAll(filesPath, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create files directory: %w", err)
+		return nil, storerr.WrapIOError("create files directory", filesPath, err)
 	}
 
 	fm := &FileManager{
@@ -77,7 +72,7 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 
 	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
 	if err != nil {
-		return "", 0, 0, utils.WrapError("failed to create file for key", key, err)
+		return "", 0, 0, storerr.WrapIOError("create file", key, err)
 	}
 	defer file.Close()
 
@@ -91,7 +86,7 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 	bytesWritten, err := io.CopyBuffer(mw, reader, buf)
 	if err != nil {
 		os.Remove(filePath)
-		return "", 0, 0, utils.WrapError("copy payload", key, err)
+		return "", 0, 0, storerr.WrapIOError("write file", key, err)
 	}
 
 	checksum := hash.Sum32()
@@ -107,12 +102,12 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 // Read reads a value from a file for the given key
 func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error) {
 	if filePath == "" || length <= 0 {
-		return nil, fmt.Errorf("invalid file path or length: path=%s, length=%d", filePath, length)
+		return nil, storerr.Wrap("invalid file params", filePath, storerr.ErrInvalidByteRange)
 	}
 
 	e, err := fm.fdCache.Acquire(filePath)
 	if err != nil {
-		return nil, err
+		return nil, storerr.WrapIOError("acquire file fd", filePath, err)
 	}
 
 	// Acquire shared read lock to protect against concurrent writers.
@@ -140,14 +135,14 @@ func (fm *FileManager) Remove(filePath string) error {
 	// Use TryLock to avoid blocking if file is being read
 	if !fileLock.TryLock() {
 		zlog.Warn().Str("path", filePath).Msg("fileManager: file is currently being read, skipping deletion")
-		return ErrFileLocked
+		return storerr.Wrap("remove file", filePath, storerr.ErrLocked)
 	}
 	defer fileLock.Unlock()
 
 	if err := os.Remove(filePath); err != nil {
 		if !os.IsNotExist(err) {
 			zlog.Error().Err(err).Str("path", filePath).Msg("fileManager: failed to delete file")
-			return utils.WrapError("failed to delete file", filePath, err)
+			return storerr.WrapIOError("delete file", filePath, err)
 		}
 
 		zlog.Debug().Str("path", filePath).Msg("fileManager: file already deleted")

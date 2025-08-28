@@ -13,6 +13,7 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -108,7 +109,8 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+		// Convert storage error to gRPC status
+		return storerr.ToGRPCError(err)
 	}
 
 	zlog.Debug().Str("key", key).Msg("Streaming put completed successfully")
@@ -132,7 +134,8 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	if err := stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds)); err != nil {
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "PutObject").Inc()
-		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
+		// Convert storage error to gRPC status
+		return nil, storerr.ToGRPCError(err)
 	}
 	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
 	return &pb.PutResponse{Success: true}, nil
@@ -153,7 +156,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Get").Inc()
-		return err
+		// Convert storage error to gRPC status
+		return storerr.ToGRPCError(err)
 	}
 	if !found {
 		metrics.RPCRequests.WithLabelValues("Get", "not_found").Inc()
@@ -184,7 +188,8 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 		if err != nil {
 			metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
 			metrics.Errors.WithLabelValues("grpc", "Get").Inc()
-			return err
+			// Convert storage error to gRPC status
+			return storerr.ToGRPCError(err)
 		}
 	}
 	metrics.RPCRequests.WithLabelValues("Get", "success").Inc()
@@ -220,7 +225,8 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("List", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "List").Inc()
-		return err
+		// Convert storage error to gRPC status
+		return storerr.ToGRPCError(err)
 	}
 	for _, key := range keys {
 		if err := stream.Send(&pb.ListResponse{Keys: []string{key}}); err != nil {

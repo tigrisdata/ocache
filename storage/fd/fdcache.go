@@ -7,7 +7,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
-	"github.com/tigrisdata/ocache/storage/utils"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 )
 
 // FileEntry wraps a cached os.File descriptor along with a per-file RWMutex and reference count.
@@ -107,7 +107,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		if e.f == nil {
 			// Decrement refs since we're not using it
 			atomic.AddInt32(&e.refs, -1)
-			return nil, utils.WrapError("failed to open raw file", path, nil)
+			return nil, storerr.WrapIOError("open-file", path, storerr.ErrFileNotExist)
 		}
 		// Track cache hit
 		metrics.FDCacheHits.Inc()
@@ -144,7 +144,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		if existing.f == nil {
 			// Decrement refs since we're not using it
 			atomic.AddInt32(&existing.refs, -1)
-			return nil, utils.WrapError("failed to open raw file", path, nil)
+			return nil, storerr.WrapIOError("open-file", path, storerr.ErrFileNotExist)
 		}
 		// Track as cache hit since another goroutine opened it for us
 		metrics.FDCacheHits.Inc()
@@ -161,9 +161,9 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 
 		if os.IsNotExist(err) {
 			zlog.Warn().Str("path", path).Msg("fdCache: file not found")
-			return nil, utils.WrapError("raw file not found", path, err)
+			return nil, storerr.WrapIOError("open-file", path, storerr.ErrFileNotExist)
 		}
-		return nil, utils.WrapError("failed to open raw file", path, err)
+		return nil, storerr.WrapIOError("open-file", path, err)
 	}
 
 	// Set the file descriptor and signal success

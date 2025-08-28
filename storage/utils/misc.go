@@ -7,6 +7,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 
 	pb "github.com/tigrisdata/ocache/proto"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	"google.golang.org/protobuf/proto"
 )
@@ -21,13 +22,13 @@ func GetMetadata(meta *metadata.MetaDB, key string) (*pb.ValueMessage, error) {
 		if metaSlice != nil {
 			metaSlice.Free()
 		}
-		return nil, err
+		return nil, storerr.WrapRocksDBError("get-metadata", key, err)
 	}
 	if !metaSlice.Exists() {
 		if metaSlice != nil {
 			metaSlice.Free()
 		}
-		return nil, ErrMetadataNotFound
+		return nil, storerr.ErrMetadataNotFound
 	}
 	defer metaSlice.Free()
 
@@ -55,7 +56,7 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 			Str("filepath", filePath).
 			Str("reason", "metadata not found").
 			Msg("stale entry")
-		return ErrMetadataNotFound
+		return storerr.ErrMetadataNotFound
 	}
 
 	// Check if metadata still points to a raw file
@@ -68,7 +69,7 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 				Str("file", filePath).
 				Str("reason", "already compacted").
 				Msg("stale entry")
-			return ErrAlreadyCompacted
+			return storerr.ErrAlreadyCompacted
 		}
 		zlog.Debug().
 			Str("context", context).
@@ -77,7 +78,7 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 			Str("value_type", metadata.ValueType.String()).
 			Str("reason", "not raw file").
 			Msg("stale entry")
-		return ErrNotRawFile
+		return storerr.ErrNotRawFile
 	}
 
 	// Check if metadata still points to this specific file
@@ -90,7 +91,7 @@ func ValidateFileEntry(metadata *pb.ValueMessage, filePath string, context strin
 			Str("new_file", metadata.RawFilePath).
 			Str("reason", "metadata updated").
 			Msg("stale entry")
-		return ErrFilePathMismatch
+		return storerr.ErrFilePathMismatch
 	}
 
 	return nil

@@ -1,7 +1,6 @@
 package segment
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -9,8 +8,8 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/fd"
-	"github.com/tigrisdata/ocache/storage/utils"
 )
 
 // Segment is a file on disk that contains key/value pairs.
@@ -144,7 +143,7 @@ func (s *Segment) Reserve(callerID string) bool {
 // Release releases the reservation on the segment
 func (s *Segment) Release(callerID string) error {
 	if callerID == "" {
-		return fmt.Errorf("callerID cannot be empty")
+		return storerr.Wrap("release segment", "", storerr.ErrInvalidKey)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -174,20 +173,20 @@ func (s *Segment) Finalize() error {
 	footer := BuildSegmentFooterWithVersion(s.version, s.numEntries, s.dataBytes)
 
 	if _, err := s.file.Write(footer); err != nil {
-		return utils.WrapError("failed to write segment footer", s.path, err)
+		return storerr.WrapIOError("write", s.path, err)
 	}
 	s.size += int64(len(footer))
 	// Shrink pre-allocated file to actual used size
 	if err := s.file.Truncate(s.size); err != nil {
-		return utils.WrapError("truncate segment", s.path, err)
+		return storerr.WrapIOError("truncate", s.path, err)
 	}
 
 	// Flush and close the R/W file descriptor
 	if err := s.file.Sync(); err != nil {
-		return utils.WrapError("failed to sync segment", s.path, err)
+		return storerr.WrapIOError("sync", s.path, err)
 	}
 	if err := s.file.Close(); err != nil {
-		return utils.WrapError("failed to close segment", s.path, err)
+		return storerr.WrapIOError("close", s.path, err)
 	}
 
 	// Clear pointer – closed segments will use fdCache for reads.
@@ -211,7 +210,7 @@ func (s *Segment) Sync() error {
 	// Flush file contents to disk
 	err := s.file.Sync()
 	if err != nil {
-		return utils.WrapError("failed to sync current segment", s.path, err)
+		return storerr.WrapIOError("sync", s.path, err)
 	}
 	return nil
 }
@@ -220,7 +219,7 @@ func (s *Segment) Sync() error {
 // The caller is responsible for closing the reader when done.
 func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCache) (io.ReadCloser, error) {
 	if key == "" || offset < 0 || length <= 0 {
-		return nil, fmt.Errorf("invalid key, offset or length: key=%s, offset=%d, length=%d", key, offset, length)
+		return nil, storerr.Wrap("read segment entry", key, storerr.ErrInvalidByteRange)
 	}
 
 	// Acquire cached read-only descriptor via FdCache.
@@ -228,12 +227,12 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 	if err != nil {
 		// If we can't acquire the FD, the segment might have been deleted
 		// This can happen if recompaction removed it between our segMap check and here
-		return nil, fmt.Errorf("failed to acquire segment fd: %w", err)
+		return nil, storerr.WrapIOError("acquire segment fd", s.path, err)
 	}
 
 	// Check if entry is nil (defensive check)
 	if entry == nil {
-		return nil, fmt.Errorf("nil file entry for segment: %s", s.path)
+		return nil, storerr.WrapIOError("nil file entry", s.path, storerr.ErrFileNotExist)
 	}
 
 	// Take shared read lock to protect against concurrent writers.
@@ -256,7 +255,7 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 // WriteEntry writes an entry to a segment from an io.Reader
 func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
 	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
-		return 0, utils.WrapError("invalid value type", key, nil)
+		return 0, storerr.Wrap("write-segment", key, storerr.ErrInvalidKey)
 	}
 
 	header := BuildValueHeader(key, vm.ValueLength, vm.Checksum, CurrentValueHeaderVersion)
@@ -278,7 +277,7 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 
 	// Check if segment file is still open
 	if s.file == nil {
-		return 0, utils.WrapError("segment file is closed", s.path, nil)
+		return 0, storerr.WrapIOError("segment file is closed", s.path, storerr.ErrFileClosed)
 	}
 
 	// Ensure we have a writable segment with space
@@ -287,7 +286,7 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 
 	// Sequential write: header then payload
 	if _, err := s.file.Write(header); err != nil {
-		return 0, utils.WrapError("failed to write value header", s.path, err)
+		return 0, storerr.WrapIOError("write", s.path, err)
 	}
 
 	// Copy with progress tracking for large files using pooled buffer
@@ -296,12 +295,12 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 
 	bytesWritten, err := io.CopyBuffer(s.file, r, buf)
 	if err != nil {
-		return 0, utils.WrapError("copy value to segment", key, err)
+		return 0, storerr.WrapIOError("write", s.path, err)
 	}
 
 	// Verify we wrote the expected amount
 	if bytesWritten != vm.ValueLength {
-		return 0, utils.WrapError(fmt.Sprintf("wrote %d bytes, expected %d", bytesWritten, vm.ValueLength), key, nil)
+		return 0, storerr.WrapIOError("write-segment", key, storerr.ErrCorrupted)
 	}
 
 	s.size += needed
@@ -360,13 +359,13 @@ type Iterator struct {
 // The caller is responsible for closing the iterator when done
 func (s *Segment) NewIterator(file *os.File) (*Iterator, error) {
 	if file == nil {
-		return nil, io.ErrClosedPipe
+		return nil, storerr.WrapIOError("create iterator", s.path, io.ErrClosedPipe)
 	}
 
 	// Get file size to know when to stop iterating
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return nil, err
+		return nil, storerr.WrapIOError("create iterator", s.path, err)
 	}
 
 	return &Iterator{
@@ -385,21 +384,22 @@ func (it *Iterator) Next() (*EntryInfo, error) {
 
 	// Check if we've reached the end of the segment (accounting for footer)
 	if it.currentPos >= it.fileSize-int64(SegmentFooterSize) {
-		return nil, io.EOF
+		return nil, storerr.WrapIOError("next entry", it.segment.path, io.EOF)
 	}
 
 	// Read the entry header at current position
 	valLen, headerSize, keyLen, version, checksum, err := ReadValueHeaderAt(it.file, it.currentPos)
 	if err != nil {
 		it.lastError = err
-		return nil, err
+		return nil, storerr.WrapIOError("next entry", it.segment.path, err)
 	}
 
 	// Read the key
 	keyBuf := make([]byte, keyLen)
 	if _, err := it.file.ReadAt(keyBuf, it.currentPos+ValueHeaderSize); err != nil {
-		it.lastError = err
-		return nil, err
+		wrappedErr := storerr.WrapIOError("readat", it.segment.path, err)
+		it.lastError = wrappedErr
+		return nil, wrappedErr
 	}
 
 	entry := &EntryInfo{

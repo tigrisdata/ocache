@@ -6,13 +6,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	pb "github.com/tigrisdata/ocache/proto"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 )
 
 func TestValidateFileEntry(t *testing.T) {
 	// Test case 1: Metadata doesn't exist (nil) - should return ErrMetadataNotFound
 	t.Run("metadata_nil", func(t *testing.T) {
 		err := ValidateFileEntry(nil, "/path/to/file", "test", "key1")
-		assert.True(t, errors.Is(err, ErrMetadataNotFound), "Should return ErrMetadataNotFound when metadata is nil")
+		assert.True(t, errors.Is(err, storerr.ErrMetadataNotFound), "Should return ErrMetadataNotFound when metadata is nil")
 	})
 
 	// Test case 2: Metadata exists with matching file path - should return nil (valid)
@@ -45,7 +46,7 @@ func TestValidateFileEntry(t *testing.T) {
 
 		// Validate old path - should return ErrFilePathMismatch
 		err := ValidateFileEntry(vm, oldPath, "test", "key3")
-		assert.True(t, errors.Is(err, ErrFilePathMismatch), "Should return ErrFilePathMismatch when paths don't match")
+		assert.True(t, errors.Is(err, storerr.ErrFilePathMismatch), "Should return ErrFilePathMismatch when paths don't match")
 	})
 
 	// Test case 4: Metadata is SEGMENT (compacted) - should return ErrAlreadyCompacted
@@ -62,7 +63,7 @@ func TestValidateFileEntry(t *testing.T) {
 
 		// Validate - should return ErrAlreadyCompacted
 		err := ValidateFileEntry(vm, filePath, "test", "key4")
-		assert.True(t, errors.Is(err, ErrAlreadyCompacted), "Should return ErrAlreadyCompacted for SEGMENT type")
+		assert.True(t, errors.Is(err, storerr.ErrAlreadyCompacted), "Should return ErrAlreadyCompacted for SEGMENT type")
 	})
 
 	// Test case 5: Metadata is INLINE - should return ErrNotRawFile
@@ -77,6 +78,6 @@ func TestValidateFileEntry(t *testing.T) {
 
 		// Validate - should return ErrNotRawFile
 		err := ValidateFileEntry(vm, filePath, "test", "key5")
-		assert.True(t, errors.Is(err, ErrNotRawFile), "Should return ErrNotRawFile for INLINE type")
+		assert.True(t, errors.Is(err, storerr.ErrNotRawFile), "Should return ErrNotRawFile for INLINE type")
 	})
 }

@@ -12,8 +12,8 @@ import (
 
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/fd"
-	"github.com/tigrisdata/ocache/storage/utils"
 
 	zlog "github.com/rs/zerolog/log"
 )
@@ -41,7 +41,7 @@ func NewManager(basePath string, segmentSize int64) (*Manager, error) {
 
 	if err := os.MkdirAll(segmentsPath, 0o755); err != nil {
 		zlog.Error().Err(err).Str("path", segmentsPath).Msg("failed to create segment directory")
-		return nil, utils.WrapError("failed to create segment directory", segmentsPath, err)
+		return nil, storerr.WrapIOError("mkdirall", segmentsPath, err)
 	}
 
 	sm := &Manager{
@@ -79,7 +79,7 @@ func (sm *Manager) RegisterSegment(path string, entries uint32, bytes int64) {
 // ReadEntry returns an io.ReadCloser over a slice of a segment file.
 func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int64) (io.ReadCloser, error) {
 	if segPath == "" || offset < 0 || length <= 0 {
-		return nil, fmt.Errorf("invalid segment path, offset or length: path=%s, offset=%d, length=%d", segPath, offset, length)
+		return nil, storerr.Wrap("read segment", userKey, storerr.ErrInvalidByteRange)
 	}
 
 	sm.mu.RLock()
@@ -88,8 +88,8 @@ func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int6
 
 	if seg == nil {
 		// Segment has been removed (likely due to recompaction)
-		// Return a specific error that can be handled by the caller
-		return nil, fmt.Errorf("segment not found: %s", segPath)
+		// This could indicate a metadata/segment mismatch (corruption)
+		return nil, storerr.WrapIOError("read segment", userKey, storerr.ErrFileNotExist)
 	}
 
 	return seg.ReadEntry(userKey, offset, length, sm.fdCache)
@@ -101,7 +101,7 @@ func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int6
 func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int64) (*Segment, error) {
 	// Strict callerID validation
 	if callerID == "" {
-		return nil, fmt.Errorf("callerID cannot be empty")
+		return nil, storerr.Wrap("acquire segment", "", storerr.ErrInvalidKey)
 	}
 
 	// Always take write lock to simplify logic and prevent race conditions
@@ -140,7 +140,7 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 // ReleaseAllSegments releases all segments reserved by the given caller
 func (sm *Manager) ReleaseAllSegments(callerID string) error {
 	if callerID == "" {
-		return fmt.Errorf("callerID cannot be empty")
+		return storerr.Wrap("release segments", "", storerr.ErrInvalidKey)
 	}
 
 	sm.mu.RLock()
@@ -195,13 +195,13 @@ func (sm *Manager) createNewSegmentWithReservationLocked(callerID string) (*Segm
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, utils.WrapError("failed to create segment file", path, err)
+		return nil, storerr.WrapIOError("create", path, err)
 	}
 
 	// Pre-allocate file to configured segment size
 	if err := file.Truncate(sm.segmentSize); err != nil {
 		file.Close()
-		return nil, utils.WrapError("truncate segment file", path, err)
+		return nil, storerr.WrapIOError("truncate", path, err)
 	}
 
 	// Create segment with atomic reservation
@@ -221,7 +221,7 @@ func (sm *Manager) loadSegments() error {
 
 	entries, err := os.ReadDir(sm.segmentsPath)
 	if err != nil {
-		return utils.WrapError("failed to read segment directory", sm.segmentsPath, err)
+		return storerr.WrapIOError("readdir", sm.segmentsPath, err)
 	}
 
 	var openSegs []*Segment
@@ -234,13 +234,13 @@ func (sm *Manager) loadSegments() error {
 		path := filepath.Join(sm.segmentsPath, entry.Name())
 		file, err := os.OpenFile(path, os.O_RDWR, 0o644)
 		if err != nil {
-			return utils.WrapError("failed to open segment", entry.Name(), err)
+			return storerr.WrapIOError("open", path, err)
 		}
 
 		stat, err := file.Stat()
 		if err != nil {
 			file.Close()
-			return utils.WrapError("failed to stat segment", entry.Name(), err)
+			return storerr.WrapIOError("stat", path, err)
 		}
 
 		// For open segments, we'll validate and determine actual size later
@@ -272,7 +272,7 @@ func (sm *Manager) loadSegments() error {
 		// Open segment – needs validation/truncation
 		if err := sm.validateOpenSegment(segment); err != nil {
 			file.Close()
-			return utils.WrapError("failed to validate open segment", entry.Name(), err)
+			return err // validateOpenSegment already wraps errors appropriately
 		}
 		openSegs = append(openSegs, segment)
 		sm.segments = append(sm.segments, segment)
@@ -328,20 +328,20 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 
 	// Seek to beginning to start validation
 	if _, err := seg.file.Seek(0, io.SeekStart); err != nil {
-		return utils.WrapError("seek to start for validation", seg.path, err)
+		return storerr.WrapIOError("seek to start", seg.path, err)
 	}
 
 	// Get the actual file size (will be the full pre-allocated size for sparse files)
 	fileInfo, err := seg.file.Stat()
 	if err != nil {
-		return utils.WrapError("stat segment file", seg.path, err)
+		return storerr.WrapIOError("stat segment", seg.path, err)
 	}
 	actualFileSize := fileInfo.Size()
 
 	// Create an iterator to scan through the segment
 	iter, err := seg.NewIterator(seg.file)
 	if err != nil {
-		return utils.WrapError("create iterator for validation", seg.path, err)
+		return err // NewIterator already wraps errors appropriately
 	}
 
 	entries := uint32(0)
@@ -356,7 +356,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		if err != nil {
 			// EOF or read error means we've reached the end of valid data
 			if err := seg.file.Truncate(currentPos); err != nil {
-				return utils.WrapError("truncate at read error", seg.path, err)
+				return storerr.WrapIOError("truncate at read error", seg.path, err)
 			}
 			lastValidPos = currentPos
 			break
@@ -365,7 +365,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		// Check that header values are reasonable
 		if entry.ValueLength <= 0 || len(entry.Key) <= 0 {
 			if err := seg.file.Truncate(currentPos); err != nil {
-				return utils.WrapError("truncate invalid header", seg.path, err)
+				return storerr.WrapIOError("truncate invalid header", seg.path, err)
 			}
 			lastValidPos = currentPos
 			break
@@ -377,7 +377,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 		// Ensure we have full entry in file
 		if nextPos > actualFileSize {
 			if err := seg.file.Truncate(currentPos); err != nil {
-				return utils.WrapError("truncate partial entry", seg.path, err)
+				return storerr.WrapIOError("truncate partial entry", seg.path, err)
 			}
 			lastValidPos = currentPos
 			break
@@ -393,14 +393,14 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 			buf, releaseBuf := bufferpool.AcquireBuffer(64 * 1024)
 			if _, err := io.CopyBuffer(h, section, buf); err != nil {
 				releaseBuf()
-				return utils.WrapError("checksum read", seg.path, err)
+				return storerr.WrapIOError("read", seg.path, err)
 			}
 			releaseBuf()
 
 			if h.Sum32() != entry.Checksum {
 				zlog.Warn().Str("segment", seg.path).Int64("offset", currentPos).Msg("checksum mismatch – truncating segment")
 				if err := seg.file.Truncate(currentPos); err != nil {
-					return utils.WrapError("truncate after checksum mismatch", seg.path, err)
+					return storerr.WrapIOError("truncate after checksum mismatch", seg.path, err)
 				}
 				lastValidPos = currentPos
 				break
@@ -422,7 +422,7 @@ func (sm *Manager) validateOpenSegment(seg *Segment) error {
 
 	// Seek file to end for further writes
 	if _, err := seg.file.Seek(lastValidPos, io.SeekStart); err != nil {
-		return utils.WrapError("seek to end", seg.path, err)
+		return storerr.WrapIOError("seek", seg.path, err)
 	}
 
 	return nil

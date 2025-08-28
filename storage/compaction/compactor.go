@@ -14,6 +14,7 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/deletion"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -60,18 +61,6 @@ type CompactorConfig struct {
 	FragThreshold      float64
 	MinSegmentAge      time.Duration
 	MinSegments        int
-}
-
-// ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
-type ErrFileSizeMismatch struct {
-	Key          string
-	FilePath     string
-	ActualSize   int64
-	ExpectedSize int64
-}
-
-func (e *ErrFileSizeMismatch) Error() string {
-	return fmt.Sprintf("file size mismatch for key %s: actual=%d expected=%d", e.Key, e.ActualSize, e.ExpectedSize)
 }
 
 type Compactor struct {
@@ -330,30 +319,30 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID i
 
 			// Handle different error cases using error types
 			switch {
-			case errors.Is(err, utils.ErrMetadataNotFound):
+			case errors.Is(err, storerr.ErrMetadataNotFound):
 				// Key already gone – queue file for deletion and remove index
 				wb.Delete(k)
 				if err := c.deletionQueue.Add(filePath); err != nil {
 					zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue file for deletion")
 				}
 				continue
-			case errors.Is(err, utils.ErrAlreadyCompacted):
+			case errors.Is(err, storerr.ErrAlreadyCompacted):
 				// Remove compaction index entry
 				// Note: don't delete the file since it might be referenced elsewhere
 				wb.Delete(k)
 				continue
-			case errors.Is(err, utils.ErrNotRawFile), errors.Is(err, utils.ErrFilePathMismatch):
+			case errors.Is(err, storerr.ErrNotRawFile), errors.Is(err, storerr.ErrFilePathMismatch):
 				// Stale entry - remove index and queue file for deletion
 				wb.Delete(k)
 				if err := c.deletionQueue.Add(filePath); err != nil {
 					zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue file for deletion")
 				}
 				continue
-			case errors.Is(err, utils.ErrMalformedIndexRow):
+			case errors.Is(err, storerr.ErrMalformedIndexRow):
 				// Malformed index row - remove it
 				wb.Delete(k)
 				continue
-			case errors.Is(err, utils.ErrFileNotExist):
+			case errors.Is(err, storerr.ErrFileNotExist):
 				// File doesn't exist - remove stale index
 				wb.Delete(k)
 				continue
@@ -378,7 +367,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID i
 				return
 			}
 			// Check if it's a file size mismatch error
-			var sizeMismatchErr *ErrFileSizeMismatch
+			var sizeMismatchErr *storerr.ErrFileSizeMismatch
 			if errors.As(err, &sizeMismatchErr) {
 				// Skip corrupted file - queue for deletion
 				wb.Delete(k)
@@ -454,14 +443,14 @@ func (c *Compactor) processCompactionEntry(ctx context.Context, k, v []byte, ro 
 	userKey, filePath, ok := parseFileIndexRow(k, v)
 	if !ok {
 		zlog.Error().Str("row", string(k)).Msg("compactor: malformed index row")
-		return nil, utils.ErrMalformedIndexRow
+		return nil, storerr.ErrMalformedIndexRow
 	}
 
 	// Stat first – cheap, and gives us size quickly.
 	fInfo, err := os.Stat(filePath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, utils.ErrFileNotExist
+			return nil, storerr.ErrFileNotExist
 		}
 		zlog.Error().Err(err).Str("path", filePath).Msg("compactor: stat failed")
 		return nil, err
@@ -489,8 +478,8 @@ func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.Value
 	meta, err := utils.GetMetadata(c.meta, string(metaKey))
 	if err != nil {
 		// If metadata not found, return the specific error
-		if errors.Is(err, utils.ErrMetadataNotFound) {
-			return nil, utils.ErrMetadataNotFound
+		if errors.Is(err, storerr.ErrMetadataNotFound) {
+			return nil, storerr.ErrMetadataNotFound
 		}
 		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: bad metadata")
 		return nil, err
@@ -515,7 +504,7 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 			Int64("expectedSize", entry.metadata.ValueLength).
 			Msg("compactor: file size mismatch - possible corruption")
 		// Return error to skip this file
-		return &ErrFileSizeMismatch{
+		return &storerr.ErrFileSizeMismatch{
 			Key:          entry.userKey,
 			FilePath:     entry.filePath,
 			ActualSize:   entry.fileInfo.Size(),

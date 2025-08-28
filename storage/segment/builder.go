@@ -2,10 +2,10 @@ package segment
 
 import (
 	"encoding/binary"
-	"errors"
 	"io"
 	"os"
 
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"golang.org/x/sys/unix"
 )
 
@@ -82,17 +82,17 @@ func ReadValueHeader(f *os.File) (valueLen int64, headerSize int64, keyLen int64
 	// Validate header fields for reasonable values
 	// Key length should be positive
 	if keyLen <= 0 {
-		return 0, 0, 0, 0, 0, errors.New("invalid key length in header")
+		return 0, 0, 0, 0, 0, storerr.ErrCorrupted
 	}
 
 	// Value length should be positive
 	if valueLen <= 0 {
-		return 0, 0, 0, 0, 0, errors.New("invalid value length in header")
+		return 0, 0, 0, 0, 0, storerr.ErrCorrupted
 	}
 
 	// Version should be a known version
 	if version <= 0 || version > CurrentValueHeaderVersion {
-		return 0, 0, 0, 0, 0, errors.New("invalid header version")
+		return 0, 0, 0, 0, 0, storerr.ErrCorrupted
 	}
 
 	headerSize = int64(ValueHeaderSize) + keyLen
@@ -135,17 +135,17 @@ func ReadValueHeaderAt(f *os.File, offset int64) (valueLen int64, headerSize int
 	// Validate header fields for reasonable values
 	// Key length should be positive
 	if keyLen <= 0 {
-		return 0, 0, 0, 0, 0, errors.New("invalid key length in header")
+		return 0, 0, 0, 0, 0, storerr.ErrCorrupted
 	}
 
 	// Value length should be positive
 	if valueLen <= 0 {
-		return 0, 0, 0, 0, 0, errors.New("invalid value length in header")
+		return 0, 0, 0, 0, 0, storerr.ErrCorrupted
 	}
 
 	// Version should be a known version
 	if version <= 0 || version > CurrentValueHeaderVersion {
-		return 0, 0, 0, 0, 0, errors.New("invalid header version")
+		return 0, 0, 0, 0, 0, storerr.ErrCorrupted
 	}
 
 	headerSize = int64(ValueHeaderSize) + keyLen

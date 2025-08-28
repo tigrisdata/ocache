@@ -16,6 +16,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/compaction"
 	"github.com/tigrisdata/ocache/storage/deletion"
+	storerr "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -354,8 +355,8 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
-
-		return nil, err
+		// Wrap the RocksDB iterator error
+		return nil, storerr.WrapRocksDBError("list-keys", userPrefix, err)
 	}
 
 	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
@@ -374,12 +375,13 @@ func (s *Storage) DeleteKey(key string) {
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
 	slice, err := s.meta.Handle().Get(ro, metaKey)
-	if err != nil || !slice.Exists() {
-		if err != nil {
-			metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
-		} else {
-			metrics.StorageOperations.WithLabelValues("delete", storageType, "not_found").Inc()
-		}
+	if err != nil {
+		err = storerr.WrapRocksDBError("get-metadata", string(key), err)
+		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
+		return
+	}
+	if !slice.Exists() {
+		metrics.StorageOperations.WithLabelValues("delete", storageType, "not_found").Inc()
 		return // Key doesn't exist, nothing to delete
 	}
 	defer slice.Free()
@@ -423,10 +425,18 @@ func (s *Storage) DeleteKey(key string) {
 	// Delete the secondary index entry
 	batch.Delete(bucketIndexKey)
 
-	err = s.meta.Handle().Write(wo, batch)
+	// Write deletion with retry for transient errors
+	err = storerr.RetryOperation("delete-rocksdb", func() error {
+		if writeErr := s.meta.Handle().Write(wo, batch); writeErr != nil {
+			return storerr.WrapRocksDBError("delete", string(key), writeErr)
+		}
+		return nil
+	})
+
 	if err != nil {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "delete").Inc()
+		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteKey: failed to delete from RocksDB")
 	} else {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
 		metrics.ObjectSize.WithLabelValues("delete").Observe(float64(dataSize))
@@ -441,23 +451,45 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
-	ro := grocksdb.NewDefaultReadOptions()
-	metaKey := keys.MakeMetadataKey(key)
 
-	slice, err := s.meta.Handle().Get(ro, metaKey)
+	// Read metadata with retry for transient errors
+	var slice *grocksdb.Slice
+	var v []byte
+	err := storerr.RetryOperation("get-metadata", func() error {
+		ro := grocksdb.NewDefaultReadOptions()
+		defer ro.Destroy()
+		metaKey := keys.MakeMetadataKey(key)
+
+		var readErr error
+		slice, readErr = s.meta.Handle().Get(ro, metaKey)
+		if readErr != nil {
+			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
+			metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
+			return storerr.WrapRocksDBError("get-metadata", key, readErr)
+		}
+
+		if !slice.Exists() {
+			if slice != nil {
+				slice.Free()
+			}
+			metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
+			zlog.Debug().Str("key", key).Msg("storage.Get: not found in DB")
+			return storerr.ErrKeyNotFound
+		}
+
+		// Copy data before freeing slice
+		v = make([]byte, len(slice.Data()))
+		copy(v, slice.Data())
+		slice.Free()
+		return nil
+	})
 	if err != nil {
-		metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
-		metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
-		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
+		// Check if it's a not found error
+		if err == storerr.ErrKeyNotFound {
+			return nil, false, nil
+		}
 		return nil, false, err
 	}
-	defer slice.Free()
-	if !slice.Exists() {
-		metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
-		zlog.Debug().Str("key", key).Msg("storage.Get: not found in DB")
-		return nil, false, nil
-	}
-	v := slice.Data()
 
 	// Try to decode as proto ValueMessage
 	valueMsg := &pb.ValueMessage{}
@@ -488,29 +520,63 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	case pb.ValueType_INLINE:
 		reader = bytes.NewReader(valueMsg.Data)
 	case pb.ValueType_SEGMENT:
-		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
+		// Read from segment with retry for transient errors
+		var segReader io.ReadCloser
+		err := storerr.RetryOperation("read-segment", func() error {
+			var readErr error
+			segReader, readErr = s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
+			if readErr != nil {
+				return storerr.Wrap("read segment", key, readErr)
+			}
+			return nil
+		})
+		if err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
-			s.DeleteKey(key)
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment")
+			// Delete corrupted entry
+			if storerr.IsDataCorruption(err) {
+				s.DeleteKey(key)
+				// Return corruption error directly
+				return nil, false, storerr.ErrCorrupted
+			}
+			// Return the specific error type
 			return nil, false, err
-		} else if r != nil {
-			reader = r
-		} else {
+		}
+
+		if segReader == nil {
 			return nil, false, nil
 		}
+		reader = segReader
 	case pb.ValueType_RAW_FILE:
-		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
+		// Read from file with retry for transient errors
+		var fileReader io.ReadCloser
+		err := storerr.RetryOperationFast("read-file", func() error {
+			var readErr error
+			fileReader, readErr = s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+			if readErr != nil {
+				return storerr.Wrap("read file", key, readErr)
+			}
+			return nil
+		})
+		if err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
-			s.DeleteKey(key)
+			// Delete corrupted entry
+			if storerr.IsDataCorruption(err) {
+				s.DeleteKey(key)
+				// Return corruption error directly
+				return nil, false, storerr.ErrCorrupted
+			}
+			// Return the specific error type
 			return nil, false, err
-		} else if r != nil {
-			reader = r
-		} else {
+		}
+
+		if fileReader == nil {
 			return nil, false, nil
 		}
+		reader = fileReader
 	default:
 		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type")
 		s.DeleteKey(key)
@@ -630,7 +696,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("io", "put").Inc()
-		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
+		// Return the underlying I/O error directly
 		return err
 	}
 
@@ -647,11 +713,30 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		storageType = "raw_file"
 		// Combine the bytes we already read with the remaining reader and write via the segment manager
 		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
-		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, multiReader)
+		// Write file with retry for transient errors
+		var filePath string
+		var checksum uint32
+		var bytesWritten int64
+
+		err := storerr.RetryOperation("write-file", func() error {
+			var writeErr error
+			filePath, checksum, bytesWritten, writeErr = s.fileManager.Write(key, multiReader)
+			if writeErr != nil {
+				// For resource exhaustion, don't retry if it's disk full
+				if storerr.IsResourceExhausted(writeErr) && !storerr.IsRetriable(writeErr) {
+					return writeErr
+				}
+				return storerr.Wrap("write file", key, writeErr)
+			}
+			return nil
+		})
 		if err != nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("file", "put").Inc()
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
+			// Check for specific error types and return appropriate error
+			if storerr.IsResourceExhausted(err) {
+				return storerr.ErrDiskFull
+			}
 			return err
 		}
 
@@ -664,10 +749,15 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		}
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
+			// Proto marshal errors are internal errors
 			return err
 		}
-		err = s.putLow(key, val, filePath, bytesWritten)
+
+		// Write to RocksDB with retry for transient errors
+		err = storerr.RetryOperation("put-rocksdb", func() error {
+			return s.putLow(key, val, filePath, bytesWritten)
+		})
+
 		if err == nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 			metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(bytesWritten))
@@ -694,10 +784,15 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	}
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {
-		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
+		// Proto marshal errors are internal errors
 		return err
 	}
-	err = s.putLow(key, val, "", int64(n))
+
+	// Write to RocksDB with retry for transient errors
+	err = storerr.RetryOperation("put-rocksdb", func() error {
+		return s.putLow(key, val, "", int64(n))
+	})
+
 	if err == nil {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 		metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(n))
@@ -751,7 +846,18 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		batch.Put(bucketIndexKey, accessKey)
 	}
 
-	return s.meta.Handle().Write(wo, batch)
+	err := s.meta.Handle().Write(wo, batch)
+	if err != nil {
+		// Wrap RocksDB error with context
+		err = storerr.WrapRocksDBError("write-metadata", key, err)
+		// Check for specific error types
+		if storerr.IsResourceExhausted(err) {
+			return storerr.ErrDiskFull
+		}
+		// Return the wrapped error
+		return err
+	}
+	return nil
 }
 
 // CleanerStats returns statistics from the background cleaner
@@ -801,7 +907,8 @@ func (s *Storage) updateDeleteIndex(segmentPath string, deletedBytes int64) {
 
 	// Use Merge for atomic update
 	if err := s.meta.Handle().Merge(wo, deleteIndexKey, operand); err != nil {
-		zlog.Error().Err(err).Str("segment", segmentPath).
+		wrappedErr := storerr.WrapRocksDBError("merge-delete-index", segmentPath, err)
+		zlog.Error().Err(wrappedErr).Str("segment", segmentPath).
 			Msg("storage.updateDeleteIndex: failed to merge delete index entry")
 	}
 }
@@ -818,7 +925,7 @@ func (s *Storage) GetDeleteIndexStats(segmentPath string) (deletedEntries, delet
 
 	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, storerr.WrapRocksDBError("get-delete-index", segmentPath, err)
 	}
 	defer slice.Free()
 
@@ -843,7 +950,10 @@ func (s *Storage) RemoveDeleteIndex(segmentPath string) error {
 	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	return s.meta.Handle().Delete(wo, deleteIndexKey)
+	if err := s.meta.Handle().Delete(wo, deleteIndexKey); err != nil {
+		return storerr.WrapRocksDBError("delete-index-remove", segmentPath, err)
+	}
+	return nil
 }
 
 // SegmentDeleteStats holds deletion statistics for a segment
