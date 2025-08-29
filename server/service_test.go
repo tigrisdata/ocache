@@ -52,11 +52,19 @@ func TestCacheService_PutObjectAndGet(t *testing.T) {
 type mockGetServer struct {
 	pb.CacheService_GetServer
 	responses []*pb.GetResponse
+	ctx       context.Context
 }
 
 func (m *mockGetServer) Send(resp *pb.GetResponse) error {
 	m.responses = append(m.responses, resp)
 	return nil
+}
+
+func (m *mockGetServer) Context() context.Context {
+	if m.ctx == nil {
+		return context.Background()
+	}
+	return m.ctx
 }
 
 func TestCacheService_Delete(t *testing.T) {
@@ -174,11 +182,19 @@ func TestCacheService_ListWithPrefix(t *testing.T) {
 type mockListServer struct {
 	pb.CacheService_ListServer
 	responses []*pb.ListResponse
+	ctx       context.Context
 }
 
 func (m *mockListServer) Send(resp *pb.ListResponse) error {
 	m.responses = append(m.responses, resp)
 	return nil
+}
+
+func (m *mockListServer) Context() context.Context {
+	if m.ctx == nil {
+		return context.Background()
+	}
+	return m.ctx
 }
 
 func TestCacheService_Put_TTL(t *testing.T) {

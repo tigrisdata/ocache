@@ -2,9 +2,9 @@ package storage
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
+	"syscall"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -16,6 +16,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/compaction"
 	"github.com/tigrisdata/ocache/storage/deletion"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -146,14 +147,16 @@ func InitStorageWithConfig(config *StorageConfig) {
 func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
-		return nil, fmt.Errorf("failed to create data directory: %w", err)
+		zlog.Error().Err(err).Str("path", config.DiskPath).Msg("storage: failed to create data directory")
+		return nil, storageErrors.NewIOError("Init", "", false, err)
 	}
 
 	// Initialize the metadata DB with multiplex merge operator
 	mergeOp := merge.NewMultiplexOperator()
 	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp)
 	if err != nil {
-		return nil, err
+		zlog.Error().Err(err).Msg("storage: failed to open metadata DB")
+		return nil, storageErrors.NewInternalError("Init", err)
 	}
 
 	// Initialize the fdCache
@@ -162,20 +165,22 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Initialize the segment manager
 	segmentManager, err := segment.NewManager(config.DiskPath, config.SegmentSize)
 	if err != nil {
-		return nil, err
+		zlog.Error().Err(err).Msg("storage: failed to initialize segment manager")
+		return nil, storageErrors.NewInternalError("Init", err)
 	}
 
 	// Initialize the file manager
 	fileManager, err := files.NewFileManager(config.DiskPath)
 	if err != nil {
-		return nil, err
+		zlog.Error().Err(err).Msg("storage: failed to create file manager")
+		return nil, storageErrors.NewInternalError("Init", err)
 	}
 
 	// Run recovery for raw files BEFORE starting any services
 	recovery := files.NewRecoveryManager(meta, config.DiskPath)
 	if err := recovery.RecoverOnStartup(); err != nil {
 		zlog.Error().Err(err).Msg("storage: file recovery failed")
-		return nil, fmt.Errorf("file recovery failed: %w", err)
+		return nil, storageErrors.NewInternalError("Init", err)
 	}
 
 	// Initialize and start the centralized deletion queue
@@ -355,7 +360,7 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
 
-		return nil, err
+		return nil, storageErrors.NewTemporaryError("ListKeys", "", err)
 	}
 
 	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
@@ -449,7 +454,8 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
-		return nil, false, err
+		// RocksDB errors are typically temporary
+		return nil, false, storageErrors.NewTemporaryError("Get", key, err)
 	}
 	defer slice.Free()
 	if !slice.Exists() {
@@ -465,7 +471,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage")
 		s.DeleteKey(key)
-		return nil, false, err
+		return nil, false, storageErrors.NewCorruptionError("Get", key, err)
 	}
 
 	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
@@ -493,7 +499,8 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
-			return nil, false, err
+			// Segment read errors are usually I/O errors, retryable for reads
+			return nil, false, storageErrors.NewIOError("Get", key, true, err)
 		} else if r != nil {
 			reader = r
 		} else {
@@ -505,7 +512,12 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
 			s.DeleteKey(key)
-			return nil, false, err
+			// Check if it's a lock error from file manager
+			if err == files.ErrFileLocked {
+				return nil, false, storageErrors.NewLockError("Get", key, err)
+			}
+			// File read errors are usually I/O errors, retryable for reads
+			return nil, false, storageErrors.NewIOError("Get", key, true, err)
 		} else if r != nil {
 			reader = r
 		} else {
@@ -631,7 +643,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("io", "put").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
-		return err
+		return storageErrors.NewIOError("Put", key, false, err)
 	}
 
 	// Determine expiry timestamp if TTL is specified
@@ -652,7 +664,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("file", "put").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
-			return err
+			// Check if it's a disk full error
+			if os.IsNotExist(err) || os.IsPermission(err) || isNoSpaceError(err) {
+				return storageErrors.NewStorageFullError("Put", err)
+			}
+			return storageErrors.NewIOError("Put", key, false, err)
 		}
 
 		valueMsg := &pb.ValueMessage{
@@ -665,7 +681,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
-			return err
+			return storageErrors.NewInternalError("Put", err)
 		}
 		err = s.putLow(key, val, filePath, bytesWritten)
 		if err == nil {
@@ -677,7 +693,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
 		}
-		return err
+		if err != nil {
+			// Map RocksDB write errors appropriately
+			return mapRocksDBError("Put", key, err)
+		}
+		return nil
 	}
 
 	// Small value: we have read the entire value into firstChunk[:n]
@@ -695,7 +715,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
-		return err
+		return storageErrors.NewInternalError("Put", err)
 	}
 	err = s.putLow(key, val, "", int64(n))
 	if err == nil {
@@ -707,7 +727,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
 	}
-	return err
+	if err != nil {
+		// Map RocksDB write errors appropriately
+		return mapRocksDBError("Put", key, err)
+	}
+	return nil
 }
 
 // putLow stores the key-value pair in the database
@@ -893,4 +917,42 @@ func (s *Storage) ListSegmentDeleteStats() ([]SegmentDeleteStats, error) {
 	}
 
 	return stats, nil
+}
+
+// Helper functions for error mapping
+
+// isNoSpaceError checks if an error indicates disk space exhaustion
+func isNoSpaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for ENOSPC (No space left on device)
+	if pathErr, ok := err.(*os.PathError); ok {
+		if errno, ok := pathErr.Err.(syscall.Errno); ok {
+			return errno == syscall.ENOSPC
+		}
+	}
+	return false
+}
+
+// mapRocksDBError maps RocksDB errors to appropriate storage errors
+func mapRocksDBError(op, key string, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// Check for specific RocksDB error conditions
+	errStr := err.Error()
+	switch {
+	case errStr == "rocksdb: not found":
+		return storageErrors.NewNotFoundError(op, key)
+	case errStr == "rocksdb: corruption":
+		return storageErrors.NewCorruptionError(op, key, err)
+	case errStr == "rocksdb: io error":
+		// Write operations are not retryable for I/O errors
+		return storageErrors.NewIOError(op, key, false, err)
+	default:
+		// Most RocksDB errors are temporary and can be retried
+		return storageErrors.NewTemporaryError(op, key, err)
+	}
 }
