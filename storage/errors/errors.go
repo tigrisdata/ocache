@@ -124,13 +124,25 @@ func NewTemporaryError(op, key string, underlying error) *StorageError {
 }
 
 // NewIOError creates a new I/O error
-func NewIOError(op, key string, retryable bool, underlying error) *StorageError {
+func NewIOError(op, key string, underlying error) *StorageError {
 	return &StorageError{
 		Type:       TypeIO,
 		Op:         op,
 		Key:        key,
 		Message:    "storage I/O error",
-		Retryable:  retryable,
+		Retryable:  false,
+		underlying: underlying,
+	}
+}
+
+// NewIORetryableError creates a new I/O error that is retryable
+func NewIORetryableError(op, key string, underlying error) *StorageError {
+	return &StorageError{
+		Type:       TypeIO,
+		Op:         op,
+		Key:        key,
+		Message:    "storage I/O error",
+		Retryable:  true,
 		underlying: underlying,
 	}
 }

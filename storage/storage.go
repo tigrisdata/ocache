@@ -148,7 +148,7 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
 		zlog.Error().Err(err).Str("path", config.DiskPath).Msg("storage: failed to create data directory")
-		return nil, storageErrors.NewIOError("Init", "", false, err)
+		return nil, storageErrors.NewIOError("Init", "", err)
 	}
 
 	// Initialize the metadata DB with multiplex merge operator
@@ -360,7 +360,7 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
 
-		return nil, storageErrors.NewTemporaryError("ListKeys", "", err)
+		return nil, mapRocksDBError("ListKeys", "", err)
 	}
 
 	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
@@ -368,7 +368,7 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 }
 
 // DeleteKey removes metadata and spills for a key
-func (s *Storage) DeleteKey(key string) {
+func (s *Storage) DeleteKey(key string) error {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -379,13 +379,15 @@ func (s *Storage) DeleteKey(key string) {
 	ro := grocksdb.NewDefaultReadOptions()
 	metaKey := keys.MakeMetadataKey(key)
 	slice, err := s.meta.Handle().Get(ro, metaKey)
-	if err != nil || !slice.Exists() {
-		if err != nil {
-			metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
-		} else {
-			metrics.StorageOperations.WithLabelValues("delete", storageType, "not_found").Inc()
-		}
-		return // Key doesn't exist, nothing to delete
+	if err != nil {
+		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
+		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteKey: db.Get error")
+		// RocksDB errors are typically temporary
+		return mapRocksDBError("DeleteKey", key, err)
+	}
+	if !slice.Exists() {
+		metrics.StorageOperations.WithLabelValues("delete", storageType, "not_found").Inc()
+		return nil // Key doesn't exist, nothing to delete
 	}
 	defer slice.Free()
 
@@ -428,14 +430,17 @@ func (s *Storage) DeleteKey(key string) {
 	// Delete the secondary index entry
 	batch.Delete(bucketIndexKey)
 
-	err = s.meta.Handle().Write(wo, batch)
-	if err != nil {
+	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "delete").Inc()
-	} else {
-		metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
-		metrics.ObjectSize.WithLabelValues("delete").Observe(float64(dataSize))
+		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteKey: db.Write error")
+		// RocksDB errors are typically temporary
+		return mapRocksDBError("DeleteKey", key, err)
 	}
+
+	metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
+	metrics.ObjectSize.WithLabelValues("delete").Observe(float64(dataSize))
+	return nil
 }
 
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
@@ -455,7 +460,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
 		// RocksDB errors are typically temporary
-		return nil, false, storageErrors.NewTemporaryError("Get", key, err)
+		return nil, false, mapRocksDBError("Get", key, err)
 	}
 	defer slice.Free()
 	if !slice.Exists() {
@@ -500,7 +505,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
 			s.DeleteKey(key)
 			// Segment read errors are usually I/O errors, retryable for reads
-			return nil, false, storageErrors.NewIOError("Get", key, true, err)
+			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
 		} else {
@@ -517,7 +522,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 				return nil, false, storageErrors.NewLockError("Get", key, err)
 			}
 			// File read errors are usually I/O errors, retryable for reads
-			return nil, false, storageErrors.NewIOError("Get", key, true, err)
+			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
 		} else {
@@ -643,7 +648,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("io", "put").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
-		return storageErrors.NewIOError("Put", key, false, err)
+		return storageErrors.NewIOError("Put", key, err)
 	}
 
 	// Determine expiry timestamp if TTL is specified
@@ -664,11 +669,14 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("file", "put").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to write to segment")
-			// Check if it's a disk full error
-			if os.IsNotExist(err) || os.IsPermission(err) || isNoSpaceError(err) {
+			switch {
+			case isNoSpaceError(err):
 				return storageErrors.NewStorageFullError("Put", err)
+			case os.IsNotExist(err) || os.IsPermission(err):
+				return storageErrors.NewIORetryableError("Put", key, err)
+			default:
+				return storageErrors.NewIOError("Put", key, err)
 			}
-			return storageErrors.NewIOError("Put", key, false, err)
 		}
 
 		valueMsg := &pb.ValueMessage{
@@ -950,7 +958,7 @@ func mapRocksDBError(op, key string, err error) error {
 		return storageErrors.NewCorruptionError(op, key, err)
 	case errStr == "rocksdb: io error":
 		// Write operations are not retryable for I/O errors
-		return storageErrors.NewIOError(op, key, false, err)
+		return storageErrors.NewIOError(op, key, err)
 	default:
 		// Most RocksDB errors are temporary and can be retried
 		return storageErrors.NewTemporaryError(op, key, err)

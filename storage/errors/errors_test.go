@@ -70,12 +70,12 @@ func TestStorageError_Retryability(t *testing.T) {
 		},
 		{
 			name:      "IO read - retryable",
-			err:       NewIOError("Get", "key", true, nil),
+			err:       NewIORetryableError("Get", "key", nil),
 			retryable: true,
 		},
 		{
 			name:      "IO write - non-retryable",
-			err:       NewIOError("Put", "key", false, nil),
+			err:       NewIOError("Put", "key", nil),
 			retryable: false,
 		},
 		{
@@ -100,13 +100,13 @@ func TestStorageError_Retryability(t *testing.T) {
 
 func TestStorageError_TypeChecking(t *testing.T) {
 	tests := []struct {
-		name         string
-		err          error
-		isNotFound   bool
-		isRetryable  bool
+		name          string
+		err           error
+		isNotFound    bool
+		isRetryable   bool
 		isStorageFull bool
-		isCorruption bool
-		expectedType ErrorType
+		isCorruption  bool
+		expectedType  ErrorType
 	}{
 		{
 			name:         "not found",
@@ -165,7 +165,7 @@ func TestStorageError_TypeChecking(t *testing.T) {
 
 func TestStorageError_Unwrap(t *testing.T) {
 	underlying := errors.New("underlying error")
-	err := NewIOError("Get", "key", true, underlying)
+	err := NewIORetryableError("Get", "key", underlying)
 
 	assert.Equal(t, underlying, err.Unwrap())
 	assert.True(t, errors.Is(err, underlying))
