@@ -113,8 +113,8 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
 		// Convert storage error to user-friendly message
-		userErr := mapStorageErrorToUserMessage("Put", err)
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: userErr})
+		userErr := mapStorageErrorToGRPC(err)
+		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: userErr.Error()})
 	}
 
 	zlog.Debug().Str("key", key).Msg("Streaming put completed successfully")
@@ -132,7 +132,8 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	zlog.Debug().Str("key", req.Key).Int64("ttl", req.TtlSeconds).Int("data_len", len(req.Data)).Msg("PutObject called (unary for REST)")
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("PutObject", "invalid").Inc()
-		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
+		userErr := status.Error(codes.InvalidArgument, "missing key")
+		return &pb.PutResponse{Success: false, Error: userErr.Error()}, nil
 	}
 	// Use the same logic as the streaming Put, but for a single chunk
 	// Wrap with retry logic for retryable errors
@@ -143,8 +144,8 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "PutObject").Inc()
 		// Convert storage error to user-friendly message
-		userErr := mapStorageErrorToUserMessage("PutObject", err)
-		return &pb.PutResponse{Success: false, Error: userErr}, nil
+		userErr := mapStorageErrorToGRPC(err)
+		return &pb.PutResponse{Success: false, Error: userErr.Error()}, nil
 	}
 	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
 	return &pb.PutResponse{Success: true}, nil
@@ -220,7 +221,8 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	zlog.Debug().Str("key", req.Key).Msg("gRPC Delete called")
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("Delete", "invalid").Inc()
-		return &pb.DeleteResponse{Success: false, Error: "missing key"}, nil
+		userErr := status.Error(codes.InvalidArgument, "missing key")
+		return &pb.DeleteResponse{Success: false, Error: userErr.Error()}, nil
 	}
 	stor.GetStorage().DeleteKey(req.Key)
 	metrics.RPCRequests.WithLabelValues("Delete", "success").Inc()
@@ -405,45 +407,5 @@ func mapStorageErrorToGRPC(err error) error {
 		return status.Error(codes.DeadlineExceeded, "operation timed out")
 	default:
 		return status.Error(codes.Internal, "internal error")
-	}
-}
-
-// mapStorageErrorToUserMessage converts storage errors to user-friendly messages
-func mapStorageErrorToUserMessage(op string, err error) string {
-	if err == nil {
-		return ""
-	}
-
-	errType, ok := storageErrors.GetType(err)
-	if !ok {
-		// Not a storage error, return generic message
-		return fmt.Sprintf("%s failed: internal error", op)
-	}
-
-	switch errType {
-	case storageErrors.TypeNotFound:
-		return "key not found"
-	case storageErrors.TypeInvalidRequest:
-		if storageErr, ok := err.(*storageErrors.StorageError); ok {
-			return storageErr.Message
-		}
-		return "invalid request"
-	case storageErrors.TypeStorageFull:
-		return "storage capacity exceeded"
-	case storageErrors.TypeCorruption:
-		return "data corruption detected, please retry"
-	case storageErrors.TypeTemporary:
-		return "temporary error, please retry"
-	case storageErrors.TypeIO:
-		if storageErrors.IsRetryable(err) {
-			return "temporary I/O error, please retry"
-		}
-		return "storage I/O error"
-	case storageErrors.TypeLock:
-		return "resource is temporarily locked, please retry"
-	case storageErrors.TypeTimeout:
-		return "operation timed out"
-	default:
-		return fmt.Sprintf("%s failed: internal error", op)
 	}
 }
