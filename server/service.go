@@ -224,7 +224,16 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 		userErr := status.Error(codes.InvalidArgument, "missing key")
 		return &pb.DeleteResponse{Success: false, Error: userErr.Error()}, nil
 	}
-	stor.GetStorage().DeleteKey(req.Key)
+
+	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "Delete", req.Key, func() error {
+		return stor.GetStorage().DeleteKey(req.Key)
+	})
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Delete", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "Delete").Inc()
+		userErr := mapStorageErrorToGRPC(err)
+		return &pb.DeleteResponse{Success: false, Error: userErr.Error()}, nil
+	}
 	metrics.RPCRequests.WithLabelValues("Delete", "success").Inc()
 	return &pb.DeleteResponse{Success: true}, nil
 }
