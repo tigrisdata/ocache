@@ -28,7 +28,8 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 		closer.Close() // Must close reader to release file lock before delete
 	}
 
-	s.DeleteKey(key)
+	err = s.DeleteKey(key)
+	assert.NoError(t, err, "DeleteKey failed")
 	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get after delete failed")
 	assert.False(t, found, "expected key to be deleted")
@@ -52,7 +53,8 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 		closer.Close() // Must close reader to release file lock before delete
 	}
 
-	s.DeleteKey(key)
+	err = s.DeleteKey(key)
+	assert.NoError(t, err, "DeleteKey failed")
 	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get after delete failed")
 	assert.False(t, found, "expected key to be deleted")

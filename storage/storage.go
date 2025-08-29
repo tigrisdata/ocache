@@ -475,7 +475,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	err = proto.Unmarshal(v, valueMsg)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage")
-		s.DeleteKey(key)
+		if err := s.DeleteKey(key); err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after corruption")
+		}
 		return nil, false, storageErrors.NewCorruptionError("Get", key, err)
 	}
 
@@ -503,7 +505,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
-			s.DeleteKey(key)
+			if err := s.DeleteKey(key); err != nil {
+				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after segment read error")
+			}
 			// Segment read errors are usually I/O errors, retryable for reads
 			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
@@ -516,7 +520,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
-			s.DeleteKey(key)
+			if err := s.DeleteKey(key); err != nil {
+				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after file read error")
+			}
 			// Check if it's a lock error from file manager
 			if err == files.ErrFileLocked {
 				return nil, false, storageErrors.NewLockError("Get", key, err)
@@ -530,7 +536,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		}
 	default:
 		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type")
-		s.DeleteKey(key)
+		if err := s.DeleteKey(key); err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after unknown value type")
+		}
 		return nil, false, nil
 	}
 

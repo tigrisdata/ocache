@@ -226,7 +226,8 @@ func TestDiskUsageTracking(t *testing.T) {
 	assert.Equal(t, totalSize, trackedSize)
 
 	// Delete a key and verify size update
-	s.DeleteKey("key-2")
+	err = s.DeleteKey("key-2")
+	require.NoError(t, err)
 	time.Sleep(100 * time.Millisecond)
 
 	expectedSize := totalSize - 200 // key-2 had 200 bytes
