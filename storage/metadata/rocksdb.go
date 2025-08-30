@@ -28,8 +28,6 @@ type RocksDBConfig struct {
 	BloomBitsPerKey int
 	// Enable statistics collection
 	EnableStatistics bool
-	// Prefix length for prefix extraction
-	PrefixLength int
 	// Target file size base in bytes
 	TargetFileSizeBase int64
 	// Maximum background jobs
@@ -53,7 +51,6 @@ func DefaultRocksDBConfig() *RocksDBConfig {
 		BlockSize:                      16 * 1024,         // 16KB blocks
 		BloomBitsPerKey:                12,                // 12 bits for bloom filter
 		EnableStatistics:               true,              // Enable stats
-		PrefixLength:                   7,                 // Length of "!meta/" and similar prefixes
 		TargetFileSizeBase:             64 * 1024 * 1024,  // 64MB files
 		MaxBackgroundJobs:              8,                 // 8 background jobs
 		Level0FileNumCompactionTrigger: 3,                 // Trigger at 3 L0 files
@@ -118,12 +115,6 @@ func CreateOptions(config *RocksDBConfig, mergeOp grocksdb.MergeOperator) *grock
 	// Set block-based table options
 	tableOpts := CreateBlockBasedTableOptions(config)
 	opts.SetBlockBasedTableFactory(tableOpts)
-
-	// Set prefix extractor for efficient prefix-based operations
-	if config.PrefixLength > 0 {
-		prefixExtractor := CreatePrefixExtractor(config.PrefixLength)
-		opts.SetPrefixExtractor(prefixExtractor)
-	}
 
 	// Configure write buffers for 4KB values
 	if config.WriteBufferSize > 0 {
@@ -210,7 +201,6 @@ func LogConfiguration(config *RocksDBConfig) {
 		Int64("db_write_buffer_size_mb", config.DbWriteBufferSize>>20).
 		Int("block_size_kb", config.BlockSize>>10).
 		Int("bloom_bits_per_key", config.BloomBitsPerKey).
-		Int("prefix_length", config.PrefixLength).
 		Int64("target_file_size_mb", config.TargetFileSizeBase>>20).
 		Int("max_background_jobs", config.MaxBackgroundJobs).
 		Int("l0_compaction_trigger", config.Level0FileNumCompactionTrigger).
@@ -227,7 +217,7 @@ func CreateReadOptions(prefixSeek bool, cacheBlocks bool) *grocksdb.ReadOptions 
 		ro.SetTotalOrderSeek(false) // Use prefix ordering
 	}
 
-	ro.SetFillCache(cacheBlocks) // Always cache reads
+	ro.SetFillCache(cacheBlocks) // Cache reads based on cacheBlocks parameter
 
 	return ro
 }
