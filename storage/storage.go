@@ -72,6 +72,9 @@ const (
 	// Default delete queue settings
 	DeleteProcessInterval = time.Second    // Interval between batch processing
 	DeletePruneAge        = 24 * time.Hour // Age after which entries are pruned
+
+	// Default RocksDB configuration
+	DefaultMetadataCacheSize = metadata.DefaultRocksDBBlockCacheSize
 )
 
 // StorageConfig holds all configuration parameters for initializing storage
@@ -91,6 +94,9 @@ type StorageConfig struct {
 	DisableRecompaction bool          // Disable automatic segment recompaction
 	CleanupInterval     time.Duration // Cleanup interval
 	AccessUpdateDelay   time.Duration // Access update delay
+
+	// RocksDB-specific configuration
+	MetadataCacheSize int64 // RocksDB Block cache size in bytes (0 = use default)
 }
 
 // Storage wraps all RocksDB access and related logic
@@ -153,7 +159,13 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize the metadata DB with multiplex merge operator
 	mergeOp := merge.NewMultiplexOperator()
-	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp)
+
+	rocksConfig := metadata.DefaultRocksDBConfig()
+	if config.MetadataCacheSize > 0 {
+		rocksConfig.BlockCacheSize = config.MetadataCacheSize
+	}
+
+	meta, err := metadata.NewMetaDBWithConfig(config.DiskPath, config.TTL, mergeOp, rocksConfig)
 	if err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to open metadata DB")
 		return nil, storageErrors.NewInternalError("Init", err)
@@ -316,9 +328,7 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	ro := grocksdb.NewDefaultReadOptions()
-	// Use prefix iteration to only scan metadata keys
-	ro.SetPrefixSameAsStart(true)
+	ro := metadata.CreateReadOptions(true, false)
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -376,7 +386,7 @@ func (s *Storage) DeleteKey(key string) error {
 	}()
 
 	// Get the value to track size changes and file cleanup
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(false, false)
 	metaKey := keys.MakeMetadataKey(key)
 	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil {
@@ -451,7 +461,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(false, true)
 	metaKey := keys.MakeMetadataKey(key)
 
 	slice, err := s.meta.Handle().Get(ro, metaKey)

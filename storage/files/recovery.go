@@ -88,7 +88,7 @@ func (r *RecoveryManager) RecoverOnStartup() error {
 		Int("stale", stats.Stale).
 		Int("orphaned", stats.Orphaned).
 		Int("missing", stats.Missing).
-		Dur("duration", stats.Duration).
+		Dur("duration_ms", stats.Duration).
 		Msg("files.recovery: completed")
 
 	return nil

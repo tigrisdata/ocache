@@ -141,7 +141,7 @@ func (q *Queue) ProcessBatch() {
 	seen := make(map[string][]byte) // filepath -> earliest queue key
 
 	// Scan and deduplicate
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 
 	it := q.meta.Handle().NewIterator(ro)
@@ -221,7 +221,7 @@ func (q *Queue) ProcessBatch() {
 		zlog.Info().
 			Int("successful", successful).
 			Int("failed", failed).
-			Dur("duration", time.Since(startTime)).
+			Dur("duration_ms", time.Since(startTime)).
 			Msg("deletion queue: processed batch")
 	}
 }
@@ -270,7 +270,7 @@ func (q *Queue) pruneOldEntries() {
 	startTime := time.Now()
 	cutoff := time.Now().Add(-q.config.PruneAge).UnixNano()
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -338,14 +338,14 @@ func (q *Queue) pruneOldEntries() {
 	if pruned > 0 {
 		zlog.Info().
 			Int("pruned", pruned).
-			Dur("duration", time.Since(startTime)).
+			Dur("duration_ms", time.Since(startTime)).
 			Msg("deletion queue: pruned old entries")
 	}
 }
 
 // GetQueueDepth returns the current queue depth
 func (q *Queue) GetQueueDepth() int64 {
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 
 	it := q.meta.Handle().NewIterator(ro)

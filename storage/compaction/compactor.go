@@ -246,8 +246,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID i
 	metrics.CompactionRuns.Inc()
 
 	// RocksDB iterator setup
-	ro := grocksdb.NewDefaultReadOptions()
-	ro.SetPrefixSameAsStart(true)
+	ro := metadata.CreateReadOptions(true, false)
 	it := c.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -421,7 +420,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, maxBytes int64, workerID i
 	metrics.CompactionFilesCompacted.Add(float64(processed))
 	metrics.CompactionBytesCompacted.Add(float64(bytesCopied))
 
-	zlog.Info().Int("worker", workerID).Int("migrated", processed).Dur("duration", duration).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
+	zlog.Info().Int("worker", workerID).Int("migrated", processed).Dur("duration_ms", duration).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
 }
 
 // parseFileIndexRow extracts userKey, filePath and size from RocksDB file-index

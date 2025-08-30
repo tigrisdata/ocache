@@ -8,6 +8,7 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -21,7 +22,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 	var evictedCount int
 	var processedKeys int
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -193,7 +194,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 		Int64("bytes", evicted).
 		Int64("target", targetBytes).
 		Int("keys_examined", processedKeys).
-		Dur("duration", time.Since(start)).
+		Dur("duration_ms", time.Since(start)).
 		Msg("cleaner: LRU eviction completed")
 
 	return evictedCount
@@ -205,7 +206,7 @@ func (c *Cleaner) cleanupOldBuckets(olderThan time.Duration) {
 	start := time.Now()
 	deleted := 0
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -260,7 +261,7 @@ func (c *Cleaner) cleanupOldBuckets(olderThan time.Duration) {
 		zlog.Info().
 			Int("deleted", deleted).
 			Dur("older_than", olderThan).
-			Dur("duration", time.Since(start)).
+			Dur("duration_ms", time.Since(start)).
 			Msg("cleaner: cleaned up old access buckets")
 	}
 }

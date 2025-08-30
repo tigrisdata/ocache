@@ -179,7 +179,7 @@ func TestCalculateDelay_WithJitter(t *testing.T) {
 
 	// Should have some variation
 	assert.Greater(t, len(delays), 1)
-	
+
 	// All delays should be within reasonable bounds
 	for delay := range delays {
 		assert.Greater(t, delay, time.Duration(0))
