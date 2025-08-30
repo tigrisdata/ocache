@@ -10,6 +10,7 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -122,7 +123,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(false, false)
 	wo := grocksdb.NewDefaultWriteOptions()
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
@@ -244,7 +245,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	zlog.Info().
 		Int("cleaned", cleaned).
 		Int64("bytes_freed", bytesFreed).
-		Dur("duration", duration).
+		Dur("duration_ms", duration).
 		Msg("cleaner: TTL cleanup completed")
 }
 
@@ -253,7 +254,7 @@ func (c *Cleaner) calculateTotalSize() {
 	start := time.Now()
 	var totalSize int64
 
-	ro := grocksdb.NewDefaultReadOptions()
+	ro := metadata.CreateReadOptions(false, false)
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -296,7 +297,7 @@ func (c *Cleaner) calculateTotalSize() {
 
 	zlog.Info().
 		Int64("total_size", totalSize).
-		Dur("duration", time.Since(start)).
+		Dur("duration_ms", time.Since(start)).
 		Msg("cleaner: calculated total storage size")
 }
 

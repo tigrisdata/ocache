@@ -26,6 +26,8 @@ type Config struct {
 	RecompactDisable       bool          // Disable automatic segment recompaction
 	TTLCleanupInterval     time.Duration // TTL cleanup interval
 	RequestLogging         bool          // Enable request logging
+	// RocksDB tuning parameters
+	MetadataCacheSize int64 // RocksDB block cache size in bytes
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -54,5 +56,6 @@ func LoadConfig() {
 		RecompactDisable:       *recompactDisable,
 		TTLCleanupInterval:     *ttlCleanupInterval,
 		RequestLogging:         *requestLogging,
+		MetadataCacheSize:      *metadataCacheSize,
 	}
 }

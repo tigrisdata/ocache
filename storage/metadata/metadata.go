@@ -16,22 +16,21 @@ func (m *MetaDB) Handle() *grocksdb.DB {
 
 var metaDB *MetaDB
 
-// NewMetaDB initializes the global metadata DB. It should be called exactly
-// once during Storage initialization.
+// NewMetaDB initializes the global metadata DB with optimized configuration
+// for 4KB values with prefixes. It should be called exactly once during
+// Storage initialization.
 func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator) (*MetaDB, error) {
 	if metaDB != nil {
 		return metaDB, nil
 	}
 
-	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB")
+	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB with optimized configuration")
 
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetCreateIfMissing(true)
+	// Use optimized configuration for 4KB values with prefixes
+	config := DefaultRocksDBConfig()
+	LogConfiguration(config)
 
-	// Set the merge operator if provided
-	if mergeOp != nil {
-		opts.SetMergeOperator(mergeOp)
-	}
+	opts := CreateOptions(config, mergeOp)
 
 	dbPath := diskPath + "/rocksdb"
 	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)
@@ -41,7 +40,32 @@ func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator) (*MetaD
 
 	metaDB = &MetaDB{handle: db}
 
-	zlog.Info().Msg("metadata DB created")
+	zlog.Info().Msg("metadata DB created with optimized configuration")
+
+	return metaDB, nil
+}
+
+// NewMetaDBWithConfig initializes the global metadata DB with custom configuration.
+// It should be called exactly once during Storage initialization.
+func NewMetaDBWithConfig(diskPath string, ttl int, mergeOp grocksdb.MergeOperator, config *RocksDBConfig) (*MetaDB, error) {
+	if metaDB != nil {
+		return metaDB, nil
+	}
+
+	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB with custom configuration")
+
+	LogConfiguration(config)
+	opts := CreateOptions(config, mergeOp)
+
+	dbPath := diskPath + "/rocksdb"
+	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)
+	if err != nil {
+		return nil, err
+	}
+
+	metaDB = &MetaDB{handle: db}
+
+	zlog.Info().Msg("metadata DB created with custom configuration")
 
 	return metaDB, nil
 }

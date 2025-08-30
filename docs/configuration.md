@@ -29,10 +29,11 @@ OCache can be configured through command-line flags when starting the server.
 
 ### Cache Configuration
 
-| Flag             | Type | Default | Description                                           |
-| ---------------- | ---- | ------- | ----------------------------------------------------- |
-| `-ttl`           | int  | 0       | Default TTL in seconds when no key-level TTL is set   |
-| `-fd-cache-size` | int  | 10000   | Size of the file descriptor cache (number of entries) |
+| Flag                   | Type | Default    | Description                                           |
+| ---------------------- | ---- | ---------- | ----------------------------------------------------- |
+| `-ttl`                 | int  | 0          | Default TTL in seconds when no key-level TTL is set   |
+| `-fd-cache-size`       | int  | 10000      | Size of the file descriptor cache (number of entries) |
+| `-metadata-cache-size` | int  | 1073741824 | Maximum size of the metadata cache in bytes (1GB)     |
 
 ### Logging
 

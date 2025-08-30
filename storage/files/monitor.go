@@ -259,7 +259,7 @@ func (m *SyncMonitor) checkAndCleanup() {
 			Int("pending", stats.pending).
 			Int("files_queued", stats.filesQueued).
 			Int("errors", stats.errors).
-			Dur("duration", time.Since(startTime)).
+			Dur("duration_ms", time.Since(startTime)).
 			Msg("files.monitor: cleanup completed")
 	}
 }

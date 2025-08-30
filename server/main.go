@@ -31,6 +31,8 @@ var (
 	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
 
+	metadataCacheSize = flag.Int64("metadata-cache-size", stor.DefaultMetadataCacheSize, "Metadata cache size in bytes (default: 1GB)")
+
 	port           = flag.Int("port", 9000, "Listen port")
 	httpPort       = flag.Int("http-port", 9001, "HTTP port")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
@@ -71,6 +73,7 @@ func RunServer() {
 		MinSegments:         AppConfig.RecompactMinSegments,
 		DisableRecompaction: AppConfig.RecompactDisable,
 		CleanupInterval:     AppConfig.TTLCleanupInterval,
+		MetadataCacheSize:   AppConfig.MetadataCacheSize,
 	}
 	stor.InitStorageWithConfig(storageConfig)
 
