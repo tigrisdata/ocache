@@ -41,7 +41,8 @@ func TestStorage_DeleteIndex_SegmentDeletion(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delete the key
-	s.DeleteKey(key)
+	err = s.DeleteKey(key)
+	require.NoError(t, err)
 
 	// Verify the key is deleted
 	_, found, err := s.Get(key, 0, 0)
@@ -85,7 +86,8 @@ func TestStorage_DeleteIndex_MultipleSegmentDeletions(t *testing.T) {
 	deletedKeys := 3
 	for i := 0; i < deletedKeys; i++ {
 		key := fmt.Sprintf("key_%d", i)
-		s.DeleteKey(key)
+		err := s.DeleteKey(key)
+		require.NoError(t, err)
 	}
 
 	// Check delete index stats
@@ -134,7 +136,8 @@ func TestStorage_DeleteIndex_RawFileDeletion(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delete the key
-	s.DeleteKey(key)
+	err = s.DeleteKey(key)
+	require.NoError(t, err)
 
 	// Verify the key is deleted
 	_, found, err := s.Get(key, 0, 0)
@@ -160,7 +163,8 @@ func TestStorage_DeleteIndex_InlineDeletion(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Delete the key
-	s.DeleteKey(key)
+	err = s.DeleteKey(key)
+	require.NoError(t, err)
 
 	// Verify the key is deleted
 	_, found, err := s.Get(key, 0, 0)
@@ -212,7 +216,8 @@ func TestStorage_ListSegmentDeleteStats(t *testing.T) {
 		// Delete some keys
 		for i := 0; i < seg.numDelete; i++ {
 			key := fmt.Sprintf("%s_key_%d", seg.path, i)
-			s.DeleteKey(key)
+			err := s.DeleteKey(key)
+			require.NoError(t, err)
 		}
 	}
 
@@ -257,7 +262,8 @@ func TestStorage_RemoveDeleteIndex(t *testing.T) {
 	err = s.meta.Handle().Put(wo, keys.MakeMetadataKey(key), data)
 	require.NoError(t, err)
 
-	s.DeleteKey(key)
+	err = s.DeleteKey(key)
+	require.NoError(t, err)
 
 	// Verify delete index exists
 	deletedEntries, deletedBytes, err := s.GetDeleteIndexStats(segmentPath)
@@ -334,7 +340,8 @@ func TestStorage_DeleteIndex_ConcurrentDeletions(t *testing.T) {
 
 			for i := start; i < end; i++ {
 				key := fmt.Sprintf("concurrent_key_%d", i)
-				s.DeleteKey(key)
+				err := s.DeleteKey(key)
+				require.NoError(t, err)
 			}
 		}(g)
 	}

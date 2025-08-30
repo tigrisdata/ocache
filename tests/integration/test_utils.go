@@ -210,8 +210,11 @@ func (h *IntegrationTestHarness) GetObject(key string) ([]byte, error) {
 func (h *IntegrationTestHarness) DeleteObject(key string) error {
 	h.Metrics.TotalDeletes.Add(1)
 
-	// The storage package uses DeleteKey which doesn't return an error
-	h.Storage.DeleteKey(key)
+	err := h.Storage.DeleteKey(key)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return err
+	}
 
 	return nil
 }

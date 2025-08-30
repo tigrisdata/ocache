@@ -13,6 +13,8 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
+	"github.com/tigrisdata/ocache/storage/retry"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -61,6 +63,8 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 
 	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
 	go func() {
+		// Note: We don't retry streaming Put operations at service layer since
+		// the client would need to resend the entire stream
 		errCh <- stor.GetStorage().Put(key, pr, ttl)
 	}()
 
@@ -108,7 +112,9 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+		// Convert storage error to user-friendly message
+		userErr := mapStorageErrorToGRPC(err)
+		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: userErr.Error()})
 	}
 
 	zlog.Debug().Str("key", key).Msg("Streaming put completed successfully")
@@ -126,13 +132,20 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	zlog.Debug().Str("key", req.Key).Int64("ttl", req.TtlSeconds).Int("data_len", len(req.Data)).Msg("PutObject called (unary for REST)")
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("PutObject", "invalid").Inc()
-		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
+		userErr := status.Error(codes.InvalidArgument, "missing key")
+		return &pb.PutResponse{Success: false, Error: userErr.Error()}, nil
 	}
 	// Use the same logic as the streaming Put, but for a single chunk
-	if err := stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds)); err != nil {
+	// Wrap with retry logic for retryable errors
+	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "PutObject", req.Key, func() error {
+		return stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
+	})
+	if err != nil {
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "PutObject").Inc()
-		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
+		// Convert storage error to user-friendly message
+		userErr := mapStorageErrorToGRPC(err)
+		return &pb.PutResponse{Success: false, Error: userErr.Error()}, nil
 	}
 	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
 	return &pb.PutResponse{Success: true}, nil
@@ -149,11 +162,18 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	metrics.StreamsActive.Inc()
 	defer metrics.StreamsActive.Dec()
 
-	r, found, err := stor.GetStorage().Get(req.Key, req.Start, req.End)
+	// Wrap Get with retry logic for retryable errors
+	var r io.Reader
+	var found bool
+	err := retry.DoWithKey(stream.Context(), retry.DefaultConfig(), "Get", req.Key, func() error {
+		var getErr error
+		r, found, getErr = stor.GetStorage().Get(req.Key, req.Start, req.End)
+		return getErr
+	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Get").Inc()
-		return err
+		return mapStorageErrorToGRPC(err)
 	}
 	if !found {
 		metrics.RPCRequests.WithLabelValues("Get", "not_found").Inc()
@@ -201,9 +221,19 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	zlog.Debug().Str("key", req.Key).Msg("gRPC Delete called")
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("Delete", "invalid").Inc()
-		return &pb.DeleteResponse{Success: false, Error: "missing key"}, nil
+		userErr := status.Error(codes.InvalidArgument, "missing key")
+		return &pb.DeleteResponse{Success: false, Error: userErr.Error()}, nil
 	}
-	stor.GetStorage().DeleteKey(req.Key)
+
+	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "Delete", req.Key, func() error {
+		return stor.GetStorage().DeleteKey(req.Key)
+	})
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Delete", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "Delete").Inc()
+		userErr := mapStorageErrorToGRPC(err)
+		return &pb.DeleteResponse{Success: false, Error: userErr.Error()}, nil
+	}
 	metrics.RPCRequests.WithLabelValues("Delete", "success").Inc()
 	return &pb.DeleteResponse{Success: true}, nil
 }
@@ -216,11 +246,17 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 	}()
 
 	zlog.Debug().Str("prefix", req.Prefix).Msg("gRPC List called")
-	keys, err := stor.GetStorage().ListKeys(req.Prefix)
+	// Wrap ListKeys with retry logic for retryable errors
+	var keys []string
+	err := retry.Do(stream.Context(), retry.DefaultConfig(), "ListKeys", func() error {
+		var listErr error
+		keys, listErr = stor.GetStorage().ListKeys(req.Prefix)
+		return listErr
+	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("List", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "List").Inc()
-		return err
+		return mapStorageErrorToGRPC(err)
 	}
 	for _, key := range keys {
 		if err := stream.Send(&pb.ListResponse{Keys: []string{key}}); err != nil {
@@ -342,5 +378,43 @@ func startGRPCGatewayServer(grpcAddr string, gatewayPort int) {
 	zlog.Info().Msgf("Starting grpc-gateway HTTP server on :%d", gatewayPort)
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", gatewayPort), mux); err != nil {
 		zlog.Fatal().Err(err).Msg("grpc-gateway server failed")
+	}
+}
+
+// mapStorageErrorToGRPC maps storage errors to appropriate gRPC status codes
+func mapStorageErrorToGRPC(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	errType, ok := storageErrors.GetType(err)
+	if !ok {
+		// Not a storage error, return as-is
+		return err
+	}
+
+	switch errType {
+	case storageErrors.TypeNotFound:
+		return status.Error(codes.NotFound, "resource not found")
+	case storageErrors.TypeInvalidRequest:
+		return status.Error(codes.InvalidArgument, err.Error())
+	case storageErrors.TypeStorageFull:
+		return status.Error(codes.ResourceExhausted, "storage capacity exceeded")
+	case storageErrors.TypeCorruption:
+		return status.Error(codes.DataLoss, "data corruption detected")
+	case storageErrors.TypeTemporary:
+		return status.Error(codes.Unavailable, "service temporarily unavailable")
+	case storageErrors.TypeIO:
+		// Check if it's retryable
+		if storageErrors.IsRetryable(err) {
+			return status.Error(codes.Unavailable, "temporary I/O error")
+		}
+		return status.Error(codes.Internal, "storage I/O error")
+	case storageErrors.TypeLock:
+		return status.Error(codes.Aborted, "resource temporarily locked")
+	case storageErrors.TypeTimeout:
+		return status.Error(codes.DeadlineExceeded, "operation timed out")
+	default:
+		return status.Error(codes.Internal, "internal error")
 	}
 }
