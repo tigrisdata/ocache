@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	pb "github.com/tigrisdata/ocache/proto"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 // TestManager_MultipleConcurrentOpenSegments tests that the manager can handle

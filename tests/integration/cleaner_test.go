@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
+	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 // Test_Cleaner_AutoTriggerTTL tests that TTL cleanup automatically triggers
@@ -555,7 +555,7 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 		data := GenerateRandomData(500) // 500 bytes (inline)
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_INLINE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_INLINE)
 	}
 
 	// Medium raw file objects with old access times
@@ -568,7 +568,7 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
 		s.Harness.SetAccessTime(key, baseTime-int64(1000+i)) // Very old access
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 	}
 
 	// Medium raw file objects with recent access times
@@ -580,7 +580,7 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
 		s.Harness.SetAccessTime(key, baseTime-int64(i)) // Recent access
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 	}
 
 	s.Harness.FlushAccessUpdates()

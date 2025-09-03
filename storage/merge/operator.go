@@ -5,8 +5,8 @@ package merge
 import (
 	"encoding/binary"
 
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 
 	"google.golang.org/protobuf/proto"
 )

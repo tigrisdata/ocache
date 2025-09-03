@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/fd"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 func TestManager_CurrentOpenSegmentTracking(t *testing.T) {

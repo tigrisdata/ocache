@@ -6,9 +6,9 @@ import (
 	"sync"
 	"testing"
 
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/merge"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 
 	"github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"

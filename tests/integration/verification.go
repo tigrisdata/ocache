@@ -12,8 +12,8 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage"
+	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 // VerifyNoRawFiles verifies that no raw files exist in the storage directory
@@ -167,7 +167,7 @@ func VerifyMetrics(t *testing.T, expected, actual *TestMetrics) {
 }
 
 // VerifyStorageType verifies that a key is stored with the expected ValueType
-func VerifyStorageType(t *testing.T, storageDir string, key string, expectedType pb.ValueType) {
+func VerifyStorageType(t *testing.T, storageDir string, key string, expectedType storagepb.ValueType) {
 	// For now, skip direct RocksDB verification since it requires the DB to be closed
 	// This would need to be called after the storage is closed, or we need to expose
 	// a method in the storage package to get the value type

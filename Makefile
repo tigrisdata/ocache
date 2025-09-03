@@ -79,13 +79,22 @@ build-cli:
 	go build -o ocachecli ./client/cmd/
 
 .PHONY: proto
-proto:
+proto: proto-api proto-storage
+
+.PHONY: proto-api
+proto-api:
 	protoc -I ./proto \
 		-I ./proto/google \
 		--go_out=paths=source_relative:./proto \
 		--go-grpc_out=paths=source_relative:./proto \
 		--grpc-gateway_out=paths=source_relative:./proto \
 		proto/cache.proto
+
+.PHONY: proto-storage
+proto-storage:
+	protoc -I ./storage/proto \
+		--go_out=paths=source_relative:./storage/proto \
+		storage/proto/storage.proto
 
 # Installation
 .PHONY: install-deps

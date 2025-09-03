@@ -3,7 +3,7 @@ package files
 import (
 	"time"
 
-	pb "github.com/tigrisdata/ocache/proto"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 	"google.golang.org/protobuf/proto"
 )
 

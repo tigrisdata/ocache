@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	pb "github.com/tigrisdata/ocache/proto"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 func TestSegmentIterator(t *testing.T) {
