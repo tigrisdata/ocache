@@ -7,9 +7,9 @@ import (
 	"sync"
 
 	zlog "github.com/rs/zerolog/log"
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/fd"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/utils"
 )
 

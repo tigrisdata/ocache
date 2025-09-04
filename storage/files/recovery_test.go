@@ -10,9 +10,9 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 	"google.golang.org/protobuf/proto"
 )
 

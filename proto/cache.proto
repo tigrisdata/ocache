@@ -68,34 +68,3 @@ message ListRequest {
 message ListResponse {
   repeated string keys = 1;
 }
-
-// ValueType indicates where the value bytes are stored.
-enum ValueType {
-  INLINE = 0;     // Value is stored directly in the `data` field.
-  RAW_FILE = 1;   // Value is stored in an external raw file referenced by `raw_file_path`.
-  SEGMENT = 2;    // Value is stored inside a segment file referenced by `segment_path`.
-}
-
-// ValueMessage is a proto-encoded value for storage
-message ValueMessage {
-  ValueType value_type = 1; // Location of the value bytes
-  bytes data = 2; // The actual value bytes
-  int64 expiry = 3; // Expiry timestamp (unix seconds), 0 if no expiry
-  string raw_file_path = 4; // Optional: raw file path for large objects (if used)
-  string segment_path = 5; // Optional: segment file storing the value for large objects (if used)
-  int64 segment_offset = 6; // Byte offset within the segment where the value starts
-  int64 value_length = 7; // Length of the value in bytes within the segment
-  uint32 checksum = 8; // CRC32 checksum of the value
-}
-
-// SyncEntry tracks a file pending sync in the sync index
-message SyncEntry {
-  string metadata_key = 1; // Key to fetch metadata for validation
-  int64 timestamp = 2; // Unix timestamp when file was written
-}
-
-// DeleteIndexEntry tracks deleted entries in a segment for garbage collection
-message DeleteIndexEntry {
-  int64 deleted_entries = 1; // Number of deleted entries in this segment
-  int64 deleted_bytes = 2; // Total bytes of deleted entries in this segment
-}

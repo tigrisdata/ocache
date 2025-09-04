@@ -8,30 +8,30 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
+	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 // Test_Objects_BasicFlow tests basic operations across all object size categories
 func (s *ObjectsSuite) Test_Objects_BasicFlow() {
 	testCases := []ObjectSizeTestCase{
 		// Small objects (< 64KB) - stored inline in RocksDB
-		{Name: "small-1B", Size: 1, ExpectedType: pb.ValueType_INLINE, Category: "small"},
-		{Name: "small-1KB", Size: 1024, ExpectedType: pb.ValueType_INLINE, Category: "small"},
-		{Name: "small-32KB", Size: 32 * 1024, ExpectedType: pb.ValueType_INLINE, Category: "small"},
-		{Name: "small-63KB", Size: 63 * 1024, ExpectedType: pb.ValueType_INLINE, Category: "small"},
-		{Name: "small-64KB", Size: 64 * 1024, ExpectedType: pb.ValueType_INLINE, Category: "small"},
+		{Name: "small-1B", Size: 1, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
+		{Name: "small-1KB", Size: 1024, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
+		{Name: "small-32KB", Size: 32 * 1024, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
+		{Name: "small-63KB", Size: 63 * 1024, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
+		{Name: "small-64KB", Size: 64 * 1024, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
 
 		// Medium objects (64KB-16MB) - stored as raw files, eligible for compaction
-		{Name: "medium-65KB", Size: 65 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "medium"},
-		{Name: "medium-100KB", Size: 100 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "medium"},
-		{Name: "medium-1MB", Size: 1024 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "medium"},
-		{Name: "medium-10MB", Size: 10 * 1024 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "medium"},
-		{Name: "medium-16MB", Size: 16 * 1024 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "medium"},
+		{Name: "medium-65KB", Size: 65 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
+		{Name: "medium-100KB", Size: 100 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
+		{Name: "medium-1MB", Size: 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
+		{Name: "medium-10MB", Size: 10 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
+		{Name: "medium-16MB", Size: 16 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
 
 		// Large objects (> 16MB) - permanent raw files, never compacted
-		{Name: "large-17MB", Size: 17 * 1024 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "large"},
-		{Name: "large-50MB", Size: 50 * 1024 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "large"},
-		{Name: "large-100MB", Size: 100 * 1024 * 1024, ExpectedType: pb.ValueType_RAW_FILE, Category: "large"},
+		{Name: "large-17MB", Size: 17 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
+		{Name: "large-50MB", Size: 50 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
+		{Name: "large-100MB", Size: 100 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
 	}
 
 	RunObjectSizeTests(s.T(), s.Harness, testCases, func(t *testing.T, h *IntegrationTestHarness, tc ObjectSizeTestCase) {
@@ -239,7 +239,7 @@ func (s *ObjectsSuite) Test_Objects_CompactionBehavior() {
 
 	// Initially all should be raw files
 	for _, key := range keys {
-		VerifyStorageType(s.T(), s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(s.T(), s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 	}
 
 	// Wait for compaction

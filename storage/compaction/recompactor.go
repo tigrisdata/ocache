@@ -10,10 +10,10 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/tigrisdata/ocache/common/metrics"
-	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
 	"github.com/tigrisdata/ocache/storage/utils"
 	"google.golang.org/protobuf/proto"

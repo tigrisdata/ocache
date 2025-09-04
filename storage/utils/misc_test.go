@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	pb "github.com/tigrisdata/ocache/proto"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 func TestValidateFileEntry(t *testing.T) {

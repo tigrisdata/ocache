@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
+	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 // Test_CompactionLoop_AutoTrigger tests that compaction automatically triggers
@@ -37,7 +37,7 @@ func (s *CompactionSuite) Test_CompactionLoop_AutoTrigger() {
 		require.NoError(t, err, "Failed to store object %d", i)
 
 		// Verify initially stored as RAW_FILE
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 	}
 
 	// Record initial state
@@ -78,7 +78,7 @@ func (s *CompactionSuite) Test_CompactionLoop_AutoTrigger() {
 		require.Equal(t, size, len(retrievedData), "Data size mismatch for key %s", key)
 
 		// Most should now be in segments
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_SEGMENT)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_SEGMENT)
 	}
 
 	// Note: CompactedFiles metric tracking would be added here if needed
@@ -104,7 +104,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_INLINE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_INLINE)
 	}
 
 	// Medium objects (should be compacted)
@@ -117,7 +117,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 
 		// Medium objects should have compaction entries
 	}
@@ -131,7 +131,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 
 		// Verify no compaction entry for large objects
 		VerifyNoCompactionEntry(t, s.Harness.Storage, key)
@@ -154,7 +154,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 
 	// Small objects should still be inline
 	for _, key := range smallKeys {
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_INLINE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_INLINE)
 		data, err := s.Harness.GetObject(key)
 		require.NoError(t, err)
 		require.Equal(t, 10*1024, len(data))
@@ -162,7 +162,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 
 	// Medium objects should be in segments
 	for i, key := range mediumKeys {
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_SEGMENT)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_SEGMENT)
 		size := 100*1024 + i*100*1024
 		data, err := s.Harness.GetObject(key)
 		require.NoError(t, err)
@@ -171,7 +171,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 
 	// Large objects should still be raw files
 	for _, key := range largeKeys {
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_RAW_FILE)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
 		data, err := s.Harness.GetObject(key)
 		require.NoError(t, err)
 		require.Equal(t, 20*1024*1024, len(data))
@@ -624,7 +624,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_BasicFragmentation() {
 
 	// Verify all remaining objects are in segments
 	for _, key := range remainingKeys {
-		VerifyStorageType(t, s.Harness.TempDir, key, pb.ValueType_SEGMENT)
+		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_SEGMENT)
 	}
 }
 

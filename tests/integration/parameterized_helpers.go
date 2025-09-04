@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
+	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 // Common error types for testing
@@ -43,7 +43,7 @@ type TestCase struct {
 type ObjectSizeTestCase struct {
 	Name         string
 	Size         int64
-	ExpectedType pb.ValueType
+	ExpectedType storagepb.ValueType
 	Category     string // "small", "medium", "large"
 	Data         []byte
 	TTL          int64
