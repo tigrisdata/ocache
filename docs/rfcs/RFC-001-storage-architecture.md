@@ -3,7 +3,7 @@
 **RFC Number:** 001  
 **Status:** Active  
 **Authors:** Ovais Tariq
-**Created:** 2025-07-15  
+**Created:** 2025-06-05  
 **Last Updated:** 2025-09-04
 
 ## Abstract
@@ -31,27 +31,27 @@ Traditional single-tier storage systems force trade-offs that compromise perform
 ```mermaid
 graph TD
     A[Client Request] --> B[Storage Layer]
-    
+
     B --> C[Size-Based Router]
-    
+
     C --> D{Object Size}
     D -->|< 64KB| E[RocksDB<br/>High Concurrency<br/>Low Latency]
     D -->|64KB - 16MB| F[Raw Files]
     D -->|> 16MB| G[Raw Files<br/>Permanent<br/>High Throughput]
-    
+
     F --> H[Compaction]
     H --> I[Segments<br/>Moderate Concurrency]
-    
+
     J[Background Processes] --> K[Compactor]
     J --> L[Cleaner]
     J --> M[Recompactor]
-    
+
     K --> I
     L --> E
     L --> I
     L --> G
     M --> I
-    
+
     style A fill:#2196F3,stroke:#1565C0,stroke-width:2px,color:#fff
     style B fill:#FF9800,stroke:#E65100,stroke-width:2px,color:#fff
     style C fill:#9C27B0,stroke:#6A1B9A,stroke-width:2px,color:#fff
