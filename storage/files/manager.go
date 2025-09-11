@@ -96,9 +96,8 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 
 	checksum := hash.Sum32()
 
-	// TODO: Sync() causes significant latency (10-50ms) regardless of file size
-	// Need to look into making this batched or async for better performance
-	// _ = file.Sync()
+	// Sync() causes significant latency (10-50ms) regardless of file size
+	// We choose to not sync here to avoid latency for writes
 
 	zlog.Debug().Str("key", key).Str("path", filePath).Int64("bytes", bytesWritten).Msg("fileManager: completed write")
 	return filePath, checksum, bytesWritten, nil
