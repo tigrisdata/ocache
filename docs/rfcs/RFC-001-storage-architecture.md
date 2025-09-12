@@ -28,43 +28,174 @@ Traditional single-tier storage systems force trade-offs that compromise perform
 
 ### Three-Tier Storage Model
 
+#### Storage Tier Selection Flow
+
+This flowchart shows how OCache determines the appropriate storage tier for incoming objects based on their size:
+
 ```mermaid
-graph TD
-    A[Client Request] --> B[Storage Layer]
+flowchart TD
+    Start([Client Write Request]) --> GetSize[Calculate Object Size]
+    
+    GetSize --> CheckSmall{Size < 64KB?}
+    
+    CheckSmall -->|Yes| InlineStorage[Store in RocksDB<br/>as INLINE type]
+    CheckSmall -->|No| CheckMedium{Size < 16MB?}
+    
+    CheckMedium -->|Yes| RawFile[Write to Raw File<br/>Mark as COMPACTABLE]
+    CheckMedium -->|No| LargeFile[Write to Raw File<br/>Mark as PERMANENT]
+    
+    InlineStorage --> WriteMeta1[Write Metadata<br/>to RocksDB]
+    RawFile --> WriteMeta2[Write Metadata<br/>to RocksDB]
+    LargeFile --> WriteMeta3[Write Metadata<br/>to RocksDB]
+    
+    WriteMeta1 --> UpdateAccess1[Update Access Index]
+    WriteMeta2 --> UpdateAccess2[Update Access Index]
+    WriteMeta3 --> UpdateAccess3[Update Access Index]
+    
+    UpdateAccess1 --> Success([Return Success])
+    UpdateAccess2 --> Success
+    UpdateAccess3 --> Success
 
-    B --> C[Size-Based Router]
+    style Start fill:#2196F3,stroke:#1565C0,stroke-width:2px,color:#fff
+    style InlineStorage fill:#4CAF50,stroke:#2E7D32,stroke-width:2px,color:#fff
+    style RawFile fill:#FF9800,stroke:#E65100,stroke-width:2px,color:#fff
+    style LargeFile fill:#795548,stroke:#4E342E,stroke-width:2px,color:#fff
+    style Success fill:#9C27B0,stroke:#6A1B9A,stroke-width:2px,color:#fff
+```
 
-    C --> D{Object Size}
-    D -->|< 64KB| E[RocksDB<br/>High Concurrency<br/>Low Latency]
-    D -->|64KB - 16MB| F[Raw Files]
-    D -->|> 16MB| G[Raw Files<br/>Permanent<br/>High Throughput]
+#### Client Read Request Flow
 
-    F --> H[Compaction]
-    H --> I[Segments<br/>Moderate Concurrency]
+This flowchart shows how OCache retrieves objects from different storage tiers based on metadata:
 
-    J[Background Processes] --> K[Compactor]
-    J --> L[Cleaner]
-    J --> M[Recompactor]
+```mermaid
+flowchart TD
+    Start([Client Read Request]) --> GetMeta[Lookup Key in RocksDB<br/>Retrieve Metadata]
+    
+    GetMeta --> CheckMeta{Metadata<br/>Found?}
+    
+    CheckMeta -->|No| NotFound[Return Not Found]
+    CheckMeta -->|Yes| CheckTTL{TTL<br/>Expired?}
+    
+    CheckTTL -->|Yes| Expired[Mark for Cleanup<br/>Return Not Found]
+    CheckTTL -->|No| CheckType{Check<br/>ValueType}
+    
+    CheckType -->|INLINE| ReadInline[Return Data<br/>from Metadata]
+    CheckType -->|RAW_FILE| ReadRaw[Open Raw File<br/>via FD Cache]
+    CheckType -->|SEGMENT| ReadSegment[Open Segment File<br/>via FD Cache]
+    
+    ReadRaw --> CheckRawFile{File<br/>Exists?}
+    CheckRawFile -->|No| Retry1[Retry with<br/>Exponential Backoff]
+    CheckRawFile -->|Yes| StreamRaw[Create File Reader<br/>Stream Data]
+    
+    ReadSegment --> SeekOffset[Seek to Offset<br/>in Segment]
+    SeekOffset --> CheckSegFile{Segment<br/>Valid?}
+    CheckSegFile -->|No| Retry2[Retry with<br/>Exponential Backoff]
+    CheckSegFile -->|Yes| StreamSeg[Create Bounded Reader<br/>Stream Data]
+    
+    ReadInline --> UpdateLRU[Queue Async<br/>Access Update]
+    StreamRaw --> UpdateLRU
+    StreamSeg --> UpdateLRU
+    
+    UpdateLRU --> ReturnData([Return Data<br/>to Client])
+    
+    Retry1 --> CheckRetry1{Max<br/>Retries?}
+    Retry2 --> CheckRetry2{Max<br/>Retries?}
+    
+    CheckRetry1 -->|No| ReadRaw
+    CheckRetry1 -->|Yes| Error1[Return Error]
+    
+    CheckRetry2 -->|No| ReadSegment
+    CheckRetry2 -->|Yes| Error2[Return Error]
 
-    K --> I
-    L --> E
-    L --> I
-    L --> G
-    M --> I
+    style Start fill:#2196F3,stroke:#1565C0,stroke-width:2px,color:#fff
+    style ReadInline fill:#4CAF50,stroke:#2E7D32,stroke-width:2px,color:#fff
+    style StreamRaw fill:#FF9800,stroke:#E65100,stroke-width:2px,color:#fff
+    style StreamSeg fill:#FF5722,stroke:#BF360C,stroke-width:2px,color:#fff
+    style ReturnData fill:#9C27B0,stroke:#6A1B9A,stroke-width:2px,color:#fff
+    style NotFound fill:#F44336,stroke:#C62828,stroke-width:2px,color:#fff
+    style Expired fill:#F44336,stroke:#C62828,stroke-width:2px,color:#fff
+    style Error1 fill:#F44336,stroke:#C62828,stroke-width:2px,color:#fff
+    style Error2 fill:#F44336,stroke:#C62828,stroke-width:2px,color:#fff
+```
 
-    style A fill:#2196F3,stroke:#1565C0,stroke-width:2px,color:#fff
-    style B fill:#FF9800,stroke:#E65100,stroke-width:2px,color:#fff
-    style C fill:#9C27B0,stroke:#6A1B9A,stroke-width:2px,color:#fff
-    style E fill:#4CAF50,stroke:#2E7D32,stroke-width:2px,color:#fff
-    style I fill:#FF5722,stroke:#BF360C,stroke-width:2px,color:#fff
-    style G fill:#795548,stroke:#4E342E,stroke-width:2px,color:#fff
-    style J fill:#E91E63,stroke:#AD1457,stroke-width:2px,color:#fff
-    style F fill:#607D8B,stroke:#37474F,stroke-width:2px,color:#fff
-    style H fill:#009688,stroke:#00695C,stroke-width:2px,color:#fff
-    style K fill:#3F51B5,stroke:#283593,stroke-width:2px,color:#fff
-    style L fill:#673AB7,stroke:#4527A0,stroke-width:2px,color:#fff
-    style M fill:#00BCD4,stroke:#00838F,stroke-width:2px,color:#fff
-    style D fill:#FFC107,stroke:#F57C00,stroke-width:2px,color:#000
+#### Compaction and Recompaction Process
+
+This diagram illustrates the background compaction and recompaction lifecycle for medium-sized objects:
+
+```mermaid
+flowchart LR
+    subgraph "Initial Storage"
+        RF1[Raw File 1<br/>100KB] 
+        RF2[Raw File 2<br/>200KB]
+        RF3[Raw File 3<br/>150KB]
+        RF4[Raw File 4<br/>500KB]
+    end
+    
+    subgraph "Compaction Process"
+        Scanner[Compactor Scanner<br/>Finds eligible files<br/>64KB - 16MB]
+        Batch[Batch Creator<br/>Groups files<br/>Target: 256MB]
+        Write[Segment Writer<br/>Creates new segment]
+    end
+    
+    subgraph "Segment Storage"
+        Seg1[Segment 1<br/>256MB<br/>Contains RF1-3]
+        Seg2[Segment 2<br/>256MB<br/>Contains RF4+others]
+    end
+    
+    subgraph "Recompaction Process"
+        Monitor[Fragment Monitor<br/>Checks dead space]
+        Check{Fragmentation<br/>> 50%?}
+        Age{Segment Age<br/>> 2 hours?}
+        Recompact[Recompactor<br/>Copies live data]
+    end
+    
+    subgraph "Recompacted Storage"
+        NewSeg[New Segment<br/>Live data only]
+    end
+    
+    RF1 --> Scanner
+    RF2 --> Scanner
+    RF3 --> Scanner
+    RF4 --> Scanner
+    
+    Scanner --> Batch
+    Batch --> Write
+    Write --> Seg1
+    Write --> Seg2
+    
+    Seg1 --> Monitor
+    Seg2 --> Monitor
+    
+    Monitor --> Check
+    Check -->|Yes| Age
+    Check -->|No| Monitor
+    
+    Age -->|Yes| Recompact
+    Age -->|No| Monitor
+    
+    Recompact --> NewSeg
+    
+    Cleanup[Cleanup Process<br/>Deletes old files<br/>after grace period]
+    
+    Seg1 -.->|After recompaction| Cleanup
+    RF1 -.->|After compaction| Cleanup
+    RF2 -.->|After compaction| Cleanup
+    RF3 -.->|After compaction| Cleanup
+    RF4 -.->|After compaction| Cleanup
+
+    style RF1 fill:#607D8B,stroke:#37474F,stroke-width:2px,color:#fff
+    style RF2 fill:#607D8B,stroke:#37474F,stroke-width:2px,color:#fff
+    style RF3 fill:#607D8B,stroke:#37474F,stroke-width:2px,color:#fff
+    style RF4 fill:#607D8B,stroke:#37474F,stroke-width:2px,color:#fff
+    style Scanner fill:#3F51B5,stroke:#283593,stroke-width:2px,color:#fff
+    style Batch fill:#009688,stroke:#00695C,stroke-width:2px,color:#fff
+    style Write fill:#00BCD4,stroke:#00838F,stroke-width:2px,color:#fff
+    style Seg1 fill:#FF5722,stroke:#BF360C,stroke-width:2px,color:#fff
+    style Seg2 fill:#FF5722,stroke:#BF360C,stroke-width:2px,color:#fff
+    style Monitor fill:#673AB7,stroke:#4527A0,stroke-width:2px,color:#fff
+    style Recompact fill:#E91E63,stroke:#AD1457,stroke-width:2px,color:#fff
+    style NewSeg fill:#4CAF50,stroke:#2E7D32,stroke-width:2px,color:#fff
+    style Cleanup fill:#9E9E9E,stroke:#424242,stroke-width:2px,color:#fff
 ```
 
 ### Key Components
