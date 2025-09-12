@@ -93,7 +93,7 @@ The access tracking system uses time-based bucketing to efficiently manage milli
 
 **Design Principles:**
 
-- **Bucket Granularity**: 24-hour buckets for access time grouping
+- **Bucket Granularity**: 1-hour buckets for access time grouping
 - **Key Format**: `!access_bucket:bucket:<timestamp>/<key>` for range queries
 - **Secondary Index**: `!access_bucket:index/<key>` points to current bucket entry
 
@@ -114,14 +114,14 @@ The access tracking system maintains a time-ordered index of object accesses usi
 
 **Primary Bucketed Index:**
 
-- **Key Format**: `!access_bucket:bucket:<unix_timestamp>/<user_key>`
+- **Key Format**: `!access_bucket/YYYYMMDDHH/timestamp_nano/<user_key>`
 - **Value Format**: 8-byte Unix timestamp of last access
 - **Bucket Size**: 24-hour periods aligned to UTC midnight
 - **Purpose**: Enables efficient LRU traversal from oldest to newest
 
 **Secondary Lookup Index:**
 
-- **Key Format**: `!access_bucket:index/<user_key>`
+- **Key Format**: `!access_bucket_index/<user_key>`
 - **Value Format**: Current bucket key for the object
 - **Purpose**: O(1) lookup and update of access times
 
