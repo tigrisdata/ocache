@@ -514,9 +514,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
-			zlog.Error().Err(err).Str("key", key).Str("segment", valueMsg.SegmentPath).Msg("storage.Get: failed to read segment - corruption detected")
-			// Return error for segment read failures, preserving the corrupted segment reference
-			return nil, false, storageErrors.NewCorruptionError("Get", key, err)
+			zlog.Error().Err(err).Str("key", key).Str("segment", valueMsg.SegmentPath).Msg("storage.Get: failed to read segment")
+			// File read errors are usually I/O errors, retryable for reads
+			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
 		} else {
@@ -526,13 +526,13 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
-			zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).Msg("storage.Get: failed to read file - possible corruption")
+			zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).Msg("storage.Get: failed to read file")
 			// Check if it's a lock error from file manager
 			if err == files.ErrFileLocked {
 				return nil, false, storageErrors.NewLockError("Get", key, err)
 			}
-			// Return error for file read failures, preserving the file reference
-			return nil, false, storageErrors.NewCorruptionError("Get", key, err)
+			// File read errors are usually I/O errors, retryable for reads
+			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
 		} else {
