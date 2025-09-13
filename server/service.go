@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
@@ -29,6 +30,7 @@ import (
 // cacheService implements pb.CacheServiceServer
 type cacheService struct {
 	pb.UnimplementedCacheServiceServer
+	coordinator *coordinator.Coordinator
 }
 
 // Streaming Put for large values
@@ -41,6 +43,11 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	zlog.Debug().Msg("gRPC Put called")
 	metrics.StreamsActive.Inc()
 	defer metrics.StreamsActive.Dec()
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredPut(stream)
+	}
 
 	// Read the first chunk to get key and ttl
 	firstChunk, err := stream.Recv()
@@ -130,6 +137,12 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	}()
 
 	zlog.Debug().Str("key", req.Key).Int64("ttl", req.TtlSeconds).Int("data_len", len(req.Data)).Msg("PutObject called (unary for REST)")
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredPutObject(ctx, req)
+	}
+
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("PutObject", "invalid").Inc()
 		userErr := status.Error(codes.InvalidArgument, "missing key")
@@ -161,6 +174,11 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	zlog.Debug().Str("key", req.Key).Int64("start", req.Start).Int64("end", req.End).Msg("gRPC Get called")
 	metrics.StreamsActive.Inc()
 	defer metrics.StreamsActive.Dec()
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredGet(req, stream)
+	}
 
 	// Wrap Get with retry logic for retryable errors
 	var r io.Reader
@@ -219,6 +237,12 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	}()
 
 	zlog.Debug().Str("key", req.Key).Msg("gRPC Delete called")
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredDelete(ctx, req)
+	}
+
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("Delete", "invalid").Inc()
 		userErr := status.Error(codes.InvalidArgument, "missing key")
@@ -345,7 +369,9 @@ func startGRPCServer() {
 	)
 
 	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterCacheServiceServer(grpcServer, &cacheService{})
+	// Create service with coordinator if clustering is enabled
+	service := newCacheService(globalCoordinator)
+	pb.RegisterCacheServiceServer(grpcServer, service)
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", AppConfig.Port))
 	if err != nil {

@@ -155,6 +155,38 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+// GetRange retrieves a byte range from the cache
+func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
+	req := &pb.GetRequest{
+		Key:   key,
+		Start: start,
+		End:   end,
+	}
+	stream, err := c.client.Get(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var result []byte
+	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, resp.Data...)
+	}
+	return result, nil
+}
+
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 	stream, err := c.client.List(ctx, &pb.ListRequest{Prefix: prefix})
 	if err != nil {

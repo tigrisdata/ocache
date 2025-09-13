@@ -8,6 +8,7 @@ require (
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
 	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/coordinator v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/storage v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
@@ -21,6 +22,8 @@ require (
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/buraksezer/consistent v0.10.0 // indirect
+	github.com/cespare/xxhash v1.1.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
@@ -45,3 +48,5 @@ replace github.com/tigrisdata/ocache/proto => ../proto
 replace github.com/tigrisdata/ocache/storage => ../storage
 
 replace github.com/tigrisdata/ocache/common => ../common
+
+replace github.com/tigrisdata/ocache/coordinator => ../coordinator

@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package cache;
+
+option go_package = "github.com/tigrisdata/ocache/proto;proto";
+
+// ClusterService handles internal cluster communication
+service ClusterService {
+  rpc Join(JoinRequest) returns (JoinResponse);
+  rpc Leave(LeaveRequest) returns (LeaveResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc GetClusterState(Empty) returns (ClusterState);
+}
+
+// Node status enum
+enum NodeStatus {
+  NODE_STATUS_ACTIVE = 0;
+  NODE_STATUS_JOINING = 1;
+  NODE_STATUS_LEAVING = 2;
+  NODE_STATUS_DOWN = 3;
+}
+
+// Empty message for requests with no parameters
+message Empty {}
+
+// Node information
+message NodeInfo {
+  string id = 1;
+  string address = 2;
+  NodeStatus status = 3;
+  uint64 joined_at = 4;
+  double weight = 5;
+}
+
+// Cluster state
+message ClusterState {
+  uint64 epoch = 1;
+  repeated NodeInfo nodes = 2;
+}
+
+// Join cluster request
+message JoinRequest {
+  string node_id = 1;
+  string address = 2;
+}
+
+// Join cluster response
+message JoinResponse {
+  bool success = 1;
+  uint64 epoch = 2;
+  string error = 3;
+}
+
+// Leave cluster request
+message LeaveRequest {
+  string node_id = 1;
+}
+
+// Leave cluster response
+message LeaveResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// Heartbeat request
+message HeartbeatRequest {
+  string node_id = 1;
+  uint64 epoch = 2;
+}
+
+// Heartbeat response
+message HeartbeatResponse {
+  uint64 epoch = 1;
+}

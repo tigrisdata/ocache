@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator"
 	stor "github.com/tigrisdata/ocache/storage"
 )
 
@@ -37,6 +40,20 @@ var (
 	httpPort       = flag.Int("http-port", 9001, "HTTP port")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
+
+	// Cluster configuration flags
+	clusterEnabled    = flag.Bool("cluster-enabled", false, "Enable cluster mode")
+	nodeID            = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
+	clusterAddr       = flag.String("cluster-addr", ":7000", "Address for cluster communication")
+	seedsStr          = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000)")
+	partitionCount    = flag.Int("partition-count", coordinator.DefaultPartitionCount, "Number of partitions in hash ring")
+	heartbeatInterval = flag.Duration("heartbeat-interval", coordinator.DefaultHeartbeatInterval, "Interval between heartbeats")
+	failureThreshold  = flag.Int("failure-threshold", coordinator.DefaultFailureThreshold, "Number of failed heartbeats before marking node down")
+
+	seeds []string
+
+	// Global coordinator instance
+	globalCoordinator *coordinator.Coordinator
 )
 
 func configureLogger() {
@@ -56,6 +73,39 @@ func RunServer() {
 	// Initialize Prometheus metrics
 	metrics.Init()
 	zlog.Info().Msg("Prometheus metrics initialized")
+
+	// Create a context for the server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize coordinator if clustering is enabled
+	if AppConfig.ClusterEnabled {
+		coordConfig := &coordinator.Config{
+			Enabled:           true,
+			MyNodeID:          AppConfig.NodeID,
+			ClusterAddr:       AppConfig.ClusterAddr,
+			Nodes:             AppConfig.Seeds,
+			PartitionCount:    AppConfig.PartitionCount,
+			HeartbeatInterval: int(AppConfig.HeartbeatInterval.Seconds()),
+			FailureThreshold:  AppConfig.FailureThreshold,
+		}
+
+		var err error
+		globalCoordinator, err = coordinator.New(coordConfig)
+		if err != nil {
+			zlog.Fatal().Err(err).Msg("Failed to create coordinator")
+		}
+
+		if err := globalCoordinator.Start(ctx); err != nil {
+			zlog.Fatal().Err(err).Msg("Failed to start coordinator")
+		}
+
+		zlog.Info().
+			Str("node_id", AppConfig.NodeID).
+			Str("cluster_addr", AppConfig.ClusterAddr).
+			Int("seeds", len(AppConfig.Seeds)).
+			Msg("Cluster coordinator started")
+	}
 
 	// Create storage config from AppConfig
 	storageConfig := &stor.StorageConfig{
@@ -84,8 +134,32 @@ func RunServer() {
 	// Handle graceful shutdown on SIGINT/SIGTERM.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigChan
-	zlog.Info().Str("signal", sig.String()).Msg("Received shutdown signal, shutting down...")
+
+	// Create coordinator error channel if coordinator is enabled
+	var coordinatorErrCh <-chan error
+	if globalCoordinator != nil {
+		coordinatorErrCh = globalCoordinator.ErrorChan()
+	}
+
+	// Wait for shutdown signal or fatal coordinator error
+	select {
+	case sig := <-sigChan:
+		zlog.Info().Str("signal", sig.String()).Msg("Received shutdown signal, shutting down...")
+	case err := <-coordinatorErrCh:
+		if err != nil {
+			zlog.Error().Err(err).Msg("Coordinator reported fatal error, shutting down...")
+		}
+	}
+
+	// Cancel context to signal graceful shutdown
+	cancel()
+
+	// Close coordinator if enabled
+	if globalCoordinator != nil {
+		if err := globalCoordinator.Stop(); err != nil {
+			zlog.Error().Err(err).Msg("Error stopping coordinator")
+		}
+	}
 
 	// Close storage (flush segments, close RocksDB, etc.)
 	stor.CloseStorage()
@@ -95,6 +169,15 @@ func RunServer() {
 
 func main() {
 	flag.Parse()
+
+	// Parse seed nodes if provided
+	if *seedsStr != "" {
+		seeds = strings.Split(*seedsStr, ",")
+		for i, seed := range seeds {
+			seeds[i] = strings.TrimSpace(seed)
+		}
+	}
+
 	LoadConfig()
 	configureLogger()
 
