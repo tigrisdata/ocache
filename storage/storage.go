@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"syscall"
@@ -484,10 +485,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	valueMsg := &pb.ValueMessage{}
 	err = proto.Unmarshal(v, valueMsg)
 	if err != nil {
-		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage")
-		if err := s.DeleteKey(key); err != nil {
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after corruption")
-		}
+		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage - corruption detected")
+		// Return corruption error without deleting the key
+		// This preserves the corrupted data for debugging/recovery
 		return nil, false, storageErrors.NewCorruptionError("Get", key, err)
 	}
 
@@ -514,11 +514,8 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		if r, err := s.segmentManager.ReadEntry(key, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength); err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read segment slice")
-			if err := s.DeleteKey(key); err != nil {
-				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after segment read error")
-			}
-			// Segment read errors are usually I/O errors, retryable for reads
+			zlog.Error().Err(err).Str("key", key).Str("segment", valueMsg.SegmentPath).Msg("storage.Get: failed to read segment")
+			// File read errors are usually I/O errors, retryable for reads
 			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
@@ -529,10 +526,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to read file")
-			if err := s.DeleteKey(key); err != nil {
-				zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after file read error")
-			}
+			zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).Msg("storage.Get: failed to read file")
 			// Check if it's a lock error from file manager
 			if err == files.ErrFileLocked {
 				return nil, false, storageErrors.NewLockError("Get", key, err)
@@ -545,11 +539,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			return nil, false, nil
 		}
 	default:
-		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type")
-		if err := s.DeleteKey(key); err != nil {
-			zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to delete key after unknown value type")
-		}
-		return nil, false, nil
+		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type - corruption detected")
+		// Return error for unknown value types
+		return nil, false, storageErrors.NewCorruptionError("Get", key, fmt.Errorf("unknown value type: %d", valueMsg.ValueType))
 	}
 
 	metrics.StorageOperations.WithLabelValues("get", storageType, "success").Inc()
