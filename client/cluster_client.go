@@ -9,7 +9,7 @@ import (
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
-	pb "github.com/tigrisdata/ocache/proto"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -107,8 +107,8 @@ func (c *ClusterClient) discoverFromSeed(seedAddr string) error {
 	}
 	defer conn.Close()
 
-	client := pb.NewClusterServiceClient(conn)
-	state, err := client.GetClusterState(ctx, &pb.Empty{})
+	client := clusterpb.NewClusterServiceClient(conn)
+	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
 	if err != nil {
 		return fmt.Errorf("failed to get cluster state from %s: %w", seedAddr, err)
 	}
@@ -126,7 +126,7 @@ func (c *ClusterClient) discoverFromSeed(seedAddr string) error {
 
 	// Add all active nodes to ring and create clients
 	for _, node := range state.Nodes {
-		if node.Status != pb.NodeStatus_NODE_STATUS_ACTIVE {
+		if node.Status != clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
 			continue
 		}
 

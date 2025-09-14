@@ -9,6 +9,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/coordinator/discovery"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -54,7 +55,7 @@ type Config struct {
 // Coordinator manages cluster membership, request routing, and cluster RPC handling.
 // Combines membership tracking, failure detection, and cluster RPC handling.
 type Coordinator struct {
-	pb.UnimplementedClusterServiceServer
+	clusterpb.UnimplementedClusterServiceServer
 
 	// Configuration for the coordinator
 	config *Config
@@ -196,7 +197,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 		grpc.MaxSendMsgSize(MaxMessageSize),
 	)
 
-	pb.RegisterClusterServiceServer(c.grpcServer, c)
+	clusterpb.RegisterClusterServiceServer(c.grpcServer, c)
 
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
@@ -339,14 +340,14 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 	}
 	defer conn.Close()
 
-	client := pb.NewClusterServiceClient(conn)
+	client := clusterpb.NewClusterServiceClient(conn)
 
 	// Get current cluster state from the node
 	zlog.Debug().
 		Str("node", nodeAddr).
 		Msg("Requesting cluster state from node")
 
-	state, err := client.GetClusterState(ctx, &pb.Empty{})
+	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
 	if err != nil {
 		return err
 	}
@@ -374,7 +375,7 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 	}
 
 	// Announce our join to the cluster
-	joinReq := &pb.JoinRequest{
+	joinReq := &clusterpb.JoinRequest{
 		NodeId:  c.config.MyNodeID,
 		Address: c.config.ClusterAddr,
 	}
@@ -457,8 +458,8 @@ func (c *Coordinator) sendHeartbeats() {
 			}
 			defer conn.Close()
 
-			client := pb.NewClusterServiceClient(conn)
-			req := &pb.HeartbeatRequest{
+			client := clusterpb.NewClusterServiceClient(conn)
+			req := &clusterpb.HeartbeatRequest{
 				NodeId: c.config.MyNodeID,
 				Epoch:  c.ring.GetEpoch(),
 			}
@@ -686,7 +687,7 @@ func (c *Coordinator) tryJoinNode(node string) {
 }
 
 // Join handles cluster join requests from new nodes
-func (c *Coordinator) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
+func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*clusterpb.JoinResponse, error) {
 	zlog.Info().
 		Str("node_id", req.NodeId).
 		Str("address", req.Address).
@@ -703,14 +704,14 @@ func (c *Coordinator) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinRe
 	c.failureCount[req.NodeId] = 0
 	c.mu.Unlock()
 
-	return &pb.JoinResponse{
+	return &clusterpb.JoinResponse{
 		Success: true,
 		Epoch:   c.ring.GetEpoch(),
 	}, nil
 }
 
 // Leave handles graceful node departure from cluster
-func (c *Coordinator) Leave(ctx context.Context, req *pb.LeaveRequest) (*pb.LeaveResponse, error) {
+func (c *Coordinator) Leave(ctx context.Context, req *clusterpb.LeaveRequest) (*clusterpb.LeaveResponse, error) {
 	zlog.Info().
 		Str("node_id", req.NodeId).
 		Msg("Received leave request")
@@ -726,13 +727,13 @@ func (c *Coordinator) Leave(ctx context.Context, req *pb.LeaveRequest) (*pb.Leav
 	delete(c.failureCount, req.NodeId)
 	c.mu.Unlock()
 
-	return &pb.LeaveResponse{
+	return &clusterpb.LeaveResponse{
 		Success: true,
 	}, nil
 }
 
 // Heartbeat receives heartbeat from remote node, updates tracking
-func (c *Coordinator) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+func (c *Coordinator) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatRequest) (*clusterpb.HeartbeatResponse, error) {
 	zlog.Debug().
 		Str("node_id", req.NodeId).
 		Uint64("epoch", req.Epoch).
@@ -751,27 +752,27 @@ func (c *Coordinator) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (
 			Msg("Received heartbeat with newer membership epoch, may need to sync")
 	}
 
-	return &pb.HeartbeatResponse{
+	return &clusterpb.HeartbeatResponse{
 		Epoch: c.ring.GetEpoch(),
 	}, nil
 }
 
 // GetClusterState returns current cluster membership for new nodes
-func (c *Coordinator) GetClusterState(ctx context.Context, req *pb.Empty) (*pb.ClusterState, error) {
+func (c *Coordinator) GetClusterState(ctx context.Context, req *clusterpb.Empty) (*clusterpb.ClusterState, error) {
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
 		Msg("Received request for cluster state")
 
 	// Get all nodes from ring
 	nodes := c.ring.GetAllNodes()
-	pbNodes := make([]*pb.NodeInfo, 0, len(nodes))
+	pbNodes := make([]*clusterpb.NodeInfo, 0, len(nodes))
 
 	// Convert nodes to protobuf format
 	for _, node := range nodes {
-		pbNode := &pb.NodeInfo{
+		pbNode := &clusterpb.NodeInfo{
 			Id:       node.ID,
 			Address:  node.Address,
-			Status:   pb.NodeStatus(node.Status),
+			Status:   clusterpb.NodeStatus(node.Status),
 			JoinedAt: uint64(node.JoinedAt.Unix()),
 		}
 		pbNodes = append(pbNodes, pbNode)
@@ -782,7 +783,7 @@ func (c *Coordinator) GetClusterState(ctx context.Context, req *pb.Empty) (*pb.C
 		Int("node_count", len(pbNodes)).
 		Msg("Returning cluster state")
 
-	return &pb.ClusterState{
+	return &clusterpb.ClusterState{
 		Epoch: c.ring.GetEpoch(),
 		Nodes: pbNodes,
 	}, nil

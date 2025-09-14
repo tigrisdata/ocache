@@ -79,7 +79,7 @@ build-cli:
 	go build -o ocachecli ./client/cmd/
 
 .PHONY: proto
-proto: proto-api proto-storage
+proto: proto-api proto-storage proto-cluster
 
 .PHONY: proto-api
 proto-api:
@@ -95,6 +95,13 @@ proto-storage:
 	protoc -I ./storage/proto \
 		--go_out=paths=source_relative:./storage/proto \
 		storage/proto/storage.proto
+
+.PHONY: proto-cluster
+proto-cluster:
+	protoc -I ./coordinator/proto \
+		--go_out=paths=source_relative:./coordinator/proto \
+		--go-grpc_out=paths=source_relative:./coordinator/proto \
+		coordinator/proto/cluster.proto
 
 # Installation
 .PHONY: install-deps

@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
 )
 
@@ -98,7 +98,7 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 
 	// Test Join RPC
 	ctx := context.Background()
-	joinReq := &pb.JoinRequest{
+	joinReq := &clusterpb.JoinRequest{
 		NodeId:  "new-node",
 		Address: "localhost:9092",
 	}
@@ -113,7 +113,7 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 	assert.Len(t, nodes, 2)
 
 	// Test Heartbeat RPC
-	hbReq := &pb.HeartbeatRequest{
+	hbReq := &clusterpb.HeartbeatRequest{
 		NodeId: "new-node",
 		Epoch:  2,
 	}
@@ -216,14 +216,14 @@ func TestCoordinator_Leave(t *testing.T) {
 	ctx := context.Background()
 
 	// Add a node
-	_, err = coord.Join(ctx, &pb.JoinRequest{
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 		NodeId:  "leaving-node",
 		Address: "localhost:9094",
 	})
 	require.NoError(t, err)
 
 	// Leave the cluster
-	leaveResp, err := coord.Leave(ctx, &pb.LeaveRequest{
+	leaveResp, err := coord.Leave(ctx, &clusterpb.LeaveRequest{
 		NodeId: "leaving-node",
 	})
 	require.NoError(t, err)
@@ -250,7 +250,7 @@ func TestCoordinator_HeartbeatWithEpochMismatch(t *testing.T) {
 	ctx := context.Background()
 
 	// Send heartbeat with newer epoch
-	hbReq := &pb.HeartbeatRequest{
+	hbReq := &clusterpb.HeartbeatRequest{
 		NodeId: "remote-node",
 		Epoch:  999,
 	}
@@ -276,7 +276,7 @@ func TestCoordinator_VerifyLastHeartbeat(t *testing.T) {
 
 	// Add a node
 	ctx := context.Background()
-	_, err = coord.Join(ctx, &pb.JoinRequest{
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 		NodeId:  "timeout-node",
 		Address: "localhost:9307",
 	})
@@ -317,20 +317,20 @@ func TestCoordinator_GetClusterState(t *testing.T) {
 	ctx := context.Background()
 
 	// Add some nodes
-	_, err = coord.Join(ctx, &pb.JoinRequest{
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 		NodeId:  "node1",
 		Address: "localhost:9096",
 	})
 	require.NoError(t, err)
 
-	_, err = coord.Join(ctx, &pb.JoinRequest{
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 		NodeId:  "node2",
 		Address: "localhost:9097",
 	})
 	require.NoError(t, err)
 
 	// Get cluster state
-	state, err := coord.GetClusterState(ctx, &pb.Empty{})
+	state, err := coord.GetClusterState(ctx, &clusterpb.Empty{})
 	require.NoError(t, err)
 	assert.Equal(t, uint64(3), state.Epoch)
 	assert.Len(t, state.Nodes, 3)
@@ -360,7 +360,7 @@ func TestCoordinator_FailureDetection(t *testing.T) {
 
 	// Add a node
 	ctx := context.Background()
-	_, err = coord.Join(ctx, &pb.JoinRequest{
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 		NodeId:  "failing-node",
 		Address: "localhost:9099",
 	})
@@ -377,12 +377,12 @@ func TestCoordinator_FailureDetection(t *testing.T) {
 	coord.recordFailure("failing-node")
 	assert.Equal(t, 3, coord.failureCount["failing-node"])
 
-	clusterState, err := coord.GetClusterState(ctx, &pb.Empty{})
+	clusterState, err := coord.GetClusterState(ctx, &clusterpb.Empty{})
 	require.NoError(t, err)
 	assert.Equal(t, uint64(2), clusterState.Epoch)
 	assert.Len(t, clusterState.Nodes, 2)
 
-	var failingNode *pb.NodeInfo
+	var failingNode *clusterpb.NodeInfo
 	for _, node := range clusterState.Nodes {
 		if node.Id == "failing-node" {
 			failingNode = node
@@ -391,7 +391,7 @@ func TestCoordinator_FailureDetection(t *testing.T) {
 	}
 
 	assert.Equal(t, "failing-node", failingNode.Id)
-	assert.Equal(t, pb.NodeStatus_NODE_STATUS_DOWN, failingNode.Status)
+	assert.Equal(t, clusterpb.NodeStatus_NODE_STATUS_DOWN, failingNode.Status)
 }
 
 // TestCoordinator_GetLocalNodeID tests getting local node ID
@@ -422,7 +422,7 @@ func TestCoordinator_IsLocal(t *testing.T) {
 
 	// Add another node
 	ctx := context.Background()
-	_, err = coord.Join(ctx, &pb.JoinRequest{
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 		NodeId:  "remote-node",
 		Address: "localhost:9100",
 	})
@@ -458,7 +458,7 @@ func TestCoordinator_GetNodeForKey(t *testing.T) {
 	// Add more nodes
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		_, err = coord.Join(ctx, &pb.JoinRequest{
+		_, err = coord.Join(ctx, &clusterpb.JoinRequest{
 			NodeId:  fmt.Sprintf("node-%d", i),
 			Address: fmt.Sprintf("localhost:930%d", 9+i),
 		})
@@ -501,7 +501,7 @@ func TestCoordinator_ConcurrentOperations(t *testing.T) {
 	// Concurrent joins
 	for i := 0; i < 10; i++ {
 		go func(id int) {
-			_, err := coord.Join(ctx, &pb.JoinRequest{
+			_, err := coord.Join(ctx, &clusterpb.JoinRequest{
 				NodeId:  fmt.Sprintf("node-%d", id),
 				Address: fmt.Sprintf("localhost:931%d", 4+id),
 			})
@@ -522,7 +522,7 @@ func TestCoordinator_ConcurrentOperations(t *testing.T) {
 	// Concurrent leaves
 	for i := 0; i < 5; i++ {
 		go func(id int) {
-			_, err := coord.Leave(ctx, &pb.LeaveRequest{
+			_, err := coord.Leave(ctx, &clusterpb.LeaveRequest{
 				NodeId: fmt.Sprintf("node-%d", id),
 			})
 			assert.NoError(t, err)
@@ -569,7 +569,7 @@ func createMockClusterServer(t *testing.T, addr string) (*grpc.Server, func()) {
 	server := grpc.NewServer()
 
 	// Register a mock cluster service
-	pb.RegisterClusterServiceServer(server, &mockClusterService{})
+	clusterpb.RegisterClusterServiceServer(server, &mockClusterService{})
 
 	go func() {
 		if err := server.Serve(lis); err != nil {
@@ -583,24 +583,24 @@ func createMockClusterServer(t *testing.T, addr string) (*grpc.Server, func()) {
 }
 
 type mockClusterService struct {
-	pb.UnimplementedClusterServiceServer
+	clusterpb.UnimplementedClusterServiceServer
 }
 
-func (m *mockClusterService) GetClusterState(ctx context.Context, req *pb.Empty) (*pb.ClusterState, error) {
-	return &pb.ClusterState{
+func (m *mockClusterService) GetClusterState(ctx context.Context, req *clusterpb.Empty) (*clusterpb.ClusterState, error) {
+	return &clusterpb.ClusterState{
 		Epoch: 1,
-		Nodes: []*pb.NodeInfo{
+		Nodes: []*clusterpb.NodeInfo{
 			{
 				Id:      "mock-node",
 				Address: "localhost:9999",
-				Status:  pb.NodeStatus_NODE_STATUS_ACTIVE,
+				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 		},
 	}, nil
 }
 
-func (m *mockClusterService) Join(ctx context.Context, req *pb.JoinRequest) (*pb.JoinResponse, error) {
-	return &pb.JoinResponse{
+func (m *mockClusterService) Join(ctx context.Context, req *clusterpb.JoinRequest) (*clusterpb.JoinResponse, error) {
+	return &clusterpb.JoinResponse{
 		Success: true,
 		Epoch:   1,
 	}, nil

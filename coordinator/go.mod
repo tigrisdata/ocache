@@ -7,6 +7,7 @@ require (
 	github.com/cespare/xxhash v1.1.0
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.10.0
+	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
 )
@@ -28,4 +29,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/tigrisdata/ocache/proto => ../proto
+replace (
+	github.com/tigrisdata/ocache/coordinator/proto => ./proto
+	github.com/tigrisdata/ocache/proto => ../proto
+)

@@ -4,6 +4,7 @@ use (
 	./client
 	./common
 	./coordinator
+	./coordinator/proto
 	./proto
 	./server
 	./storage

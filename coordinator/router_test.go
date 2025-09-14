@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	pb "github.com/tigrisdata/ocache/proto"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -19,16 +19,16 @@ import (
 
 // mockRouterClusterService implements a minimal ClusterServiceServer for router testing
 type mockRouterClusterService struct {
-	pb.UnimplementedClusterServiceServer
+	clusterpb.UnimplementedClusterServiceServer
 	failUntil time.Time
 	nodeID    string
 }
 
-func (m *mockRouterClusterService) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+func (m *mockRouterClusterService) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatRequest) (*clusterpb.HeartbeatResponse, error) {
 	if time.Now().Before(m.failUntil) {
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
-	return &pb.HeartbeatResponse{
+	return &clusterpb.HeartbeatResponse{
 		Epoch: 1,
 	}, nil
 }
@@ -39,7 +39,7 @@ func startMockRouterServer(t *testing.T, nodeID string) (string, *grpc.Server, *
 
 	grpcServer := grpc.NewServer()
 	mockService := &mockRouterClusterService{nodeID: nodeID}
-	pb.RegisterClusterServiceServer(grpcServer, mockService)
+	clusterpb.RegisterClusterServiceServer(grpcServer, mockService)
 
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {
