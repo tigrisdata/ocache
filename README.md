@@ -37,6 +37,7 @@ make all
 - [Testing Guide](docs/testing.md) - Running and writing tests
 - [Static Builds](docs/static_build.md) - Production deployment
 - [Benchmark Guide](docs/benchmark.md) - Running benchmarks
+- [Metrics Guide](docs/metrics.md) - Prometheus metrics
 
 ## Basic Usage
 
