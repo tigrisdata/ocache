@@ -319,10 +319,11 @@ func (r *Router) isCircuitOpen(state *clientState) bool {
 	state.mu.RUnlock()
 
 	if time.Since(openTime) > r.config.CircuitBreakerTimeout {
-		// Attempt to close circuit
-		atomic.StoreInt32(&state.circuitOpen, 0)
-		atomic.StoreInt32(&state.failureCount, 0)
-
+		// Attempt to close circuit using compare-and-swap
+		if atomic.CompareAndSwapInt32(&state.circuitOpen, 1, 0) {
+			// Only reset failure count if we successfully closed the circuit
+			atomic.StoreInt32(&state.failureCount, 0)
+		}
 		return false
 	}
 

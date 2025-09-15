@@ -135,7 +135,7 @@ func (r *Ring) RemoveNode(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	node, exists := r.nodes[id]
+	_, exists := r.nodes[id]
 	if !exists {
 		return fmt.Errorf("node %s not found in ring", id)
 	}
@@ -143,9 +143,7 @@ func (r *Ring) RemoveNode(id string) error {
 	// Remove from consistent hash ring
 	r.ch.Remove(id)
 
-	// Mark as removed and delete from registry
-	node.Status = NodeStatusDown
-	node.Available = false
+	// Delete from registry
 	delete(r.nodes, id)
 
 	// Increment membership epoch (true membership change)
@@ -312,7 +310,7 @@ func (r *Ring) GetEpoch() uint64 {
 
 // IsLocal checks if the local node is the owner of the key
 func (r *Ring) IsLocal(key string) bool {
-	node, err := r.GetNode(key)
+	node, err := r.GetPrimaryNode(key)
 	if err != nil {
 		return false
 	}
@@ -365,14 +363,14 @@ func (r *Ring) GetClosestN(key string, count int) ([]*NodeInfo, error) {
 
 	nodes := make([]*NodeInfo, 0, len(members))
 	for _, member := range members {
-		if node, exists := r.nodes[member.String()]; exists && node.Status == NodeStatusActive {
+		if node, exists := r.nodes[member.String()]; exists && node.Available {
 			nodeCopy := *node
 			nodes = append(nodes, &nodeCopy)
 		}
 	}
 
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no active nodes found")
+		return nil, fmt.Errorf("no available nodes found")
 	}
 
 	return nodes, nil

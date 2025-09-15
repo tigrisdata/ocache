@@ -159,11 +159,18 @@ func IsRoutingError(err error) bool {
 		return false
 	}
 
-	// Check for RouterError types
-	var routerErr *RouterError
-	if errors.As(err, &routerErr) {
-		// Let IsRetryableError handle RouterError logic
-		return IsRetryableError(err)
+	// Check RouterError types directly to avoid infinite recursion
+	switch {
+	case errors.Is(err, ErrCircuitBreakerOpen):
+		return false
+	case errors.Is(err, ErrLocalRouting):
+		return false
+	case errors.Is(err, ErrNodeNotFound):
+		return false
+	case errors.Is(err, ErrMaxRetriesExceeded):
+		return false
+	case errors.Is(err, ErrConnectionFailed):
+		return true
 	}
 
 	// Check gRPC status errors

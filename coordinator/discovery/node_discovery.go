@@ -15,6 +15,9 @@ const (
 
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
+
+	// defaultClusterPort is the default port for cluster communication
+	defaultClusterPort = "9090"
 )
 
 // NodeDiscovery provides an interface for discovering cluster nodes
@@ -49,17 +52,19 @@ func CreateNodeDiscovery(nodes []string, dnsRefreshInterval time.Duration) (Node
 		// Try to parse as address
 		host, port, err := splitAddress(node)
 		if err != nil {
-			_, err := validatePort(port)
-			if err != nil {
-				return nil, err
-			}
-
-			// If it's a DNS name, use DNS discovery
-			if isDNSName(node) {
-				// Use DNS discovery with default port
-				return NewDNSNodeDiscovery(host, port, dnsRefreshInterval)
-			}
 			return nil, err
+		}
+
+		// Successfully parsed as host:port
+		_, err = validatePort(port)
+		if err != nil {
+			return nil, err
+		}
+
+		// If the host part is a DNS name, use DNS discovery
+		if isDNSName(host) {
+			// Use DNS discovery with the parsed port
+			return NewDNSNodeDiscovery(host, port, dnsRefreshInterval)
 		}
 	}
 

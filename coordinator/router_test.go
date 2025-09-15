@@ -225,11 +225,10 @@ func TestRouter_CircuitBreaker(t *testing.T) {
 
 	// Circuit should be open now
 	_, err = router.Route(deadKey)
-	if err != nil {
-		// Circuit breaker might be open
-		assert.True(t, errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrMaxRetriesExceeded),
-			"Expected circuit breaker or max retries error")
-	}
+	require.Error(t, err, "Expected error when circuit breaker is open")
+	// After threshold failures, circuit breaker should be open
+	assert.True(t, errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrMaxRetriesExceeded),
+		"Expected circuit breaker or max retries error")
 
 	// Wait for circuit breaker timeout
 	time.Sleep(config.CircuitBreakerTimeout + 100*time.Millisecond)
