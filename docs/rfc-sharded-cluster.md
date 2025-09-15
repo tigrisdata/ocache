@@ -1,11 +1,10 @@
-# RFC: OCache Sharded Cluster Architecture
+# RFC-007: Distributed Sharding and High Availability
 
-**RFC Number**: 001  
-**Title**: Distributed Sharding and High Availability for OCache  
-**Author(s)**: Ovais Tariq  
+**RFC Number**: 007
 **Status**: Implemented (Phase 1)  
-**Created**: 2025-09-01  
-**Last Updated**: 2025-09-12
+**Author(s)**: Ovais Tariq
+**Created**: 2025-08-20
+**Last Updated**: 2025-09-15
 
 ## 1. Abstract
 
@@ -171,7 +170,7 @@ New Node                    Seed Node
 
 ## 6. Operational Considerations
 
-### 6.3 Failure Scenarios
+### 6.1 Failure Scenarios
 
 | Scenario               | Impact                            | Recovery                             |
 | ---------------------- | --------------------------------- | ------------------------------------ |

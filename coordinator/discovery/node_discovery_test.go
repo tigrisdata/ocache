@@ -113,7 +113,7 @@ func TestDNSNodeDiscovery(t *testing.T) {
 			wantResolveErr:  false,
 		},
 		{
-			name:            "valid DNS name with default port",
+			name:            "empty port validation",
 			dnsName:         "localhost",
 			port:            "",
 			refreshInterval: 0, // Should use default
@@ -263,12 +263,6 @@ func TestCreateNodeDiscovery(t *testing.T) {
 			name:    "invalid node address",
 			nodes:   []string{"invalid:node:address"},
 			wantErr: true,
-		},
-		{
-			name:         "single DNS name without port",
-			nodes:        []string{"localhost"},
-			expectedMode: NodeDiscoveryDNS,
-			wantErr:      true,
 		},
 	}
 

@@ -61,7 +61,7 @@ func ValidateNodeAddress(addr string) error {
 	// Validate port
 	_, err = validatePort(portStr)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid port in node address: %w", err)
 	}
 
 	// Node addresses must have a host (unlike cluster addresses which can be ":port")
@@ -71,7 +71,7 @@ func ValidateNodeAddress(addr string) error {
 
 	// Validate host
 	if err := validateHost(host); err != nil {
-		return err
+		return fmt.Errorf("invalid host in node address: %w", err)
 	}
 
 	return nil

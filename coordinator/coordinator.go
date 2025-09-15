@@ -563,7 +563,7 @@ func (c *Coordinator) verifyLastHeartbeat() {
 	}
 
 	// Calculate timeout as a multiple of the heartbeat interval
-	timeout := time.Duration(int64(c.failureThreshold) * c.heartbeatInterval.Milliseconds())
+	timeout := time.Duration(c.failureThreshold) * c.heartbeatInterval
 	now := time.Now()
 
 	for nodeID, lastSeen := range c.lastHeartbeat {

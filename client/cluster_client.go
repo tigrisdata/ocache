@@ -17,12 +17,11 @@ import (
 // ClusterClient is a cluster-aware cache client that routes requests
 // to the appropriate node based on consistent hashing
 type ClusterClient struct {
-	nodes      map[string]*Client
-	ring       *consistent.Consistent
-	seedAddrs  []string
-	mu         sync.RWMutex
-	refreshing bool
-	stopCh     chan struct{}
+	nodes     map[string]*Client
+	ring      *consistent.Consistent
+	seedAddrs []string
+	mu        sync.RWMutex
+	stopCh    chan struct{}
 }
 
 type hasher struct{}
