@@ -46,7 +46,7 @@ var (
 	nodeID            = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
 	clusterAddr       = flag.String("cluster-addr", ":7000", "Address for cluster communication")
 	seedsStr          = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000)")
-	partitionCount    = flag.Int("partition-count", coordinator.DefaultPartitionCount, "Number of partitions in hash ring")
+	partitionCount    = flag.Int("partition-count", coordinator.DefaultRingPartitionCount, "Number of partitions in hash ring")
 	heartbeatInterval = flag.Duration("heartbeat-interval", coordinator.DefaultHeartbeatInterval, "Interval between heartbeats")
 	failureThreshold  = flag.Int("failure-threshold", coordinator.DefaultFailureThreshold, "Number of failed heartbeats before marking node down")
 
@@ -81,13 +81,13 @@ func RunServer() {
 	// Initialize coordinator if clustering is enabled
 	if AppConfig.ClusterEnabled {
 		coordConfig := &coordinator.Config{
-			Enabled:           true,
-			MyNodeID:          AppConfig.NodeID,
-			ClusterAddr:       AppConfig.ClusterAddr,
-			Nodes:             AppConfig.Seeds,
-			PartitionCount:    AppConfig.PartitionCount,
-			HeartbeatInterval: int(AppConfig.HeartbeatInterval.Seconds()),
-			FailureThreshold:  AppConfig.FailureThreshold,
+			Enabled:            true,
+			MyNodeID:           AppConfig.NodeID,
+			ClusterAddr:        AppConfig.ClusterAddr,
+			Nodes:              AppConfig.Seeds,
+			RingPartitionCount: AppConfig.PartitionCount,
+			HeartbeatInterval:  int(AppConfig.HeartbeatInterval.Seconds()),
+			FailureThreshold:   AppConfig.FailureThreshold,
 		}
 
 		var err error

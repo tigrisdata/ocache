@@ -7,6 +7,7 @@ import (
 
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 type Client struct {
@@ -35,6 +36,15 @@ func New(addr string, opts ...grpc.DialOption) (*Client, error) {
 
 func (c *Client) Close() error {
 	return c.conn.Close()
+}
+
+// isHealthy checks if the client connection is healthy
+func (c *Client) isHealthy() bool {
+	if c.conn == nil {
+		return false
+	}
+	state := c.conn.GetState()
+	return state == connectivity.Ready || state == connectivity.Idle
 }
 
 func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {

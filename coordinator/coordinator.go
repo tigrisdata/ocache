@@ -34,8 +34,10 @@ const (
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
 
-	// DefaultPartitionCount is the default number of partitions in the hash ring
-	DefaultPartitionCount = 16384
+	// Hash ring defaults
+	DefaultRingPartitionCount    = 16384 // DefaultRingPartitionCount is the default number of partitions in the hash ring
+	DefaultRingReplicationFactor = 20    // DefaultRingReplicationFactor is the default replication factor for the nodes in the hash ring
+	DefaultRingLoad              = 1.25  // DefaultRingLoad is the default load for the hash ring
 )
 
 // Config contains the configuration for the coordinator
@@ -44,7 +46,7 @@ type Config struct {
 	MyNodeID           string        // The ID of the node
 	ClusterAddr        string        // The address the coordinator will listen on for cluster communication
 	Nodes              []string      // The nodes of the cluster (can be static list or DNS name)
-	PartitionCount     int           // The number of partitions in the hash ring
+	RingPartitionCount int           // The number of partitions in the hash ring
 	HeartbeatInterval  int           // The interval at which heartbeats are sent to detect node failures
 	FailureThreshold   int           // The number of consecutive failures before a node is marked as down
 	AllowLocalhost     bool          // Whether to restrict to localhost addresses (for testing)
@@ -94,7 +96,7 @@ func New(config *Config) (*Coordinator, error) {
 		Str("node_id", config.MyNodeID).
 		Str("cluster_addr", config.ClusterAddr).
 		Int("node_count", len(config.Nodes)).
-		Int("partition_count", config.PartitionCount).
+		Int("partition_count", config.RingPartitionCount).
 		Msg("Creating new coordinator")
 
 	if config.MyNodeID == "" {
@@ -134,11 +136,11 @@ func New(config *Config) (*Coordinator, error) {
 		Msg("Node discovery initialized")
 
 	// Default to 16384 partitions if not set
-	if config.PartitionCount < 1 {
-		config.PartitionCount = DefaultPartitionCount
+	if config.RingPartitionCount < 1 {
+		config.RingPartitionCount = DefaultRingPartitionCount
 	}
 
-	ring, err := NewRing(config.PartitionCount, config.MyNodeID)
+	ring, err := NewRing(config.RingPartitionCount, config.MyNodeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ring: %w", err)
 	}
@@ -244,7 +246,7 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	zlog.Info().
 		Str("node_id", c.config.MyNodeID).
 		Str("cluster_addr", c.config.ClusterAddr).
-		Int("partition_count", c.config.PartitionCount).
+		Int("partition_count", c.config.RingPartitionCount).
 		Int("node_count", len(c.config.Nodes)).
 		Msg("Coordinator started")
 
@@ -786,6 +788,59 @@ func (c *Coordinator) GetClusterState(ctx context.Context, req *clusterpb.Empty)
 	return &clusterpb.ClusterState{
 		Epoch: c.ring.GetEpoch(),
 		Nodes: pbNodes,
+	}, nil
+}
+
+// GetClusterTopology returns full cluster topology including partition ownership
+func (c *Coordinator) GetClusterTopology(ctx context.Context, req *clusterpb.Empty) (*clusterpb.ClusterTopology, error) {
+	zlog.Debug().
+		Str("node_id", c.config.MyNodeID).
+		Msg("Received request for cluster topology")
+
+	// Get all nodes from ring
+	nodes := c.ring.GetAllNodes()
+	pbNodes := make([]*clusterpb.NodeInfo, 0, len(nodes))
+
+	// Convert nodes to protobuf format
+	for _, node := range nodes {
+		pbNode := &clusterpb.NodeInfo{
+			Id:       node.ID,
+			Address:  node.Address,
+			Status:   clusterpb.NodeStatus(node.Status),
+			JoinedAt: uint64(node.JoinedAt.Unix()),
+		}
+		pbNodes = append(pbNodes, pbNode)
+	}
+
+	// Get ring configuration
+	partitionCount, replicationFactor, load := c.ring.GetRingConfig()
+	ringConfig := &clusterpb.RingConfig{
+		PartitionCount:    partitionCount,
+		ReplicationFactor: replicationFactor,
+		Load:              load,
+	}
+
+	// Get partition ownership mapping
+	partitionOwners := c.ring.GetAllPartitionOwners()
+	pbPartitionOwners := make([]*clusterpb.PartitionOwner, 0, len(partitionOwners))
+	for partitionID, nodeID := range partitionOwners {
+		pbPartitionOwners = append(pbPartitionOwners, &clusterpb.PartitionOwner{
+			PartitionId: partitionID,
+			NodeId:      nodeID,
+		})
+	}
+
+	zlog.Debug().
+		Str("node_id", c.config.MyNodeID).
+		Int("node_count", len(pbNodes)).
+		Int("partition_count", len(pbPartitionOwners)).
+		Msg("Returning cluster topology")
+
+	return &clusterpb.ClusterTopology{
+		Epoch:           c.ring.GetEpoch(),
+		Nodes:           pbNodes,
+		RingConfig:      ringConfig,
+		PartitionOwners: pbPartitionOwners,
 	}, nil
 }
 

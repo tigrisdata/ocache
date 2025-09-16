@@ -64,34 +64,34 @@ func (h hasher) Sum64(data []byte) uint64 {
 // It separates membership changes (add/remove) from availability changes (up/down)
 // to later support hinted handoff without unnecessary ownership transfers.
 type Ring struct {
-	ch          *consistent.Consistent
-	nodes       map[string]*NodeInfo
-	epoch       uint64 // Only incremented on add/remove of nodes
-	mu          sync.RWMutex
-	partitions  int
-	localNodeID string
+	ch             *consistent.Consistent
+	nodes          map[string]*NodeInfo
+	epoch          uint64 // Only incremented on add/remove of nodes
+	mu             sync.RWMutex
+	partitionCount int
+	localNodeID    string
 }
 
 // NewRing creates a new consistent hash ring
 func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 	if partitionCount <= 0 {
-		partitionCount = 16384
+		partitionCount = DefaultRingPartitionCount
 	}
 
 	cfg := consistent.Config{
 		PartitionCount:    partitionCount,
-		ReplicationFactor: 20,
-		Load:              1.25,
+		ReplicationFactor: DefaultRingReplicationFactor,
+		Load:              DefaultRingLoad,
 		Hasher:            hasher{},
 	}
 
 	ch := consistent.New(nil, cfg)
 
 	return &Ring{
-		ch:          ch,
-		nodes:       make(map[string]*NodeInfo),
-		partitions:  partitionCount,
-		localNodeID: localNodeID,
+		ch:             ch,
+		nodes:          make(map[string]*NodeInfo),
+		partitionCount: partitionCount,
+		localNodeID:    localNodeID,
 	}, nil
 }
 
@@ -374,4 +374,28 @@ func (r *Ring) GetClosestN(key string, count int) ([]*NodeInfo, error) {
 	}
 
 	return nodes, nil
+}
+
+// GetAllPartitionOwners returns a map of all partition IDs to their owner node IDs
+func (r *Ring) GetAllPartitionOwners() map[int32]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	owners := make(map[int32]string)
+	for i := 0; i < r.partitionCount; i++ {
+		owner := r.ch.GetPartitionOwner(i)
+		if owner != nil {
+			owners[int32(i)] = owner.String()
+		}
+	}
+	return owners
+}
+
+// GetRingConfig returns the configuration of the consistent hash ring
+func (r *Ring) GetRingConfig() (partitionCount int32, replicationFactor int32, load float64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	// These are the constants we use for the ring configuration
+	return int32(r.partitionCount), DefaultRingReplicationFactor, DefaultRingLoad
 }

@@ -15,12 +15,12 @@ import (
 
 func TestCoordinator_New(t *testing.T) {
 	config := &Config{
-		Enabled:           true,
-		MyNodeID:          "test-node",
-		ClusterAddr:       "localhost:9090",
-		PartitionCount:    16384,
-		HeartbeatInterval: 5,
-		FailureThreshold:  3,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9090",
+		RingPartitionCount: 16384,
+		HeartbeatInterval:  5,
+		FailureThreshold:   3,
 	}
 
 	coord, err := New(config)
@@ -34,10 +34,10 @@ func TestCoordinator_New(t *testing.T) {
 // TestCoordinator_StartWithInvalidAddress tests invalid address validation
 func TestCoordinator_StartWithInvalidAddress(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "invalid-address",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "invalid-address",
+		RingPartitionCount: 1024,
 	}
 
 	// Should fail during New() with address validation
@@ -51,10 +51,10 @@ func TestCoordinator_StartWithInvalidAddress(t *testing.T) {
 func TestCoordinator_PortAlreadyInUse(t *testing.T) {
 	// Start first coordinator
 	config1 := &Config{
-		Enabled:        true,
-		MyNodeID:       "node1",
-		ClusterAddr:    "localhost:9324",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "node1",
+		ClusterAddr:        "localhost:9324",
+		RingPartitionCount: 1024,
 	}
 
 	coord1, err := New(config1)
@@ -69,10 +69,10 @@ func TestCoordinator_PortAlreadyInUse(t *testing.T) {
 
 	// Try to start second coordinator on same port
 	config2 := &Config{
-		Enabled:        true,
-		MyNodeID:       "node2",
-		ClusterAddr:    "localhost:9324", // Same port
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "node2",
+		ClusterAddr:        "localhost:9324", // Same port
+		RingPartitionCount: 1024,
 	}
 
 	coord2, err := New(config2)
@@ -85,12 +85,12 @@ func TestCoordinator_PortAlreadyInUse(t *testing.T) {
 
 func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 	config := &Config{
-		Enabled:           true,
-		MyNodeID:          "test-node",
-		ClusterAddr:       "localhost:9091",
-		PartitionCount:    1024,
-		HeartbeatInterval: 1,
-		FailureThreshold:  2,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9091",
+		RingPartitionCount: 1024,
+		HeartbeatInterval:  1,
+		FailureThreshold:   2,
 	}
 
 	coord, err := New(config)
@@ -133,13 +133,13 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 // TestCoordinator_JoinClusterFailure tests that joinCluster returns error when all nodes fail
 func TestCoordinator_JoinClusterFailure(t *testing.T) {
 	config := &Config{
-		Enabled:           true,
-		MyNodeID:          "test-node",
-		ClusterAddr:       "localhost:19200",
-		Nodes:             []string{"invalid-node1:9999", "invalid-node2:9999"}, // Invalid nodes
-		PartitionCount:    10,
-		HeartbeatInterval: 1,
-		FailureThreshold:  2,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:19200",
+		Nodes:              []string{"invalid-node1:9999", "invalid-node2:9999"}, // Invalid nodes
+		RingPartitionCount: 10,
+		HeartbeatInterval:  1,
+		FailureThreshold:   2,
 	}
 
 	coord, err := New(config)
@@ -159,10 +159,10 @@ func TestCoordinator_JoinClusterFailure(t *testing.T) {
 func TestCoordinator_JoinClusterWithNodes(t *testing.T) {
 	// Start a node
 	nodeConfig := &Config{
-		Enabled:        true,
-		MyNodeID:       "node1",
-		ClusterAddr:    "localhost:9301",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "node1",
+		ClusterAddr:        "localhost:9301",
+		RingPartitionCount: 1024,
 	}
 
 	node, err := New(nodeConfig)
@@ -180,11 +180,11 @@ func TestCoordinator_JoinClusterWithNodes(t *testing.T) {
 
 	// Start a new node
 	newNodeConfig := &Config{
-		Enabled:        true,
-		MyNodeID:       "node2",
-		ClusterAddr:    "localhost:9302",
-		Nodes:          []string{"localhost:9301"},
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "node2",
+		ClusterAddr:        "localhost:9302",
+		Nodes:              []string{"localhost:9301"},
+		RingPartitionCount: 1024,
 	}
 
 	node2, err := New(newNodeConfig)
@@ -204,10 +204,10 @@ func TestCoordinator_JoinClusterWithNodes(t *testing.T) {
 
 func TestCoordinator_Leave(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9093",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9093",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -238,10 +238,10 @@ func TestCoordinator_Leave(t *testing.T) {
 // TestCoordinator_HeartbeatWithEpochMismatch tests heartbeat with epoch mismatch
 func TestCoordinator_HeartbeatWithEpochMismatch(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9303",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9303",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -263,12 +263,12 @@ func TestCoordinator_HeartbeatWithEpochMismatch(t *testing.T) {
 // TestCoordinator_VerifyLastHeartbeat tests heartbeat timeout detection
 func TestCoordinator_VerifyLastHeartbeat(t *testing.T) {
 	config := &Config{
-		Enabled:           true,
-		MyNodeID:          "test-node",
-		ClusterAddr:       "localhost:9306",
-		PartitionCount:    1024,
-		HeartbeatInterval: 1,
-		FailureThreshold:  2,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9306",
+		RingPartitionCount: 1024,
+		HeartbeatInterval:  1,
+		FailureThreshold:   2,
 	}
 
 	coord, err := New(config)
@@ -305,10 +305,10 @@ func TestCoordinator_VerifyLastHeartbeat(t *testing.T) {
 
 func TestCoordinator_GetClusterState(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9095",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9095",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -345,14 +345,81 @@ func TestCoordinator_GetClusterState(t *testing.T) {
 	assert.True(t, nodeIDs["node2"])
 }
 
+func TestCoordinator_GetClusterTopology(t *testing.T) {
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9095",
+		RingPartitionCount: 128, // Use smaller count for testing
+	}
+
+	coord, err := New(config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Add some nodes
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
+		NodeId:  "node1",
+		Address: "localhost:9096",
+	})
+	require.NoError(t, err)
+
+	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
+		NodeId:  "node2",
+		Address: "localhost:9097",
+	})
+	require.NoError(t, err)
+
+	// Get cluster topology
+	topology, err := coord.GetClusterTopology(ctx, &clusterpb.Empty{})
+	require.NoError(t, err)
+
+	// Verify basic topology info
+	assert.Equal(t, uint64(3), topology.Epoch)
+	assert.Len(t, topology.Nodes, 3)
+
+	// Verify ring configuration
+	assert.NotNil(t, topology.RingConfig)
+	assert.Equal(t, int32(128), topology.RingConfig.PartitionCount)
+	assert.Equal(t, int32(20), topology.RingConfig.ReplicationFactor)
+	assert.Equal(t, 1.25, topology.RingConfig.Load)
+
+	// Verify partition ownership
+	assert.NotEmpty(t, topology.PartitionOwners)
+	assert.LessOrEqual(t, len(topology.PartitionOwners), 128) // Should not exceed partition count
+
+	// Verify all partitions are owned
+	partitionMap := make(map[int32]string)
+	for _, owner := range topology.PartitionOwners {
+		partitionMap[owner.PartitionId] = owner.NodeId
+	}
+
+	// Check that partition IDs are in valid range
+	for partID := range partitionMap {
+		assert.GreaterOrEqual(t, partID, int32(0))
+		assert.Less(t, partID, int32(128))
+	}
+
+	// Verify that owners are valid nodes
+	validNodes := map[string]bool{
+		"test-node": true,
+		"node1":     true,
+		"node2":     true,
+	}
+	for _, nodeID := range partitionMap {
+		assert.True(t, validNodes[nodeID], "Invalid node ID in partition ownership: %s", nodeID)
+	}
+}
+
 func TestCoordinator_FailureDetection(t *testing.T) {
 	config := &Config{
-		Enabled:           true,
-		MyNodeID:          "test-node",
-		ClusterAddr:       "localhost:9098",
-		PartitionCount:    1024,
-		HeartbeatInterval: 1,
-		FailureThreshold:  2,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9098",
+		RingPartitionCount: 1024,
+		HeartbeatInterval:  1,
+		FailureThreshold:   2,
 	}
 
 	coord, err := New(config)
@@ -397,10 +464,10 @@ func TestCoordinator_FailureDetection(t *testing.T) {
 // TestCoordinator_GetLocalNodeID tests getting local node ID
 func TestCoordinator_GetLocalNodeID(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "my-special-node",
-		ClusterAddr:    "localhost:9325",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "my-special-node",
+		ClusterAddr:        "localhost:9325",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -411,10 +478,10 @@ func TestCoordinator_GetLocalNodeID(t *testing.T) {
 
 func TestCoordinator_IsLocal(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "local-node",
-		ClusterAddr:    "localhost:9099",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "local-node",
+		ClusterAddr:        "localhost:9099",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -446,10 +513,10 @@ func TestCoordinator_IsLocal(t *testing.T) {
 // TestCoordinator_GetNodeForKey tests key routing
 func TestCoordinator_GetNodeForKey(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9308",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9308",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -486,10 +553,10 @@ func TestCoordinator_GetNodeForKey(t *testing.T) {
 // TestCoordinator_ConcurrentOperations tests concurrent join/leave operations
 func TestCoordinator_ConcurrentOperations(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9313",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9313",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -543,10 +610,10 @@ func TestCoordinator_ConcurrentOperations(t *testing.T) {
 // TestCoordinator_RouteError tests routing when no nodes are available
 func TestCoordinator_RouteError(t *testing.T) {
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9326",
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9326",
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)
@@ -616,11 +683,11 @@ func TestCoordinator_SyncWithNodeSuccess(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	config := &Config{
-		Enabled:        true,
-		MyNodeID:       "test-node",
-		ClusterAddr:    "localhost:9328",
-		Nodes:          []string{"localhost:9327"},
-		PartitionCount: 1024,
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9328",
+		Nodes:              []string{"localhost:9327"},
+		RingPartitionCount: 1024,
 	}
 
 	coord, err := New(config)

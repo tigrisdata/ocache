@@ -10,6 +10,7 @@ service ClusterService {
   rpc Leave(LeaveRequest) returns (LeaveResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc GetClusterState(Empty) returns (ClusterState);
+  rpc GetClusterTopology(Empty) returns (ClusterTopology);
 }
 
 // Node status enum
@@ -71,4 +72,25 @@ message HeartbeatRequest {
 // Heartbeat response
 message HeartbeatResponse {
   uint64 epoch = 1;
+}
+
+// Partition ownership information
+message PartitionOwner {
+  int32 partition_id = 1;
+  string node_id = 2;
+}
+
+// Ring configuration for clients to replicate hashing
+message RingConfig {
+  int32 partition_count = 1;
+  int32 replication_factor = 2;
+  double load = 3;
+}
+
+// Enhanced cluster state with partition mapping
+message ClusterTopology {
+  uint64 epoch = 1;
+  repeated NodeInfo nodes = 2;
+  RingConfig ring_config = 3;
+  repeated PartitionOwner partition_owners = 4;
 }

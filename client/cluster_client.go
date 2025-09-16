@@ -5,39 +5,24 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/buraksezer/consistent"
-	"github.com/cespare/xxhash"
-	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// ClusterClient is a cluster-aware cache client that routes requests
-// to the appropriate node based on consistent hashing
+// ClusterClient is a cluster-aware cache client that connects to seed nodes
+// and relies on server-side routing for request distribution
 type ClusterClient struct {
-	nodes     map[string]*Client
-	ring      *consistent.Consistent
-	seedAddrs []string
-	mu        sync.RWMutex
-	stopCh    chan struct{}
+	seedAddrs  []string
+	clients    []*Client // Clients for each seed node
+	currentIdx int32     // Current client index for round-robin
+	mu         sync.RWMutex
+	stopCh     chan struct{}
 }
 
-type hasher struct{}
-
-func (h hasher) Sum64(data []byte) uint64 {
-	return xxhash.Sum64(data)
-}
-
-// nodeMember implements consistent.Member interface
-type nodeMember string
-
-func (n nodeMember) String() string {
-	return string(n)
-}
-
-// NewClusterClient creates a new cluster-aware client
+// NewClusterClient creates a new cluster-aware client that uses server-side routing
 func NewClusterClient(seedAddrs []string, opts ...grpc.DialOption) (*ClusterClient, error) {
 	if len(seedAddrs) == 0 {
 		return nil, fmt.Errorf("at least one seed address is required")
@@ -53,135 +38,92 @@ func NewClusterClient(seedAddrs []string, opts ...grpc.DialOption) (*ClusterClie
 		grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB
 	))
 
-	cfg := consistent.Config{
-		PartitionCount:    16384,
-		ReplicationFactor: 20,
-		Load:              1.25,
-		Hasher:            hasher{},
-	}
-
-	ring := consistent.New(nil, cfg)
-
 	c := &ClusterClient{
-		nodes:     make(map[string]*Client),
-		ring:      ring,
 		seedAddrs: seedAddrs,
+		clients:   make([]*Client, 0, len(seedAddrs)),
 		stopCh:    make(chan struct{}),
 	}
 
-	// Connect to seed nodes and discover cluster
-	if err := c.discoverCluster(); err != nil {
-		return nil, err
+	// Connect to all seed nodes
+	for _, addr := range seedAddrs {
+		client, err := New(addr, opts...)
+		if err != nil {
+			// Log error but continue - we want to connect to as many as possible
+			continue
+		}
+		c.clients = append(c.clients, client)
 	}
 
-	// Start background refresh of cluster state
-	go c.refreshLoop()
+	if len(c.clients) == 0 {
+		return nil, fmt.Errorf("failed to connect to any seed nodes")
+	}
+
+	// Start health check loop
+	go c.healthCheckLoop()
 
 	return c, nil
 }
 
-// discoverCluster connects to seed nodes and discovers all cluster members
-func (c *ClusterClient) discoverCluster() error {
-	for _, seed := range c.seedAddrs {
-		if err := c.discoverFromSeed(seed); err != nil {
-			// Try next seed
-			continue
-		}
-		return nil // Successfully discovered cluster
-	}
-	return fmt.Errorf("failed to discover cluster from any seed node")
-}
-
-// discoverFromSeed discovers cluster members from a seed node
-func (c *ClusterClient) discoverFromSeed(seedAddr string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	conn, err := grpc.DialContext(ctx, seedAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to connect to seed %s: %w", seedAddr, err)
-	}
-	defer conn.Close()
-
-	client := clusterpb.NewClusterServiceClient(conn)
-	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
-	if err != nil {
-		return fmt.Errorf("failed to get cluster state from %s: %w", seedAddr, err)
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Clear existing ring
-	c.ring = consistent.New(nil, consistent.Config{
-		PartitionCount:    16384,
-		ReplicationFactor: 20,
-		Load:              1.25,
-		Hasher:            hasher{},
-	})
-
-	// Add all active nodes to ring and create clients
-	for _, node := range state.Nodes {
-		if node.Status != clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
-			continue
-		}
-
-		// Add to ring
-		member := nodeMember(node.Id)
-		c.ring.Add(member)
-
-		// Create client if not exists
-		if _, exists := c.nodes[node.Id]; !exists {
-			nodeClient, err := New(node.Address)
-			if err != nil {
-				// Log error but continue
-				continue
-			}
-			c.nodes[node.Id] = nodeClient
-		}
-	}
-
-	if len(c.nodes) == 0 {
-		return fmt.Errorf("no active nodes found in cluster")
-	}
-
-	return nil
-}
-
-// refreshLoop periodically refreshes cluster state
-func (c *ClusterClient) refreshLoop() {
+// healthCheckLoop periodically checks connection health and reconnects if needed
+func (c *ClusterClient) healthCheckLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			c.discoverCluster()
+			c.checkAndReconnect()
 		case <-c.stopCh:
 			return
 		}
 	}
 }
 
-// getClient returns the client for the node that owns the given key
-func (c *ClusterClient) getClient(key string) (*Client, error) {
+// checkAndReconnect checks connection health and reconnects failed connections
+func (c *ClusterClient) checkAndReconnect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check each client's connection state
+	for i, client := range c.clients {
+		if client == nil || !client.isHealthy() {
+			// Try to reconnect
+			addr := c.seedAddrs[i]
+			newClient, err := New(addr)
+			if err == nil {
+				// Close old client if it exists
+				if client != nil {
+					client.Close()
+				}
+				c.clients[i] = newClient
+			}
+		}
+	}
+}
+
+// getClient returns an available client using round-robin with failover
+func (c *ClusterClient) getClient() (*Client, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	member := c.ring.LocateKey([]byte(key))
-	if member == nil {
-		return nil, fmt.Errorf("no node available for key %s", key)
+	if len(c.clients) == 0 {
+		return nil, fmt.Errorf("no available clients")
 	}
 
-	client, exists := c.nodes[member.String()]
-	if !exists {
-		return nil, fmt.Errorf("client not found for node %s", member.String())
+	// Try each client starting from current index
+	startIdx := atomic.LoadInt32(&c.currentIdx)
+	for i := 0; i < len(c.clients); i++ {
+		idx := (int(startIdx) + i) % len(c.clients)
+		client := c.clients[idx]
+
+		if client != nil && client.isHealthy() {
+			// Update current index for next request (round-robin)
+			atomic.StoreInt32(&c.currentIdx, int32((idx+1)%len(c.clients)))
+			return client, nil
+		}
 	}
 
-	return client, nil
+	return nil, fmt.Errorf("no healthy clients available")
 }
 
 // Close closes all connections
@@ -192,99 +134,99 @@ func (c *ClusterClient) Close() error {
 	defer c.mu.Unlock()
 
 	var lastErr error
-	for _, client := range c.nodes {
-		if err := client.Close(); err != nil {
-			lastErr = err
+	for _, client := range c.clients {
+		if client != nil {
+			if err := client.Close(); err != nil {
+				lastErr = err
+			}
 		}
 	}
 
 	return lastErr
 }
 
-// Put stores a value in the cache
+// Put stores a value in the cache (server-side routing)
 func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return err
 	}
 	return client.Put(ctx, key, data, ttlSeconds)
 }
 
-// PutStream streams data to the cache
+// PutStream streams data to the cache (server-side routing)
 func (c *ClusterClient) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return err
 	}
 	return client.PutStream(ctx, key, r, ttlSeconds)
 }
 
-// Get retrieves a value from the cache
+// Get retrieves a value from the cache (server-side routing)
 func (c *ClusterClient) Get(ctx context.Context, key string) ([]byte, error) {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return nil, err
 	}
 	return client.Get(ctx, key)
 }
 
-// GetStream streams a value from the cache
+// GetStream streams a value from the cache (server-side routing)
 func (c *ClusterClient) GetStream(ctx context.Context, key string, w io.Writer) error {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return err
 	}
 	return client.GetStream(ctx, key, w)
 }
 
-// GetRange retrieves a byte range from the cache
+// GetRange retrieves a byte range from the cache (server-side routing)
 func (c *ClusterClient) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return nil, err
 	}
 	return client.GetRange(ctx, key, start, end)
 }
 
-// GetRangeStream streams a byte range from the cache
+// GetRangeStream streams a byte range from the cache (server-side routing)
 func (c *ClusterClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return err
 	}
 	return client.GetRangeStream(ctx, key, start, end, w)
 }
 
-// Delete removes a key from the cache
+// Delete removes a key from the cache (server-side routing)
 func (c *ClusterClient) Delete(ctx context.Context, key string) error {
-	client, err := c.getClient(key)
+	client, err := c.getClient()
 	if err != nil {
 		return err
 	}
 	return client.Delete(ctx, key)
 }
 
-// GetNodeForKey returns the node ID that owns the given key
-func (c *ClusterClient) GetNodeForKey(key string) (string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	member := c.ring.LocateKey([]byte(key))
-	if member == nil {
-		return "", fmt.Errorf("no node available for key %s", key)
+// List lists all keys with optional prefix (server-side routing)
+func (c *ClusterClient) List(ctx context.Context, prefix string) ([]string, error) {
+	client, err := c.getClient()
+	if err != nil {
+		return nil, err
 	}
-
-	return member.String(), nil
+	return client.List(ctx, prefix)
 }
 
-// GetActiveNodes returns the list of active nodes in the cluster
-func (c *ClusterClient) GetActiveNodes() []string {
+// GetConnectedNodes returns the addresses of connected seed nodes
+func (c *ClusterClient) GetConnectedNodes() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	nodes := make([]string, 0, len(c.nodes))
-	for nodeID := range c.nodes {
-		nodes = append(nodes, nodeID)
+	connected := make([]string, 0, len(c.clients))
+	for i, client := range c.clients {
+		if client != nil && client.isHealthy() {
+			connected = append(connected, c.seedAddrs[i])
+		}
 	}
-	return nodes
+	return connected
 }
