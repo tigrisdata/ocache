@@ -96,63 +96,7 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	req := &pb.GetRequest{Key: key}
-	stream, err := c.client.Get(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var result []byte
-	for {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, resp.Data...)
-	}
-	return result, nil
-}
-
-// GetStream streams the value directly to the provided writer, efficient for large values.
-func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
-	req := &pb.GetRequest{Key: key}
-	stream, err := c.client.Get(ctx, req)
-	if err != nil {
-		return err
-	}
-	for {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(resp.Data); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *Client) Delete(ctx context.Context, key string) error {
-	_, err := c.client.Delete(ctx, &pb.DeleteRequest{Key: key})
-	return err
+	return c.getValueBuffered(ctx, req)
 }
 
 // GetRange retrieves a byte range from the cache
@@ -162,29 +106,28 @@ func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]
 		Start: start,
 		End:   end,
 	}
-	stream, err := c.client.Get(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var result []byte
-	for {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+	return c.getValueBuffered(ctx, req)
+}
 
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, resp.Data...)
+// GetStream streams the value directly to the provided writer, efficient for large values.
+func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
+	req := &pb.GetRequest{Key: key}
+	return c.getValueStream(ctx, req, w)
+}
+
+// GetRangeStream streams the value directly to the provided writer, efficient for large values.
+func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	req := &pb.GetRequest{
+		Key:   key,
+		Start: start,
+		End:   end,
 	}
-	return result, nil
+	return c.getValueStream(ctx, req, w)
+}
+
+func (c *Client) Delete(ctx context.Context, key string) error {
+	_, err := c.client.Delete(ctx, &pb.DeleteRequest{Key: key})
+	return err
 }
 
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
@@ -211,4 +154,59 @@ func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 		keys = append(keys, resp.Keys...)
 	}
 	return keys, nil
+}
+
+// getValueBuffered reads the entire value into memory
+func (c *Client) getValueBuffered(ctx context.Context, req *pb.GetRequest) ([]byte, error) {
+	stream, err := c.client.Get(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var result []byte
+	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, resp.Data...)
+	}
+	return result, nil
+}
+
+// getValueStream streams the value directly to the provided writer, efficient for large values.
+func (c *Client) getValueStream(ctx context.Context, req *pb.GetRequest, w io.Writer) error {
+	stream, err := c.client.Get(ctx, req)
+	if err != nil {
+		return err
+	}
+	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write(resp.Data); err != nil {
+			return err
+		}
+	}
+	return nil
 }

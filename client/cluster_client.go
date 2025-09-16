@@ -246,6 +246,15 @@ func (c *ClusterClient) GetRange(ctx context.Context, key string, start, end int
 	return client.GetRange(ctx, key, start, end)
 }
 
+// GetRangeStream streams a byte range from the cache
+func (c *ClusterClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	client, err := c.getClient(key)
+	if err != nil {
+		return err
+	}
+	return client.GetRangeStream(ctx, key, start, end, w)
+}
+
 // Delete removes a key from the cache
 func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 	client, err := c.getClient(key)
