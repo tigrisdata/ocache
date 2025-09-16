@@ -12,5 +12,6 @@ Design documents for OCache's architecture and major features.
 | [004](RFC-004-file-management-recovery.md) | File Management      | Raw file lifecycle, crash recovery, orphan detection                                  |
 | [005](RFC-005-ttl-eviction-system.md)      | TTL & Eviction       | Time-based expiration and LRU eviction strategies                                     |
 | [006](RFC-006-rocksdb-integration.md)      | RocksDB Integration  | Metadata store and small object storage configuration                                 |
+| [007](RFC-007-sharded-cluster.md)          | Sharded Cluster      | Distributed sharding with consistent hashing and high availability                    |
 
 Start with [RFC-001](RFC-001-storage-architecture.md) for an architecture overview.
