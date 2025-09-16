@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
 	"os/signal"
 	"strings"
@@ -37,8 +36,8 @@ var (
 
 	metadataCacheSize = flag.Int64("metadata-cache-size", stor.DefaultMetadataCacheSize, "Metadata cache size in bytes (default: 1GB)")
 
-	port           = flag.Int("port", 9000, "Listen port")
-	httpPort       = flag.Int("http-port", 9001, "HTTP port")
+	listenAddr     = flag.String("listen-addr", ":9000", "Listen address for gRPC server")
+	listenHTTP     = flag.String("listen-http", ":9001", "Listen address for HTTP/grpc-gateway server")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
 
@@ -70,45 +69,41 @@ func configureLogger() {
 	zlog.Logger = zlog.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 }
 
-func RunServer() {
-	// Initialize Prometheus metrics
-	metrics.Init()
-	zlog.Info().Msg("Prometheus metrics initialized")
-
-	// Create a context for the server
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Initialize coordinator if clustering is enabled
-	if AppConfig.ClusterEnabled {
-		coordConfig := &coordinator.Config{
-			Enabled:            true,
-			MyNodeID:           AppConfig.NodeID,
-			ClusterAddr:        AppConfig.ClusterAddr,
-			Nodes:              AppConfig.Seeds,
-			RingPartitionCount: AppConfig.PartitionCount,
-			HeartbeatInterval:  int(AppConfig.HeartbeatInterval.Seconds()),
-			FailureThreshold:   AppConfig.FailureThreshold,
-		}
-
-		var err error
-		globalCoordinator, err = coordinator.New(coordConfig)
-		if err != nil {
-			zlog.Fatal().Err(err).Msg("Failed to create coordinator")
-		}
-
-		if err := globalCoordinator.Start(ctx); err != nil {
-			zlog.Fatal().Err(err).Msg("Failed to start coordinator")
-		}
-
-		zlog.Info().
-			Str("node_id", AppConfig.NodeID).
-			Str("cluster_addr", AppConfig.ClusterAddr).
-			Int("seeds", len(AppConfig.Seeds)).
-			Msg("Cluster coordinator started")
+// initializeCluster sets up the cluster coordinator if clustering is enabled
+func initializeCluster(ctx context.Context) {
+	if !AppConfig.ClusterEnabled {
+		return
 	}
 
-	// Create storage config from AppConfig
+	coordConfig := &coordinator.Config{
+		Enabled:            true,
+		MyNodeID:           AppConfig.NodeID,
+		ClusterAddr:        AppConfig.ClusterAddr,
+		Nodes:              AppConfig.Seeds,
+		RingPartitionCount: AppConfig.PartitionCount,
+		HeartbeatInterval:  int(AppConfig.HeartbeatInterval.Seconds()),
+		FailureThreshold:   AppConfig.FailureThreshold,
+	}
+
+	var err error
+	globalCoordinator, err = coordinator.New(coordConfig)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("Failed to create coordinator")
+	}
+
+	if err := globalCoordinator.Start(ctx); err != nil {
+		zlog.Fatal().Err(err).Msg("Failed to start coordinator")
+	}
+
+	zlog.Info().
+		Str("node_id", AppConfig.NodeID).
+		Str("cluster_addr", AppConfig.ClusterAddr).
+		Int("seeds", len(AppConfig.Seeds)).
+		Msg("Cluster coordinator started")
+}
+
+// initializeStorage sets up the storage layer
+func initializeStorage() {
 	storageConfig := &stor.StorageConfig{
 		DiskPath:            AppConfig.DiskPath,
 		TTL:                 AppConfig.TTL,
@@ -127,11 +122,16 @@ func RunServer() {
 		MetadataCacheSize:   AppConfig.MetadataCacheSize,
 	}
 	stor.InitStorageWithConfig(storageConfig)
+}
 
-	grpcAddr := fmt.Sprintf(":%d", *port)
-	go startGRPCServer()                           // Start gRPC server in goroutine
-	go startGRPCGatewayServer(grpcAddr, *httpPort) // Start grpc-gateway on different port
+// startUserServices starts the user-facing gRPC and HTTP gateway services
+func startUserServices() {
+	go startGRPCServer()                                // Start gRPC server in goroutine
+	go startGRPCGatewayServer(*listenAddr, *listenHTTP) // Start grpc-gateway on different address
+}
 
+// waitForShutdown waits for shutdown signal or coordinator error
+func waitForShutdown(ctx context.Context, cancel context.CancelFunc) {
 	// Handle graceful shutdown on SIGINT/SIGTERM.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -154,7 +154,10 @@ func RunServer() {
 
 	// Cancel context to signal graceful shutdown
 	cancel()
+}
 
+// performShutdown handles graceful shutdown of all components
+func performShutdown() {
 	// Close coordinator if enabled
 	if globalCoordinator != nil {
 		if err := globalCoordinator.Stop(); err != nil {
@@ -166,6 +169,31 @@ func RunServer() {
 	stor.CloseStorage()
 
 	zlog.Info().Msg("Shutdown complete")
+}
+
+func RunServer() {
+	// Create a context for the server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Initialize Prometheus metrics
+	metrics.Init()
+	zlog.Info().Msg("Prometheus metrics initialized")
+
+	// Set up internal cluster communication if enabled
+	initializeCluster(ctx)
+
+	// Initialize the storage layer
+	initializeStorage()
+
+	// Start gRPC and HTTP gateway for client requests
+	startUserServices()
+
+	// Wait for shutdown signal
+	waitForShutdown(ctx, cancel)
+
+	// Perform graceful shutdown
+	performShutdown()
 }
 
 func main() {

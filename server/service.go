@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -373,17 +372,17 @@ func startGRPCServer() {
 	service := newCacheService(globalCoordinator)
 	pb.RegisterCacheServiceServer(grpcServer, service)
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", AppConfig.Port))
+	lis, err := net.Listen("tcp", AppConfig.ListenAddr)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to listen for gRPC")
 	}
-	zlog.Info().Msgf("gRPC server listening on :%d", AppConfig.Port)
+	zlog.Info().Msgf("gRPC server listening on %s", AppConfig.ListenAddr)
 	if err := grpcServer.Serve(lis); err != nil {
 		zlog.Fatal().Err(err).Msg("gRPC server failed")
 	}
 }
 
-func startGRPCGatewayServer(grpcAddr string, gatewayPort int) {
+func startGRPCGatewayServer(grpcAddr string, listenHTTP string) {
 	ctx := context.Background()
 	mux := http.NewServeMux()
 
@@ -401,8 +400,8 @@ func startGRPCGatewayServer(grpcAddr string, gatewayPort int) {
 	// Handle all other routes with the gRPC gateway
 	mux.Handle("/", gwMux)
 
-	zlog.Info().Msgf("Starting grpc-gateway HTTP server on :%d", gatewayPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", gatewayPort), mux); err != nil {
+	zlog.Info().Msgf("Starting grpc-gateway HTTP server on %s", listenHTTP)
+	if err := http.ListenAndServe(listenHTTP, mux); err != nil {
 		zlog.Fatal().Err(err).Msg("grpc-gateway server failed")
 	}
 }
