@@ -49,17 +49,52 @@ OCache currently operates as a single-node cache service. This presents several 
 
 ### 3.2 High-Level Architecture
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Client    │────▶│   OCache    │────▶│   OCache    │
-│  (Cluster   │     │   Node 1    │     │   Node 2    │
-│   Aware)    │     └─────────────┘     └─────────────┘
-└─────────────┘             │                   │
-                            ▼                   ▼
-                    ┌─────────────┐     ┌─────────────┐
-                    │  Coordinator│     │  Coordinator│
-                    │   + Ring    │◀───▶│   + Ring    │
-                    └─────────────┘     └─────────────┘
+```mermaid
+graph TB
+    subgraph "Clients"
+        C1["Client<br/>(Cluster Aware)"]
+        C2["Client<br/>(Cluster Aware)"]
+    end
+    
+    subgraph "OCache Cluster"
+        subgraph "Node 1"
+            N1["OCache Node 1"]
+            CO1["Coordinator<br/>+ Ring"]
+            N1 --> CO1
+        end
+        
+        subgraph "Node 2"
+            N2["OCache Node 2"]
+            CO2["Coordinator<br/>+ Ring"]
+            N2 --> CO2
+        end
+        
+        subgraph "Node 3"
+            N3["OCache Node 3"]
+            CO3["Coordinator<br/>+ Ring"]
+            N3 --> CO3
+        end
+    end
+    
+    C1 --> N1
+    C1 --> N2
+    C1 --> N3
+    C2 --> N1
+    C2 --> N2
+    C2 --> N3
+    
+    CO1 <--> CO2
+    CO2 <--> CO3
+    CO1 <--> CO3
+    
+    style C1 fill:#e1f5fe
+    style C2 fill:#e1f5fe
+    style N1 fill:#fff3e0
+    style N2 fill:#fff3e0
+    style N3 fill:#fff3e0
+    style CO1 fill:#f3e5f5
+    style CO2 fill:#f3e5f5
+    style CO3 fill:#f3e5f5
 ```
 
 ### 3.3 Key Components
@@ -84,18 +119,43 @@ OCache currently operates as a single-node cache service. This presents several 
 
 ### 4.2 Request Routing
 
-```
-1. Client sends request to any node
-2. Node calculates hash(key) → partition
-3. Ring.GetNode(key) → owner node
-4. If owner == local:
-   - Process locally
-5. If owner == remote:
-   - Router.Route(key) with retry and circuit breaker
-   - Forward request to owner
-6. If owner == unavailable:
-   - Phase 1: Return error
-   - Phase 2: Route to temporary owner (hinted handoff)
+```mermaid
+flowchart TD
+    Start([Client sends request<br/>to any node]) --> Hash[Calculate hash of key]
+    Hash --> Partition[Map to partition number]
+    Partition --> Owner[Ring.GetNode finds owner]
+    
+    Owner --> Decision{Owner node?}
+    
+    Decision -->|Local| ProcessLocal[Process request locally]
+    ProcessLocal --> Success([Return response])
+    
+    Decision -->|Remote| CheckCircuit{Circuit breaker<br/>open?}
+    
+    CheckCircuit -->|Yes| CBError([Return circuit<br/>breaker error])
+    
+    CheckCircuit -->|No| Route[Router.Route to owner]
+    Route --> RetryLogic{Success?}
+    
+    RetryLogic -->|Yes| Success
+    RetryLogic -->|No, retry| Backoff[Exponential backoff]
+    Backoff --> Retry{Retries<br/>exhausted?}
+    
+    Retry -->|No| Route
+    Retry -->|Yes| MaxRetries([Return max<br/>retries error])
+    
+    Decision -->|Unavailable| Phase{Phase?}
+    
+    Phase -->|Phase 1| UnavailError([Return unavailable<br/>error])
+    Phase -->|Phase 2<br/>planned| HintedHandoff[Route to<br/>temporary owner]
+    HintedHandoff --> Success
+    
+    style Start fill:#e8f5e9
+    style Success fill:#c8e6c9
+    style CBError fill:#ffcdd2
+    style UnavailError fill:#ffcdd2
+    style MaxRetries fill:#ffcdd2
+    style HintedHandoff fill:#fff9c4
 ```
 
 #### Router Configuration
@@ -114,18 +174,31 @@ OCache currently operates as a single-node cache service. This presents several 
 
 #### 4.3.1 Join Protocol
 
-```
-New Node                    Seed Node
-   │                           │
-   ├──GetClusterState()────────▶
-   │                           │
-   ◀────ClusterState───────────┤
-   │                           │
-   ├──Join(NodeInfo)───────────▶
-   │                           │
-   ◀────JoinResponse────────────┤
-   │                           │
-   ├──Start Heartbeat──────────▶
+```mermaid
+sequenceDiagram
+    participant NewNode as New Node
+    participant SeedNode as Seed Node
+    participant Cluster as Other Nodes
+    
+    Note over NewNode: Node starts up
+    
+    NewNode->>+SeedNode: GetClusterState()
+    SeedNode-->>-NewNode: ClusterState (nodes, epoch)
+    
+    Note over NewNode: Builds local ring
+    
+    NewNode->>+SeedNode: Join(NodeInfo)
+    SeedNode->>Cluster: Broadcast new member
+    SeedNode-->>-NewNode: JoinResponse (success, epoch)
+    
+    Note over NewNode: Starts serving
+    
+    loop Every 5 seconds
+        NewNode->>SeedNode: Heartbeat(node_id, epoch)
+        SeedNode-->>NewNode: HeartbeatResponse(epoch)
+    end
+    
+    Note over NewNode,Cluster: Node is now part of cluster
 ```
 
 #### 4.3.2 Failure Detection
