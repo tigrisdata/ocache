@@ -4,7 +4,7 @@
 **Status**: Implemented (Phase 1)  
 **Author(s)**: Ovais Tariq
 **Created**: 2025-08-20
-**Last Updated**: 2025-09-15
+**Last Updated**: 2025-09-16
 
 ## 1. Abstract
 
@@ -64,21 +64,23 @@ OCache currently operates as a single-node cache service. This presents several 
 
 ### 3.3 Key Components
 
-1. **Consistent Hash Ring**: Determines data ownership
-2. **Coordinator**: Manages membership and routing
-3. **Router**: Handles request forwarding with retries and circuit breaking
-4. **Failure Detector**: Monitors node health via heartbeats
-5. **Seed Discovery**: Dynamic or static node discovery
-6. **Cluster Client**: Client-side routing and connection pooling
+1. **Consistent Hash Ring**: Determines data ownership using buraksezer/consistent library
+2. **Coordinator**: Manages membership and routing, implements ClusterService gRPC interface
+3. **Router**: Handles request forwarding with retries, circuit breaking, and connection pooling
+4. **Failure Detector**: Monitors node health via heartbeats with configurable thresholds
+5. **Node Discovery**: Static or DNS-based discovery with address validation
+6. **Cluster Client**: Client-side routing with local ring replica and topology caching
+7. **Error Handling**: Structured error types with retryable/non-retryable classification
 
 ## 4. Detailed Design
 
 ### 4.1 Consistent Hashing
 
-- Uses xxhash for consistent hashing
-- Virtual nodes (vnodes) for better distribution (ReplicationFactor: 20)
-- Partition count: 16384 (configurable)
-- Load factor: 1.25 for bounded loads
+- Uses xxhash64 for consistent hashing (via custom Hasher implementation)
+- Virtual nodes (vnodes) for better distribution (DefaultReplicationFactor: 20)
+- Partition count: 16384 (DefaultPartitionCount, configurable)
+- Load factor: 1.25 (DefaultLoad) for bounded loads
+- Library: buraksezer/consistent for ring management
 
 ### 4.2 Request Routing
 
@@ -95,6 +97,18 @@ OCache currently operates as a single-node cache service. This presents several 
    - Phase 1: Return error
    - Phase 2: Route to temporary owner (hinted handoff)
 ```
+
+#### Router Configuration
+
+- **Connection Timeout**: 5 seconds
+- **Max Message Size**: 128MB (send and receive)
+- **Max Retries**: 3 attempts
+- **Initial Retry Backoff**: 100ms
+- **Max Retry Backoff**: 5 seconds
+- **Keepalive Time**: 30 seconds
+- **Keepalive Timeout**: 10 seconds
+- **Circuit Breaker Threshold**: 5 consecutive failures
+- **Circuit Breaker Timeout**: 30 seconds
 
 ### 4.3 Cluster Membership
 
@@ -116,21 +130,39 @@ New Node                    Seed Node
 
 #### 4.3.2 Failure Detection
 
-- **Heartbeat Interval**: 5 seconds (configurable)
-- **Failure Threshold**: 3 missed heartbeats
+- **Heartbeat Interval**: 5 seconds (DefaultHeartbeatInterval, configurable)
+- **Heartbeat Request Timeout**: 2 seconds
+- **Failure Detection Interval**: 10 seconds (periodic health check)
+- **Failure Threshold**: 3 missed heartbeats (DefaultFailureThreshold)
 - **Detection Time**: ~15 seconds
 - **State Transitions**: Active → Down (no intermediate states in Phase 1)
 
 #### 4.3.3 Seed Discovery
 
-- Static and DNS-based seed discovery.
+- **Static Discovery**: Direct list of node addresses
+- **DNS Discovery**: DNS resolution for dynamic node discovery (e.g., Kubernetes headless service)
+- **DNS Refresh Interval**: 30 seconds (DefaultDNSRefreshInterval, configurable)
+- **Address Validation**: Validates addresses based on allowLocalhost flag (for testing)
 
 ### 4.4 Client Integration
 
-- Maintains local copy of ring topology
+#### ClusterClient Features
+
+- Maintains local copy of ring topology (consistent.Consistent)
+- Caches partition ownership mapping for fast lookups
 - Routes requests directly to owner nodes
-- Handles retries and failover
+- Handles retries and failover with exponential backoff
 - Refreshes topology periodically (30s default)
+- Supports topology epoch tracking for consistency
+- Round-robin fallback when routing information unavailable
+
+#### Client Protocol
+
+1. Connect to seed nodes to fetch initial topology
+2. Build local hash ring from topology information
+3. Cache partition ownership mapping
+4. Route requests based on key hash
+5. Refresh topology periodically or on routing errors
 
 ### 4.5 Data Consistency Model
 
@@ -162,22 +194,31 @@ New Node                    Seed Node
 - **Connection pooling**: Reduces connection overhead
 - **Circuit breaker**: Prevents cascade failures
 
-### 5.3 Resource Usage
-
-- **Memory**: ~100MB per node for ring + connections
-- **CPU**: <1% for heartbeat and failure detection
-- **Network**: Heartbeat traffic: N*(N-1) * 100 bytes/5s
-
 ## 6. Operational Considerations
 
 ### 6.1 Failure Scenarios
 
-| Scenario               | Impact                            | Recovery                             |
-| ---------------------- | --------------------------------- | ------------------------------------ |
-| Single node failure    | Keys on failed node unavailable   | Automatic detection in ~15s          |
-| Network partition      | Split brain possible              | Manual intervention required         |
-| Cascading failures     | Circuit breakers prevent overload | Automatic recovery when nodes return |
-| DNS resolution failure | New nodes cannot join             | Cached seeds used for 5 minutes      |
+| Scenario               | Impact                            | Recovery                              |
+| ---------------------- | --------------------------------- | ------------------------------------- |
+| Single node failure    | Keys on failed node unavailable   | Automatic detection in ~15s           |
+| Network partition      | Split brain possible              | Manual intervention required          |
+| Cascading failures     | Circuit breakers prevent overload | Automatic recovery when nodes return  |
+| DNS resolution failure | New nodes cannot join             | Cached nodes continue to be used      |
+| Connection failure     | Retries with exponential backoff  | Circuit breaker opens after threshold |
+
+### 6.2 Error Types
+
+#### Non-Retryable Errors
+
+- `ErrNodeNotFound`: Target node doesn't exist in ring
+- `ErrCircuitBreakerOpen`: Circuit breaker is open for a node
+- `ErrLocalRouting`: Attempt to route to local node
+- `ErrMaxRetriesExceeded`: All retry attempts exhausted
+
+#### Retryable Errors
+
+- `ErrConnectionFailed`: Failed to establish connection
+- gRPC `Unavailable`, `DeadlineExceeded`, `Canceled`, `Aborted` codes
 
 ## 7. Security Considerations
 
@@ -186,13 +227,6 @@ New Node                    Seed Node
 - No authentication between nodes
 - No encryption for inter-node communication
 - Trust-based cluster membership
-
-### 7.2 Future Enhancements
-
-- mTLS for inter-node communication
-- Token-based authentication for join operations
-- Network isolation via private VPC
-- Rate limiting for cluster operations
 
 ## 8. Alternatives Considered
 
@@ -214,7 +248,29 @@ New Node                    Seed Node
 - **Cons**: Additional dependency, operational complexity
 - **Decision**: Rejected for simplicity
 
-## 9. References
+## 9. Implementation Status
+
+### Phase 1 (Completed)
+
+- ✅ Consistent hash ring with virtual nodes
+- ✅ Coordinator service with membership management
+- ✅ Node discovery (static and DNS)
+- ✅ Failure detection with heartbeats
+- ✅ Router with connection pooling and circuit breakers
+- ✅ Cluster-aware client with smart routing
+- ✅ Protocol buffer definitions for cluster communication
+- ✅ Error handling with retry logic
+- ✅ Topology synchronization and epoch tracking
+
+### Phase 2 (Planned)
+
+- ⏳ Hinted handoff for temporary ownership transfer
+- ⏳ Hint storage and replay protocol
+- ⏳ Automatic data rebalancing on node addition
+- ⏳ Advanced load balancing strategies
+- ⏳ Multi-datacenter support
+
+## 10. References
 
 - [Amazon Dynamo Paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
 - [Consistent Hashing with Bounded Loads](https://ai.googleblog.com/2017/04/consistent-hashing-with-bounded-loads.html)
