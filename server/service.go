@@ -3,13 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/bufferpool"
@@ -29,6 +29,7 @@ import (
 // cacheService implements pb.CacheServiceServer
 type cacheService struct {
 	pb.UnimplementedCacheServiceServer
+	coordinator *coordinator.Coordinator
 }
 
 // Streaming Put for large values
@@ -41,6 +42,11 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	zlog.Debug().Msg("gRPC Put called")
 	metrics.StreamsActive.Inc()
 	defer metrics.StreamsActive.Dec()
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredPut(stream)
+	}
 
 	// Read the first chunk to get key and ttl
 	firstChunk, err := stream.Recv()
@@ -130,6 +136,12 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	}()
 
 	zlog.Debug().Str("key", req.Key).Int64("ttl", req.TtlSeconds).Int("data_len", len(req.Data)).Msg("PutObject called (unary for REST)")
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredPutObject(ctx, req)
+	}
+
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("PutObject", "invalid").Inc()
 		userErr := status.Error(codes.InvalidArgument, "missing key")
@@ -161,6 +173,11 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	zlog.Debug().Str("key", req.Key).Int64("start", req.Start).Int64("end", req.End).Msg("gRPC Get called")
 	metrics.StreamsActive.Inc()
 	defer metrics.StreamsActive.Dec()
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredGet(req, stream)
+	}
 
 	// Wrap Get with retry logic for retryable errors
 	var r io.Reader
@@ -219,6 +236,12 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	}()
 
 	zlog.Debug().Str("key", req.Key).Msg("gRPC Delete called")
+
+	// If clustering is enabled, handle routing
+	if s.coordinator != nil {
+		return s.handleClusteredDelete(ctx, req)
+	}
+
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("Delete", "invalid").Inc()
 		userErr := status.Error(codes.InvalidArgument, "missing key")
@@ -345,19 +368,21 @@ func startGRPCServer() {
 	)
 
 	grpcServer := grpc.NewServer(opts...)
-	pb.RegisterCacheServiceServer(grpcServer, &cacheService{})
+	// Create service with coordinator if clustering is enabled
+	service := newCacheService(globalCoordinator)
+	pb.RegisterCacheServiceServer(grpcServer, service)
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", AppConfig.Port))
+	lis, err := net.Listen("tcp", AppConfig.ListenAddr)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to listen for gRPC")
 	}
-	zlog.Info().Msgf("gRPC server listening on :%d", AppConfig.Port)
+	zlog.Info().Msgf("gRPC server listening on %s", AppConfig.ListenAddr)
 	if err := grpcServer.Serve(lis); err != nil {
 		zlog.Fatal().Err(err).Msg("gRPC server failed")
 	}
 }
 
-func startGRPCGatewayServer(grpcAddr string, gatewayPort int) {
+func startGRPCGatewayServer(grpcAddr string, listenHTTP string) {
 	ctx := context.Background()
 	mux := http.NewServeMux()
 
@@ -375,8 +400,8 @@ func startGRPCGatewayServer(grpcAddr string, gatewayPort int) {
 	// Handle all other routes with the gRPC gateway
 	mux.Handle("/", gwMux)
 
-	zlog.Info().Msgf("Starting grpc-gateway HTTP server on :%d", gatewayPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", gatewayPort), mux); err != nil {
+	zlog.Info().Msgf("Starting grpc-gateway HTTP server on %s", listenHTTP)
+	if err := http.ListenAndServe(listenHTTP, mux); err != nil {
 		zlog.Fatal().Err(err).Msg("grpc-gateway server failed")
 	}
 }

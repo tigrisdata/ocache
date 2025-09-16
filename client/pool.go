@@ -90,11 +90,24 @@ func (p *ConnectionPool) Get(ctx context.Context, key string) ([]byte, error) {
 	return client.Get(ctx, key)
 }
 
+// GetRange retrieves a byte range from the cache using a client from the pool.
+func (p *ConnectionPool) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
+	client := p.GetClient()
+	return client.GetRange(ctx, key, start, end)
+}
+
 // GetStream streams a value directly to the provided writer using a client from the pool.
 // This is efficient for large values.
 func (p *ConnectionPool) GetStream(ctx context.Context, key string, w io.Writer) error {
 	client := p.GetClient()
 	return client.GetStream(ctx, key, w)
+}
+
+// GetRangeStream streams a byte range from the cache using a client from the pool.
+// This is efficient for large values.
+func (p *ConnectionPool) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	client := p.GetClient()
+	return client.GetRangeStream(ctx, key, start, end, w)
 }
 
 // Delete removes a key from the cache using a client from the pool.

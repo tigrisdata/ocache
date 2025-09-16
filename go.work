@@ -3,6 +3,8 @@ go 1.24.2
 use (
 	./client
 	./common
+	./coordinator
+	./coordinator/proto
 	./proto
 	./server
 	./storage

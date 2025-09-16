@@ -13,8 +13,8 @@ type Config struct {
 	CompactThreshold       int64         // Objects less than this size are compacted to segments (bytes)
 	SegmentSize            int64         // Segment size (bytes)
 	TTL                    int           // Default TTL when no key-level TTL is set (seconds)
-	Port                   int           // gRPC listen port
-	HTTPPort               int           // HTTP (grpc-gateway) port
+	ListenAddr             string        // gRPC listen address
+	ListenHTTP             string        // HTTP (grpc-gateway) listen address
 	Verbose                bool          // Enable verbose/debug logging
 	FdCacheSize            int           // Size of the file descriptor cache
 	MaxDiskUsage           int64         // Maximum disk usage in bytes (0 = unlimited)
@@ -28,6 +28,15 @@ type Config struct {
 	RequestLogging         bool          // Enable request logging
 	// RocksDB tuning parameters
 	MetadataCacheSize int64 // RocksDB block cache size in bytes
+
+	// Cluster configuration
+	ClusterEnabled    bool          // Enable cluster mode
+	NodeID            string        // Unique node identifier in cluster
+	ClusterAddr       string        // Address for cluster communication
+	Seeds             []string      // Seed nodes for joining cluster
+	PartitionCount    int           // Number of partitions in hash ring
+	HeartbeatInterval time.Duration // Interval between heartbeats
+	FailureThreshold  int           // Number of failed heartbeats before marking node down
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -43,8 +52,8 @@ func LoadConfig() {
 		CompactThreshold:       *compactThreshold,
 		SegmentSize:            *segmentSize,
 		TTL:                    *ttl,
-		Port:                   *port,
-		HTTPPort:               *httpPort,
+		ListenAddr:             *listenAddr,
+		ListenHTTP:             *listenHTTP,
 		Verbose:                *verbose,
 		FdCacheSize:            *fdCacheSize,
 		MaxDiskUsage:           *maxDiskUsage,
@@ -57,5 +66,12 @@ func LoadConfig() {
 		TTLCleanupInterval:     *ttlCleanupInterval,
 		RequestLogging:         *requestLogging,
 		MetadataCacheSize:      *metadataCacheSize,
+		ClusterEnabled:         *clusterEnabled,
+		NodeID:                 *nodeID,
+		ClusterAddr:            *clusterAddr,
+		Seeds:                  seeds,
+		PartitionCount:         *partitionCount,
+		HeartbeatInterval:      *heartbeatInterval,
+		FailureThreshold:       *failureThreshold,
 	}
 }

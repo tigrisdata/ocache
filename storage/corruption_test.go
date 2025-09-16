@@ -160,10 +160,10 @@ func TestStorage_IOErrorHandling(t *testing.T) {
 
 		// Create a ValueMessage pointing to a non-existent segment file
 		valueMsg := &pb.ValueMessage{
-			ValueType:      pb.ValueType_SEGMENT,
-			SegmentPath:    "/non/existent/segment.seg",
-			SegmentOffset:  0,
-			ValueLength:    100,
+			ValueType:     pb.ValueType_SEGMENT,
+			SegmentPath:   "/non/existent/segment.seg",
+			SegmentOffset: 0,
+			ValueLength:   100,
 		}
 
 		// Marshal and store
@@ -181,7 +181,7 @@ func TestStorage_IOErrorHandling(t *testing.T) {
 		// Should return an IO error that is retryable
 		assert.Error(t, err)
 		assert.False(t, found)
-		
+
 		// Check error type
 		errType, ok := storageErrors.GetType(err)
 		assert.True(t, ok, "Should be a StorageError")
@@ -219,7 +219,7 @@ func TestStorage_IOErrorHandling(t *testing.T) {
 		// Should return an IO error that is retryable
 		assert.Error(t, err)
 		assert.False(t, found)
-		
+
 		// Check error type
 		errType, ok := storageErrors.GetType(err)
 		assert.True(t, ok, "Should be a StorageError")
