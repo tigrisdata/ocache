@@ -10,6 +10,13 @@ import (
 	"google.golang.org/grpc/connectivity"
 )
 
+const (
+	// MaxRecvMsgSize is the maximum message size for receiving (in bytes)
+	MaxRecvMsgSize = 128 * 1024 * 1024 // 128MB
+	// MaxSendMsgSize is the maximum message size for sending (in bytes)
+	MaxSendMsgSize = 128 * 1024 * 1024 // 128MB
+)
+
 type Client struct {
 	conn   *grpc.ClientConn
 	client pb.CacheServiceClient
@@ -21,8 +28,8 @@ func New(addr string, opts ...grpc.DialOption) (*Client, error) {
 	}
 	// Set max message sizes for streaming
 	opts = append(opts, grpc.WithDefaultCallOptions(
-		grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB
-		grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB
+		grpc.MaxCallRecvMsgSize(MaxRecvMsgSize), // 128MB
+		grpc.MaxCallSendMsgSize(MaxSendMsgSize), // 128MB
 	))
 	conn, err := grpc.Dial(addr, opts...)
 	if err != nil {

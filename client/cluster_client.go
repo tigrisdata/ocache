@@ -28,8 +28,6 @@ func (n nodeMember) String() string {
 // ClusterClient is a cluster-aware cache client that uses smart routing
 // based on consistent hashing and partition ownership information
 type ClusterClient struct {
-	seedAddrs       []string
-	seedClients     []*grpc.ClientConn         // Connections to seed nodes for topology
 	clients         map[string]*Client         // nodeID -> client for all nodes
 	ring            *consistent.Consistent     // Local hash ring for routing
 	partitionOwners map[int32]string           // partition -> nodeID mapping
@@ -50,41 +48,21 @@ func NewClusterClient(seedAddrs []string, opts ...grpc.DialOption) (*ClusterClie
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	// Set max message sizes for streaming
-	opts = append(opts, grpc.WithDefaultCallOptions(
-		grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB
-		grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB
-	))
-
 	c := &ClusterClient{
-		seedAddrs:       seedAddrs,
-		seedClients:     make([]*grpc.ClientConn, 0, len(seedAddrs)),
 		clients:         make(map[string]*Client),
 		partitionOwners: make(map[int32]string),
 		stopCh:          make(chan struct{}),
 	}
 
-	// Connect to seed nodes
-	for _, addr := range seedAddrs {
-		conn, err := grpc.Dial(addr, opts...)
-		if err != nil {
-			// Log error but continue - we want to connect to as many as possible
-			continue
-		}
-		c.seedClients = append(c.seedClients, conn)
-	}
-
-	if len(c.seedClients) == 0 {
-		return nil, fmt.Errorf("failed to connect to any seed nodes")
-	}
-
-	// Fetch initial topology
-	if err := c.refreshTopology(); err != nil {
-		// Close connections and return error
-		for _, conn := range c.seedClients {
-			conn.Close()
-		}
+	// Fetch initial topology from seed nodes
+	topology, err := fetchTopologyFromNodes(seedAddrs, opts)
+	if err != nil {
 		return nil, fmt.Errorf("failed to fetch initial topology: %w", err)
+	}
+
+	// Initialize with topology
+	if err := c.updateTopology(topology); err != nil {
+		return nil, fmt.Errorf("failed to initialize with topology: %w", err)
 	}
 
 	// Start topology refresh loop
@@ -93,25 +71,77 @@ func NewClusterClient(seedAddrs []string, opts ...grpc.DialOption) (*ClusterClie
 	return c, nil
 }
 
-// refreshTopology fetches the latest cluster topology from seed nodes
+// fetchTopologyFromNodes connects to nodes to fetch topology
+func fetchTopologyFromNodes(nodeAddrs []string, opts []grpc.DialOption) (*clusterpb.ClusterTopology, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Try each node until we get topology
+	for _, addr := range nodeAddrs {
+		conn, err := grpc.DialContext(ctx, addr, opts...)
+		if err != nil {
+			continue // Try next node
+		}
+		defer conn.Close()
+
+		client := clusterpb.NewClusterServiceClient(conn)
+		topology, err := client.GetClusterTopology(ctx, &clusterpb.Empty{})
+		if err != nil {
+			continue // Try next node
+		}
+
+		return topology, nil
+	}
+
+	return nil, fmt.Errorf("failed to get topology from any node")
+}
+
+// refreshTopology fetches the latest cluster topology from existing nodes
 func (c *ClusterClient) refreshTopology() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Try each seed node until we get topology
-	for _, conn := range c.seedClients {
+	// Get current nodes from topology
+	c.mu.RLock()
+	var nodeAddresses []string
+	if c.topology != nil {
+		for _, node := range c.topology.Nodes {
+			if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
+				nodeAddresses = append(nodeAddresses, node.Address)
+			}
+		}
+	}
+	c.mu.RUnlock()
+
+	// If no nodes in topology, we can't refresh
+	if len(nodeAddresses) == 0 {
+		return fmt.Errorf("no active nodes available for topology refresh")
+	}
+
+	// Try each node until we get topology
+	for _, addr := range nodeAddresses {
+		conn, err := grpc.DialContext(ctx, addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultCallOptions(
+				grpc.MaxCallRecvMsgSize(128*1024*1024),
+				grpc.MaxCallSendMsgSize(128*1024*1024),
+			))
+		if err != nil {
+			continue // Try next node
+		}
+		defer conn.Close()
+
 		client := clusterpb.NewClusterServiceClient(conn)
 		topology, err := client.GetClusterTopology(ctx, &clusterpb.Empty{})
 		if err != nil {
-			// Try next seed
-			continue
+			continue // Try next node
 		}
 
 		// Update topology
 		return c.updateTopology(topology)
 	}
 
-	return fmt.Errorf("failed to get topology from any seed node")
+	return fmt.Errorf("failed to get topology from any node")
 }
 
 // updateTopology updates the local ring and partition ownership based on new topology
@@ -213,16 +243,10 @@ func (c *ClusterClient) getNodeForPartition(partition int32) string {
 
 // getClientForKey returns the client for the node that owns the key
 func (c *ClusterClient) getClientForKey(key string) (*Client, error) {
-	// Find partition for key
-	partition := c.getPartitionForKey(key)
-	if partition < 0 {
-		return nil, fmt.Errorf("no ring configured")
-	}
-
-	// Find node for partition
-	nodeID := c.getNodeForPartition(partition)
-	if nodeID == "" {
-		return nil, fmt.Errorf("no owner for partition %d", partition)
+	// Find node for key
+	nodeID, err := c.GetNodeForKey(key)
+	if err != nil {
+		return nil, err
 	}
 
 	// Get client for node
@@ -294,12 +318,7 @@ func (c *ClusterClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Close seed connections
-	for _, conn := range c.seedClients {
-		conn.Close()
-	}
-
-	// Close node clients
+	// Close all node clients
 	var lastErr error
 	for _, client := range c.clients {
 		if err := client.Close(); err != nil {
