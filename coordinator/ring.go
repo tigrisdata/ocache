@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/buraksezer/consistent"
-	"github.com/cespare/xxhash"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/hash"
 )
 
 // NodeStatus represents the status of a node in the cluster
@@ -53,13 +53,6 @@ func (n nodeMember) String() string {
 	return string(n)
 }
 
-// hasher implements the consistent.Hasher interface
-type hasher struct{}
-
-func (h hasher) Sum64(data []byte) uint64 {
-	return xxhash.Sum64(data)
-}
-
 // Ring manages consistent hash ring for key-to-node mapping.
 // It separates membership changes (add/remove) from availability changes (up/down)
 // to later support hinted handoff without unnecessary ownership transfers.
@@ -75,14 +68,14 @@ type Ring struct {
 // NewRing creates a new consistent hash ring
 func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 	if partitionCount <= 0 {
-		partitionCount = DefaultRingPartitionCount
+		partitionCount = hash.DefaultPartitionCount
 	}
 
 	cfg := consistent.Config{
 		PartitionCount:    partitionCount,
-		ReplicationFactor: DefaultRingReplicationFactor,
-		Load:              DefaultRingLoad,
-		Hasher:            hasher{},
+		ReplicationFactor: hash.DefaultReplicationFactor,
+		Load:              hash.DefaultLoad,
+		Hasher:            hash.Hasher{},
 	}
 
 	ch := consistent.New(nil, cfg)
@@ -396,6 +389,6 @@ func (r *Ring) GetRingConfig() (partitionCount int32, replicationFactor int32, l
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// These are the constants we use for the ring configuration
-	return int32(r.partitionCount), DefaultRingReplicationFactor, DefaultRingLoad
+	// Return the actual configuration used by this ring
+	return int32(r.partitionCount), hash.DefaultReplicationFactor, hash.DefaultLoad
 }

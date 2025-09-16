@@ -11,6 +11,7 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
 	stor "github.com/tigrisdata/ocache/storage"
@@ -46,7 +47,7 @@ var (
 	nodeID            = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
 	clusterAddr       = flag.String("cluster-addr", ":7000", "Address for cluster communication")
 	seedsStr          = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000)")
-	partitionCount    = flag.Int("partition-count", coordinator.DefaultRingPartitionCount, "Number of partitions in hash ring")
+	partitionCount    = flag.Int("partition-count", hash.DefaultPartitionCount, "Number of partitions in hash ring")
 	heartbeatInterval = flag.Duration("heartbeat-interval", coordinator.DefaultHeartbeatInterval, "Interval between heartbeats")
 	failureThreshold  = flag.Int("failure-threshold", coordinator.DefaultFailureThreshold, "Number of failed heartbeats before marking node down")
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/coordinator/discovery"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -33,11 +34,6 @@ const (
 
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
-
-	// Hash ring defaults
-	DefaultRingPartitionCount    = 16384 // DefaultRingPartitionCount is the default number of partitions in the hash ring
-	DefaultRingReplicationFactor = 20    // DefaultRingReplicationFactor is the default replication factor for the nodes in the hash ring
-	DefaultRingLoad              = 1.25  // DefaultRingLoad is the default load for the hash ring
 )
 
 // Config contains the configuration for the coordinator
@@ -137,7 +133,7 @@ func New(config *Config) (*Coordinator, error) {
 
 	// Default to 16384 partitions if not set
 	if config.RingPartitionCount < 1 {
-		config.RingPartitionCount = DefaultRingPartitionCount
+		config.RingPartitionCount = hash.DefaultPartitionCount
 	}
 
 	ring, err := NewRing(config.RingPartitionCount, config.MyNodeID)

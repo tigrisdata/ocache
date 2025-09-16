@@ -3,9 +3,12 @@ module github.com/tigrisdata/ocache/client
 go 1.24.2
 
 require (
+	github.com/buraksezer/consistent v0.10.0
 	github.com/pterm/pterm v0.12.81
 	github.com/spf13/cobra v1.9.1
 	github.com/stretchr/testify v1.10.0
+	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
 )
@@ -14,6 +17,7 @@ require (
 	atomicgo.dev/cursor v0.2.0 // indirect
 	atomicgo.dev/keyboard v0.2.9 // indirect
 	atomicgo.dev/schedule v0.1.0 // indirect
+	github.com/cespare/xxhash v1.1.0 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/gookit/color v1.5.4 // indirect
@@ -37,8 +41,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-// We want to import the local `proto/` module
+// We want to import the local modules
 replace (
+	github.com/tigrisdata/ocache/common => ../common
 	github.com/tigrisdata/ocache/coordinator/proto => ../coordinator/proto
 	github.com/tigrisdata/ocache/proto => ../proto
 )
