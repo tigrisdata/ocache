@@ -22,15 +22,18 @@ The ClusterClient is a cluster-aware cache client that provides smart routing ba
 The ClusterClient requires a configuration object that specifies connection parameters:
 
 ```go
-type ClusterClientConfig struct {
+type ClientConfig struct {
     // List of seed node addresses to bootstrap the client
-    SeedAddrs []string
+    Addrs []string
 
     // Number of connections to maintain per node (must be > 0)
-    PoolSizePerNode int
+    PoolSize int
+
+    // Connection mode (default: "auto")
+    Mode ConnectionMode
 
     // How often to refresh cluster topology (default: 30s)
-    TopologyRefreshInterval time.Duration
+    RefreshInterval time.Duration
 
     // Optional gRPC dial options
     DialOpts []grpc.DialOption
