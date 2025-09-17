@@ -545,6 +545,11 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 
 // Get retrieves a value from the cache
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
+	return c.getWithRetry(ctx, key, 1)
+}
+
+// getWithRetry implements Get with retry logic
+func (c *Client) getWithRetry(ctx context.Context, key string, retryCount int) ([]byte, error) {
 	pool, err := c.route(key)
 	if err != nil {
 		return nil, err
@@ -569,11 +574,15 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 			break
 		}
 		if err != nil {
-			// Retry once with topology refresh for cluster mode
-			if c.mode == ModeCluster && isRoutingError(err) {
+			// Only retry if:
+			// 1. We're in cluster mode
+			// 2. It's a routing error
+			// 3. We haven't exceeded retry limit
+			// 4. We haven't received any data yet (to avoid data loss)
+			if c.mode == ModeCluster && isRoutingError(err) && retryCount > 0 && len(result) == 0 {
 				if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 					c.updateTopology(topology)
-					return c.Get(ctx, key)
+					return c.getWithRetry(ctx, key, retryCount-1)
 				}
 			}
 			return nil, err
@@ -585,6 +594,11 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetStream streams a value from the cache
 func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
+	return c.getStreamWithRetry(ctx, key, w, 1)
+}
+
+// getStreamWithRetry implements GetStream with retry logic
+func (c *Client) getStreamWithRetry(ctx context.Context, key string, w io.Writer, retryCount int) error {
 	pool, err := c.route(key)
 	if err != nil {
 		return err
@@ -596,6 +610,7 @@ func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
 		return err
 	}
 
+	var bytesWritten int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -608,18 +623,24 @@ func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
 			break
 		}
 		if err != nil {
-			// Retry once with topology refresh for cluster mode
-			if c.mode == ModeCluster && isRoutingError(err) {
+			// Only retry if:
+			// 1. We're in cluster mode
+			// 2. It's a routing error
+			// 3. We haven't exceeded retry limit
+			// 4. We haven't written any data yet (to avoid duplicates)
+			if c.mode == ModeCluster && isRoutingError(err) && retryCount > 0 && bytesWritten == 0 {
 				if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 					c.updateTopology(topology)
-					return c.GetStream(ctx, key, w)
+					return c.getStreamWithRetry(ctx, key, w, retryCount-1)
 				}
 			}
 			return err
 		}
-		if _, err := w.Write(resp.Data); err != nil {
+		n, err := w.Write(resp.Data)
+		if err != nil {
 			return err
 		}
+		bytesWritten += int64(n)
 	}
 	return nil
 }
@@ -816,4 +837,3 @@ func isRoutingError(err error) bool {
 		st.Code() == codes.NotFound ||
 		st.Code() == codes.Unavailable
 }
-
