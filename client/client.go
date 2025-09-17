@@ -545,18 +545,19 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 
 // Get retrieves a value from the cache
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
-	return c.getWithRetry(ctx, key, 1)
+	req := &pb.GetRequest{Key: key}
+	return c.getDataWithRetry(ctx, key, req, 1)
 }
 
-// getWithRetry implements Get with retry logic
-func (c *Client) getWithRetry(ctx context.Context, key string, retryCount int) ([]byte, error) {
+// getDataWithRetry implements Get/GetRange with retry logic
+func (c *Client) getDataWithRetry(ctx context.Context, key string, req *pb.GetRequest, retryCount int) ([]byte, error) {
 	pool, err := c.route(key)
 	if err != nil {
 		return nil, err
 	}
 
 	client := pool.getClient()
-	stream, err := client.Get(ctx, &pb.GetRequest{Key: key})
+	stream, err := client.Get(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -582,7 +583,7 @@ func (c *Client) getWithRetry(ctx context.Context, key string, retryCount int) (
 			if c.mode == ModeCluster && isRoutingError(err) && retryCount > 0 && len(result) == 0 {
 				if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 					c.updateTopology(topology)
-					return c.getWithRetry(ctx, key, retryCount-1)
+					return c.getDataWithRetry(ctx, key, req, retryCount-1)
 				}
 			}
 			return nil, err
@@ -594,18 +595,19 @@ func (c *Client) getWithRetry(ctx context.Context, key string, retryCount int) (
 
 // GetStream streams a value from the cache
 func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
-	return c.getStreamWithRetry(ctx, key, w, 1)
+	req := &pb.GetRequest{Key: key}
+	return c.getStreamWithRetry(ctx, key, req, w, 1)
 }
 
-// getStreamWithRetry implements GetStream with retry logic
-func (c *Client) getStreamWithRetry(ctx context.Context, key string, w io.Writer, retryCount int) error {
+// getStreamWithRetry implements GetStream/GetRangeStream with retry logic
+func (c *Client) getStreamWithRetry(ctx context.Context, key string, req *pb.GetRequest, w io.Writer, retryCount int) error {
 	pool, err := c.route(key)
 	if err != nil {
 		return err
 	}
 
 	client := pool.getClient()
-	stream, err := client.Get(ctx, &pb.GetRequest{Key: key})
+	stream, err := client.Get(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -631,7 +633,7 @@ func (c *Client) getStreamWithRetry(ctx context.Context, key string, w io.Writer
 			if c.mode == ModeCluster && isRoutingError(err) && retryCount > 0 && bytesWritten == 0 {
 				if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 					c.updateTopology(topology)
-					return c.getStreamWithRetry(ctx, key, w, retryCount-1)
+					return c.getStreamWithRetry(ctx, key, req, w, retryCount-1)
 				}
 			}
 			return err
@@ -647,70 +649,25 @@ func (c *Client) getStreamWithRetry(ctx context.Context, key string, w io.Writer
 
 // GetRange retrieves a byte range from the cache
 func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	pool, err := c.route(key)
-	if err != nil {
-		return nil, err
-	}
-
-	client := pool.getClient()
 	req := &pb.GetRequest{
 		Key:   key,
 		Start: start,
 		End:   end,
 	}
-
-	stream, err := client.Get(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	var result []byte
-	for {
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, resp.Data...)
-	}
-	return result, nil
+	return c.getDataWithRetry(ctx, key, req, 1)
 }
+
 
 // GetRangeStream streams a byte range from the cache
 func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	pool, err := c.route(key)
-	if err != nil {
-		return err
-	}
-
-	client := pool.getClient()
 	req := &pb.GetRequest{
 		Key:   key,
 		Start: start,
 		End:   end,
 	}
-
-	stream, err := client.Get(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	for {
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(resp.Data); err != nil {
-			return err
-		}
-	}
-	return nil
+	return c.getStreamWithRetry(ctx, key, req, w, 1)
 }
+
 
 // Delete removes a key from the cache
 func (c *Client) Delete(ctx context.Context, key string) error {
