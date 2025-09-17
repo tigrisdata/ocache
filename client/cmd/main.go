@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "cachecli",
+	Use:   "ocachecli",
 	Short: "CLI for interacting with the cache service",
 }
 
@@ -28,8 +29,11 @@ func main() {
 
 // flags for the CLI
 var (
-	addr string
-	ttl  int64
+	addr            string
+	ttl             int64
+	connMode        string
+	poolSize        int
+	topologyRefresh time.Duration
 
 	numKeys        int
 	valueSize      int
@@ -43,11 +47,30 @@ var (
 )
 
 func newClient() *cacheclient.Client {
-	c, err := cacheclient.New(addr)
+	// Parse comma-separated addresses
+	addrs := strings.Split(addr, ",")
+	for i, a := range addrs {
+		addrs[i] = strings.TrimSpace(a)
+	}
+
+	config := &cacheclient.ClientConfig{
+		Addrs:           addrs,
+		PoolSize:        poolSize,
+		Mode:            cacheclient.ConnectionMode(connMode),
+		RefreshInterval: topologyRefresh,
+	}
+
+	c, err := cacheclient.NewWithConfig(config)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to create client: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Log the detected mode if auto was used
+	if connMode == "auto" {
+		fmt.Fprintf(os.Stderr, "Using %s mode\n", c.GetMode())
+	}
+
 	return c
 }
 
@@ -188,15 +211,18 @@ var benchCmd = &cobra.Command{
 		defer cancel()
 
 		cfg := ycsb.YCSBConfig{
-			Addr:           addr,
-			NumKeys:        numKeys,
-			ValueSize:      valueSize,
-			NumOps:         numOps,
-			Concurrency:    concurrency,
-			Workload:       workload,
-			Seed:           seed,
-			NoProgress:     noProgress,
-			ForceStreaming: forceStreaming,
+			Addr:            addr,
+			ConnMode:        connMode,
+			PoolSize:        poolSize,
+			TopologyRefresh: topologyRefresh,
+			NumKeys:         numKeys,
+			ValueSize:       valueSize,
+			NumOps:          numOps,
+			Concurrency:     concurrency,
+			Workload:        workload,
+			Seed:            seed,
+			NoProgress:      noProgress,
+			ForceStreaming:  forceStreaming,
 		}
 		_, err := ycsb.RunYCSBWithContext(ctx, cfg)
 		if err != nil {
@@ -211,7 +237,10 @@ var benchCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&addr, "addr", "localhost:9000", "Cache server address")
+	rootCmd.PersistentFlags().StringVar(&addr, "addr", "localhost:9000", "Cache server address (comma-separated for multiple servers)")
+	rootCmd.PersistentFlags().StringVar(&connMode, "mode", "auto", "Connection mode: auto, simple, or cluster")
+	rootCmd.PersistentFlags().IntVar(&poolSize, "pool-size", 4, "Connection pool size per address")
+	rootCmd.PersistentFlags().DurationVar(&topologyRefresh, "topology-refresh", 30*time.Second, "Topology refresh interval (cluster mode only)")
 	putCmd.Flags().Int64Var(&ttl, "ttl", 0, "TTL for the key in seconds (0 = no expiry)")
 	listCmd.Flags().StringVar(&listPrefix, "prefix", "", "Optional prefix to filter keys")
 	benchCmd.Flags().IntVar(&numKeys, "num-keys", 1000, "Number of unique keys")

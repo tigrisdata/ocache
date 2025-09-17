@@ -8,13 +8,16 @@ ocachecli bench [options]
 
 **Options:**
 
-- `--concurrency value`: Number of concurrent workers (default: 8)
-- `--num-keys value`: Number of unique keys (default: 1000)
-- `--num-ops value`: Total number of operations (default: 10000)
-- `--value-size value`: Value size in bytes (default: 100)
-- `--workload value`: Workload type or custom mix (default: "A")
-- `--force-streaming`: Force streaming for all operations regardless of size
-- `--no-progress`: Disable progress output during benchmark
+| Flag                | Description                           | Default           |
+| ------------------- | ------------------------------------- | ----------------- |
+| `--num-keys`        | Number of unique keys                 | `1000`            |
+| `--value-size`      | Size of each value in bytes           | `100`             |
+| `--num-ops`         | Total number of operations            | `10000`           |
+| `--concurrency`     | Number of concurrent workers          | `8`               |
+| `--workload`        | Workload type (A, B, C) or custom mix | `A`               |
+| `--seed`            | Random seed for reproducibility       | Current timestamp |
+| `--no-progress`     | Disable progress output               | `false`           |
+| `--force-streaming` | Force streaming for all operations    | `false`           |
 
 **Workload Types:**
 
@@ -36,28 +39,25 @@ make run
 Then, run the benchmark:
 
 ```bash
-# Run default benchmark (Workload A)
+# Basic benchmark with default settings
 ocachecli bench
 
-# Run read-heavy benchmark with more operations
-ocachecli bench --workload B --num-ops 100000
-
-# Run with custom workload mix
-ocachecli bench --workload "read=70,update=30"
-
-# High concurrency test
-ocachecli bench --concurrency 50 --num-keys 10000
-
-# Large value test
-ocachecli bench --value-size 1000000 --num-ops 1000
-
-# Comprehensive benchmark
+# Custom workload with more operations
 ocachecli bench \
-  --workload B \
+  --num-keys 10000 \
+  --num-ops 100000 \
   --concurrency 16 \
-  --num-keys 5000 \
-  --num-ops 50000 \
-  --value-size 1000
+  --value-size 1024 \
+  --workload B
+
+# Benchmark with multiple servers and custom pool size
+ocachecli \
+  --addr "node1:9001,node2:9002,node3:9003" \
+  --pool-size 10 \
+  bench \
+  --num-keys 50000 \
+  --num-ops 500000 \
+  --concurrency 32
 ```
 
 **Benchmark Examples by Object Size:**

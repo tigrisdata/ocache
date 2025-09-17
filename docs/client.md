@@ -54,33 +54,17 @@ import (
 
 func main() {
     // Create configuration for the cluster client
-    config := &cacheclient.ClusterClientConfig{
+    config := &cacheclient.ClientConfig{
         // Seed addresses for initial topology discovery
-        SeedAddrs: []string{
+        Addrs: []string{
             "localhost:9001",
             "localhost:9002",
             "localhost:9003",
         },
-
-        // Number of connections per node
-        // For 3 nodes with pool size 5 = 15 total connections
-        PoolSizePerNode: 5,
-
-        // Topology refresh interval
-        TopologyRefreshInterval: 30 * time.Second,
-
-        // gRPC options
-        DialOpts: []grpc.DialOption{
-            grpc.WithTransportCredentials(insecure.NewCredentials()),
-            grpc.WithDefaultCallOptions(
-                grpc.MaxCallRecvMsgSize(128*1024*1024), // 128MB
-                grpc.MaxCallSendMsgSize(128*1024*1024), // 128MB
-            ),
-        },
     }
 
     // Create cluster client with connection pooling
-    client, err := cacheclient.NewClusterClient(config)
+    client, err := cacheclient.NewWithConfig(config)
     if err != nil {
         panic(fmt.Sprintf("Failed to create cluster client: %v", err))
     }
@@ -212,29 +196,29 @@ nodeID, err := client.GetNodeForKey(key)
 #### High Throughput Configuration
 
 ```go
-config := &cacheclient.ClusterClientConfig{
-    SeedAddrs:               seedNodes,
-    PoolSizePerNode:         20, // High pool size for throughput
-    TopologyRefreshInterval: 10 * time.Second, // Frequent updates
+config := &cacheclient.ClientConfig{
+    Addrs:               seedNodes,
+    PoolSize:         20, // High pool size for throughput
+    RefreshInterval: 10 * time.Second, // Frequent updates
 }
 ```
 
 #### Resource-Constrained Configuration
 
 ```go
-config := &cacheclient.ClusterClientConfig{
-    SeedAddrs:               seedNodes,
-    PoolSizePerNode:         2, // Minimal connections
-    TopologyRefreshInterval: 60 * time.Second, // Less frequent updates
+config := &cacheclient.ClientConfig{
+    Addrs:               seedNodes,
+    PoolSize:         2, // Minimal connections
+    RefreshInterval: 60 * time.Second, // Less frequent updates
 }
 ```
 
 #### Development/Testing Configuration
 
 ```go
-config := &cacheclient.ClusterClientConfig{
-    SeedAddrs:               []string{"localhost:9001"},
-    PoolSizePerNode:         1, // Single connection for debugging
-    TopologyRefreshInterval: 5 * time.Second, // Fast feedback
+config := &cacheclient.ClientConfig{
+    Addrs:               []string{"localhost:9001"},
+    PoolSize:         1, // Single connection for debugging
+    RefreshInterval: 5 * time.Second, // Fast feedback
 }
 ```
