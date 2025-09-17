@@ -85,34 +85,39 @@ func TestClientConfig(t *testing.T) {
 }
 
 func TestConnectionMode(t *testing.T) {
+	// Test mode constants
+	t.Run("mode constants", func(t *testing.T) {
+		assert.Equal(t, "auto", string(ModeAuto))
+		assert.Equal(t, "simple", string(ModeSimple))
+		assert.Equal(t, "cluster", string(ModeCluster))
+	})
+
+	// Test mode string conversion
 	tests := []struct {
 		name     string
 		mode     ConnectionMode
-		expected ConnectionMode
+		expected string
 	}{
 		{
-			name:     "auto mode",
+			name:     "auto mode string",
 			mode:     ModeAuto,
-			expected: ModeSimple, // Will default to simple without topology service
+			expected: "auto",
 		},
 		{
-			name:     "simple mode",
+			name:     "simple mode string", 
 			mode:     ModeSimple,
-			expected: ModeSimple,
+			expected: "simple",
 		},
 		{
-			name:     "cluster mode",
+			name:     "cluster mode string",
 			mode:     ModeCluster,
-			expected: ModeCluster,
+			expected: "cluster",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Test mode constants
-			assert.Equal(t, "auto", string(ModeAuto))
-			assert.Equal(t, "simple", string(ModeSimple))
-			assert.Equal(t, "cluster", string(ModeCluster))
+			assert.Equal(t, tt.expected, string(tt.mode))
 		})
 	}
 }
