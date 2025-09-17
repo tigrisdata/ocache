@@ -3,6 +3,7 @@ package cacheclient
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,9 +38,14 @@ func TestClusterClient_PartitionRouting(t *testing.T) {
 	}
 
 	// Create cluster client
+	config := &ClusterClientConfig{
+		PoolSizePerNode:         3,
+		TopologyRefreshInterval: 30 * time.Second,
+	}
 	c := &ClusterClient{
-		clients:         make(map[string]*Client),
+		clients:         make(map[string]*ConnectionPool),
 		partitionOwners: make(map[int32]string),
+		config:          config,
 		stopCh:          make(chan struct{}),
 	}
 
@@ -79,9 +85,14 @@ func TestClusterClient_PartitionRouting(t *testing.T) {
 }
 
 func TestClusterClient_TopologyUpdate(t *testing.T) {
+	config := &ClusterClientConfig{
+		PoolSizePerNode:         3,
+		TopologyRefreshInterval: 30 * time.Second,
+	}
 	c := &ClusterClient{
-		clients:         make(map[string]*Client),
+		clients:         make(map[string]*ConnectionPool),
 		partitionOwners: make(map[int32]string),
+		config:          config,
 		stopCh:          make(chan struct{}),
 	}
 

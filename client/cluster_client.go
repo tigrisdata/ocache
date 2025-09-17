@@ -18,6 +18,21 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const (
+	// DefaultPoolSizePerNode is the default pool size per node
+	DefaultPoolSizePerNode = 4
+	// DefaultTopologyRefreshInterval is the default interval for refreshing the cluster topology
+	DefaultTopologyRefreshInterval = 30 * time.Second
+)
+
+// ClusterClientConfig contains configuration for ClusterClient
+type ClusterClientConfig struct {
+	SeedAddrs               []string
+	PoolSizePerNode         int           // Default: 4
+	TopologyRefreshInterval time.Duration // Default: 30s
+	DialOpts                []grpc.DialOption
+}
+
 // nodeMember implements consistent.Member interface
 type nodeMember string
 
@@ -28,34 +43,46 @@ func (n nodeMember) String() string {
 // ClusterClient is a cluster-aware cache client that uses smart routing
 // based on consistent hashing and partition ownership information
 type ClusterClient struct {
-	clients         map[string]*Client         // nodeID -> client for all nodes
+	clients         map[string]*ConnectionPool // nodeID -> connection pool for all nodes
 	ring            *consistent.Consistent     // Local hash ring for routing
 	partitionOwners map[int32]string           // partition -> nodeID mapping
 	topology        *clusterpb.ClusterTopology // Cached topology
 	topologyEpoch   uint64                     // Current topology version
 	currentIdx      int32                      // For round-robin fallback
+	config          *ClusterClientConfig       // Store config
 	mu              sync.RWMutex
 	stopCh          chan struct{}
 }
 
 // NewClusterClient creates a new cluster-aware client with smart routing
-func NewClusterClient(seedAddrs []string, opts ...grpc.DialOption) (*ClusterClient, error) {
-	if len(seedAddrs) == 0 {
+func NewClusterClient(config *ClusterClientConfig) (*ClusterClient, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config is required")
+	}
+	if len(config.SeedAddrs) == 0 {
 		return nil, fmt.Errorf("at least one seed address is required")
 	}
 
-	if len(opts) == 0 {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Set defaults
+	if config.PoolSizePerNode <= 0 {
+		config.PoolSizePerNode = DefaultPoolSizePerNode
+	}
+	if config.TopologyRefreshInterval == 0 {
+		config.TopologyRefreshInterval = DefaultTopologyRefreshInterval
+	}
+	if len(config.DialOpts) == 0 {
+		config.DialOpts = append(config.DialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
 	c := &ClusterClient{
-		clients:         make(map[string]*Client),
+		clients:         make(map[string]*ConnectionPool),
 		partitionOwners: make(map[int32]string),
+		config:          config,
 		stopCh:          make(chan struct{}),
 	}
 
 	// Fetch initial topology from seed nodes
-	topology, err := fetchTopologyFromNodes(seedAddrs, opts)
+	topology, err := fetchTopologyFromNodes(config.SeedAddrs, config.DialOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch initial topology: %w", err)
 	}
@@ -169,7 +196,7 @@ func (c *ClusterClient) updateTopology(topology *clusterpb.ClusterTopology) erro
 		partitionOwners[owner.PartitionId] = owner.NodeId
 	}
 
-	// Create/update clients for all nodes
+	// Create/update pools for all nodes
 	activeNodes := make(map[string]bool)
 	for _, node := range topology.Nodes {
 		activeNodes[node.Id] = true
@@ -178,21 +205,21 @@ func (c *ClusterClient) updateTopology(topology *clusterpb.ClusterTopology) erro
 		member := nodeMember(node.Id)
 		ring.Add(member)
 
-		// Create client if doesn't exist
+		// Create pool if doesn't exist
 		if _, exists := c.clients[node.Id]; !exists {
-			client, err := New(node.Address)
+			pool, err := NewConnectionPool(node.Address, c.config.PoolSizePerNode, c.config.DialOpts...)
 			if err != nil {
 				// Log error but continue
 				continue
 			}
-			c.clients[node.Id] = client
+			c.clients[node.Id] = pool
 		}
 	}
 
-	// Remove clients for nodes no longer in topology
-	for nodeID, client := range c.clients {
+	// Remove pools for nodes no longer in topology
+	for nodeID, pool := range c.clients {
 		if !activeNodes[nodeID] {
-			client.Close()
+			pool.Close()
 			delete(c.clients, nodeID)
 		}
 	}
@@ -208,7 +235,7 @@ func (c *ClusterClient) updateTopology(topology *clusterpb.ClusterTopology) erro
 
 // topologyRefreshLoop periodically refreshes cluster topology
 func (c *ClusterClient) topologyRefreshLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(c.config.TopologyRefreshInterval)
 	defer ticker.Stop()
 
 	for {
@@ -241,38 +268,33 @@ func (c *ClusterClient) getNodeForPartition(partition int32) string {
 	return c.partitionOwners[partition]
 }
 
-// getClientForKey returns the client for the node that owns the key
-func (c *ClusterClient) getClientForKey(key string) (*Client, error) {
+// getPoolForKey returns the connection pool for the node that owns the key
+func (c *ClusterClient) getPoolForKey(key string) (*ConnectionPool, error) {
 	// Find node for key
 	nodeID, err := c.GetNodeForKey(key)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get client for node
+	// Get pool for node
 	c.mu.RLock()
-	client, exists := c.clients[nodeID]
+	pool, exists := c.clients[nodeID]
 	c.mu.RUnlock()
 
 	if !exists {
-		return nil, fmt.Errorf("no client for node %s", nodeID)
+		return nil, fmt.Errorf("no connection pool for node %s", nodeID)
 	}
 
-	// Check if client is healthy
-	if client.isHealthy() {
-		return client, nil
-	}
-
-	return nil, fmt.Errorf("client for node %s is not healthy", nodeID)
+	return pool, nil
 }
 
-// getRoundRobinClient returns a client using round-robin selection (fallback)
-func (c *ClusterClient) getRoundRobinClient() (*Client, error) {
+// getRoundRobinPool returns a connection pool using round-robin selection (fallback)
+func (c *ClusterClient) getRoundRobinPool() (*ConnectionPool, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if len(c.clients) == 0 {
-		return nil, fmt.Errorf("no available clients")
+		return nil, fmt.Errorf("no available connection pools")
 	}
 
 	// Convert map to slice for consistent ordering
@@ -282,33 +304,28 @@ func (c *ClusterClient) getRoundRobinClient() (*Client, error) {
 	}
 	sort.Strings(nodeIDs)
 
-	// Try each client starting from current index
+	// Select next pool using round-robin
 	startIdx := atomic.LoadInt32(&c.currentIdx)
-	for i := 0; i < len(nodeIDs); i++ {
-		idx := (int(startIdx) + i) % len(nodeIDs)
-		nodeID := nodeIDs[idx]
-		client := c.clients[nodeID]
+	idx := int(startIdx) % len(nodeIDs)
+	nodeID := nodeIDs[idx]
+	pool := c.clients[nodeID]
 
-		if client != nil && client.isHealthy() {
-			// Update current index for next request
-			atomic.StoreInt32(&c.currentIdx, int32((idx+1)%len(nodeIDs)))
-			return client, nil
-		}
-	}
+	// Update current index for next request
+	atomic.StoreInt32(&c.currentIdx, int32((idx+1)%len(nodeIDs)))
 
-	return nil, fmt.Errorf("no healthy clients available")
+	return pool, nil
 }
 
 // routeRequest routes a request with smart routing and fallback
-func (c *ClusterClient) routeRequest(key string) (*Client, error) {
+func (c *ClusterClient) routeRequest(key string) (*ConnectionPool, error) {
 	// Try smart routing first
-	client, err := c.getClientForKey(key)
+	pool, err := c.getPoolForKey(key)
 	if err == nil {
-		return client, nil
+		return pool, nil
 	}
 
 	// Fallback to round-robin
-	return c.getRoundRobinClient()
+	return c.getRoundRobinPool()
 }
 
 // Close closes all connections
@@ -318,10 +335,10 @@ func (c *ClusterClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Close all node clients
+	// Close all connection pools
 	var lastErr error
-	for _, client := range c.clients {
-		if err := client.Close(); err != nil {
+	for _, pool := range c.clients {
+		if err := pool.Close(); err != nil {
 			lastErr = err
 		}
 	}
@@ -331,21 +348,21 @@ func (c *ClusterClient) Close() error {
 
 // Put stores a value in the cache using smart routing
 func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return err
 	}
 
-	err = client.Put(ctx, key, data, ttlSeconds)
+	err = pool.Put(ctx, key, data, ttlSeconds)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return err
 		}
-		return client.Put(ctx, key, data, ttlSeconds)
+		return pool.Put(ctx, key, data, ttlSeconds)
 	}
 
 	return err
@@ -353,21 +370,21 @@ func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSec
 
 // PutStream streams data to the cache using smart routing
 func (c *ClusterClient) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return err
 	}
 
-	err = client.PutStream(ctx, key, r, ttlSeconds)
+	err = pool.PutStream(ctx, key, r, ttlSeconds)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return err
 		}
-		return client.PutStream(ctx, key, r, ttlSeconds)
+		return pool.PutStream(ctx, key, r, ttlSeconds)
 	}
 
 	return err
@@ -375,21 +392,21 @@ func (c *ClusterClient) PutStream(ctx context.Context, key string, r io.Reader, 
 
 // Get retrieves a value from the cache using smart routing
 func (c *ClusterClient) Get(ctx context.Context, key string) ([]byte, error) {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := client.Get(ctx, key)
+	data, err := pool.Get(ctx, key)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return nil, err
 		}
-		return client.Get(ctx, key)
+		return pool.Get(ctx, key)
 	}
 
 	return data, err
@@ -397,21 +414,21 @@ func (c *ClusterClient) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetStream streams a value from the cache using smart routing
 func (c *ClusterClient) GetStream(ctx context.Context, key string, w io.Writer) error {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return err
 	}
 
-	err = client.GetStream(ctx, key, w)
+	err = pool.GetStream(ctx, key, w)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return err
 		}
-		return client.GetStream(ctx, key, w)
+		return pool.GetStream(ctx, key, w)
 	}
 
 	return err
@@ -419,21 +436,21 @@ func (c *ClusterClient) GetStream(ctx context.Context, key string, w io.Writer) 
 
 // GetRange retrieves a byte range from the cache using smart routing
 func (c *ClusterClient) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return nil, err
 	}
 
-	data, err := client.GetRange(ctx, key, start, end)
+	data, err := pool.GetRange(ctx, key, start, end)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return nil, err
 		}
-		return client.GetRange(ctx, key, start, end)
+		return pool.GetRange(ctx, key, start, end)
 	}
 
 	return data, err
@@ -441,21 +458,21 @@ func (c *ClusterClient) GetRange(ctx context.Context, key string, start, end int
 
 // GetRangeStream streams a byte range from the cache using smart routing
 func (c *ClusterClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return err
 	}
 
-	err = client.GetRangeStream(ctx, key, start, end, w)
+	err = pool.GetRangeStream(ctx, key, start, end, w)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return err
 		}
-		return client.GetRangeStream(ctx, key, start, end, w)
+		return pool.GetRangeStream(ctx, key, start, end, w)
 	}
 
 	return err
@@ -463,21 +480,21 @@ func (c *ClusterClient) GetRangeStream(ctx context.Context, key string, start, e
 
 // Delete removes a key from the cache using smart routing
 func (c *ClusterClient) Delete(ctx context.Context, key string) error {
-	client, err := c.routeRequest(key)
+	pool, err := c.routeRequest(key)
 	if err != nil {
 		return err
 	}
 
-	err = client.Delete(ctx, key)
+	err = pool.Delete(ctx, key)
 
 	// If we get a routing error, refresh topology and retry once
 	if isRoutingError(err) {
 		c.refreshTopology()
-		client, err = c.routeRequest(key)
+		pool, err = c.routeRequest(key)
 		if err != nil {
 			return err
 		}
-		return client.Delete(ctx, key)
+		return pool.Delete(ctx, key)
 	}
 
 	return err
@@ -485,11 +502,11 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 
 // List lists all keys with optional prefix (uses round-robin)
 func (c *ClusterClient) List(ctx context.Context, prefix string) ([]string, error) {
-	client, err := c.getRoundRobinClient()
+	pool, err := c.getRoundRobinPool()
 	if err != nil {
 		return nil, err
 	}
-	return client.List(ctx, prefix)
+	return pool.List(ctx, prefix)
 }
 
 // GetNodeForKey returns the node ID that owns the given key
