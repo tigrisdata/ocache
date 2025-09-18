@@ -2,6 +2,7 @@ package cacheclient
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -173,7 +174,7 @@ func TestClient_Close_ConcurrentOperations(t *testing.T) {
 				case <-stopCh:
 					return
 				default:
-					key := "concurrent-" + string(rune('0'+id))
+					key := fmt.Sprintf("concurrent-%d", id)
 					// Ignore errors as close might happen during operation
 					client.Put(ctx, key, []byte("value"), 0)
 					client.Get(ctx, key)
@@ -241,12 +242,15 @@ func TestClient_Lifecycle_FullCycle(t *testing.T) {
 			require.NoError(t, err)
 		}
 
-		// Verify operations
+		// Put data through client and verify operations
 		for i := 0; i < 10; i++ {
-			key := "cycle-" + string(rune('0'+cycle)) + "-key-" + string(rune('0'+i))
-			servers[0].cacheService.data[key] = []byte("value")
-			servers[1].cacheService.data[key] = []byte("value")
+			key := fmt.Sprintf("cycle-%d-key-%d", cycle, i)
 			
+			// Put data using client
+			err := client.Put(ctx, key, []byte("value"), 0)
+			require.NoError(t, err)
+			
+			// Verify with Get
 			data, err := client.Get(ctx, key)
 			require.NoError(t, err)
 			assert.Equal(t, []byte("value"), data)

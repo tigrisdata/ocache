@@ -2,6 +2,7 @@ package cacheclient
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -348,7 +349,7 @@ func TestUpdateTopology_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			key := "write-key-" + string(rune('0'+id))
+			key := fmt.Sprintf("write-key-%d", id)
 			for {
 				select {
 				case <-stopCh:

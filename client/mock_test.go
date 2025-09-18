@@ -411,6 +411,9 @@ func (ts *testServer) Stop() {
 
 func (ts *testServer) Dialer() func(context.Context, string) (net.Conn, error) {
 	return func(ctx context.Context, addr string) (net.Conn, error) {
+		if ts.listener == nil {
+			return nil, fmt.Errorf("dialer not available for real address servers")
+		}
 		return ts.listener.Dial()
 	}
 }

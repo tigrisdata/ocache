@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"testing"
 	"time"
 
@@ -504,7 +503,7 @@ func TestRetryLogic_StreamingEdgeCases(t *testing.T) {
 		failingWriter := &failingWriter{failAfter: 5}
 		err := client.GetStream(ctx, testKey, failingWriter)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "short write")
+		assert.Contains(t, err.Error(), "simulated write failure")
 	})
 
 	t.Run("GetRangeStream_ValidRange", func(t *testing.T) {
@@ -527,10 +526,12 @@ type failingWriter struct {
 
 func (f *failingWriter) Write(p []byte) (n int, err error) {
 	if f.written+len(p) > f.failAfter {
-		return 0, io.ErrShortWrite
+		// Write would exceed limit
+		return 0, errors.New("simulated write failure")
 	}
 	f.written += len(p)
 	if f.written >= f.failAfter {
+		// Exactly at limit
 		return 0, errors.New("simulated write failure")
 	}
 	return len(p), nil

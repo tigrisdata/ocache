@@ -145,8 +145,6 @@ func TestError_StreamingErrors(t *testing.T) {
 		err := client.GetStream(ctx, testKey, buf)
 		assert.Error(t, err)
 		assert.Equal(t, 5, buf.Len()) // Should have received partial data
-
-		server.Reset()
 	})
 
 	t.Run("StreamWriteError", func(t *testing.T) {
