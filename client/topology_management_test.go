@@ -31,7 +31,6 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 100 * time.Millisecond, // Short interval for testing
-		PoolSize:        1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -40,7 +39,7 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 	defer client.Close()
 
 	// Initial epoch should be 1
-	assert.Equal(t, uint64(1), client.topologyEpoch)
+	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
 
 	// Update topology with higher epoch
 	topology2 := setupSimpleTopology([]string{server.address})
@@ -51,7 +50,7 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Epoch should be updated
-	assert.Equal(t, uint64(2), client.topologyEpoch)
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
 
 	// Update again
 	topology3 := setupSimpleTopology([]string{server.address})
@@ -62,7 +61,7 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Epoch should be updated again
-	assert.Equal(t, uint64(3), client.topologyEpoch)
+	assert.Equal(t, uint64(3), client.GetTopologyEpoch())
 
 	// Verify multiple calls to GetClusterTopology
 	assert.Greater(t, server.clusterService.getTopologyCallCount.Load(), int32(2))
@@ -84,7 +83,6 @@ func TestTopologyRefreshLoop_ErrorHandling(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 100 * time.Millisecond,
-		PoolSize:        1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -93,7 +91,7 @@ func TestTopologyRefreshLoop_ErrorHandling(t *testing.T) {
 	defer client.Close()
 
 	// Initial epoch should be 1
-	assert.Equal(t, uint64(1), client.topologyEpoch)
+	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
 
 	// Make topology fetch fail
 	server.clusterService.SetTopologyError(status.Error(codes.Unavailable, "topology unavailable"))
@@ -102,7 +100,7 @@ func TestTopologyRefreshLoop_ErrorHandling(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Epoch should remain unchanged
-	assert.Equal(t, uint64(1), client.topologyEpoch)
+	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
 
 	// Fix the error and update topology
 	server.clusterService.SetTopologyError(nil)
@@ -114,7 +112,7 @@ func TestTopologyRefreshLoop_ErrorHandling(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// Epoch should now be updated
-	assert.Equal(t, uint64(2), client.topologyEpoch)
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
 }
 
 // TestTopologyRefreshLoop_StopOnClose verifies clean shutdown
@@ -133,7 +131,6 @@ func TestTopologyRefreshLoop_StopOnClose(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 50 * time.Millisecond,
-		PoolSize:        1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -177,7 +174,6 @@ func TestUpdateTopology_RingUpdate(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server1.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -187,7 +183,7 @@ func TestUpdateTopology_RingUpdate(t *testing.T) {
 
 	// Initial state
 	assert.Len(t, client.GetConnectedNodes(), 1)
-	assert.Equal(t, uint64(1), client.topologyEpoch)
+	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
 
 	// Update topology to include both servers
 	topology2 := setupSimpleTopology([]string{server1.address, server2.address})
@@ -202,8 +198,8 @@ func TestUpdateTopology_RingUpdate(t *testing.T) {
 
 	// Verify update
 	assert.Len(t, client.GetConnectedNodes(), 2)
-	assert.Equal(t, uint64(2), client.topologyEpoch)
-	assert.NotNil(t, client.ring)
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
+	assert.True(t, client.HasRing())
 }
 
 // TestUpdateTopology_PoolManagement verifies pools added/removed
@@ -227,7 +223,6 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{servers[0].address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -235,8 +230,8 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
-	// Initial state - 2 pools
-	assert.Len(t, client.pools, 2)
+	// Initial state - 2 connections
+	assert.Len(t, client.conns, 2)
 	assert.Len(t, client.GetConnectedNodes(), 2)
 
 	// Add third server
@@ -250,8 +245,8 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	err = client.updateTopology(newTopology)
 	require.NoError(t, err)
 
-	// Should have 3 pools now
-	assert.Len(t, client.pools, 3)
+	// Should have 3 connections now
+	assert.Len(t, client.conns, 3)
 	assert.Len(t, client.GetConnectedNodes(), 3)
 
 	// Remove second server (mark as inactive)
@@ -289,7 +284,6 @@ func TestUpdateTopology_ConcurrentAccess(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 10 * time.Millisecond, // Very short for stress testing
-		PoolSize:        2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -422,7 +416,6 @@ func TestTopology_NodeFailure(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{servers[0].address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -508,7 +501,6 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server1.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -517,9 +509,9 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 	defer client.Close()
 
 	// Verify initial partition ownership
-	assert.Len(t, client.partitionOwners, 10)
+	assert.Equal(t, 10, client.GetPartitionOwnerCount())
 	for i := int32(0); i < 10; i++ {
-		assert.Equal(t, "node-0", client.partitionOwners[i])
+		assert.Equal(t, "node-0", client.GetPartitionOwner(i))
 	}
 
 	// Rebalance - move half partitions to node-1
@@ -551,9 +543,9 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 
 	// Verify partition reassignment
 	for i := int32(0); i < 5; i++ {
-		assert.Equal(t, "node-0", client.partitionOwners[i])
+		assert.Equal(t, "node-0", client.GetPartitionOwner(i))
 	}
 	for i := int32(5); i < 10; i++ {
-		assert.Equal(t, "node-1", client.partitionOwners[i])
+		assert.Equal(t, "node-1", client.GetPartitionOwner(i))
 	}
 }

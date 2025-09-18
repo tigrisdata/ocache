@@ -32,7 +32,6 @@ func TestRetryLogic_MaxRetryCount(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -153,7 +152,6 @@ func TestRetryLogic_OnlyOnRoutingErrors(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -219,7 +217,6 @@ func TestRetryLogic_TopologyRefresh(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server1.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -228,7 +225,7 @@ func TestRetryLogic_TopologyRefresh(t *testing.T) {
 	defer client.Close()
 
 	// Verify initial topology epoch
-	assert.Equal(t, uint64(1), client.topologyEpoch)
+	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
 
 	// Configure server1 to return routing error on first call
 	// but return updated topology on refresh
@@ -280,7 +277,7 @@ func TestRetryLogic_TopologyRefresh(t *testing.T) {
 	assert.Equal(t, []byte("value-from-server2"), data)
 
 	// Verify topology was updated
-	assert.Equal(t, uint64(2), client.topologyEpoch)
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
 	assert.Len(t, client.GetConnectedNodes(), 2)
 }
 
@@ -299,7 +296,6 @@ func TestRetryLogic_NoRetryAfterPartialData(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -369,7 +365,6 @@ func TestRetryLogic_SimpleMode(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -407,7 +402,6 @@ func TestRetryLogic_ConcurrentRetries(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeCluster,
-		PoolSize: 4, // Multiple connections for concurrency
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -493,7 +487,6 @@ func TestRetryLogic_StreamingEdgeCases(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeCluster,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},

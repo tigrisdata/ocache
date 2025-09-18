@@ -29,7 +29,6 @@ func TestClient_Close_SimpleMode(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    addresses,
 		Mode:     ModeSimple,
-		PoolSize: 3,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -82,7 +81,6 @@ func TestClient_Close_ClusterMode(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 50 * time.Millisecond,
-		PoolSize:        2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -123,7 +121,6 @@ func TestClient_Close_IdempotentCalls(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -156,7 +153,6 @@ func TestClient_Close_ConcurrentOperations(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 4,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -230,7 +226,6 @@ func TestClient_Lifecycle_FullCycle(t *testing.T) {
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs:    addresses,
 			Mode:     ModeSimple,
-			PoolSize: 2,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -279,7 +274,6 @@ func TestClient_Lifecycle_ResourceLeak(t *testing.T) {
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeSimple,
-			PoolSize: 5,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -315,7 +309,6 @@ func TestClient_Lifecycle_ClusterModeTransition(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeAuto,
-		PoolSize: 2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -347,7 +340,6 @@ func TestClient_Lifecycle_PanicRecovery(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -396,7 +388,6 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 		_, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{"invalid-address-without-port"},
 			Mode:     ModeSimple,
-			PoolSize: 1,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithBlock(),
@@ -414,7 +405,6 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 		_, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{"localhost:59999"}, // Unlikely to be in use
 			Mode:     ModeSimple,
-			PoolSize: 1,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithBlock(),
@@ -437,7 +427,6 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 		_, err = NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeCluster,
-			PoolSize: 1,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -467,7 +456,6 @@ func TestClient_Lifecycle_LongRunning(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 100 * time.Millisecond,
-		PoolSize:        2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},

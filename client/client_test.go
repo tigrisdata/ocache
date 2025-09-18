@@ -82,7 +82,6 @@ func TestClient_SimpleMode(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server1.address, server2.address},
 		Mode:     ModeSimple,
-		PoolSize: 2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -137,7 +136,6 @@ func TestClient_ClusterMode(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{servers[0].address}, // Only need one seed node
 		Mode:     ModeCluster,
-		PoolSize: 2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -198,7 +196,6 @@ func TestClient_AutoMode(t *testing.T) {
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeAuto,
-			PoolSize: 2,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -222,7 +219,6 @@ func TestClient_AutoMode(t *testing.T) {
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeAuto,
-			PoolSize: 2,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},

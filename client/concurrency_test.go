@@ -25,7 +25,6 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 4,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -151,7 +150,6 @@ func TestConcurrent_TopologyUpdates(t *testing.T) {
 		Addrs:           []string{servers[0].address},
 		Mode:            ModeCluster,
 		RefreshInterval: 50 * time.Millisecond, // Fast refresh for testing
-		PoolSize:        2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -241,7 +239,6 @@ func TestConcurrent_PoolAccess(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -317,7 +314,6 @@ func TestConcurrent_RaceConditions(t *testing.T) {
 		Addrs:           []string{server.address},
 		Mode:            ModeCluster,
 		RefreshInterval: 10 * time.Millisecond,
-		PoolSize:        2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -378,7 +374,6 @@ func TestConcurrent_StreamingOperations(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 4,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -457,7 +452,6 @@ func TestConcurrent_LoadBalancing(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    addresses,
 		Mode:     ModeSimple,
-		PoolSize: 2,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},

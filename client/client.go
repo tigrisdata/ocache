@@ -33,8 +33,6 @@ const (
 )
 
 const (
-	// DefaultPoolSize is the default connection pool size per address
-	DefaultPoolSize = 4
 	// DefaultRefreshInterval is the default topology refresh interval
 	DefaultRefreshInterval = 30 * time.Second
 	// MaxMessageSize is the maximum message size for gRPC
@@ -46,30 +44,29 @@ const (
 // ClientConfig contains configuration for the unified Client
 type ClientConfig struct {
 	Addrs           []string          // One or more server addresses
-	PoolSize        int               // Connections per address (default: 4)
 	Mode            ConnectionMode    // Connection mode (default: "auto")
 	RefreshInterval time.Duration     // Topology refresh for cluster mode (default: 30s)
 	DialOpts        []grpc.DialOption // Optional gRPC dial options
 }
 
-// connectionPool wraps multiple gRPC clients for a single address
-type connectionPool struct {
+// connection wraps a single gRPC connection
+type connection struct {
 	address string
-	clients []*grpcClient
-	index   atomic.Uint64
-	mu      sync.RWMutex
+	conn    *grpc.ClientConn
+	client  pb.CacheServiceClient
 }
 
-// grpcClient wraps a single gRPC connection
-type grpcClient struct {
-	conn   *grpc.ClientConn
-	client pb.CacheServiceClient
+// nodeMember implements consistent.Member interface
+type nodeMember string
+
+func (n nodeMember) String() string {
+	return string(n)
 }
 
 // Client is the unified cache client supporting both simple and cluster modes
 type Client struct {
-	pools map[string]*connectionPool // address -> pool
-	mode  ConnectionMode             // Actual mode (resolved from auto)
+	conns map[string]*connection // address -> connection
+	mode  ConnectionMode         // Actual mode (resolved from auto)
 
 	// For cluster mode
 	ring            *consistent.Consistent     // Consistent hash ring
@@ -108,9 +105,6 @@ func NewWithConfig(config *ClientConfig) (*Client, error) {
 	}
 
 	// Set defaults
-	if config.PoolSize <= 0 {
-		config.PoolSize = DefaultPoolSize
-	}
 	if config.Mode == "" {
 		config.Mode = ModeAuto
 	}
@@ -128,7 +122,7 @@ func NewWithConfig(config *ClientConfig) (*Client, error) {
 	}
 
 	client := &Client{
-		pools:         make(map[string]*connectionPool),
+		conns:         make(map[string]*connection),
 		nodeAddresses: make(map[string]string),
 		config:        config,
 		addresses:     config.Addrs,
@@ -154,7 +148,7 @@ func NewWithConfig(config *ClientConfig) (*Client, error) {
 	}
 
 	if err != nil {
-		// Clean up any created pools
+		// Clean up any created connections
 		client.Close()
 		return nil, err
 	}
@@ -190,13 +184,13 @@ func (c *Client) detectMode() ConnectionMode {
 
 // initSimpleMode initializes the client in simple mode
 func (c *Client) initSimpleMode() error {
-	// Create connection pools for each address
+	// Create connections for each address
 	for _, addr := range c.addresses {
-		pool, err := c.createPool(addr)
+		conn, err := c.createConnection(addr)
 		if err != nil {
-			return fmt.Errorf("failed to create pool for %s: %w", addr, err)
+			return fmt.Errorf("failed to create connection for %s: %w", addr, err)
 		}
-		c.pools[addr] = pool
+		c.conns[addr] = conn
 	}
 	return nil
 }
@@ -220,29 +214,17 @@ func (c *Client) initClusterMode() error {
 	return nil
 }
 
-// createPool creates a connection pool for a single address
-func (c *Client) createPool(addr string) (*connectionPool, error) {
-	pool := &connectionPool{
+// createConnection creates a single connection to an address
+func (c *Client) createConnection(addr string) (*connection, error) {
+	conn, err := grpc.Dial(addr, c.config.DialOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create connection: %w", err)
+	}
+	return &connection{
 		address: addr,
-		clients: make([]*grpcClient, c.config.PoolSize),
-	}
-
-	for i := 0; i < c.config.PoolSize; i++ {
-		conn, err := grpc.Dial(addr, c.config.DialOpts...)
-		if err != nil {
-			// Clean up already created connections
-			for j := 0; j < i; j++ {
-				pool.clients[j].conn.Close()
-			}
-			return nil, fmt.Errorf("failed to create connection %d: %w", i, err)
-		}
-		pool.clients[i] = &grpcClient{
-			conn:   conn,
-			client: pb.NewCacheServiceClient(conn),
-		}
-	}
-
-	return pool, nil
+		conn:    conn,
+		client:  pb.NewCacheServiceClient(conn),
+	}, nil
 }
 
 // fetchTopology fetches the cluster topology from available nodes
@@ -324,20 +306,20 @@ func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
 		partitionOwners[owner.PartitionId] = owner.NodeId
 	}
 
-	// Create/update pools for all active nodes
+	// Create/update connections for all active nodes
 	for _, address := range nodeAddresses {
-		if _, exists := c.pools[address]; !exists {
-			pool, err := c.createPool(address)
+		if _, exists := c.conns[address]; !exists {
+			conn, err := c.createConnection(address)
 			if err != nil {
 				// Log error but continue
 				continue
 			}
-			c.pools[address] = pool
+			c.conns[address] = conn
 		}
 	}
 
-	// Remove pools for nodes no longer in topology
-	for addr, pool := range c.pools {
+	// Remove connections for nodes no longer in topology
+	for addr, conn := range c.conns {
 		found := false
 		for _, nodeAddr := range nodeAddresses {
 			if addr == nodeAddr {
@@ -346,8 +328,8 @@ func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
 			}
 		}
 		if !found {
-			pool.close()
-			delete(c.pools, addr)
+			conn.close()
+			delete(c.conns, addr)
 		}
 	}
 
@@ -379,8 +361,8 @@ func (c *Client) topologyRefreshLoop() {
 	}
 }
 
-// route determines which pool to use for a given key
-func (c *Client) route(key string) (*connectionPool, error) {
+// route determines which connection to use for a given key
+func (c *Client) route(key string) (*connection, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -394,9 +376,9 @@ func (c *Client) route(key string) (*connectionPool, error) {
 	}
 }
 
-// routeSimple routes in simple mode (round-robin or hash-based)
-func (c *Client) routeSimple(key string) (*connectionPool, error) {
-	if len(c.pools) == 0 {
+// routeSimple routes in simple mode (hash-based)
+func (c *Client) routeSimple(key string) (*connection, error) {
+	if len(c.conns) == 0 {
 		return nil, fmt.Errorf("no available connections")
 	}
 
@@ -406,15 +388,15 @@ func (c *Client) routeSimple(key string) (*connectionPool, error) {
 	hash := h.Sum32()
 
 	addr := c.addresses[hash%uint32(len(c.addresses))]
-	pool, exists := c.pools[addr]
+	conn, exists := c.conns[addr]
 	if !exists {
-		return nil, fmt.Errorf("no pool for address %s", addr)
+		return nil, fmt.Errorf("no connection for address %s", addr)
 	}
-	return pool, nil
+	return conn, nil
 }
 
 // routeCluster routes in cluster mode using consistent hashing
-func (c *Client) routeCluster(key string) (*connectionPool, error) {
+func (c *Client) routeCluster(key string) (*connection, error) {
 	if c.ring == nil {
 		return nil, fmt.Errorf("ring not initialized")
 	}
@@ -434,55 +416,36 @@ func (c *Client) routeCluster(key string) (*connectionPool, error) {
 		return nil, fmt.Errorf("no address for node %s", nodeID)
 	}
 
-	// Get pool for address
-	pool, exists := c.pools[addr]
+	// Get connection for address
+	conn, exists := c.conns[addr]
 	if !exists {
-		return nil, fmt.Errorf("no pool for address %s", addr)
+		return nil, fmt.Errorf("no connection for address %s", addr)
 	}
 
-	return pool, nil
+	return conn, nil
 }
 
-// nodeMember implements consistent.Member interface
-type nodeMember string
-
-func (n nodeMember) String() string {
-	return string(n)
-}
-
-// getClient returns a client from the pool using round-robin
-func (p *connectionPool) getClient() pb.CacheServiceClient {
-	idx := p.index.Add(1) - 1
-	return p.clients[idx%uint64(len(p.clients))].client
-}
-
-// close closes all connections in the pool
-func (p *connectionPool) close() error {
-	var firstErr error
-	for _, client := range p.clients {
-		if err := client.conn.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+// close closes the connection
+func (c *connection) close() error {
+	return c.conn.Close()
 }
 
 // Put stores a value in the cache
 func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	pool, err := c.route(key)
+	conn, err := c.route(key)
 	if err != nil {
 		return err
 	}
 
 	req := &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds}
-	_, err = pool.getClient().PutObject(ctx, req)
+	_, err = conn.client.PutObject(ctx, req)
 
 	// If we get a routing error in cluster mode, refresh topology and retry once
 	if c.mode == ModeCluster && isRoutingError(err) {
 		if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 			c.updateTopology(topology)
-			if pool, routeErr := c.route(key); routeErr == nil {
-				_, err = pool.getClient().PutObject(ctx, req)
+			if conn, routeErr := c.route(key); routeErr == nil {
+				_, err = conn.client.PutObject(ctx, req)
 			}
 		}
 	}
@@ -492,13 +455,12 @@ func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds in
 
 // PutStream streams data to the cache
 func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	pool, err := c.route(key)
+	conn, err := c.route(key)
 	if err != nil {
 		return err
 	}
 
-	client := pool.getClient()
-	stream, err := client.Put(ctx)
+	stream, err := conn.client.Put(ctx)
 	if err != nil {
 		return err
 	}
@@ -551,13 +513,12 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 
 // getDataWithRetry implements Get/GetRange with retry logic
 func (c *Client) getDataWithRetry(ctx context.Context, key string, req *pb.GetRequest, retryCount int) ([]byte, error) {
-	pool, err := c.route(key)
+	conn, err := c.route(key)
 	if err != nil {
 		return nil, err
 	}
 
-	client := pool.getClient()
-	stream, err := client.Get(ctx, req)
+	stream, err := conn.client.Get(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -601,13 +562,12 @@ func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
 
 // getStreamWithRetry implements GetStream/GetRangeStream with retry logic
 func (c *Client) getStreamWithRetry(ctx context.Context, key string, req *pb.GetRequest, w io.Writer, retryCount int) error {
-	pool, err := c.route(key)
+	conn, err := c.route(key)
 	if err != nil {
 		return err
 	}
 
-	client := pool.getClient()
-	stream, err := client.Get(ctx, req)
+	stream, err := conn.client.Get(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -669,19 +629,19 @@ func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int6
 
 // Delete removes a key from the cache
 func (c *Client) Delete(ctx context.Context, key string) error {
-	pool, err := c.route(key)
+	conn, err := c.route(key)
 	if err != nil {
 		return err
 	}
 
-	_, err = pool.getClient().Delete(ctx, &pb.DeleteRequest{Key: key})
+	_, err = conn.client.Delete(ctx, &pb.DeleteRequest{Key: key})
 
 	// Retry once with topology refresh for cluster mode
 	if c.mode == ModeCluster && isRoutingError(err) {
 		if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 			c.updateTopology(topology)
-			if pool, routeErr := c.route(key); routeErr == nil {
-				_, err = pool.getClient().Delete(ctx, &pb.DeleteRequest{Key: key})
+			if conn, routeErr := c.route(key); routeErr == nil {
+				_, err = conn.client.Delete(ctx, &pb.DeleteRequest{Key: key})
 			}
 		}
 	}
@@ -692,28 +652,28 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 // List lists keys with optional prefix
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 	// For list operation, just use round-robin selection
-	var pool *connectionPool
+	var conn *connection
 
 	c.mu.RLock()
-	if len(c.pools) > 0 {
-		// Get all pools and sort for consistent ordering
+	if len(c.conns) > 0 {
+		// Get all connections and sort for consistent ordering
 		var addresses []string
-		for addr := range c.pools {
+		for addr := range c.conns {
 			addresses = append(addresses, addr)
 		}
 		sort.Strings(addresses)
 
 		idx := c.currentIdx.Add(1) - 1
 		addr := addresses[idx%uint32(len(addresses))]
-		pool = c.pools[addr]
+		conn = c.conns[addr]
 	}
 	c.mu.RUnlock()
 
-	if pool == nil {
+	if conn == nil {
 		return nil, fmt.Errorf("no available connections")
 	}
 
-	stream, err := pool.getClient().List(ctx, &pb.ListRequest{Prefix: prefix})
+	stream, err := conn.client.List(ctx, &pb.ListRequest{Prefix: prefix})
 	if err != nil {
 		return nil, err
 	}
@@ -753,15 +713,15 @@ func (c *Client) Close() error {
 		close(c.stopCh)
 	}
 
-	// Close all connection pools
+	// Close all connections
 	var firstErr error
-	for _, pool := range c.pools {
-		if err := pool.close(); err != nil && firstErr == nil {
+	for _, conn := range c.conns {
+		if err := conn.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
 
-	c.pools = make(map[string]*connectionPool)
+	c.conns = make(map[string]*connection)
 	return firstErr
 }
 
@@ -776,11 +736,39 @@ func (c *Client) GetConnectedNodes() []string {
 	defer c.mu.RUnlock()
 
 	var nodes []string
-	for addr := range c.pools {
+	for addr := range c.conns {
 		nodes = append(nodes, addr)
 	}
 	sort.Strings(nodes)
 	return nodes
+}
+
+// GetTopologyEpoch returns the current topology epoch (cluster mode only)
+func (c *Client) GetTopologyEpoch() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.topologyEpoch
+}
+
+// HasRing returns true if the consistent hash ring is initialized (cluster mode only)
+func (c *Client) HasRing() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ring != nil
+}
+
+// GetPartitionOwner returns the node ID that owns the given partition (cluster mode only)
+func (c *Client) GetPartitionOwner(partitionID int32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.partitionOwners[partitionID]
+}
+
+// GetPartitionOwnerCount returns the number of partition owners (cluster mode only)
+func (c *Client) GetPartitionOwnerCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.partitionOwners)
 }
 
 // isRoutingError checks if an error indicates we should refresh topology

@@ -32,7 +32,6 @@ var (
 	addr            string
 	ttl             int64
 	connMode        string
-	poolSize        int
 	topologyRefresh time.Duration
 
 	numKeys        int
@@ -55,7 +54,6 @@ func newClient() *cacheclient.Client {
 
 	config := &cacheclient.ClientConfig{
 		Addrs:           addrs,
-		PoolSize:        poolSize,
 		Mode:            cacheclient.ConnectionMode(connMode),
 		RefreshInterval: topologyRefresh,
 	}
@@ -213,7 +211,6 @@ var benchCmd = &cobra.Command{
 		cfg := ycsb.YCSBConfig{
 			Addr:            addr,
 			ConnMode:        connMode,
-			PoolSize:        poolSize,
 			TopologyRefresh: topologyRefresh,
 			NumKeys:         numKeys,
 			ValueSize:       valueSize,
@@ -239,7 +236,6 @@ var benchCmd = &cobra.Command{
 func init() {
 	rootCmd.PersistentFlags().StringVar(&addr, "addr", "localhost:9000", "Cache server address (comma-separated for multiple servers)")
 	rootCmd.PersistentFlags().StringVar(&connMode, "mode", "auto", "Connection mode: auto, simple, or cluster")
-	rootCmd.PersistentFlags().IntVar(&poolSize, "pool-size", 4, "Connection pool size per address")
 	rootCmd.PersistentFlags().DurationVar(&topologyRefresh, "topology-refresh", 30*time.Second, "Topology refresh interval (cluster mode only)")
 	putCmd.Flags().Int64Var(&ttl, "ttl", 0, "TTL for the key in seconds (0 = no expiry)")
 	listCmd.Flags().StringVar(&listPrefix, "prefix", "", "Optional prefix to filter keys")

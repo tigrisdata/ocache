@@ -39,7 +39,6 @@ func TestError_NetworkFailure(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{serverAddr},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -77,7 +76,6 @@ func TestError_InvalidResponses(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -124,7 +122,6 @@ func TestError_StreamingErrors(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server.address},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -190,7 +187,6 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		_, err = NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeCluster, // Force cluster mode
-			PoolSize: 1,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -216,7 +212,6 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeCluster,
-			PoolSize: 1,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -258,7 +253,6 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs:    []string{server.address},
 			Mode:     ModeCluster,
-			PoolSize: 1,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -288,7 +282,6 @@ func TestError_Recovery(t *testing.T) {
 	client, err := NewWithConfig(&ClientConfig{
 		Addrs:    []string{server1.address, server2.address},
 		Mode:     ModeSimple,
-		PoolSize: 1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -359,7 +352,6 @@ func TestError_ClusterDegradation(t *testing.T) {
 		Addrs:           []string{servers[0].address},
 		Mode:            ModeCluster,
 		RefreshInterval: 100 * time.Millisecond,
-		PoolSize:        1,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
