@@ -657,7 +657,6 @@ func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]
 	return c.getDataWithRetry(ctx, key, req, 1)
 }
 
-
 // GetRangeStream streams a byte range from the cache
 func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
 	req := &pb.GetRequest{
@@ -667,7 +666,6 @@ func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int6
 	}
 	return c.getStreamWithRetry(ctx, key, req, w, 1)
 }
-
 
 // Delete removes a key from the cache
 func (c *Client) Delete(ctx context.Context, key string) error {
@@ -742,11 +740,18 @@ func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 
 // Close closes all connections and stops background goroutines
 func (c *Client) Close() error {
-	// Signal stop to background goroutines
-	close(c.stopCh)
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Check if already closed
+	select {
+	case <-c.stopCh:
+		// Already closed
+		return nil
+	default:
+		// Signal stop to background goroutines
+		close(c.stopCh)
+	}
 
 	// Close all connection pools
 	var firstErr error
