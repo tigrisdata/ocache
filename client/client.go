@@ -16,6 +16,7 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
@@ -39,6 +40,8 @@ const (
 	MaxMessageSize = 128 * 1024 * 1024 // 128MB
 	// TopologyDetectTimeout is the timeout for detecting cluster topology
 	TopologyDetectTimeout = 2 * time.Second
+	// DefaultBufferSize is the default buffer size for streaming operations
+	DefaultBufferSize = 64 * 1024 // 64KB
 )
 
 // ClientConfig contains configuration for the unified Client
@@ -49,11 +52,15 @@ type ClientConfig struct {
 	DialOpts        []grpc.DialOption // Optional gRPC dial options
 }
 
-// connection wraps a single gRPC connection
+// connection wraps a single gRPC connection with health monitoring
 type connection struct {
-	address string
-	conn    *grpc.ClientConn
-	client  pb.CacheServiceClient
+	address       string
+	conn          *grpc.ClientConn
+	client        pb.CacheServiceClient
+	lastError     error
+	lastErrorTime time.Time
+	reconnecting  atomic.Bool
+	mu            sync.RWMutex
 }
 
 // nodeMember implements consistent.Member interface
@@ -61,6 +68,30 @@ type nodeMember string
 
 func (n nodeMember) String() string {
 	return string(n)
+}
+
+// bufferPool manages reusable byte buffers for streaming operations
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		// Create a new buffer with default size
+		buf := make([]byte, DefaultBufferSize)
+		return &buf
+	},
+}
+
+// getBuffer gets a buffer from the pool
+func getBuffer() []byte {
+	bufPtr := bufferPool.Get().(*[]byte)
+	return *bufPtr
+}
+
+// putBuffer returns a buffer to the pool
+func putBuffer(buf []byte) {
+	// Only return buffers of the expected size to avoid memory issues
+	if cap(buf) == DefaultBufferSize {
+		bufPtr := &buf
+		bufferPool.Put(bufPtr)
+	}
 }
 
 // Client is the unified cache client supporting both simple and cluster modes
@@ -185,13 +216,28 @@ func (c *Client) detectMode() ConnectionMode {
 // initSimpleMode initializes the client in simple mode
 func (c *Client) initSimpleMode() error {
 	// Create connections for each address
+	successfulConns := 0
+	var lastErr error
+
 	for _, addr := range c.addresses {
 		conn, err := c.createConnection(addr)
 		if err != nil {
-			return fmt.Errorf("failed to create connection for %s: %w", addr, err)
+			lastErr = fmt.Errorf("failed to create connection for %s: %w", addr, err)
+			// Continue trying other addresses
+			continue
 		}
 		c.conns[addr] = conn
+		successfulConns++
 	}
+
+	// Require at least one successful connection
+	if successfulConns == 0 {
+		if lastErr != nil {
+			return fmt.Errorf("failed to create any connections, last error: %w", lastErr)
+		}
+		return fmt.Errorf("failed to create any connections")
+	}
+
 	return nil
 }
 
@@ -272,15 +318,19 @@ func (c *Client) fetchTopologyFromAddress(ctx context.Context, addr string) (*cl
 
 // updateTopology updates the internal state based on new topology
 func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Check if topology has changed
+	// First, check if topology has changed without holding lock long
+	c.mu.RLock()
 	if c.topologyEpoch >= topology.Epoch {
+		c.mu.RUnlock()
 		return nil // No change
 	}
+	existingConns := make(map[string]*connection)
+	for addr, conn := range c.conns {
+		existingConns[addr] = conn
+	}
+	c.mu.RUnlock()
 
-	// Create new ring
+	// Create new ring (no lock needed)
 	cfg := consistent.Config{
 		PartitionCount:    int(topology.RingConfig.PartitionCount),
 		ReplicationFactor: int(topology.RingConfig.ReplicationFactor),
@@ -289,7 +339,7 @@ func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
 	}
 	ring := consistent.New(nil, cfg)
 
-	// Build partition ownership map and node addresses
+	// Build partition ownership map and node addresses (no lock needed)
 	partitionOwners := make(map[int32]string)
 	nodeAddresses := make(map[string]string)
 	activeNodes := make(map[string]bool)
@@ -306,31 +356,46 @@ func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
 		partitionOwners[owner.PartitionId] = owner.NodeId
 	}
 
-	// Create/update connections for all active nodes
+	// Create new connections outside of lock
+	newConns := make(map[string]*connection)
+	connectionsToClose := make([]*connection, 0)
+
+	// Determine which connections to create (without lock)
 	for _, address := range nodeAddresses {
-		if _, exists := c.conns[address]; !exists {
+		if existingConn, exists := existingConns[address]; exists {
+			// Reuse existing connection
+			newConns[address] = existingConn
+		} else {
+			// Create new connection (network I/O, no lock)
 			conn, err := c.createConnection(address)
 			if err != nil {
-				// Log error but continue
+				// Continue with other connections, but track error
+				// In production, should log this error
 				continue
 			}
-			c.conns[address] = conn
+			newConns[address] = conn
 		}
 	}
 
-	// Remove connections for nodes no longer in topology
-	for addr, conn := range c.conns {
-		found := false
-		for _, nodeAddr := range nodeAddresses {
-			if addr == nodeAddr {
-				found = true
-				break
+	// Determine which connections to close
+	for _, conn := range existingConns {
+		if _, needed := nodeAddresses[conn.address]; !needed {
+			connectionsToClose = append(connectionsToClose, conn)
+		}
+	}
+
+	// Now update state atomically with lock
+	c.mu.Lock()
+	// Double-check epoch hasn't changed while we were creating connections
+	if c.topologyEpoch >= topology.Epoch {
+		c.mu.Unlock()
+		// Clean up any new connections we created
+		for addr, conn := range newConns {
+			if _, existed := existingConns[addr]; !existed {
+				conn.close()
 			}
 		}
-		if !found {
-			conn.close()
-			delete(c.conns, addr)
-		}
+		return nil
 	}
 
 	// Update state
@@ -339,6 +404,13 @@ func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
 	c.nodeAddresses = nodeAddresses
 	c.topology = topology
 	c.topologyEpoch = topology.Epoch
+	c.conns = newConns
+	c.mu.Unlock()
+
+	// Close old connections outside of lock
+	for _, conn := range connectionsToClose {
+		conn.close()
+	}
 
 	return nil
 }
@@ -392,6 +464,11 @@ func (c *Client) routeSimple(key string) (*connection, error) {
 	if !exists {
 		return nil, fmt.Errorf("no connection for address %s", addr)
 	}
+
+	// Note: Auto-reconnect disabled to avoid race conditions
+	// The connection health check and reconnect logic would need
+	// more sophisticated coordination to work safely in concurrent environments
+
 	return conn, nil
 }
 
@@ -422,12 +499,87 @@ func (c *Client) routeCluster(key string) (*connection, error) {
 		return nil, fmt.Errorf("no connection for address %s", addr)
 	}
 
+	// Note: Auto-reconnect disabled to avoid race conditions
+	// The connection health check and reconnect logic would need
+	// more sophisticated coordination to work safely in concurrent environments
+
 	return conn, nil
 }
 
 // close closes the connection
 func (c *connection) close() error {
 	return c.conn.Close()
+}
+
+// recordError records an error for health tracking
+func (c *connection) recordError(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	c.lastError = err
+	c.lastErrorTime = time.Now()
+	c.mu.Unlock()
+}
+
+// isHealthy checks if the connection is healthy
+func (c *connection) isHealthy() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Check gRPC connection state
+	state := c.conn.GetState()
+	if state == connectivity.TransientFailure || state == connectivity.Shutdown {
+		return false
+	}
+
+	// Check if we've had recent errors (within last 30 seconds)
+	if c.lastError != nil && time.Since(c.lastErrorTime) < 30*time.Second {
+		// Only consider certain errors as unhealthy
+		if isConnectionError(c.lastError) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// reconnect attempts to re-establish the connection
+func (c *connection) reconnect(dialOpts []grpc.DialOption) error {
+	// Use atomic CAS to ensure only one goroutine reconnects at a time
+	if !c.reconnecting.CompareAndSwap(false, true) {
+		// Another goroutine is already reconnecting
+		return nil
+	}
+	defer c.reconnecting.Store(false)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check again if connection is healthy while holding the lock
+	state := c.conn.GetState()
+	if state != connectivity.TransientFailure && state != connectivity.Shutdown {
+		// Connection is fine, no need to reconnect
+		return nil
+	}
+
+	// Close existing connection
+	if c.conn != nil {
+		c.conn.Close()
+	}
+
+	// Create new connection
+	conn, err := grpc.Dial(c.address, dialOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to reconnect: %w", err)
+	}
+
+	c.conn = conn
+	c.client = pb.NewCacheServiceClient(conn)
+	c.lastError = nil
+	c.lastErrorTime = time.Time{}
+
+	return nil
 }
 
 // Put stores a value in the cache
@@ -440,12 +592,16 @@ func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds in
 	req := &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds}
 	_, err = conn.client.PutObject(ctx, req)
 
+	// Record error for health tracking
+	conn.recordError(err)
+
 	// If we get a routing error in cluster mode, refresh topology and retry once
 	if c.mode == ModeCluster && isRoutingError(err) {
 		if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
 			c.updateTopology(topology)
 			if conn, routeErr := c.route(key); routeErr == nil {
 				_, err = conn.client.PutObject(ctx, req)
+				conn.recordError(err)
 			}
 		}
 	}
@@ -465,7 +621,10 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 		return err
 	}
 
-	buf := make([]byte, 64*1024) // 64KB chunks
+	// Get buffer from pool
+	buf := getBuffer()
+	defer putBuffer(buf)
+
 	first := true
 
 	for {
@@ -523,7 +682,10 @@ func (c *Client) getDataWithRetry(ctx context.Context, key string, req *pb.GetRe
 		return nil, err
 	}
 
-	var result []byte
+	// Pre-allocate result slice with initial capacity to reduce allocations
+	// Start with a reasonable size and let it grow if needed
+	result := make([]byte, 0, DefaultBufferSize)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -786,4 +948,24 @@ func isRoutingError(err error) bool {
 	return st.Code() == codes.FailedPrecondition ||
 		st.Code() == codes.NotFound ||
 		st.Code() == codes.Unavailable
+}
+
+// isConnectionError checks if an error indicates a connection problem
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	st, ok := status.FromError(err)
+	if !ok {
+		// Non-gRPC errors might be network errors
+		return true
+	}
+
+	// These errors indicate connection issues
+	return st.Code() == codes.Unavailable ||
+		st.Code() == codes.Internal ||
+		st.Code() == codes.Unknown ||
+		st.Code() == codes.DeadlineExceeded ||
+		st.Code() == codes.Canceled
 }

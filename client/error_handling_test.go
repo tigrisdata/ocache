@@ -37,8 +37,8 @@ func TestError_NetworkFailure(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{serverAddr},
-		Mode:     ModeSimple,
+		Addrs: []string{serverAddr},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -64,7 +64,6 @@ func TestError_NetworkFailure(t *testing.T) {
 	assert.Error(t, err)
 }
 
-
 // TestError_InvalidResponses tests malformed response handling
 func TestError_InvalidResponses(t *testing.T) {
 	// Create server
@@ -74,8 +73,8 @@ func TestError_InvalidResponses(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -110,7 +109,6 @@ func TestError_InvalidResponses(t *testing.T) {
 	})
 }
 
-
 // TestError_StreamingErrors tests error handling in streaming operations
 func TestError_StreamingErrors(t *testing.T) {
 	// Create server
@@ -120,8 +118,8 @@ func TestError_StreamingErrors(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -183,8 +181,8 @@ func TestError_ClusterModeErrors(t *testing.T) {
 
 		// Try to create client in cluster mode (should fail)
 		_, err = NewWithConfig(&ClientConfig{
-			Addrs:    []string{server.address},
-			Mode:     ModeCluster, // Force cluster mode
+			Addrs: []string{server.address},
+			Mode:  ModeCluster, // Force cluster mode
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -208,8 +206,8 @@ func TestError_ClusterModeErrors(t *testing.T) {
 
 		// Client creation might succeed but operations should fail
 		client, err := NewWithConfig(&ClientConfig{
-			Addrs:    []string{server.address},
-			Mode:     ModeCluster,
+			Addrs: []string{server.address},
+			Mode:  ModeCluster,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -249,8 +247,8 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		server.clusterService.SetTopology(topology)
 
 		client, err := NewWithConfig(&ClientConfig{
-			Addrs:    []string{server.address},
-			Mode:     ModeCluster,
+			Addrs: []string{server.address},
+			Mode:  ModeCluster,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -278,8 +276,8 @@ func TestError_Recovery(t *testing.T) {
 
 	// Create client with both servers
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server1.address, server2.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server1.address, server2.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},

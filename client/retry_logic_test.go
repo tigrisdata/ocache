@@ -29,8 +29,8 @@ func TestRetryLogic_MaxRetryCount(t *testing.T) {
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeCluster,
+		Addrs: []string{server.address},
+		Mode:  ModeCluster,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -48,7 +48,7 @@ func TestRetryLogic_MaxRetryCount(t *testing.T) {
 		server.InjectErrors(testKey, &errorInjector{
 			routingError: true,
 		})
-		
+
 		// Store the initial count
 		_, initialGetCount, _, _ := server.GetCallCounts()
 
@@ -75,7 +75,7 @@ func TestRetryLogic_MaxRetryCount(t *testing.T) {
 		server.InjectErrors(testKey, &errorInjector{
 			routingError: true,
 		})
-		
+
 		// Store the initial count
 		_, initialGetCount, _, _ := server.GetCallCounts()
 
@@ -98,7 +98,7 @@ func TestRetryLogic_MaxRetryCount(t *testing.T) {
 	t.Run("Put_RetriesOnce", func(t *testing.T) {
 		// Configure server to always return routing error
 		server.cacheService.putError = status.Error(codes.FailedPrecondition, "routing error")
-		
+
 		// Store the initial count
 		initialPutCount, _, _, _ := server.GetCallCounts()
 
@@ -118,7 +118,7 @@ func TestRetryLogic_MaxRetryCount(t *testing.T) {
 	t.Run("Delete_RetriesOnce", func(t *testing.T) {
 		// Configure server to always return routing error
 		server.cacheService.deleteError = status.Error(codes.FailedPrecondition, "routing error")
-		
+
 		// Store the initial count
 		_, _, initialDeleteCount, _ := server.GetCallCounts()
 
@@ -149,8 +149,8 @@ func TestRetryLogic_OnlyOnRoutingErrors(t *testing.T) {
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeCluster,
+		Addrs: []string{server.address},
+		Mode:  ModeCluster,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -214,8 +214,8 @@ func TestRetryLogic_TopologyRefresh(t *testing.T) {
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server1.address},
-		Mode:     ModeCluster,
+		Addrs: []string{server1.address},
+		Mode:  ModeCluster,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -293,8 +293,8 @@ func TestRetryLogic_NoRetryAfterPartialData(t *testing.T) {
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeCluster,
+		Addrs: []string{server.address},
+		Mode:  ModeCluster,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -362,8 +362,8 @@ func TestRetryLogic_SimpleMode(t *testing.T) {
 
 	// Create client in simple mode (no retry on routing errors)
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -399,8 +399,8 @@ func TestRetryLogic_ConcurrentRetries(t *testing.T) {
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeCluster,
+		Addrs: []string{server.address},
+		Mode:  ModeCluster,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -484,8 +484,8 @@ func TestRetryLogic_StreamingEdgeCases(t *testing.T) {
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeCluster,
+		Addrs: []string{server.address},
+		Mode:  ModeCluster,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},

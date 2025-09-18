@@ -2,6 +2,7 @@ package cacheclient
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -23,8 +24,8 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -48,7 +49,7 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				key := "put-key-" + string(rune('0'+id)) + "-" + string(rune('0'+j))
+				key := fmt.Sprintf("put-key-%d-%d", id, j)
 				err := client.Put(ctx, key, []byte("value"), 0)
 				if err != nil {
 					atomic.AddInt32(&errors, 1)
@@ -65,7 +66,7 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				key := "put-key-" + string(rune('0'+id)) + "-" + string(rune('0'+j))
+				key := fmt.Sprintf("put-key-%d-%d", id, j)
 				// Small delay to allow puts to complete
 				time.Sleep(10 * time.Millisecond)
 				_, err := client.Get(ctx, key)
@@ -84,7 +85,7 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 10; j++ {
-				key := "delete-key-" + string(rune('0'+id)) + "-" + string(rune('0'+j))
+				key := fmt.Sprintf("delete-key-%d-%d", id, j)
 				// First put, then delete
 				client.Put(ctx, key, []byte("temp"), 0)
 				err := client.Delete(ctx, key)
@@ -207,7 +208,7 @@ func TestConcurrent_TopologyUpdates(t *testing.T) {
 				case <-stopCh:
 					return
 				default:
-					key := "topology-key-" + string(rune('0'+id))
+					key := fmt.Sprintf("topology-key-%d", id)
 					err := client.Put(ctx, key, []byte("value"), 0)
 					if err == nil {
 						atomic.AddInt32(&successfulOps, 1)
@@ -237,8 +238,8 @@ func TestConcurrent_PoolAccess(t *testing.T) {
 
 	// Create client with small pool to stress contention
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -256,7 +257,7 @@ func TestConcurrent_PoolAccess(t *testing.T) {
 
 	// Pre-populate some test data
 	for i := 0; i < 10; i++ {
-		key := "pool-key-" + string(rune('0'+i))
+		key := fmt.Sprintf("pool-key-%d", i)
 		server.cacheService.data[key] = []byte("initial-value")
 	}
 
@@ -266,7 +267,7 @@ func TestConcurrent_PoolAccess(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < opsPerWorker; j++ {
-				key := "pool-key-" + string(rune('0'+(j%10)))
+				key := fmt.Sprintf("pool-key-%d", j%10)
 				// Mix of operations
 				switch j % 3 {
 				case 0:
@@ -293,7 +294,6 @@ func TestConcurrent_PoolAccess(t *testing.T) {
 	t.Logf("Successful operations: %d/%d", successful, expectedOps)
 	assert.Greater(t, successful, expectedOps*9/10, "Most operations should succeed")
 }
-
 
 // TestConcurrent_RaceConditions uses Go race detector
 func TestConcurrent_RaceConditions(t *testing.T) {
@@ -372,8 +372,8 @@ func TestConcurrent_StreamingOperations(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -388,7 +388,7 @@ func TestConcurrent_StreamingOperations(t *testing.T) {
 
 	// Store large data for streaming
 	for i := 0; i < 5; i++ {
-		key := "stream-key-" + string(rune('0'+i))
+		key := fmt.Sprintf("stream-key-%d", i)
 		server.cacheService.data[key] = largeData
 	}
 
@@ -398,7 +398,7 @@ func TestConcurrent_StreamingOperations(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 5; j++ {
-				key := "stream-key-" + string(rune('0'+j))
+				key := fmt.Sprintf("stream-key-%d", j)
 				buf := &safeBuffer{}
 				err := client.GetStream(ctx, key, buf)
 				if err != nil {
@@ -417,7 +417,7 @@ func TestConcurrent_StreamingOperations(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			key := "write-stream-" + string(rune('0'+id))
+			key := fmt.Sprintf("write-stream-%d", id)
 			reader := &safeReader{data: largeData}
 			err := client.PutStream(ctx, key, reader, 0)
 			if err != nil {
@@ -450,8 +450,8 @@ func TestConcurrent_LoadBalancing(t *testing.T) {
 
 	// Create client with multiple addresses
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    addresses,
-		Mode:     ModeSimple,
+		Addrs: addresses,
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -471,7 +471,7 @@ func TestConcurrent_LoadBalancing(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < opsPerWorker; j++ {
-				key := "lb-key-" + string(rune('0'+(id*opsPerWorker+j)%26))
+				key := fmt.Sprintf("lb-key-%d", (id*opsPerWorker+j)%26)
 				client.Put(ctx, key, []byte("value"), 0)
 			}
 		}(i)

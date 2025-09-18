@@ -28,8 +28,8 @@ func TestClient_Close_SimpleMode(t *testing.T) {
 
 	// Create client in simple mode
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    addresses,
-		Mode:     ModeSimple,
+		Addrs: addresses,
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -120,8 +120,8 @@ func TestClient_Close_IdempotentCalls(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -152,8 +152,8 @@ func TestClient_Close_ConcurrentOperations(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -225,8 +225,8 @@ func TestClient_Lifecycle_FullCycle(t *testing.T) {
 
 		// Create client
 		client, err := NewWithConfig(&ClientConfig{
-			Addrs:    addresses,
-			Mode:     ModeSimple,
+			Addrs: addresses,
+			Mode:  ModeSimple,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -245,11 +245,11 @@ func TestClient_Lifecycle_FullCycle(t *testing.T) {
 		// Put data through client and verify operations
 		for i := 0; i < 10; i++ {
 			key := fmt.Sprintf("cycle-%d-key-%d", cycle, i)
-			
+
 			// Put data using client
 			err := client.Put(ctx, key, []byte("value"), 0)
 			require.NoError(t, err)
-			
+
 			// Verify with Get
 			data, err := client.Get(ctx, key)
 			require.NoError(t, err)
@@ -276,8 +276,8 @@ func TestClient_Lifecycle_ResourceLeak(t *testing.T) {
 	// Create and close many clients
 	for i := 0; i < 100; i++ {
 		client, err := NewWithConfig(&ClientConfig{
-			Addrs:    []string{server.address},
-			Mode:     ModeSimple,
+			Addrs: []string{server.address},
+			Mode:  ModeSimple,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -311,8 +311,8 @@ func TestClient_Lifecycle_ClusterModeTransition(t *testing.T) {
 
 	// Start without topology (will use simple mode in auto)
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeAuto,
+		Addrs: []string{server.address},
+		Mode:  ModeAuto,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -342,8 +342,8 @@ func TestClient_Lifecycle_PanicRecovery(t *testing.T) {
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
-		Addrs:    []string{server.address},
-		Mode:     ModeSimple,
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
 		DialOpts: []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		},
@@ -355,9 +355,9 @@ func TestClient_Lifecycle_PanicRecovery(t *testing.T) {
 	testCases := []func(){
 		func() { client.GetMode() },
 		func() { client.GetConnectedNodes() },
-		func() { 
+		func() {
 			ctx := context.Background()
-			client.Put(ctx, "", []byte{}, 0) 
+			client.Put(ctx, "", []byte{}, 0)
 		},
 		func() {
 			ctx := context.Background()
@@ -390,8 +390,8 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 	t.Run("InvalidAddress", func(t *testing.T) {
 		// Try to create client with invalid address
 		_, err := NewWithConfig(&ClientConfig{
-			Addrs:    []string{"invalid-address-without-port"},
-			Mode:     ModeSimple,
+			Addrs: []string{"invalid-address-without-port"},
+			Mode:  ModeSimple,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithBlock(),
@@ -407,8 +407,8 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 	t.Run("UnreachableServer", func(t *testing.T) {
 		// Try to create client with unreachable server
 		_, err := NewWithConfig(&ClientConfig{
-			Addrs:    []string{"localhost:59999"}, // Unlikely to be in use
-			Mode:     ModeSimple,
+			Addrs: []string{"localhost:59999"}, // Unlikely to be in use
+			Mode:  ModeSimple,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 				grpc.WithBlock(),
@@ -429,8 +429,8 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 
 		// Force cluster mode should fail without topology
 		_, err = NewWithConfig(&ClientConfig{
-			Addrs:    []string{server.address},
-			Mode:     ModeCluster,
+			Addrs: []string{server.address},
+			Mode:  ModeCluster,
 			DialOpts: []grpc.DialOption{
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			},
@@ -477,7 +477,7 @@ func TestClient_Lifecycle_LongRunning(t *testing.T) {
 		defer wg.Done()
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
-		
+
 		i := 0
 		for {
 			select {
@@ -497,7 +497,7 @@ func TestClient_Lifecycle_LongRunning(t *testing.T) {
 		defer wg.Done()
 		ticker := time.NewTicker(500 * time.Millisecond)
 		defer ticker.Stop()
-		
+
 		epoch := uint64(2)
 		for {
 			select {
