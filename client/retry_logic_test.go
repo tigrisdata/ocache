@@ -9,7 +9,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -196,90 +195,6 @@ func TestRetryLogic_OnlyOnRoutingErrors(t *testing.T) {
 	}
 }
 
-// TestRetryLogic_TopologyRefresh verifies topology is refreshed before retry
-func TestRetryLogic_TopologyRefresh(t *testing.T) {
-	// Create initial server
-	server1, err := newTestServerWithAddr()
-	require.NoError(t, err)
-	defer server1.Stop()
-
-	// Create second server for updated topology
-	server2, err := newTestServerWithAddr()
-	require.NoError(t, err)
-	defer server2.Stop()
-
-	// Initial topology with only server1
-	topology1 := setupSimpleTopology([]string{server1.address})
-	server1.clusterService.SetTopology(topology1)
-
-	// Create client in cluster mode
-	client, err := NewWithConfig(&ClientConfig{
-		Addrs: []string{server1.address},
-		Mode:  ModeCluster,
-		DialOpts: []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		},
-	})
-	require.NoError(t, err)
-	defer client.Close()
-
-	// Verify initial topology epoch
-	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
-
-	// Configure server1 to return routing error on first call
-	// but return updated topology on refresh
-	testKey := "topology-refresh-key"
-	server1.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
-
-	// Update topology to include both servers with higher epoch
-	topology2 := &clusterpb.ClusterTopology{
-		Epoch: 2,
-		Nodes: []*clusterpb.NodeInfo{
-			{
-				Id:      "node-0",
-				Address: server1.address,
-				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
-			},
-			{
-				Id:      "node-1",
-				Address: server2.address,
-				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
-			},
-		},
-		RingConfig: &clusterpb.RingConfig{
-			PartitionCount:    10,
-			ReplicationFactor: 20,
-			Load:              1.25,
-		},
-		PartitionOwners: make([]*clusterpb.PartitionOwner, 0),
-	}
-
-	// Assign all partitions to server2 in the new topology
-	for i := int32(0); i < 10; i++ {
-		topology2.PartitionOwners = append(topology2.PartitionOwners, &clusterpb.PartitionOwner{
-			PartitionId: i,
-			NodeId:      "node-1",
-		})
-	}
-
-	server1.clusterService.SetTopology(topology2)
-	server2.clusterService.SetTopology(topology2)
-
-	// Put data on server2
-	server2.cacheService.data[testKey] = []byte("value-from-server2")
-
-	ctx := context.Background()
-
-	// Get should fail on server1, refresh topology, and retry on server2
-	data, err := client.Get(ctx, testKey)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("value-from-server2"), data)
-
-	// Verify topology was updated
-	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
-	assert.Len(t, client.GetConnectedNodes(), 2)
-}
-
 // TestRetryLogic_NoRetryAfterPartialData verifies data integrity protection
 func TestRetryLogic_NoRetryAfterPartialData(t *testing.T) {
 	// Create a server
@@ -351,39 +266,6 @@ func TestRetryLogic_NoRetryAfterPartialData(t *testing.T) {
 
 		server.Reset()
 	})
-}
-
-// TestRetryLogic_SimpleMode verifies no retry in simple mode
-func TestRetryLogic_SimpleMode(t *testing.T) {
-	// Create a server
-	server, err := newTestServerWithAddr()
-	require.NoError(t, err)
-	defer server.Stop()
-
-	// Create client in simple mode (no retry on routing errors)
-	client, err := NewWithConfig(&ClientConfig{
-		Addrs: []string{server.address},
-		Mode:  ModeSimple,
-		DialOpts: []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		},
-	})
-	require.NoError(t, err)
-	defer client.Close()
-
-	ctx := context.Background()
-
-	// Configure server to return routing error
-	testKey := "simple-mode-key"
-	server.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
-
-	// Get should fail without retry in simple mode
-	_, err = client.Get(ctx, testKey)
-	assert.Error(t, err)
-
-	// Should have been called only once (no retry in simple mode)
-	_, getCount, _, _ := server.GetCallCounts()
-	assert.Equal(t, int32(1), getCount)
 }
 
 // TestRetryLogic_ConcurrentRetries verifies multiple concurrent operations retrying

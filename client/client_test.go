@@ -2,7 +2,9 @@ package cacheclient
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -228,5 +230,119 @@ func TestClient_AutoMode(t *testing.T) {
 
 		// Should fall back to simple mode
 		assert.Equal(t, ModeSimple, client.GetMode())
+	})
+}
+
+// TestClient_Lifecycle_FullCycle tests complete lifecycle
+func TestClient_Lifecycle_FullCycle(t *testing.T) {
+	// Create servers
+	servers := make([]*testServer, 2)
+	addresses := make([]string, 2)
+	for i := 0; i < 2; i++ {
+		server, err := newTestServerWithAddr()
+		require.NoError(t, err)
+		defer server.Stop()
+		servers[i] = server
+		addresses[i] = server.address
+	}
+
+	// Test multiple client lifecycles
+	for cycle := 0; cycle < 3; cycle++ {
+		t.Logf("Starting lifecycle cycle %d", cycle+1)
+
+		// Create client
+		client, err := NewWithConfig(&ClientConfig{
+			Addrs: addresses,
+			Mode:  ModeSimple,
+			DialOpts: []grpc.DialOption{
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+			},
+		})
+		require.NoError(t, err)
+
+		ctx := context.Background()
+
+		// Perform operations
+		for i := 0; i < 10; i++ {
+			key := "cycle-" + string(rune('0'+cycle)) + "-key-" + string(rune('0'+i))
+			err := client.Put(ctx, key, []byte("value"), 0)
+			require.NoError(t, err)
+		}
+
+		// Put data through client and verify operations
+		for i := 0; i < 10; i++ {
+			key := fmt.Sprintf("cycle-%d-key-%d", cycle, i)
+
+			// Put data using client
+			err := client.Put(ctx, key, []byte("value"), 0)
+			require.NoError(t, err)
+
+			// Verify with Get
+			data, err := client.Get(ctx, key)
+			require.NoError(t, err)
+			assert.Equal(t, []byte("value"), data)
+		}
+
+		// Close client
+		err = client.Close()
+		require.NoError(t, err)
+
+		// Verify closed
+		err = client.Put(ctx, "after-close", []byte("value"), 0)
+		assert.Error(t, err)
+	}
+}
+
+// TestClient_Lifecycle_InitializationFailure tests handling of initialization failures
+func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
+	t.Run("InvalidAddress", func(t *testing.T) {
+		// Try to create client with invalid address
+		_, err := NewWithConfig(&ClientConfig{
+			Addrs: []string{"invalid-address-without-port"},
+			Mode:  ModeSimple,
+			DialOpts: []grpc.DialOption{
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithBlock(),
+				grpc.WithTimeout(100 * time.Millisecond),
+			},
+		})
+		// Should either fail or timeout
+		if err == nil {
+			t.Log("Client created with invalid address - might fail on first operation")
+		}
+	})
+
+	t.Run("UnreachableServer", func(t *testing.T) {
+		// Try to create client with unreachable server
+		_, err := NewWithConfig(&ClientConfig{
+			Addrs: []string{"localhost:59999"}, // Unlikely to be in use
+			Mode:  ModeSimple,
+			DialOpts: []grpc.DialOption{
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithBlock(),
+				grpc.WithTimeout(100 * time.Millisecond),
+			},
+		})
+		// Should timeout or fail
+		if err == nil {
+			t.Log("Client created with unreachable server - will fail on operations")
+		}
+	})
+
+	t.Run("ClusterModeNoTopology", func(t *testing.T) {
+		// Create server without topology
+		server, err := newTestServerWithAddr()
+		require.NoError(t, err)
+		defer server.Stop()
+
+		// Force cluster mode should fail without topology
+		_, err = NewWithConfig(&ClientConfig{
+			Addrs: []string{server.address},
+			Mode:  ModeCluster,
+			DialOpts: []grpc.DialOption{
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+			},
+		})
+		assert.Error(t, err)
 	})
 }

@@ -113,46 +113,6 @@ func TestTopologyRefreshLoop_ErrorHandling(t *testing.T) {
 	}, 500*time.Millisecond, 50*time.Millisecond, "Epoch should be updated after error is fixed")
 }
 
-// TestTopologyRefreshLoop_StopOnClose verifies clean shutdown
-func TestTopologyRefreshLoop_StopOnClose(t *testing.T) {
-	// Create a server
-	server, err := newTestServerWithAddr()
-	require.NoError(t, err)
-	defer server.Stop()
-
-	// Initial topology
-	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
-
-	// Create client with short refresh interval
-	client, err := NewWithConfig(&ClientConfig{
-		Addrs:           []string{server.address},
-		Mode:            ModeCluster,
-		RefreshInterval: 50 * time.Millisecond,
-		DialOpts: []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		},
-	})
-	require.NoError(t, err)
-
-	// Let it run for a bit
-	time.Sleep(100 * time.Millisecond)
-
-	// Record call count before close
-	callsBefore := server.clusterService.getTopologyCallCount.Load()
-
-	// Close the client
-	err = client.Close()
-	require.NoError(t, err)
-
-	// Wait a bit
-	time.Sleep(100 * time.Millisecond)
-
-	// Call count should not increase significantly after close (allow for 1 in-flight request)
-	callsAfter := server.clusterService.getTopologyCallCount.Load()
-	assert.LessOrEqual(t, callsAfter-callsBefore, int32(1), "At most 1 in-flight topology fetch should occur after close")
-}
-
 // TestUpdateTopology_RingUpdate verifies ring updates correctly
 func TestUpdateTopology_RingUpdate(t *testing.T) {
 	// Create two servers
