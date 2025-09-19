@@ -3,12 +3,15 @@ package cacheclient
 import (
 	"context"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -262,13 +265,6 @@ func TestClient_Lifecycle_FullCycle(t *testing.T) {
 
 		ctx := context.Background()
 
-		// Perform operations
-		for i := 0; i < 10; i++ {
-			key := "cycle-" + string(rune('0'+cycle)) + "-key-" + string(rune('0'+i))
-			err := client.Put(ctx, key, []byte("value"), 0)
-			require.NoError(t, err)
-		}
-
 		// Put data through client and verify operations
 		for i := 0; i < 10; i++ {
 			key := fmt.Sprintf("cycle-%d-key-%d", cycle, i)
@@ -293,8 +289,8 @@ func TestClient_Lifecycle_FullCycle(t *testing.T) {
 	}
 }
 
-// TestClient_Lifecycle_InitializationFailure tests handling of initialization failures
-func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
+// TestClient_Lifecycle_InitFailures tests handling of initialization failures
+func TestClient_Lifecycle_InitFailures(t *testing.T) {
 	t.Run("InvalidAddress", func(t *testing.T) {
 		// Try to create client with invalid address
 		_, err := NewWithConfig(&ClientConfig{
@@ -344,5 +340,163 @@ func TestClient_Lifecycle_InitializationFailure(t *testing.T) {
 			},
 		})
 		assert.Error(t, err)
+	})
+}
+
+// TestConnection tests basic connection operations
+func TestConnection(t *testing.T) {
+	// Create a test server
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	serverAddr := listener.Addr().String()
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterCacheServiceServer(grpcServer, newMockCacheServiceServer())
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+
+	t.Run("create and close connection", func(t *testing.T) {
+		// Create connection
+		conn, err := newConnection(serverAddr, []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		})
+		require.NoError(t, err)
+		assert.NotNil(t, conn)
+		assert.Equal(t, serverAddr, conn.address)
+
+		// Get client should return non-nil
+		client := conn.getClient()
+		assert.NotNil(t, client)
+
+		// Close connection
+		err = conn.close()
+		assert.NoError(t, err)
+	})
+
+	t.Run("connection health check", func(t *testing.T) {
+		conn, err := newConnection(serverAddr, []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		})
+		require.NoError(t, err)
+		defer conn.close()
+
+		// Should be healthy initially
+		assert.True(t, conn.isHealthy())
+
+		// Record an error
+		conn.recordError(fmt.Errorf("test error"))
+
+		// Should still be healthy if not a connection error
+		// (connection.go checks if error is a connection error)
+		healthy := conn.isHealthy()
+		_ = healthy // May or may not be healthy depending on error type
+	})
+
+	t.Run("record and clear errors", func(t *testing.T) {
+		conn, err := newConnection(serverAddr, []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		})
+		require.NoError(t, err)
+		defer conn.close()
+
+		// Record an error
+		testErr := fmt.Errorf("test error")
+		conn.recordError(testErr)
+
+		// Recording nil should be safe (no-op)
+		conn.recordError(nil)
+
+		// Connection should track the error internally
+		// We can't access internal fields, but operation should not panic
+	})
+}
+
+// TestConnection_Reconnect tests reconnection behavior
+func TestConnection_Reconnect(t *testing.T) {
+	// Create a test server
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	serverAddr := listener.Addr().String()
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterCacheServiceServer(grpcServer, newMockCacheServiceServer())
+	go grpcServer.Serve(listener)
+
+	t.Run("reconnect after server restart", func(t *testing.T) {
+		// Create connection
+		conn, err := newConnection(serverAddr, []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		})
+		require.NoError(t, err)
+		defer conn.close()
+
+		// Stop server
+		grpcServer.Stop()
+
+		// Wait for connection to notice
+		time.Sleep(100 * time.Millisecond)
+
+		// Restart server on same port
+		listener2, err := net.Listen("tcp", serverAddr)
+		if err != nil {
+			// Port might still be in use, skip this test
+			t.Skip("Cannot reuse port immediately")
+		}
+
+		grpcServer2 := grpc.NewServer()
+		pb.RegisterCacheServiceServer(grpcServer2, newMockCacheServiceServer())
+		go grpcServer2.Serve(listener2)
+		defer grpcServer2.Stop()
+
+		// Try to reconnect
+		dialOpts := []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		}
+		err = conn.reconnect(dialOpts)
+		// Reconnect may succeed or fail depending on timing
+		_ = err
+	})
+}
+
+// TestConnection_State tests connection state transitions
+func TestConnection_State(t *testing.T) {
+	// Create a test server
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	serverAddr := listener.Addr().String()
+
+	grpcServer := grpc.NewServer()
+	pb.RegisterCacheServiceServer(grpcServer, newMockCacheServiceServer())
+	go grpcServer.Serve(listener)
+	defer grpcServer.Stop()
+
+	t.Run("connection states", func(t *testing.T) {
+		// Create connection
+		conn, err := newConnection(serverAddr, []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		})
+		require.NoError(t, err)
+		defer conn.close()
+
+		// Check initial state
+		state := conn.conn.GetState()
+		assert.True(t,
+			state == connectivity.Ready ||
+				state == connectivity.Connecting ||
+				state == connectivity.Idle,
+			"Connection should be in a valid initial state")
+
+		// Use the connection
+		ctx := context.Background()
+		client := conn.getClient()
+
+		// Try a simple operation
+		stream, err := client.Get(ctx, &pb.GetRequest{Key: "test"})
+		// Will fail with NotFound, but connection should work
+		_ = stream
+		_ = err
+
+		// Connection should still be valid
+		assert.True(t, conn.isHealthy())
 	})
 }

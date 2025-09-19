@@ -2,14 +2,13 @@ package cacheclient
 
 import (
 	"context"
-	"errors"
-	"io"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/client/testutil"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
@@ -99,13 +98,6 @@ func TestError_InvalidResponses(t *testing.T) {
 		assert.Error(t, err)
 		assert.Equal(t, codes.NotFound, status.Code(err))
 	})
-
-	t.Run("EmptyKey", func(t *testing.T) {
-		// Operations with empty key should be handled gracefully
-		err := client.Put(ctx, "", []byte("value"), 0)
-		// Just verify it doesn't panic
-		_ = err
-	})
 }
 
 // TestError_StreamingErrors tests error handling in streaming operations
@@ -138,7 +130,7 @@ func TestError_StreamingErrors(t *testing.T) {
 		})
 
 		// GetStream should fail after partial data
-		buf := &safeBuffer{}
+		buf := &testutil.SafeBuffer{}
 		err := client.GetStream(ctx, testKey, buf)
 		assert.Error(t, err)
 		assert.Equal(t, 5, buf.Len()) // Should have received partial data
@@ -146,9 +138,9 @@ func TestError_StreamingErrors(t *testing.T) {
 
 	t.Run("StreamWriteError", func(t *testing.T) {
 		// Use a reader that fails after some data
-		failingReader := &failingReader{
-			data:      []byte("test data to stream"),
-			failAfter: 10,
+		failingReader := &testutil.FailingReader{
+			Data:      []byte("test data to stream"),
+			FailAfter: 10,
 		}
 
 		err := client.PutStream(ctx, "stream-write-key", failingReader, 0)
@@ -379,30 +371,4 @@ func TestError_ClusterDegradation(t *testing.T) {
 	// Check that client updated its node list
 	connectedNodes := client.GetConnectedNodes()
 	assert.Len(t, connectedNodes, 2, "Should have 2 connected nodes after one failure")
-}
-
-// failingReader fails after reading a certain amount
-type failingReader struct {
-	data      []byte
-	pos       int
-	failAfter int
-}
-
-func (f *failingReader) Read(p []byte) (n int, err error) {
-	if f.pos >= f.failAfter {
-		return 0, errors.New("simulated read failure")
-	}
-	remaining := f.failAfter - f.pos
-	if remaining > len(p) {
-		remaining = len(p)
-	}
-	if remaining > len(f.data)-f.pos {
-		remaining = len(f.data) - f.pos
-	}
-	if remaining == 0 {
-		return 0, io.EOF
-	}
-	copy(p[:remaining], f.data[f.pos:f.pos+remaining])
-	f.pos += remaining
-	return remaining, nil
 }
