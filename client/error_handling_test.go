@@ -103,7 +103,6 @@ func TestError_InvalidResponses(t *testing.T) {
 	t.Run("EmptyKey", func(t *testing.T) {
 		// Operations with empty key should be handled gracefully
 		err := client.Put(ctx, "", []byte("value"), 0)
-		// Depending on implementation, this might succeed or fail
 		// Just verify it doesn't panic
 		_ = err
 	})
