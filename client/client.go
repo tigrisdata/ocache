@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/buraksezer/consistent"
+	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/hash"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -68,30 +69,6 @@ type nodeMember string
 
 func (n nodeMember) String() string {
 	return string(n)
-}
-
-// bufferPool manages reusable byte buffers for streaming operations
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		// Create a new buffer with default size
-		buf := make([]byte, DefaultBufferSize)
-		return &buf
-	},
-}
-
-// getBuffer gets a buffer from the pool
-func getBuffer() []byte {
-	bufPtr := bufferPool.Get().(*[]byte)
-	return *bufPtr
-}
-
-// putBuffer returns a buffer to the pool
-func putBuffer(buf []byte) {
-	// Only return buffers of the expected size to avoid memory issues
-	if cap(buf) == DefaultBufferSize {
-		bufPtr := &buf
-		bufferPool.Put(bufPtr)
-	}
 }
 
 // Client is the unified cache client supporting both simple and cluster modes
@@ -622,8 +599,8 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 	}
 
 	// Get buffer from pool
-	buf := getBuffer()
-	defer putBuffer(buf)
+	buf, release := bufferpool.AcquireBuffer(DefaultBufferSize)
+	defer release()
 
 	first := true
 
