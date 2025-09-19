@@ -8,13 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/tigrisdata/ocache/common/bufferpool"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 )
 
 // ClusterClient implements a cluster-aware cache client with topology support
 type ClusterClient struct {
+	*Operations                          // Embedded for shared operations
 	conns         map[string]*connection // address -> connection
 	topology      *TopologyManager       // Manages topology
 	config        *ClientConfig
@@ -59,6 +59,9 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 		client.Close()
 		return nil, fmt.Errorf("failed to initialize connections: %w", err)
 	}
+
+	// Initialize operations with this client as the router
+	client.Operations = NewOperations(client)
 
 	// Start topology refresh goroutine
 	refreshCtx, cancel := context.WithCancel(context.Background())
@@ -116,8 +119,9 @@ func (c *ClusterClient) updateConnections(topology *clusterpb.ClusterTopology) e
 	return nil
 }
 
-// route determines which connection to use for a given key
-func (c *ClusterClient) route(key string) (*connection, error) {
+// Route determines which connection to use for a given key
+// Implements Router interface
+func (c *ClusterClient) Route(key string) (*connection, error) {
 	addr, err := c.topology.GetNodeForKey(key)
 	if err != nil {
 		return nil, err
@@ -134,99 +138,81 @@ func (c *ClusterClient) route(key string) (*connection, error) {
 	return conn, nil
 }
 
-// Put stores a value in the cache
-func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
+// RoundRobinRoute selects a connection using round-robin (for List operation)
+// Implements Router interface
+func (c *ClusterClient) RoundRobinRoute() (*connection, error) {
+	c.mu.RLock()
+	if len(c.conns) == 0 {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("no available connections")
 	}
 
-	req := &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds}
-	_, err = conn.getClient().PutObject(ctx, req)
-	conn.recordError(err)
+	// Get all connections and sort for consistent ordering
+	var addresses []string
+	for addr := range c.conns {
+		addresses = append(addresses, addr)
+	}
+	sort.Strings(addresses)
+
+	idx := c.currentIdx.Add(1) - 1
+	addr := addresses[idx%uint32(len(addresses))]
+	conn := c.conns[addr]
+	c.mu.RUnlock()
+
+	return conn, nil
+}
+
+// refreshTopology attempts to refresh topology and update connections
+func (c *ClusterClient) refreshTopology(ctx context.Context) bool {
+	fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
+	topology, err := c.topology.FetchTopology(fetchCtx, c.seedAddrs, c.config.DialOpts)
+	cancel()
+
+	if err == nil {
+		c.updateConnections(topology)
+		return true
+	}
+	return false
+}
+
+// Put stores a value with retry logic for routing errors
+func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
+	err := c.Operations.Put(ctx, key, data, ttlSeconds)
 
 	// If we get a routing error, refresh topology and retry once
-	if isRoutingError(err) {
-		fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-		topology, fetchErr := c.topology.FetchTopology(fetchCtx, c.seedAddrs, c.config.DialOpts)
-		cancel()
-
-		if fetchErr == nil {
-			c.updateConnections(topology)
-			if conn, routeErr := c.route(key); routeErr == nil {
-				_, err = conn.getClient().PutObject(ctx, req)
-				conn.recordError(err)
-			}
-		}
+	if isRoutingError(err) && c.refreshTopology(ctx) {
+		return c.Operations.Put(ctx, key, data, ttlSeconds)
 	}
 
 	return err
 }
 
-// PutStream streams data to the cache
-func (c *ClusterClient) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
-	}
-
-	stream, err := conn.getClient().Put(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Get buffer from pool
-	buf, release := bufferpool.AcquireBuffer(DefaultBufferSize)
-	defer release()
-
-	first := true
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		n, err := r.Read(buf)
-		if n > 0 {
-			req := &pb.PutRequest{Data: buf[:n]}
-			if first {
-				req.Key = key
-				req.TtlSeconds = ttlSeconds
-				first = false
-			}
-			if sendErr := stream.Send(req); sendErr != nil {
-				return sendErr
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return err
-	}
-	if resp != nil && !resp.Success {
-		return fmt.Errorf("put failed: %s", resp.Error)
-	}
-	return nil
-}
-
-// Get retrieves a value from the cache with retry logic
+// Get retrieves a value with retry logic
 func (c *ClusterClient) Get(ctx context.Context, key string) ([]byte, error) {
-	return c.getDataWithRetry(ctx, key, &pb.GetRequest{Key: key}, 1)
+	// We need custom logic to track if partial data was received
+	return c.getDataWithRetry(ctx, key, 0, 0, 1)
 }
 
-// getDataWithRetry implements Get/GetRange with retry logic
-func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, req *pb.GetRequest, retryCount int) ([]byte, error) {
-	conn, err := c.route(key)
+// GetRange retrieves a byte range with retry logic
+func (c *ClusterClient) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
+	// Use the unified retry logic with range parameters
+	return c.getDataWithRetry(ctx, key, start, end, 1)
+}
+
+// getDataWithRetry implements Get/GetRange with retry logic that tracks partial data
+// For regular Get operations, pass start=0 and end=0
+// For GetRange operations, pass the actual start and end values
+func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, start, end int64, retryCount int) ([]byte, error) {
+	conn, err := c.Route(key)
 	if err != nil {
 		return nil, err
+	}
+
+	// Build request with optional range parameters
+	req := &pb.GetRequest{Key: key}
+	if start > 0 || end > 0 {
+		req.Start = start
+		req.End = end
 	}
 
 	stream, err := conn.getClient().Get(ctx, req)
@@ -247,16 +233,12 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, req *p
 			break
 		}
 		if err != nil {
-			// Retry on routing errors if we haven't received any data yet
-			if isRoutingError(err) && retryCount > 0 && len(result) == 0 {
-				fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-				topology, fetchErr := c.topology.FetchTopology(fetchCtx, c.seedAddrs, c.config.DialOpts)
-				cancel()
-
-				if fetchErr == nil {
-					c.updateConnections(topology)
-					return c.getDataWithRetry(ctx, key, req, retryCount-1)
-				}
+			// Only retry if:
+			// 1. It's a routing error
+			// 2. We haven't received any data yet (to avoid data corruption)
+			// 3. We have retries remaining
+			if isRoutingError(err) && len(result) == 0 && retryCount > 0 && c.refreshTopology(ctx) {
+				return c.getDataWithRetry(ctx, key, start, end, retryCount-1)
 			}
 			return nil, err
 		}
@@ -265,16 +247,32 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, req *p
 	return result, nil
 }
 
-// GetStream streams a value from the cache
+// GetStream streams a value with retry logic
 func (c *ClusterClient) GetStream(ctx context.Context, key string, w io.Writer) error {
-	return c.getStreamWithRetry(ctx, key, &pb.GetRequest{Key: key}, w, 1)
+	// We need custom logic to track if partial data was written
+	return c.getStreamDataWithRetry(ctx, key, 0, 0, w, 1)
 }
 
-// getStreamWithRetry implements GetStream/GetRangeStream with retry logic
-func (c *ClusterClient) getStreamWithRetry(ctx context.Context, key string, req *pb.GetRequest, w io.Writer, retryCount int) error {
-	conn, err := c.route(key)
+// GetRangeStream streams a byte range with retry logic
+func (c *ClusterClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
+	// Use the unified retry logic with range parameters
+	return c.getStreamDataWithRetry(ctx, key, start, end, w, 1)
+}
+
+// getStreamDataWithRetry implements GetStream/GetRangeStream with retry logic that tracks partial data
+// For regular GetStream operations, pass start=0 and end=0
+// For GetRangeStream operations, pass the actual start and end values
+func (c *ClusterClient) getStreamDataWithRetry(ctx context.Context, key string, start, end int64, w io.Writer, retryCount int) error {
+	conn, err := c.Route(key)
 	if err != nil {
 		return err
+	}
+
+	// Build request with optional range parameters
+	req := &pb.GetRequest{Key: key}
+	if start > 0 || end > 0 {
+		req.Start = start
+		req.End = end
 	}
 
 	stream, err := conn.getClient().Get(ctx, req)
@@ -295,16 +293,12 @@ func (c *ClusterClient) getStreamWithRetry(ctx context.Context, key string, req 
 			break
 		}
 		if err != nil {
-			// Retry on routing errors if we haven't written any data yet
-			if isRoutingError(err) && retryCount > 0 && bytesWritten == 0 {
-				fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-				topology, fetchErr := c.topology.FetchTopology(fetchCtx, c.seedAddrs, c.config.DialOpts)
-				cancel()
-
-				if fetchErr == nil {
-					c.updateConnections(topology)
-					return c.getStreamWithRetry(ctx, key, req, w, retryCount-1)
-				}
+			// Only retry if:
+			// 1. It's a routing error
+			// 2. We haven't written any data yet (to avoid data corruption)
+			// 3. We have retries remaining
+			if isRoutingError(err) && bytesWritten == 0 && retryCount > 0 && c.refreshTopology(ctx) {
+				return c.getStreamDataWithRetry(ctx, key, start, end, w, retryCount-1)
 			}
 			return err
 		}
@@ -317,97 +311,19 @@ func (c *ClusterClient) getStreamWithRetry(ctx context.Context, key string, req 
 	return nil
 }
 
-// GetRange retrieves a byte range from the cache
-func (c *ClusterClient) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	req := &pb.GetRequest{
-		Key:   key,
-		Start: start,
-		End:   end,
-	}
-	return c.getDataWithRetry(ctx, key, req, 1)
-}
-
-// GetRangeStream streams a byte range from the cache
-func (c *ClusterClient) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	req := &pb.GetRequest{
-		Key:   key,
-		Start: start,
-		End:   end,
-	}
-	return c.getStreamWithRetry(ctx, key, req, w, 1)
-}
-
-// Delete removes a key from the cache
+// Delete removes a key with retry logic
 func (c *ClusterClient) Delete(ctx context.Context, key string) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
-	}
+	err := c.Operations.Delete(ctx, key)
 
-	_, err = conn.getClient().Delete(ctx, &pb.DeleteRequest{Key: key})
-
-	// Retry once with topology refresh for cluster mode
-	if isRoutingError(err) {
-		fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-		topology, fetchErr := c.topology.FetchTopology(fetchCtx, c.seedAddrs, c.config.DialOpts)
-		cancel()
-
-		if fetchErr == nil {
-			c.updateConnections(topology)
-			if conn, routeErr := c.route(key); routeErr == nil {
-				_, err = conn.getClient().Delete(ctx, &pb.DeleteRequest{Key: key})
-			}
-		}
+	// Retry once with topology refresh for routing errors
+	if isRoutingError(err) && c.refreshTopology(ctx) {
+		return c.Operations.Delete(ctx, key)
 	}
 
 	return err
 }
 
-// List lists keys with optional prefix
-func (c *ClusterClient) List(ctx context.Context, prefix string) ([]string, error) {
-	// For list operation, use round-robin selection
-	c.mu.RLock()
-	if len(c.conns) == 0 {
-		c.mu.RUnlock()
-		return nil, fmt.Errorf("no available connections")
-	}
-
-	// Get all connections and sort for consistent ordering
-	var addresses []string
-	for addr := range c.conns {
-		addresses = append(addresses, addr)
-	}
-	sort.Strings(addresses)
-
-	idx := c.currentIdx.Add(1) - 1
-	addr := addresses[idx%uint32(len(addresses))]
-	conn := c.conns[addr]
-	c.mu.RUnlock()
-
-	stream, err := conn.getClient().List(ctx, &pb.ListRequest{Prefix: prefix})
-	if err != nil {
-		return nil, err
-	}
-
-	var keys []string
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, resp.Keys...)
-	}
-	return keys, nil
-}
+// PutStream and List are inherited from Operations
 
 // Close closes all connections and stops background goroutines
 func (c *ClusterClient) Close() error {
