@@ -189,10 +189,14 @@ func TestUpdateTopology_RingUpdate(t *testing.T) {
 	server1.clusterService.SetTopology(topology2)
 
 	// Manually trigger topology update
-	newTopology, err := client.fetchTopology()
-	require.NoError(t, err)
-	err = client.updateTopology(newTopology)
-	require.NoError(t, err)
+	if cc, ok := client.CacheClient.(*ClusterClient); ok {
+		newTopology, err := cc.FetchTopology()
+		require.NoError(t, err)
+		err = cc.UpdateTopology(newTopology)
+		require.NoError(t, err)
+	} else {
+		t.Skip("Test requires ClusterClient")
+	}
 
 	// Verify update
 	assert.Len(t, client.GetConnectedNodes(), 2)
@@ -229,7 +233,11 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	defer client.Close()
 
 	// Initial state - 2 connections
-	assert.Len(t, client.conns, 2)
+	if cc, ok := client.CacheClient.(*ClusterClient); ok {
+		assert.Equal(t, 2, cc.GetConnectionCount())
+	} else {
+		t.Skip("Test requires ClusterClient")
+	}
 	assert.Len(t, client.GetConnectedNodes(), 2)
 
 	// Add third server
@@ -238,13 +246,14 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	servers[0].clusterService.SetTopology(topology2)
 
 	// Update topology
-	newTopology, err := client.fetchTopology()
-	require.NoError(t, err)
-	err = client.updateTopology(newTopology)
-	require.NoError(t, err)
-
-	// Should have 3 connections now
-	assert.Len(t, client.conns, 3)
+	if cc, ok := client.CacheClient.(*ClusterClient); ok {
+		newTopology, err := cc.FetchTopology()
+		require.NoError(t, err)
+		err = cc.UpdateTopology(newTopology)
+		require.NoError(t, err)
+		// Should have 3 connections now
+		assert.Equal(t, 3, cc.GetConnectionCount())
+	}
 	assert.Len(t, client.GetConnectedNodes(), 3)
 
 	// Remove second server (mark as inactive)
@@ -254,10 +263,12 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	servers[0].clusterService.SetTopology(topology3)
 
 	// Update topology
-	newTopology, err = client.fetchTopology()
-	require.NoError(t, err)
-	err = client.updateTopology(newTopology)
-	require.NoError(t, err)
+	if cc, ok := client.CacheClient.(*ClusterClient); ok {
+		newTopology, err := cc.FetchTopology()
+		require.NoError(t, err)
+		err = cc.UpdateTopology(newTopology)
+		require.NoError(t, err)
+	}
 
 	// Should have 2 active pools (server 0 and 2)
 	connectedNodes := client.GetConnectedNodes()
@@ -459,10 +470,12 @@ func TestTopology_NodeFailure(t *testing.T) {
 	servers[2].clusterService.SetTopology(topology2)
 
 	// Fetch and update topology
-	newTopology, err := client.fetchTopology()
-	require.NoError(t, err)
-	err = client.updateTopology(newTopology)
-	require.NoError(t, err)
+	if cc, ok := client.CacheClient.(*ClusterClient); ok {
+		newTopology, err := cc.FetchTopology()
+		require.NoError(t, err)
+		err = cc.UpdateTopology(newTopology)
+		require.NoError(t, err)
+	}
 
 	// Only 2 nodes should be connected
 	connectedNodes := client.GetConnectedNodes()
@@ -558,10 +571,12 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 	server1.clusterService.SetTopology(topology2)
 
 	// Update topology
-	newTopology, err := client.fetchTopology()
-	require.NoError(t, err)
-	err = client.updateTopology(newTopology)
-	require.NoError(t, err)
+	if cc, ok := client.CacheClient.(*ClusterClient); ok {
+		newTopology, err := cc.FetchTopology()
+		require.NoError(t, err)
+		err = cc.UpdateTopology(newTopology)
+		require.NoError(t, err)
+	}
 
 	// Verify partition reassignment
 	for i := int32(0); i < 5; i++ {

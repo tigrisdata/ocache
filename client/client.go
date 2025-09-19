@@ -3,93 +3,16 @@ package cacheclient
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
-	"io"
-	"sort"
-	"sync"
-	"sync/atomic"
-	"time"
 
-	"github.com/buraksezer/consistent"
-	"github.com/tigrisdata/ocache/common/bufferpool"
-	"github.com/tigrisdata/ocache/common/hash"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
-	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
-// ConnectionMode defines how the client connects to servers
-type ConnectionMode string
-
-const (
-	// ModeAuto automatically detects cluster vs simple mode (default)
-	ModeAuto ConnectionMode = "auto"
-	// ModeSimple uses direct connections without topology service
-	ModeSimple ConnectionMode = "simple"
-	// ModeCluster uses topology service for smart routing
-	ModeCluster ConnectionMode = "cluster"
-)
-
-const (
-	// DefaultRefreshInterval is the default topology refresh interval
-	DefaultRefreshInterval = 30 * time.Second
-	// MaxMessageSize is the maximum message size for gRPC
-	MaxMessageSize = 128 * 1024 * 1024 // 128MB
-	// TopologyDetectTimeout is the timeout for detecting cluster topology
-	TopologyDetectTimeout = 2 * time.Second
-	// DefaultBufferSize is the default buffer size for streaming operations
-	DefaultBufferSize = 64 * 1024 // 64KB
-)
-
-// ClientConfig contains configuration for the unified Client
-type ClientConfig struct {
-	Addrs           []string          // One or more server addresses
-	Mode            ConnectionMode    // Connection mode (default: "auto")
-	RefreshInterval time.Duration     // Topology refresh for cluster mode (default: 30s)
-	DialOpts        []grpc.DialOption // Optional gRPC dial options
-}
-
-// connection wraps a single gRPC connection with health monitoring
-type connection struct {
-	address       string
-	conn          *grpc.ClientConn
-	client        pb.CacheServiceClient
-	lastError     error
-	lastErrorTime time.Time
-	reconnecting  atomic.Bool
-	mu            sync.RWMutex
-}
-
-// nodeMember implements consistent.Member interface
-type nodeMember string
-
-func (n nodeMember) String() string {
-	return string(n)
-}
-
-// Client is the unified cache client supporting both simple and cluster modes
+// Client is a wrapper that maintains backward compatibility
+// It delegates to either SimpleClient or ClusterClient based on mode detection
 type Client struct {
-	conns map[string]*connection // address -> connection
-	mode  ConnectionMode         // Actual mode (resolved from auto)
-
-	// For cluster mode
-	ring            *consistent.Consistent     // Consistent hash ring
-	partitionOwners map[int32]string           // partition -> nodeID
-	nodeAddresses   map[string]string          // nodeID -> address
-	topology        *clusterpb.ClusterTopology // Current topology
-	topologyEpoch   uint64                     // Topology version
-
-	// For simple mode
-	addresses  []string      // List of addresses
-	currentIdx atomic.Uint32 // For round-robin
-
-	config *ClientConfig
-	mu     sync.RWMutex
-	stopCh chan struct{}
+	CacheClient
+	mode ConnectionMode
 }
 
 // New creates a new client with default configuration
@@ -112,66 +35,45 @@ func NewWithConfig(config *ClientConfig) (*Client, error) {
 		return nil, fmt.Errorf("at least one address is required")
 	}
 
-	// Set defaults
-	if config.Mode == "" {
-		config.Mode = ModeAuto
-	}
-	if config.RefreshInterval == 0 {
-		config.RefreshInterval = DefaultRefreshInterval
-	}
-	if len(config.DialOpts) == 0 {
-		config.DialOpts = []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(MaxMessageSize),
-				grpc.MaxCallSendMsgSize(MaxMessageSize),
-			),
-		}
-	}
-
-	client := &Client{
-		conns:         make(map[string]*connection),
-		nodeAddresses: make(map[string]string),
-		config:        config,
-		addresses:     config.Addrs,
-		stopCh:        make(chan struct{}),
-	}
+	config.SetDefaults()
 
 	// Resolve auto mode
-	if config.Mode == ModeAuto {
-		client.mode = client.detectMode()
-	} else {
-		client.mode = config.Mode
+	mode := config.Mode
+	if mode == ModeAuto {
+		mode = detectMode(config.Addrs, config.DialOpts)
 	}
 
-	// Initialize based on mode
+	// Create appropriate client based on mode
+	var cacheClient CacheClient
 	var err error
-	switch client.mode {
+
+	switch mode {
 	case ModeCluster:
-		err = client.initClusterMode()
+		cacheClient, err = NewClusterClient(config)
 	case ModeSimple:
-		err = client.initSimpleMode()
+		cacheClient, err = NewSimpleClient(config)
 	default:
-		err = fmt.Errorf("unknown mode: %s", client.mode)
+		return nil, fmt.Errorf("unknown mode: %s", mode)
 	}
 
 	if err != nil {
-		// Clean up any created connections
-		client.Close()
 		return nil, err
 	}
 
-	return client, nil
+	return &Client{
+		CacheClient: cacheClient,
+		mode:        mode,
+	}, nil
 }
 
 // detectMode attempts to detect if cluster topology is available
-func (c *Client) detectMode() ConnectionMode {
+func detectMode(addrs []string, dialOpts []grpc.DialOption) ConnectionMode {
 	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
 	defer cancel()
 
 	// Try to fetch topology from any seed address
-	for _, addr := range c.config.Addrs {
-		conn, err := grpc.DialContext(ctx, addr, c.config.DialOpts...)
+	for _, addr := range addrs {
+		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
 			continue
 		}
@@ -190,759 +92,41 @@ func (c *Client) detectMode() ConnectionMode {
 	return ModeSimple
 }
 
-// initSimpleMode initializes the client in simple mode
-func (c *Client) initSimpleMode() error {
-	// Create connections for each address
-	successfulConns := 0
-	var lastErr error
-
-	for _, addr := range c.addresses {
-		conn, err := c.createConnection(addr)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to create connection for %s: %w", addr, err)
-			// Continue trying other addresses
-			continue
-		}
-		c.conns[addr] = conn
-		successfulConns++
-	}
-
-	// Require at least one successful connection
-	if successfulConns == 0 {
-		if lastErr != nil {
-			return fmt.Errorf("failed to create any connections, last error: %w", lastErr)
-		}
-		return fmt.Errorf("failed to create any connections")
-	}
-
-	return nil
-}
-
-// initClusterMode initializes the client in cluster mode
-func (c *Client) initClusterMode() error {
-	// Fetch initial topology
-	topology, err := c.fetchTopology()
-	if err != nil {
-		return fmt.Errorf("failed to fetch initial topology: %w", err)
-	}
-
-	// Initialize ring and pools based on topology
-	if err := c.updateTopology(topology); err != nil {
-		return fmt.Errorf("failed to initialize with topology: %w", err)
-	}
-
-	// Start topology refresh goroutine
-	go c.topologyRefreshLoop()
-
-	return nil
-}
-
-// createConnection creates a single connection to an address
-func (c *Client) createConnection(addr string) (*connection, error) {
-	conn, err := grpc.Dial(addr, c.config.DialOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create connection: %w", err)
-	}
-	return &connection{
-		address: addr,
-		conn:    conn,
-		client:  pb.NewCacheServiceClient(conn),
-	}, nil
-}
-
-// fetchTopology fetches the cluster topology from available nodes
-func (c *Client) fetchTopology() (*clusterpb.ClusterTopology, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
-	defer cancel()
-
-	// Try seed addresses first
-	for _, addr := range c.config.Addrs {
-		topology, err := c.fetchTopologyFromAddress(ctx, addr)
-		if err == nil {
-			return topology, nil
-		}
-	}
-
-	// If we have existing topology, try those nodes
-	c.mu.RLock()
-	var nodeAddresses []string
-	for _, addr := range c.nodeAddresses {
-		nodeAddresses = append(nodeAddresses, addr)
-	}
-	c.mu.RUnlock()
-
-	for _, addr := range nodeAddresses {
-		topology, err := c.fetchTopologyFromAddress(ctx, addr)
-		if err == nil {
-			return topology, nil
-		}
-	}
-
-	return nil, fmt.Errorf("failed to fetch topology from any node")
-}
-
-// fetchTopologyFromAddress fetches topology from a specific address
-func (c *Client) fetchTopologyFromAddress(ctx context.Context, addr string) (*clusterpb.ClusterTopology, error) {
-	conn, err := grpc.DialContext(ctx, addr, c.config.DialOpts...)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	client := clusterpb.NewClusterServiceClient(conn)
-	return client.GetClusterTopology(ctx, &clusterpb.Empty{})
-}
-
-// updateTopology updates the internal state based on new topology
-func (c *Client) updateTopology(topology *clusterpb.ClusterTopology) error {
-	// First, check if topology has changed without holding lock long
-	c.mu.RLock()
-	if c.topologyEpoch >= topology.Epoch {
-		c.mu.RUnlock()
-		return nil // No change
-	}
-	existingConns := make(map[string]*connection)
-	for addr, conn := range c.conns {
-		existingConns[addr] = conn
-	}
-	c.mu.RUnlock()
-
-	// Create new ring (no lock needed)
-	cfg := consistent.Config{
-		PartitionCount:    int(topology.RingConfig.PartitionCount),
-		ReplicationFactor: int(topology.RingConfig.ReplicationFactor),
-		Load:              topology.RingConfig.Load,
-		Hasher:            hash.Hasher{},
-	}
-	ring := consistent.New(nil, cfg)
-
-	// Build partition ownership map and node addresses (no lock needed)
-	partitionOwners := make(map[int32]string)
-	nodeAddresses := make(map[string]string)
-	activeNodes := make(map[string]bool)
-
-	for _, node := range topology.Nodes {
-		if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
-			activeNodes[node.Id] = true
-			nodeAddresses[node.Id] = node.Address
-			ring.Add(nodeMember(node.Id))
-		}
-	}
-
-	for _, owner := range topology.PartitionOwners {
-		partitionOwners[owner.PartitionId] = owner.NodeId
-	}
-
-	// Create new connections outside of lock
-	newConns := make(map[string]*connection)
-	connectionsToClose := make([]*connection, 0)
-
-	// Determine which connections to create (without lock)
-	for _, address := range nodeAddresses {
-		if existingConn, exists := existingConns[address]; exists {
-			// Reuse existing connection
-			newConns[address] = existingConn
-		} else {
-			// Create new connection (network I/O, no lock)
-			conn, err := c.createConnection(address)
-			if err != nil {
-				// Continue with other connections, but track error
-				// In production, should log this error
-				continue
-			}
-			newConns[address] = conn
-		}
-	}
-
-	// Determine which connections to close
-	for _, conn := range existingConns {
-		if _, needed := nodeAddresses[conn.address]; !needed {
-			connectionsToClose = append(connectionsToClose, conn)
-		}
-	}
-
-	// Now update state atomically with lock
-	c.mu.Lock()
-	// Double-check epoch hasn't changed while we were creating connections
-	if c.topologyEpoch >= topology.Epoch {
-		c.mu.Unlock()
-		// Clean up any new connections we created
-		for addr, conn := range newConns {
-			if _, existed := existingConns[addr]; !existed {
-				conn.close()
-			}
-		}
-		return nil
-	}
-
-	// Update state
-	c.ring = ring
-	c.partitionOwners = partitionOwners
-	c.nodeAddresses = nodeAddresses
-	c.topology = topology
-	c.topologyEpoch = topology.Epoch
-	c.conns = newConns
-	c.mu.Unlock()
-
-	// Close old connections outside of lock
-	for _, conn := range connectionsToClose {
-		conn.close()
-	}
-
-	return nil
-}
-
-// topologyRefreshLoop periodically refreshes the cluster topology
-func (c *Client) topologyRefreshLoop() {
-	ticker := time.NewTicker(c.config.RefreshInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			topology, err := c.fetchTopology()
-			if err == nil {
-				c.updateTopology(topology)
-			}
-		case <-c.stopCh:
-			return
-		}
-	}
-}
-
-// route determines which connection to use for a given key
-func (c *Client) route(key string) (*connection, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	switch c.mode {
-	case ModeCluster:
-		return c.routeCluster(key)
-	case ModeSimple:
-		return c.routeSimple(key)
-	default:
-		return nil, fmt.Errorf("unknown mode: %s", c.mode)
-	}
-}
-
-// routeSimple routes in simple mode (hash-based)
-func (c *Client) routeSimple(key string) (*connection, error) {
-	if len(c.conns) == 0 {
-		return nil, fmt.Errorf("no available connections")
-	}
-
-	// Use hash-based routing for better key locality
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	hash := h.Sum32()
-
-	addr := c.addresses[hash%uint32(len(c.addresses))]
-	conn, exists := c.conns[addr]
-	if !exists {
-		return nil, fmt.Errorf("no connection for address %s", addr)
-	}
-
-	// Note: Auto-reconnect disabled to avoid race conditions
-	// The connection health check and reconnect logic would need
-	// more sophisticated coordination to work safely in concurrent environments
-
-	return conn, nil
-}
-
-// routeCluster routes in cluster mode using consistent hashing
-func (c *Client) routeCluster(key string) (*connection, error) {
-	if c.ring == nil {
-		return nil, fmt.Errorf("ring not initialized")
-	}
-
-	// Find partition for key
-	partition := int32(c.ring.FindPartitionID([]byte(key)))
-
-	// Get node for partition
-	nodeID, exists := c.partitionOwners[partition]
-	if !exists {
-		return nil, fmt.Errorf("no owner for partition %d", partition)
-	}
-
-	// Get address for node
-	addr, exists := c.nodeAddresses[nodeID]
-	if !exists {
-		return nil, fmt.Errorf("no address for node %s", nodeID)
-	}
-
-	// Get connection for address
-	conn, exists := c.conns[addr]
-	if !exists {
-		return nil, fmt.Errorf("no connection for address %s", addr)
-	}
-
-	// Note: Auto-reconnect disabled to avoid race conditions
-	// The connection health check and reconnect logic would need
-	// more sophisticated coordination to work safely in concurrent environments
-
-	return conn, nil
-}
-
-// close closes the connection
-func (c *connection) close() error {
-	return c.conn.Close()
-}
-
-// recordError records an error for health tracking
-func (c *connection) recordError(err error) {
-	if err == nil {
-		return
-	}
-	c.mu.Lock()
-	c.lastError = err
-	c.lastErrorTime = time.Now()
-	c.mu.Unlock()
-}
-
-// isHealthy checks if the connection is healthy
-func (c *connection) isHealthy() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	// Check gRPC connection state
-	state := c.conn.GetState()
-	if state == connectivity.TransientFailure || state == connectivity.Shutdown {
-		return false
-	}
-
-	// Check if we've had recent errors (within last 30 seconds)
-	if c.lastError != nil && time.Since(c.lastErrorTime) < 30*time.Second {
-		// Only consider certain errors as unhealthy
-		if isConnectionError(c.lastError) {
-			return false
-		}
-	}
-
-	return true
-}
-
-// reconnect attempts to re-establish the connection
-func (c *connection) reconnect(dialOpts []grpc.DialOption) error {
-	// Use atomic CAS to ensure only one goroutine reconnects at a time
-	if !c.reconnecting.CompareAndSwap(false, true) {
-		// Another goroutine is already reconnecting
-		return nil
-	}
-	defer c.reconnecting.Store(false)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Check again if connection is healthy while holding the lock
-	state := c.conn.GetState()
-	if state != connectivity.TransientFailure && state != connectivity.Shutdown {
-		// Connection is fine, no need to reconnect
-		return nil
-	}
-
-	// Close existing connection
-	if c.conn != nil {
-		c.conn.Close()
-	}
-
-	// Create new connection
-	conn, err := grpc.Dial(c.address, dialOpts...)
-	if err != nil {
-		return fmt.Errorf("failed to reconnect: %w", err)
-	}
-
-	c.conn = conn
-	c.client = pb.NewCacheServiceClient(conn)
-	c.lastError = nil
-	c.lastErrorTime = time.Time{}
-
-	return nil
-}
-
-// Put stores a value in the cache
-func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
-	}
-
-	req := &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds}
-	_, err = conn.client.PutObject(ctx, req)
-
-	// Record error for health tracking
-	conn.recordError(err)
-
-	// If we get a routing error in cluster mode, refresh topology and retry once
-	if c.mode == ModeCluster && isRoutingError(err) {
-		if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
-			c.updateTopology(topology)
-			if conn, routeErr := c.route(key); routeErr == nil {
-				_, err = conn.client.PutObject(ctx, req)
-				conn.recordError(err)
-			}
-		}
-	}
-
-	return err
-}
-
-// PutStream streams data to the cache
-func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
-	}
-
-	stream, err := conn.client.Put(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Get buffer from pool
-	buf, release := bufferpool.AcquireBuffer(DefaultBufferSize)
-	defer release()
-
-	first := true
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		n, err := r.Read(buf)
-		if n > 0 {
-			req := &pb.PutRequest{Data: buf[:n]}
-			if first {
-				req.Key = key
-				req.TtlSeconds = ttlSeconds
-				first = false
-			}
-			if sendErr := stream.Send(req); sendErr != nil {
-				return sendErr
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return err
-	}
-	if resp != nil && !resp.Success {
-		return fmt.Errorf("put failed: %s", resp.Error)
-	}
-	return nil
-}
-
-// Get retrieves a value from the cache
-func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
-	req := &pb.GetRequest{Key: key}
-	return c.getDataWithRetry(ctx, key, req, 1)
-}
-
-// getDataWithRetry implements Get/GetRange with retry logic
-func (c *Client) getDataWithRetry(ctx context.Context, key string, req *pb.GetRequest, retryCount int) ([]byte, error) {
-	conn, err := c.route(key)
-	if err != nil {
-		return nil, err
-	}
-
-	stream, err := conn.client.Get(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// Pre-allocate result slice with initial capacity to reduce allocations
-	// Start with a reasonable size and let it grow if needed
-	result := make([]byte, 0, DefaultBufferSize)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Only retry if:
-			// 1. We're in cluster mode
-			// 2. It's a routing error
-			// 3. We haven't exceeded retry limit
-			// 4. We haven't received any data yet (to avoid data loss)
-			if c.mode == ModeCluster && isRoutingError(err) && retryCount > 0 && len(result) == 0 {
-				if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
-					c.updateTopology(topology)
-					return c.getDataWithRetry(ctx, key, req, retryCount-1)
-				}
-			}
-			return nil, err
-		}
-		result = append(result, resp.Data...)
-	}
-	return result, nil
-}
-
-// GetStream streams a value from the cache
-func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
-	req := &pb.GetRequest{Key: key}
-	return c.getStreamWithRetry(ctx, key, req, w, 1)
-}
-
-// getStreamWithRetry implements GetStream/GetRangeStream with retry logic
-func (c *Client) getStreamWithRetry(ctx context.Context, key string, req *pb.GetRequest, w io.Writer, retryCount int) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
-	}
-
-	stream, err := conn.client.Get(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	var bytesWritten int64
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			// Only retry if:
-			// 1. We're in cluster mode
-			// 2. It's a routing error
-			// 3. We haven't exceeded retry limit
-			// 4. We haven't written any data yet (to avoid duplicates)
-			if c.mode == ModeCluster && isRoutingError(err) && retryCount > 0 && bytesWritten == 0 {
-				if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
-					c.updateTopology(topology)
-					return c.getStreamWithRetry(ctx, key, req, w, retryCount-1)
-				}
-			}
-			return err
-		}
-		n, err := w.Write(resp.Data)
-		if err != nil {
-			return err
-		}
-		bytesWritten += int64(n)
-	}
-	return nil
-}
-
-// GetRange retrieves a byte range from the cache
-func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	req := &pb.GetRequest{
-		Key:   key,
-		Start: start,
-		End:   end,
-	}
-	return c.getDataWithRetry(ctx, key, req, 1)
-}
-
-// GetRangeStream streams a byte range from the cache
-func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	req := &pb.GetRequest{
-		Key:   key,
-		Start: start,
-		End:   end,
-	}
-	return c.getStreamWithRetry(ctx, key, req, w, 1)
-}
-
-// Delete removes a key from the cache
-func (c *Client) Delete(ctx context.Context, key string) error {
-	conn, err := c.route(key)
-	if err != nil {
-		return err
-	}
-
-	_, err = conn.client.Delete(ctx, &pb.DeleteRequest{Key: key})
-
-	// Retry once with topology refresh for cluster mode
-	if c.mode == ModeCluster && isRoutingError(err) {
-		if topology, fetchErr := c.fetchTopology(); fetchErr == nil {
-			c.updateTopology(topology)
-			if conn, routeErr := c.route(key); routeErr == nil {
-				_, err = conn.client.Delete(ctx, &pb.DeleteRequest{Key: key})
-			}
-		}
-	}
-
-	return err
-}
-
-// List lists keys with optional prefix
-func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
-	// For list operation, just use round-robin selection
-	var conn *connection
-
-	c.mu.RLock()
-	if len(c.conns) > 0 {
-		// Get all connections and sort for consistent ordering
-		var addresses []string
-		for addr := range c.conns {
-			addresses = append(addresses, addr)
-		}
-		sort.Strings(addresses)
-
-		idx := c.currentIdx.Add(1) - 1
-		addr := addresses[idx%uint32(len(addresses))]
-		conn = c.conns[addr]
-	}
-	c.mu.RUnlock()
-
-	if conn == nil {
-		return nil, fmt.Errorf("no available connections")
-	}
-
-	stream, err := conn.client.List(ctx, &pb.ListRequest{Prefix: prefix})
-	if err != nil {
-		return nil, err
-	}
-
-	var keys []string
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, resp.Keys...)
-	}
-	return keys, nil
-}
-
-// Close closes all connections and stops background goroutines
-func (c *Client) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Check if already closed
-	select {
-	case <-c.stopCh:
-		// Already closed
-		return nil
-	default:
-		// Signal stop to background goroutines
-		close(c.stopCh)
-	}
-
-	// Close all connections
-	var firstErr error
-	for _, conn := range c.conns {
-		if err := conn.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-
-	c.conns = make(map[string]*connection)
-	return firstErr
-}
-
 // GetMode returns the actual connection mode being used
 func (c *Client) GetMode() ConnectionMode {
 	return c.mode
 }
 
-// GetConnectedNodes returns the addresses of all connected nodes
-func (c *Client) GetConnectedNodes() []string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	var nodes []string
-	for addr := range c.conns {
-		nodes = append(nodes, addr)
-	}
-	sort.Strings(nodes)
-	return nodes
-}
+// Additional methods for backward compatibility with tests
 
 // GetTopologyEpoch returns the current topology epoch (cluster mode only)
 func (c *Client) GetTopologyEpoch() uint64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.topologyEpoch
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetTopologyEpoch()
+	}
+	return 0
 }
 
 // HasRing returns true if the consistent hash ring is initialized (cluster mode only)
 func (c *Client) HasRing() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.ring != nil
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.HasRing()
+	}
+	return false
 }
 
 // GetPartitionOwner returns the node ID that owns the given partition (cluster mode only)
 func (c *Client) GetPartitionOwner(partitionID int32) string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.partitionOwners[partitionID]
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetPartitionOwner(partitionID)
+	}
+	return ""
 }
 
 // GetPartitionOwnerCount returns the number of partition owners (cluster mode only)
 func (c *Client) GetPartitionOwnerCount() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.partitionOwners)
-}
-
-// isRoutingError checks if an error indicates we should refresh topology
-func isRoutingError(err error) bool {
-	if err == nil {
-		return false
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetPartitionOwnerCount()
 	}
-
-	st, ok := status.FromError(err)
-	if !ok {
-		return false
-	}
-
-	// These errors indicate the node doesn't own the key anymore
-	return st.Code() == codes.FailedPrecondition ||
-		st.Code() == codes.NotFound ||
-		st.Code() == codes.Unavailable
-}
-
-// isConnectionError checks if an error indicates a connection problem
-func isConnectionError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	st, ok := status.FromError(err)
-	if !ok {
-		// Non-gRPC errors might be network errors
-		return true
-	}
-
-	// These errors indicate connection issues
-	return st.Code() == codes.Unavailable ||
-		st.Code() == codes.Internal ||
-		st.Code() == codes.Unknown ||
-		st.Code() == codes.DeadlineExceeded ||
-		st.Code() == codes.Canceled
+	return 0
 }
