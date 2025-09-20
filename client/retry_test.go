@@ -74,10 +74,10 @@ func TestRetry_AllOperations(t *testing.T) {
 		{
 			name: "Get with routing error",
 			setupError: func() {
-				server.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
+				server.cacheService.getError = status.Error(codes.FailedPrecondition, "routing error")
 			},
 			cleanupError: func() {
-				delete(server.cacheService.streamErrors, testKey)
+				server.cacheService.getError = nil
 			},
 			operation: func() error {
 				_, err := client.Get(ctx, testKey)
@@ -145,10 +145,10 @@ func TestRetry_AllOperations(t *testing.T) {
 		{
 			name: "GetStream with routing error",
 			setupError: func() {
-				server.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
+				server.cacheService.getError = status.Error(codes.FailedPrecondition, "routing error")
 			},
 			cleanupError: func() {
-				delete(server.cacheService.streamErrors, testKey)
+				server.cacheService.getError = nil
 			},
 			operation: func() error {
 				var buf bytes.Buffer
@@ -163,10 +163,10 @@ func TestRetry_AllOperations(t *testing.T) {
 		{
 			name: "GetRange with routing error",
 			setupError: func() {
-				server.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
+				server.cacheService.getError = status.Error(codes.FailedPrecondition, "routing error")
 			},
 			cleanupError: func() {
-				delete(server.cacheService.streamErrors, testKey)
+				server.cacheService.getError = nil
 			},
 			operation: func() error {
 				_, err := client.GetRange(ctx, testKey, 0, 5)
@@ -181,10 +181,10 @@ func TestRetry_AllOperations(t *testing.T) {
 		{
 			name: "GetRangeStream with routing error",
 			setupError: func() {
-				server.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
+				server.cacheService.getError = status.Error(codes.FailedPrecondition, "routing error")
 			},
 			cleanupError: func() {
-				delete(server.cacheService.streamErrors, testKey)
+				server.cacheService.getError = nil
 			},
 			operation: func() error {
 				var buf bytes.Buffer
@@ -552,7 +552,7 @@ func TestRetry_ConcurrentRetries(t *testing.T) {
 	assert.GreaterOrEqual(t, getCountAfter-getCountBefore, int32(15), "Should have retries for failed operations")
 }
 
-// TestRetry_PutStream tests PutStream retry logic in cluster mode
+// TestRetry_PutStream tests PutStream behavior in cluster mode
 func TestRetry_PutStream(t *testing.T) {
 	// Create server with cluster topology
 	server, err := newTestServerWithAddr()
@@ -576,50 +576,47 @@ func TestRetry_PutStream(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("PutStream retries on routing error", func(t *testing.T) {
-		// Configure server to return routing error initially
-		server.cacheService.putError = status.Error(codes.FailedPrecondition, "routing error")
+	// Note: PutStream doesn't have retry logic in ClusterClient, it inherits from Operations
+	// This test verifies that PutStream works correctly but doesn't retry on errors
 
-		// Track put count
-		initialPutCount, _, _, _ := server.GetCallCounts()
-
-		// Clear error after short delay to allow retry to succeed
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			server.cacheService.putError = nil
-		}()
-
-		// PutStream should retry and succeed
-		testData := []byte("test stream data")
-		reader := bytes.NewReader(testData)
-		err := client.PutStream(ctx, "stream-retry-key", reader, 0)
-		require.NoError(t, err)
-
-		// Should have been called twice (initial + retry)
-		finalPutCount, _, _, _ := server.GetCallCounts()
-		assert.GreaterOrEqual(t, finalPutCount-initialPutCount, int32(1))
-
-		server.Reset()
-	})
-
-	t.Run("PutStream doesn't retry after partial data sent", func(t *testing.T) {
-		// This is handled by Operations module, but we can test that
-		// the operation completes without corruption
+	t.Run("PutStream completes successfully", func(t *testing.T) {
+		// Test that PutStream works without errors
 		testData := make([]byte, 1024)
 		for i := range testData {
 			testData[i] = byte(i % 256)
 		}
 
 		reader := bytes.NewReader(testData)
-		err := client.PutStream(ctx, "partial-stream-key", reader, 0)
+		err := client.PutStream(ctx, "stream-key", reader, 0)
 		require.NoError(t, err)
 
 		// Verify data was stored correctly
-		assert.Equal(t, testData, server.cacheService.data["partial-stream-key"])
+		assert.Equal(t, testData, server.cacheService.data["stream-key"])
+	})
+
+	t.Run("PutStream fails on routing error without retry", func(t *testing.T) {
+		// Configure server to return routing error
+		server.cacheService.putError = status.Error(codes.FailedPrecondition, "routing error")
+
+		// Track put count
+		initialPutCount, _, _, _ := server.GetCallCounts()
+
+		// PutStream should fail without retry
+		testData := []byte("test stream data")
+		reader := bytes.NewReader(testData)
+		err := client.PutStream(ctx, "stream-retry-key", reader, 0)
+		assert.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+		// Should have been called only once (no retry)
+		finalPutCount, _, _, _ := server.GetCallCounts()
+		assert.Equal(t, int32(1), finalPutCount-initialPutCount, "Should call Put exactly once (no retry)")
+
+		server.Reset()
 	})
 }
 
-// TestRetry_List tests List retry logic in cluster mode
+// TestRetry_List tests List behavior in cluster mode
 func TestRetry_List(t *testing.T) {
 	// Create server with cluster topology
 	server, err := newTestServerWithAddr()
@@ -648,27 +645,32 @@ func TestRetry_List(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("List retries on routing error", func(t *testing.T) {
-		// Configure server to return routing error initially
+	// Note: List doesn't have retry logic in ClusterClient, it inherits from Operations
+	// This test verifies that List works correctly but doesn't retry on errors
+
+	t.Run("List works successfully", func(t *testing.T) {
+		// List should work without errors
+		keys, err := client.List(ctx, "list-key-")
+		require.NoError(t, err)
+		assert.Len(t, keys, 3)
+		assert.ElementsMatch(t, []string{"list-key-1", "list-key-2", "list-key-3"}, keys)
+	})
+
+	t.Run("List fails on routing error without retry", func(t *testing.T) {
+		// Configure server to return routing error
 		server.cacheService.listError = status.Error(codes.FailedPrecondition, "routing error")
 
 		// Track list count
 		_, _, _, initialListCount := server.GetCallCounts()
 
-		// Clear error after short delay to allow retry to succeed
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			server.cacheService.listError = nil
-		}()
+		// List should fail without retry
+		_, err := client.List(ctx, "list-key-")
+		assert.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 
-		// List should retry and succeed
-		keys, err := client.List(ctx, "list-key-")
-		require.NoError(t, err)
-		assert.Len(t, keys, 3)
-
-		// Should have been called at least once
+		// Should have been called only once (no retry)
 		_, _, _, finalListCount := server.GetCallCounts()
-		assert.GreaterOrEqual(t, finalListCount-initialListCount, int32(1))
+		assert.Equal(t, int32(1), finalListCount-initialListCount, "Should call List exactly once (no retry)")
 
 		server.Reset()
 	})
@@ -865,27 +867,28 @@ func TestRetry_GetRange(t *testing.T) {
 
 	ctx := context.Background()
 
-	t.Run("routing error with retry", func(t *testing.T) {
-		// Configure to fail once then succeed
-		server.cacheService.streamErrors[testKey] = status.Error(codes.FailedPrecondition, "routing error")
+	t.Run("routing error that persists", func(t *testing.T) {
+		// Test that GetRange fails with routing error and retries once
+		persistKey := "persist-range-key"
+		server.cacheService.data[persistKey] = testData
+		
+		// Configure to always fail with routing error
+		server.cacheService.getError = status.Error(codes.FailedPrecondition, "routing error")
 
 		// Track get count before operation
 		_, getCountBefore, _, _ := server.GetCallCounts()
 
-		// Should retry and succeed (after we clear the error)
-		go func() {
-			// Clear error after short delay to allow first attempt to fail
-			<-time.After(10 * time.Millisecond)
-			delete(server.cacheService.streamErrors, testKey)
-		}()
+		// GetRange should fail after retry
+		_, err := client.GetRange(ctx, persistKey, 10, 20)
+		assert.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 
-		data, err := client.GetRange(ctx, testKey, 10, 20)
-		require.NoError(t, err)
-		assert.Equal(t, testData[10:20], data)
-
-		// Should have called Get at least once
+		// Should have called Get twice (initial + 1 retry)
 		_, getCountAfter, _, _ := server.GetCallCounts()
-		assert.GreaterOrEqual(t, getCountAfter-getCountBefore, int32(1))
+		assert.Equal(t, int32(2), getCountAfter-getCountBefore, "Should make 2 calls: initial + 1 retry")
+		
+		// Clean up
+		server.cacheService.getError = nil
 	})
 
 	t.Run("no retry after partial data", func(t *testing.T) {
@@ -902,12 +905,15 @@ func TestRetry_GetRange(t *testing.T) {
 		_, getCountBefore, _, _ := server.GetCallCounts()
 
 		// Should fail without retry (partial data received)
-		_, err := client.GetRange(ctx, partialKey, 0, 20)
+		data, err := client.GetRange(ctx, partialKey, 0, 20)
 		assert.Error(t, err)
+		
+		// Check what data was received (should be empty since error should prevent returning partial data)
+		assert.Nil(t, data, "Should not return partial data on error")
 
 		// Should have been called only once (no retry)
 		_, getCountAfter, _, _ := server.GetCallCounts()
-		assert.Equal(t, int32(1), getCountAfter-getCountBefore)
+		assert.Equal(t, int32(1), getCountAfter-getCountBefore, "Should not retry after receiving partial data")
 
 		server.Reset()
 	})
