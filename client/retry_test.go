@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -508,8 +509,8 @@ func TestRetry_ConcurrentRetries(t *testing.T) {
 
 	// Set up test data - half with errors, half without
 	for i := 0; i < 10; i++ {
-		key := "concurrent-key-" + string(rune('0'+i))
-		server.cacheService.data[key] = []byte("value-" + string(rune('0'+i)))
+		key := fmt.Sprintf("concurrent-key-%d", i)
+		server.cacheService.data[key] = []byte(fmt.Sprintf("value-%d", i))
 		// Only set routing errors for first 5 keys
 		if i < 5 {
 			server.cacheService.streamErrors[key] = status.Error(codes.FailedPrecondition, "routing error")
@@ -524,7 +525,7 @@ func TestRetry_ConcurrentRetries(t *testing.T) {
 	// Launch concurrent Get operations
 	for i := 0; i < 10; i++ {
 		go func(idx int) {
-			key := "concurrent-key-" + string(rune('0'+idx))
+			key := fmt.Sprintf("concurrent-key-%d", idx)
 			_, err := client.Get(ctx, key)
 			errChan <- err
 		}(i)
@@ -871,7 +872,7 @@ func TestRetry_GetRange(t *testing.T) {
 		// Test that GetRange fails with routing error and retries once
 		persistKey := "persist-range-key"
 		server.cacheService.data[persistKey] = testData
-		
+
 		// Configure to always fail with routing error
 		server.cacheService.getError = status.Error(codes.FailedPrecondition, "routing error")
 
@@ -886,7 +887,7 @@ func TestRetry_GetRange(t *testing.T) {
 		// Should have called Get twice (initial + 1 retry)
 		_, getCountAfter, _, _ := server.GetCallCounts()
 		assert.Equal(t, int32(2), getCountAfter-getCountBefore, "Should make 2 calls: initial + 1 retry")
-		
+
 		// Clean up
 		server.cacheService.getError = nil
 	})
@@ -907,7 +908,7 @@ func TestRetry_GetRange(t *testing.T) {
 		// Should fail without retry (partial data received)
 		data, err := client.GetRange(ctx, partialKey, 0, 20)
 		assert.Error(t, err)
-		
+
 		// Check what data was received (should be empty since error should prevent returning partial data)
 		assert.Nil(t, data, "Should not return partial data on error")
 
@@ -926,15 +927,11 @@ type failingWriter struct {
 }
 
 func (f *failingWriter) Write(p []byte) (n int, err error) {
-	if f.written+len(p) > f.failAfter {
-		// Write would exceed limit
+	if f.written+len(p) >= f.failAfter {
+		// Write would reach or exceed limit
 		return 0, errors.New("simulated write failure")
 	}
 	f.written += len(p)
-	if f.written >= f.failAfter {
-		// Exactly at limit
-		return 0, errors.New("simulated write failure")
-	}
 	return len(p), nil
 }
 

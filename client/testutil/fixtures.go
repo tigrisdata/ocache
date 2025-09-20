@@ -38,7 +38,7 @@ func StandardTestKeys() []string {
 func CreateSimpleTopology(addresses []string, epoch uint64) *clusterpb.ClusterTopology {
 	nodes := make([]*clusterpb.NodeInfo, len(addresses))
 	partitionOwners := make([]*clusterpb.PartitionOwner, 0)
-	
+
 	for i, addr := range addresses {
 		nodes[i] = &clusterpb.NodeInfo{
 			Id:      fmt.Sprintf("node-%d", i),
@@ -46,7 +46,7 @@ func CreateSimpleTopology(addresses []string, epoch uint64) *clusterpb.ClusterTo
 			Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 		}
 	}
-	
+
 	// Distribute partitions among nodes
 	partitionCount := int32(10)
 	for i := int32(0); i < partitionCount; i++ {
@@ -56,7 +56,7 @@ func CreateSimpleTopology(addresses []string, epoch uint64) *clusterpb.ClusterTo
 			NodeId:      nodes[nodeIdx].Id,
 		})
 	}
-	
+
 	return &clusterpb.ClusterTopology{
 		Epoch: epoch,
 		Nodes: nodes,
@@ -72,13 +72,13 @@ func CreateSimpleTopology(addresses []string, epoch uint64) *clusterpb.ClusterTo
 // CreateTopologyWithDownNodes creates a topology with some nodes marked as down
 func CreateTopologyWithDownNodes(addresses []string, downIndices []int, epoch uint64) *clusterpb.ClusterTopology {
 	topology := CreateSimpleTopology(addresses, epoch)
-	
+
 	for _, idx := range downIndices {
 		if idx < len(topology.Nodes) {
 			topology.Nodes[idx].Status = clusterpb.NodeStatus_NODE_STATUS_DOWN
 		}
 	}
-	
+
 	return topology
 }
 

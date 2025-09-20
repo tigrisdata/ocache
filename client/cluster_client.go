@@ -210,7 +210,7 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, start,
 
 	// Build request with optional range parameters
 	req := &pb.GetRequest{Key: key}
-	if start > 0 || end > 0 {
+	if start != 0 || end != 0 {
 		req.Start = start
 		req.End = end
 	}
@@ -270,7 +270,7 @@ func (c *ClusterClient) getStreamDataWithRetry(ctx context.Context, key string, 
 
 	// Build request with optional range parameters
 	req := &pb.GetRequest{Key: key}
-	if start > 0 || end > 0 {
+	if start != 0 || end != 0 {
 		req.Start = start
 		req.End = end
 	}

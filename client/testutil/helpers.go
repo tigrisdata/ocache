@@ -69,8 +69,7 @@ func RetryWithBackoff(ctx context.Context, maxRetries int, initialDelay time.Dur
 			return err // Last attempt failed
 		}
 	}
-
-	return nil // Should never reach here
+	panic("unreachable") // Loop always exits via return
 }
 
 // AssertNoError asserts that no error occurred and fails the test if there was
@@ -110,8 +109,9 @@ func RunConcurrently(n int, fn func(id int)) {
 
 // CollectErrors collects errors from concurrent operations
 type ErrorCollector struct {
-	errors []error
-	ch     chan error
+	errors    []error
+	ch        chan error
+	collected bool
 }
 
 // NewErrorCollector creates a new error collector
@@ -124,7 +124,7 @@ func NewErrorCollector(bufferSize int) *ErrorCollector {
 
 // Add adds an error to the collector
 func (ec *ErrorCollector) Add(err error) {
-	if err != nil {
+	if err != nil && !ec.collected {
 		select {
 		case ec.ch <- err:
 		default:
@@ -133,11 +133,15 @@ func (ec *ErrorCollector) Add(err error) {
 	}
 }
 
-// Collect collects all errors and returns them
+// Collect collects all errors and returns them.
+// This method can only be called once - subsequent calls will return the same slice.
 func (ec *ErrorCollector) Collect() []error {
-	close(ec.ch)
-	for err := range ec.ch {
-		ec.errors = append(ec.errors, err)
+	if !ec.collected {
+		ec.collected = true
+		close(ec.ch)
+		for err := range ec.ch {
+			ec.errors = append(ec.errors, err)
+		}
 	}
 	return ec.errors
 }

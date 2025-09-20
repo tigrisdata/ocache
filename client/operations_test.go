@@ -305,8 +305,12 @@ func TestConcurrent_MixedOperations(t *testing.T) {
 			for j := 0; j < 10; j++ {
 				key := fmt.Sprintf("delete-key-%d-%d", id, j)
 				// First put, then delete
-				client.Put(ctx, key, []byte("temp"), 0)
-				err := client.Delete(ctx, key)
+				err := client.Put(ctx, key, []byte("temp"), 0)
+				if err != nil {
+					atomic.AddInt32(&errors, 1)
+					continue
+				}
+				err = client.Delete(ctx, key)
 				if err != nil {
 					atomic.AddInt32(&errors, 1)
 				} else {

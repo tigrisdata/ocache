@@ -113,5 +113,8 @@ func (c *connection) reconnect(dialOpts []grpc.DialOption) error {
 
 // getClient returns the gRPC client for this connection
 func (c *connection) getClient() pb.CacheServiceClient {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	return c.client
 }
