@@ -32,6 +32,13 @@ type cacheService struct {
 	coordinator *coordinator.Coordinator
 }
 
+// newCacheService creates a new cache service, optionally with clustering support
+func newCacheService(coord *coordinator.Coordinator) *cacheService {
+	return &cacheService{
+		coordinator: coord,
+	}
+}
+
 // Streaming Put for large values
 func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	start := time.Now()

@@ -8,20 +8,12 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
-	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
-
-// newCacheService creates a new cache service, optionally with clustering support
-func newCacheService(coord *coordinator.Coordinator) *cacheService {
-	return &cacheService{
-		coordinator: coord,
-	}
-}
 
 // handleClusteredPut handles Put requests in cluster mode
 func (s *cacheService) handleClusteredPut(stream pb.CacheService_PutServer) error {
