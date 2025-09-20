@@ -359,7 +359,7 @@ func TestConnection(t *testing.T) {
 		// Create connection
 		conn, err := newConnection(serverAddr, []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		})
+		}, 1)
 		require.NoError(t, err)
 		assert.NotNil(t, conn)
 		assert.Equal(t, serverAddr, conn.address)
@@ -376,7 +376,7 @@ func TestConnection(t *testing.T) {
 	t.Run("connection health check", func(t *testing.T) {
 		conn, err := newConnection(serverAddr, []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		})
+		}, 1)
 		require.NoError(t, err)
 		defer conn.close()
 
@@ -395,7 +395,7 @@ func TestConnection(t *testing.T) {
 	t.Run("record and clear errors", func(t *testing.T) {
 		conn, err := newConnection(serverAddr, []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		})
+		}, 1)
 		require.NoError(t, err)
 		defer conn.close()
 
@@ -426,7 +426,7 @@ func TestConnection_Reconnect(t *testing.T) {
 		// Create connection
 		conn, err := newConnection(serverAddr, []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		})
+		}, 1)
 		require.NoError(t, err)
 		defer conn.close()
 
@@ -474,12 +474,12 @@ func TestConnection_State(t *testing.T) {
 		// Create connection
 		conn, err := newConnection(serverAddr, []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-		})
+		}, 1)
 		require.NoError(t, err)
 		defer conn.close()
 
 		// Check initial state
-		state := conn.conn.GetState()
+		state := conn.connections[0].GetState()
 		assert.True(t,
 			state == connectivity.Ready ||
 				state == connectivity.Connecting ||

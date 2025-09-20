@@ -32,14 +32,17 @@ const (
 	ConnectionHealthCheckInterval = 30 * time.Second
 	// ConnectionErrorWindow is the time window for tracking connection errors
 	ConnectionErrorWindow = 30 * time.Second
+	// DefaultConnectionPoolSize is the default number of connections per address
+	DefaultConnectionPoolSize = 4
 )
 
 // ClientConfig contains configuration for the unified Client
 type ClientConfig struct {
-	Addrs           []string          // One or more server addresses
-	Mode            ConnectionMode    // Connection mode (default: "auto")
-	RefreshInterval time.Duration     // Topology refresh for cluster mode (default: 30s)
-	DialOpts        []grpc.DialOption // Optional gRPC dial options
+	Addrs              []string          // One or more server addresses
+	Mode               ConnectionMode    // Connection mode (default: "auto")
+	RefreshInterval    time.Duration     // Topology refresh for cluster mode (default: 30s)
+	ConnectionPoolSize int               // Number of connections per address (default: 3)
+	DialOpts           []grpc.DialOption // Optional gRPC dial options
 }
 
 // SetDefaults sets default values for unspecified config fields
@@ -49,6 +52,9 @@ func (c *ClientConfig) SetDefaults() {
 	}
 	if c.RefreshInterval == 0 {
 		c.RefreshInterval = DefaultRefreshInterval
+	}
+	if c.ConnectionPoolSize <= 0 {
+		c.ConnectionPoolSize = DefaultConnectionPoolSize
 	}
 	if len(c.DialOpts) == 0 {
 		c.DialOpts = DefaultDialOptions()

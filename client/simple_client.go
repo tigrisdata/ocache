@@ -38,7 +38,7 @@ func NewSimpleClient(config *ClientConfig) (*SimpleClient, error) {
 	// Create connections for each address
 	var lastErr error
 	for _, addr := range client.addresses {
-		conn, err := newConnection(addr, config.DialOpts)
+		conn, err := newConnection(addr, config.DialOpts, config.ConnectionPoolSize)
 		if err != nil {
 			lastErr = fmt.Errorf("failed to create connection for %s: %w", addr, err)
 			// Continue trying other addresses

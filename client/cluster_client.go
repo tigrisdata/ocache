@@ -99,7 +99,7 @@ func (c *ClusterClient) updateConnections(topology *clusterpb.ClusterTopology) e
 	// Create new connections for new nodes
 	for addr := range activeNodes {
 		if _, exists := c.conns[addr]; !exists {
-			conn, err := newConnection(addr, c.config.DialOpts)
+			conn, err := newConnection(addr, c.config.DialOpts, c.config.ConnectionPoolSize)
 			if err != nil {
 				// Log error but continue
 				continue
