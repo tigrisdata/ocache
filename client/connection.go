@@ -150,10 +150,9 @@ func (c *connection) reconnectUnhealthy(dialOpts []grpc.DialOption) error {
 			// Close the unhealthy connection
 			conn.Close()
 
-			// Create unique dial options for this connection
 			opts := append([]grpc.DialOption{}, dialOpts...)
 			opts = append(opts, grpc.WithDefaultCallOptions(
-				grpc.MaxCallRecvMsgSize(MaxMessageSize+i),
+				grpc.MaxCallRecvMsgSize(MaxMessageSize),
 			))
 
 			// Create new connection
