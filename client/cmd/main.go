@@ -34,15 +34,16 @@ var (
 	connMode        string
 	topologyRefresh time.Duration
 
-	numKeys        int
-	valueSize      int
-	numOps         int
-	concurrency    int
-	workload       string
-	seed           int64
-	noProgress     bool
-	forceStreaming bool
-	listPrefix     string
+	connectionPoolSize int
+	numKeys            int
+	valueSize          int
+	numOps             int
+	concurrency        int
+	workload           string
+	seed               int64
+	noProgress         bool
+	forceStreaming     bool
+	listPrefix         string
 )
 
 func newClient() *cacheclient.Client {
@@ -53,9 +54,10 @@ func newClient() *cacheclient.Client {
 	}
 
 	config := &cacheclient.ClientConfig{
-		Addrs:           addrs,
-		Mode:            cacheclient.ConnectionMode(connMode),
-		RefreshInterval: topologyRefresh,
+		Addrs:              addrs,
+		Mode:               cacheclient.ConnectionMode(connMode),
+		RefreshInterval:    topologyRefresh,
+		ConnectionPoolSize: connectionPoolSize,
 	}
 
 	c, err := cacheclient.NewWithConfig(config)
@@ -209,17 +211,18 @@ var benchCmd = &cobra.Command{
 		defer cancel()
 
 		cfg := ycsb.YCSBConfig{
-			Addr:            addr,
-			ConnMode:        connMode,
-			TopologyRefresh: topologyRefresh,
-			NumKeys:         numKeys,
-			ValueSize:       valueSize,
-			NumOps:          numOps,
-			Concurrency:     concurrency,
-			Workload:        workload,
-			Seed:            seed,
-			NoProgress:      noProgress,
-			ForceStreaming:  forceStreaming,
+			Addr:               addr,
+			ConnMode:           connMode,
+			TopologyRefresh:    topologyRefresh,
+			ConnectionPoolSize: connectionPoolSize,
+			NumKeys:            numKeys,
+			ValueSize:          valueSize,
+			NumOps:             numOps,
+			Concurrency:        concurrency,
+			Workload:           workload,
+			Seed:               seed,
+			NoProgress:         noProgress,
+			ForceStreaming:     forceStreaming,
 		}
 		_, err := ycsb.RunYCSBWithContext(ctx, cfg)
 		if err != nil {
@@ -239,6 +242,7 @@ func init() {
 	rootCmd.PersistentFlags().DurationVar(&topologyRefresh, "topology-refresh", 30*time.Second, "Topology refresh interval (cluster mode only)")
 	putCmd.Flags().Int64Var(&ttl, "ttl", 0, "TTL for the key in seconds (0 = no expiry)")
 	listCmd.Flags().StringVar(&listPrefix, "prefix", "", "Optional prefix to filter keys")
+	benchCmd.Flags().IntVar(&connectionPoolSize, "connection-pool-size", 8, "Number of connections per cache server")
 	benchCmd.Flags().IntVar(&numKeys, "num-keys", 1000, "Number of unique keys")
 	benchCmd.Flags().IntVar(&valueSize, "value-size", 100, "Value size in bytes")
 	benchCmd.Flags().IntVar(&numOps, "num-ops", 10000, "Total number of operations")

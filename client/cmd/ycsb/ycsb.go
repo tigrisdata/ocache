@@ -76,17 +76,18 @@ func ParseWorkload(s string) (WorkloadSpec, error) {
 }
 
 type YCSBConfig struct {
-	Addr            string        // Address of the cache service (host:port or comma-separated)
-	ConnMode        string        // Connection mode: auto, simple, or cluster
-	TopologyRefresh time.Duration // Topology refresh interval (cluster mode only)
-	NumKeys         int           // Number of unique keys to use in the benchmark
-	ValueSize       int           // Size of each value in bytes
-	NumOps          int           // Total number of operations to perform
-	Concurrency     int           // Number of concurrent workers
-	Workload        string        // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
-	Seed            int64         // Seed for random number generation (for reproducibility)
-	NoProgress      bool          // Disable progress output during benchmark
-	ForceStreaming  bool          // Force streaming for all operations regardless of size
+	Addr               string        // Address of the cache service (host:port or comma-separated)
+	ConnMode           string        // Connection mode: auto, simple, or cluster
+	TopologyRefresh    time.Duration // Topology refresh interval (cluster mode only)
+	ConnectionPoolSize int           // Number of connections per address (default: 4)
+	NumKeys            int           // Number of unique keys to use in the benchmark
+	ValueSize          int           // Size of each value in bytes
+	NumOps             int           // Total number of operations to perform
+	Concurrency        int           // Number of concurrent workers
+	Workload           string        // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
+	Seed               int64         // Seed for random number generation (for reproducibility)
+	NoProgress         bool          // Disable progress output during benchmark
+	ForceStreaming     bool          // Force streaming for all operations regardless of size
 }
 
 type Result struct {
@@ -143,9 +144,10 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 	}
 
 	config := &cacheclient.ClientConfig{
-		Addrs:           addrs,
-		Mode:            cacheclient.ConnectionMode(cfg.ConnMode),
-		RefreshInterval: cfg.TopologyRefresh,
+		Addrs:              addrs,
+		Mode:               cacheclient.ConnectionMode(cfg.ConnMode),
+		RefreshInterval:    cfg.TopologyRefresh,
+		ConnectionPoolSize: cfg.ConnectionPoolSize,
 	}
 
 	client, err := cacheclient.NewWithConfig(config)
@@ -302,9 +304,10 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 
 	// Create one client for the benchmark
 	config := &cacheclient.ClientConfig{
-		Addrs:           addrs,
-		Mode:            cacheclient.ConnectionMode(cfg.ConnMode),
-		RefreshInterval: cfg.TopologyRefresh,
+		Addrs:              addrs,
+		Mode:               cacheclient.ConnectionMode(cfg.ConnMode),
+		RefreshInterval:    cfg.TopologyRefresh,
+		ConnectionPoolSize: cfg.ConnectionPoolSize,
 	}
 
 	mainClient, err := cacheclient.NewWithConfig(config)
