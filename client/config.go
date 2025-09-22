@@ -41,7 +41,7 @@ type ClientConfig struct {
 	Addrs              []string          // One or more server addresses
 	Mode               ConnectionMode    // Connection mode (default: "auto")
 	RefreshInterval    time.Duration     // Topology refresh for cluster mode (default: 30s)
-	ConnectionPoolSize int               // Number of connections per address (default: 3)
+	ConnectionPoolSize int               // Number of connections per address (default: 4)
 	DialOpts           []grpc.DialOption // Optional gRPC dial options
 }
 

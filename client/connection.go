@@ -37,13 +37,11 @@ func newConnection(addr string, dialOpts []grpc.DialOption, poolSize int) (*conn
 		clients:     make([]pb.CacheServiceClient, 0, poolSize),
 	}
 
-	// Create multiple connections with unique channel args to prevent connection reuse
+	// Create multiple connections
 	for i := 0; i < poolSize; i++ {
-		// Create unique dial options for each connection
 		opts := append([]grpc.DialOption{}, dialOpts...)
-		// Add a unique option to force separate connections
 		opts = append(opts, grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(MaxMessageSize+i), // Slightly different size to ensure unique connections
+			grpc.MaxCallRecvMsgSize(MaxMessageSize),
 		))
 
 		conn, err := grpc.Dial(addr, opts...)
