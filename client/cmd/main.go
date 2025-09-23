@@ -242,7 +242,7 @@ func init() {
 	rootCmd.PersistentFlags().DurationVar(&topologyRefresh, "topology-refresh", 30*time.Second, "Topology refresh interval (cluster mode only)")
 	putCmd.Flags().Int64Var(&ttl, "ttl", 0, "TTL for the key in seconds (0 = no expiry)")
 	listCmd.Flags().StringVar(&listPrefix, "prefix", "", "Optional prefix to filter keys")
-	benchCmd.Flags().IntVar(&connectionPoolSize, "connection-pool-size", 8, "Number of connections per cache server")
+	benchCmd.Flags().IntVar(&connectionPoolSize, "connection-pool-size", 4, "Number of connections per cache server")
 	benchCmd.Flags().IntVar(&numKeys, "num-keys", 1000, "Number of unique keys")
 	benchCmd.Flags().IntVar(&valueSize, "value-size", 100, "Value size in bytes")
 	benchCmd.Flags().IntVar(&numOps, "num-ops", 10000, "Total number of operations")
