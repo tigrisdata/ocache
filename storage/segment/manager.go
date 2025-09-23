@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/metrics"
-	"github.com/tigrisdata/ocache/storage/bufferpool"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/utils"
 

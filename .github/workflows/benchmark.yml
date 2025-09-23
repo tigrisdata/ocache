@@ -114,22 +114,22 @@ jobs:
       - name: Run benchmark - 100 bytes
         run: |
           echo "=== Running benchmark with 100 byte objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 100 --workload "read=80,update=20" --no-progress | tee 100-byte-read-80-update-20.log
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 100000 --value-size 100 --workload "read=80,update=20" --no-progress | tee 100-byte-read-80-update-20.log
 
       - name: Run benchmark - 100 KB
         run: |
           echo "=== Running benchmark with 100 KB objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 102400 --workload "read=80,update=20" --no-progress | tee 100kb-read-80-update-20.log
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 100000 --value-size 102400 --workload "read=80,update=20" --no-progress | tee 100kb-read-80-update-20.log
 
       - name: Run benchmark - 1 MB
         run: |
           echo "=== Running benchmark with 1 MB objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee 1mb-read-80-update-20.log
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee 1mb-read-80-update-20.log
 
       - name: Run benchmark - 10 MB
         run: |
           echo "=== Running benchmark with 10 MB objects ==="
-          ./ocachecli bench --addr localhost:9000 --num-ops 10000 --value-size 10485760 --workload "read=80,update=20" --no-progress | tee 10mb-read-80-update-20.log
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 10000 --value-size 10485760 --workload "read=80,update=20" --no-progress | tee 10mb-read-80-update-20.log
 
       - name: Stop server
         if: always()

@@ -76,15 +76,18 @@ func ParseWorkload(s string) (WorkloadSpec, error) {
 }
 
 type YCSBConfig struct {
-	Addr           string // Address of the cache service (host:port)
-	NumKeys        int    // Number of unique keys to use in the benchmark
-	ValueSize      int    // Size of each value in bytes
-	NumOps         int    // Total number of operations to perform
-	Concurrency    int    // Number of concurrent workers
-	Workload       string // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
-	Seed           int64  // Seed for random number generation (for reproducibility)
-	NoProgress     bool   // Disable progress output during benchmark
-	ForceStreaming bool   // Force streaming for all operations regardless of size
+	Addr               string        // Address of the cache service (host:port or comma-separated)
+	ConnMode           string        // Connection mode: auto, simple, or cluster
+	TopologyRefresh    time.Duration // Topology refresh interval (cluster mode only)
+	ConnectionPoolSize int           // Number of connections per address (default: 4)
+	NumKeys            int           // Number of unique keys to use in the benchmark
+	ValueSize          int           // Size of each value in bytes
+	NumOps             int           // Total number of operations to perform
+	Concurrency        int           // Number of concurrent workers
+	Workload           string        // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
+	Seed               int64         // Seed for random number generation (for reproducibility)
+	NoProgress         bool          // Disable progress output during benchmark
+	ForceStreaming     bool          // Force streaming for all operations regardless of size
 }
 
 type Result struct {
@@ -134,16 +137,24 @@ func isConnectionError(err error) bool {
 }
 
 func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
-	// Use a small pool for preloading to avoid overwhelming the server
-	poolSize := 4
-	if cfg.Concurrency < poolSize {
-		poolSize = cfg.Concurrency
+	// Create client for preloading
+	addrs := strings.Split(cfg.Addr, ",")
+	for i, a := range addrs {
+		addrs[i] = strings.TrimSpace(a)
 	}
-	pool, err := cacheclient.NewConnectionPool(cfg.Addr, poolSize)
+
+	config := &cacheclient.ClientConfig{
+		Addrs:              addrs,
+		Mode:               cacheclient.ConnectionMode(cfg.ConnMode),
+		RefreshInterval:    cfg.TopologyRefresh,
+		ConnectionPoolSize: cfg.ConnectionPoolSize,
+	}
+
+	client, err := cacheclient.NewWithConfig(config)
 	if err != nil {
-		return fmt.Errorf("failed to create connection pool for preload: %w", err)
+		return fmt.Errorf("failed to create client for preload: %w", err)
 	}
-	defer pool.Close()
+	defer client.Close()
 
 	// Use pterm spinner for preloading only if progress is enabled
 	var spinner *pterm.SpinnerPrinter
@@ -174,9 +185,9 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 		var err error
 		useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
 		if useStreaming {
-			err = pool.PutStream(ctx, k, bytes.NewReader(val), 0)
+			err = client.PutStream(ctx, k, bytes.NewReader(val), 0)
 		} else {
-			err = pool.Put(ctx, k, val, 0)
+			err = client.Put(ctx, k, val, 0)
 		}
 
 		if err != nil {
@@ -285,16 +296,31 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		return Result{}, err
 	}
 
-	// Create connection pool with size equal to concurrency
-	// This ensures each worker can have its own connection without contention
-	pool, err := cacheclient.NewConnectionPool(cfg.Addr, cfg.Concurrency)
-	if err != nil {
-		return Result{}, fmt.Errorf("failed to create connection pool: %w", err)
+	// Create clients for workers
+	addrs := strings.Split(cfg.Addr, ",")
+	for i, a := range addrs {
+		addrs[i] = strings.TrimSpace(a)
 	}
-	defer pool.Close()
 
-	// Get all clients from the pool to distribute one per worker
-	clients := pool.GetAll()
+	// Create one client for the benchmark
+	config := &cacheclient.ClientConfig{
+		Addrs:              addrs,
+		Mode:               cacheclient.ConnectionMode(cfg.ConnMode),
+		RefreshInterval:    cfg.TopologyRefresh,
+		ConnectionPoolSize: cfg.ConnectionPoolSize,
+	}
+
+	mainClient, err := cacheclient.NewWithConfig(config)
+	if err != nil {
+		return Result{}, fmt.Errorf("failed to create client: %w", err)
+	}
+	defer mainClient.Close()
+
+	// For workers, we'll use the same client since it has internal pooling
+	var workerClients []*cacheclient.Client
+	for i := 0; i < cfg.Concurrency; i++ {
+		workerClients = append(workerClients, mainClient)
+	}
 
 	// Create metrics collector
 	metricsCollector := NewMetricsCollector()
@@ -369,8 +395,8 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	t0 := time.Now()
 	for i := range cfg.Concurrency {
 		wg.Add(1)
-		seed := rng.Int63()  // Each goroutine gets its own seed
-		client := clients[i] // Assign dedicated client to each worker
+		seed := rng.Int63()        // Each goroutine gets its own seed
+		client := workerClients[i] // Assign dedicated client to each worker
 		go func(workerID int, seed int64, c *cacheclient.Client, reporter *PtermProgressReporter, metrics *MetricsCollector, throughputCh chan<- struct {
 			ops    int
 			opType OpType

@@ -3,227 +3,130 @@ package cacheclient
 import (
 	"context"
 	"fmt"
-	"io"
 
-	pb "github.com/tigrisdata/ocache/proto"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
 )
 
-const (
-	// MaxRecvMsgSize is the maximum message size for receiving (in bytes)
-	MaxRecvMsgSize = 128 * 1024 * 1024 // 128MB
-	// MaxSendMsgSize is the maximum message size for sending (in bytes)
-	MaxSendMsgSize = 128 * 1024 * 1024 // 128MB
-)
-
+// Client is a wrapper that maintains backward compatibility
+// It delegates to either SimpleClient or ClusterClient based on mode detection
 type Client struct {
-	conn   *grpc.ClientConn
-	client pb.CacheServiceClient
+	CacheClient
+	mode ConnectionMode
 }
 
-func New(addr string, opts ...grpc.DialOption) (*Client, error) {
-	if len(opts) == 0 {
-		opts = append(opts, grpc.WithInsecure())
+// New creates a new client with default configuration
+func New(addrs ...string) (*Client, error) {
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("at least one address is required")
 	}
-	// Set max message sizes for streaming
-	opts = append(opts, grpc.WithDefaultCallOptions(
-		grpc.MaxCallRecvMsgSize(MaxRecvMsgSize), // 128MB
-		grpc.MaxCallSendMsgSize(MaxSendMsgSize), // 128MB
-	))
-	conn, err := grpc.Dial(addr, opts...)
+	return NewWithConfig(&ClientConfig{
+		Addrs: addrs,
+		Mode:  ModeAuto,
+	})
+}
+
+// NewWithConfig creates a new client with custom configuration
+func NewWithConfig(config *ClientConfig) (*Client, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config is required")
+	}
+	if len(config.Addrs) == 0 {
+		return nil, fmt.Errorf("at least one address is required")
+	}
+
+	config.SetDefaults()
+
+	// Resolve auto mode
+	mode := config.Mode
+	if mode == ModeAuto {
+		mode = detectMode(config.Addrs, config.DialOpts)
+	}
+
+	// Create appropriate client based on mode
+	var cacheClient CacheClient
+	var err error
+
+	switch mode {
+	case ModeCluster:
+		cacheClient, err = NewClusterClient(config)
+	case ModeSimple:
+		cacheClient, err = NewSimpleClient(config)
+	default:
+		return nil, fmt.Errorf("unknown mode: %s", mode)
+	}
+
 	if err != nil {
 		return nil, err
 	}
+
 	return &Client{
-		conn:   conn,
-		client: pb.NewCacheServiceClient(conn),
+		CacheClient: cacheClient,
+		mode:        mode,
 	}, nil
 }
 
-func (c *Client) Close() error {
-	return c.conn.Close()
-}
+// detectMode attempts to detect if cluster topology is available
+func detectMode(addrs []string, dialOpts []grpc.DialOption) ConnectionMode {
+	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
+	defer cancel()
 
-// isHealthy checks if the client connection is healthy
-func (c *Client) isHealthy() bool {
-	if c.conn == nil {
-		return false
-	}
-	state := c.conn.GetState()
-	return state == connectivity.Ready || state == connectivity.Idle
-}
-
-func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	req := &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds}
-	_, err := c.client.PutObject(ctx, req)
-	return err
-}
-
-// PutStream streams data from an io.Reader to the cache service, efficient for large values.
-func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	stream, err := c.client.Put(ctx)
-	if err != nil {
-		return err
-	}
-
-	buf := make([]byte, 64*1024) // 64KB chunks
-	first := true
-	totalBytes := 0
-
-	for {
-		// Check for context cancellation before reading
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		n, err := r.Read(buf)
-		if n > 0 {
-			req := &pb.PutRequest{Data: buf[:n]}
-			if first {
-				req.Key = key
-				req.TtlSeconds = ttlSeconds
-				first = false
-			}
-
-			if sendErr := stream.Send(req); sendErr != nil {
-				return sendErr
-			}
-			totalBytes += n
-		}
-		if err == io.EOF {
-			break
-		}
+	// Try to fetch topology from any seed address
+	for _, addr := range addrs {
+		conn, err := grpc.DialContext(ctx, addr, dialOpts...)
 		if err != nil {
-			return err
+			continue
+		}
+
+		clusterClient := clusterpb.NewClusterServiceClient(conn)
+		topology, err := clusterClient.GetClusterTopology(ctx, &clusterpb.Empty{})
+		conn.Close()
+
+		if err == nil && topology != nil {
+			// Successfully fetched topology
+			return ModeCluster
 		}
 	}
 
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return err
-	}
-	if resp != nil && !resp.Success {
-		return fmt.Errorf("put failed: %s", resp.Error)
-	}
-	return nil
+	// No topology service available, use simple mode
+	return ModeSimple
 }
 
-func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
-	req := &pb.GetRequest{Key: key}
-	return c.getValueBuffered(ctx, req)
+// GetMode returns the actual connection mode being used
+func (c *Client) GetMode() ConnectionMode {
+	return c.mode
 }
 
-// GetRange retrieves a byte range from the cache
-func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	req := &pb.GetRequest{
-		Key:   key,
-		Start: start,
-		End:   end,
+// Additional methods for backward compatibility with tests
+
+// GetTopologyEpoch returns the current topology epoch (cluster mode only)
+func (c *Client) GetTopologyEpoch() uint64 {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetTopologyEpoch()
 	}
-	return c.getValueBuffered(ctx, req)
+	return 0
 }
 
-// GetStream streams the value directly to the provided writer, efficient for large values.
-func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
-	req := &pb.GetRequest{Key: key}
-	return c.getValueStream(ctx, req, w)
+// HasRing returns true if the consistent hash ring is initialized (cluster mode only)
+func (c *Client) HasRing() bool {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.HasRing()
+	}
+	return false
 }
 
-// GetRangeStream streams the value directly to the provided writer, efficient for large values.
-func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	req := &pb.GetRequest{
-		Key:   key,
-		Start: start,
-		End:   end,
+// GetPartitionOwner returns the node ID that owns the given partition (cluster mode only)
+func (c *Client) GetPartitionOwner(partitionID int32) string {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetPartitionOwner(partitionID)
 	}
-	return c.getValueStream(ctx, req, w)
+	return ""
 }
 
-func (c *Client) Delete(ctx context.Context, key string) error {
-	_, err := c.client.Delete(ctx, &pb.DeleteRequest{Key: key})
-	return err
-}
-
-func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
-	stream, err := c.client.List(ctx, &pb.ListRequest{Prefix: prefix})
-	if err != nil {
-		return nil, err
+// GetPartitionOwnerCount returns the number of partition owners (cluster mode only)
+func (c *Client) GetPartitionOwnerCount() int {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetPartitionOwnerCount()
 	}
-	var keys []string
-	for {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, resp.Keys...)
-	}
-	return keys, nil
-}
-
-// getValueBuffered reads the entire value into memory
-func (c *Client) getValueBuffered(ctx context.Context, req *pb.GetRequest) ([]byte, error) {
-	stream, err := c.client.Get(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	var result []byte
-	for {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, resp.Data...)
-	}
-	return result, nil
-}
-
-// getValueStream streams the value directly to the provided writer, efficient for large values.
-func (c *Client) getValueStream(ctx context.Context, req *pb.GetRequest, w io.Writer) error {
-	stream, err := c.client.Get(ctx, req)
-	if err != nil {
-		return err
-	}
-	for {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(resp.Data); err != nil {
-			return err
-		}
-	}
-	return nil
+	return 0
 }

@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
-	"github.com/tigrisdata/ocache/storage/bufferpool"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/retry"
 
@@ -30,6 +30,13 @@ import (
 type cacheService struct {
 	pb.UnimplementedCacheServiceServer
 	coordinator *coordinator.Coordinator
+}
+
+// newCacheService creates a new cache service, optionally with clustering support
+func newCacheService(coord *coordinator.Coordinator) *cacheService {
+	return &cacheService{
+		coordinator: coord,
+	}
 }
 
 // Streaming Put for large values

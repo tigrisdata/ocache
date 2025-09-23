@@ -4,373 +4,224 @@ OCache provides multiple client options for interacting with the cache service:
 
 - **Go Client Library** - A native Go library for programmatic access
 - **CLI Client** - Command-line interface for manual operations and scripting
-- **gRPC Clients** - Can be generated for any language supported by gRPC
 
 ## Go Client Library
 
-The OCache Go client library (`cacheclient`) provides a high-performance, feature-rich interface for interacting with the OCache service via gRPC.
+The ClusterClient is a cluster-aware cache client that provides smart routing based on consistent hashing and partition ownership information. It automatically distributes requests to the appropriate nodes in the cluster and uses connection pooling for improved performance and fault tolerance.
 
-### Installation
+### Key Features
 
-```bash
-go get github.com/tigrisdata/ocache/client
+- **Smart Routing**: Uses consistent hashing to route requests to the correct node
+- **Connection Pooling**: Maintains multiple connections per node for better load distribution
+- **Automatic Topology Refresh**: Periodically updates cluster topology to handle node changes
+- **Fallback Routing**: Falls back to round-robin when smart routing is unavailable
+- **Retry Logic**: Automatically retries on routing errors with topology refresh
+
+### Configuration
+
+The ClusterClient requires a configuration object that specifies connection parameters:
+
+```go
+type ClientConfig struct {
+    // List of seed node addresses to bootstrap the client
+    Addrs []string
+
+    // Number of connections to maintain per node (must be > 0)
+    PoolSize int
+
+    // Connection mode (default: "auto")
+    Mode ConnectionMode
+
+    // How often to refresh cluster topology (default: 30s)
+    RefreshInterval time.Duration
+
+    // Optional gRPC dial options
+    DialOpts []grpc.DialOption
+}
 ```
 
-### Basic Usage
+### Usage Example
 
 ```go
 package main
 
 import (
     "context"
-    "log"
+    "fmt"
+    "time"
 
     cacheclient "github.com/tigrisdata/ocache/client"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
-    // Create client
-    client, err := cacheclient.New("localhost:9000")
+    // Create configuration for the cluster client
+    config := &cacheclient.ClientConfig{
+        // Seed addresses for initial topology discovery
+        Addrs: []string{
+            "localhost:9001",
+            "localhost:9002",
+            "localhost:9003",
+        },
+    }
+
+    // Create cluster client with connection pooling
+    client, err := cacheclient.NewWithConfig(config)
     if err != nil {
-        log.Fatal(err)
+        panic(fmt.Sprintf("Failed to create cluster client: %v", err))
     }
     defer client.Close()
 
     ctx := context.Background()
 
-    // Store data
-    err = client.Put(ctx, "mykey", []byte("hello world"), 3600)
+    // Put a value - automatically routed to appropriate node
+    err = client.Put(ctx, "my-key", []byte("my-value"), 3600)
     if err != nil {
-        log.Fatal(err)
+        fmt.Printf("Failed to put: %v\n", err)
+        return
     }
 
-    // Retrieve data
-    data, err := client.Get(ctx, "mykey")
+    // Get the value - routed to same node as Put
+    value, err := client.Get(ctx, "my-key")
     if err != nil {
-        log.Fatal(err)
-    }
-    log.Printf("Retrieved: %s\n", string(data))
-
-    // Delete data
-    err = client.Delete(ctx, "mykey")
-    if err != nil {
-        log.Fatal(err)
+        fmt.Printf("Failed to get: %v\n", err)
+        return
     }
 
-    // List keys
-    keys, err := client.List(ctx, "")
-    if err != nil {
-        log.Fatal(err)
-    }
-    log.Printf("Keys: %v\n", keys)
+    fmt.Printf("Retrieved value: %s\n", string(value))
 }
 ```
 
-### Client Methods
+### Connection Pool Size Guidelines
 
-#### New(addr string, opts ...grpc.DialOption) (\*Client, error)
+Choosing the right pool size depends on your workload:
 
-Creates a new client connection to the OCache server.
+- **Low concurrency (1-10 concurrent requests)**: 2-3 connections per node
+- **Medium concurrency (10-50 concurrent requests)**: 5-10 connections per node
+- **High concurrency (50+ concurrent requests)**: 10-20 connections per node
 
-**Parameters:**
+Total connections = Number of nodes × Pool size per node
 
-- `addr`: Server address (e.g., "localhost:9000")
-- `opts`: Optional gRPC dial options for customizing the connection
+### Operations
 
-**Example:**
+All operations support automatic routing and connection pooling:
 
-```go
-// Default connection (insecure)
-client, err := cacheclient.New("localhost:9000")
-
-// With custom options
-client, err := cacheclient.New(
-    "cache.example.com:9000",
-    grpc.WithTransportCredentials(creds),
-    grpc.WithTimeout(10*time.Second),
-)
-```
-
-#### Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error
-
-Stores a key-value pair in the cache.
-
-**Parameters:**
-
-- `ctx`: Context for cancellation and timeout
-- `key`: Cache key
-- `data`: Value to store
-- `ttlSeconds`: Time-to-live in seconds (0 for no expiration)
-
-**Example:**
+#### Basic Operations
 
 ```go
-// Store with TTL
-err := client.Put(ctx, "session:123", sessionData, 3600)
+// Put a value
+err := client.Put(ctx, key, data, ttlSeconds)
 
-// Store without TTL
-err := client.Put(ctx, "config", configData, 0)
-```
+// Get a value
+data, err := client.Get(ctx, key)
 
-#### PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error
-
-Streams data from an io.Reader to the cache service, efficient for large values.
-
-**Parameters:**
-
-- `ctx`: Context for cancellation and timeout
-- `key`: Cache key
-- `r`: Reader providing the data to store
-- `ttlSeconds`: Time-to-live in seconds
-
-**Example:**
-
-```go
-// Stream a file
-file, err := os.Open("large-file.dat")
-if err != nil {
-    log.Fatal(err)
-}
-defer file.Close()
-
-err = client.PutStream(ctx, "large-data", file, 0)
-
-// Stream from HTTP response
-resp, err := http.Get("https://example.com/data")
-if err != nil {
-    log.Fatal(err)
-}
-defer resp.Body.Close()
-
-err = client.PutStream(ctx, "remote-data", resp.Body, 3600)
-```
-
-#### Get(ctx context.Context, key string) ([]byte, error)
-
-Retrieves a value by key.
-
-**Parameters:**
-
-- `ctx`: Context for cancellation and timeout
-- `key`: Cache key to retrieve
-
-**Returns:**
-
-- `[]byte`: Retrieved data
-- `error`: Error if key not found or other issues
-
-**Example:**
-
-```go
-data, err := client.Get(ctx, "mykey")
-if err != nil {
-    if strings.Contains(err.Error(), "not found") {
-        log.Println("Key not found")
-    } else {
-        log.Fatal(err)
-    }
-}
-```
-
-#### GetStream(ctx context.Context, key string, w io.Writer) error
-
-Streams the value directly to a writer, efficient for large values.
-
-**Parameters:**
-
-- `ctx`: Context for cancellation and timeout
-- `key`: Cache key to retrieve
-- `w`: Writer to receive the data
-
-**Example:**
-
-```go
-// Stream to file
-file, err := os.Create("output.dat")
-if err != nil {
-    log.Fatal(err)
-}
-defer file.Close()
-
-err = client.GetStream(ctx, "large-data", file)
-
-// Stream to HTTP response
-func handler(w http.ResponseWriter, r *http.Request) {
-    key := r.URL.Query().Get("key")
-    err := client.GetStream(r.Context(), key, w)
-    if err != nil {
-        http.Error(w, err.Error(), http.StatusNotFound)
-    }
-}
-```
-
-#### Delete(ctx context.Context, key string) error
-
-Removes a key-value pair from the cache.
-
-**Parameters:**
-
-- `ctx`: Context for cancellation and timeout
-- `key`: Cache key to delete
-
-**Example:**
-
-```go
-err := client.Delete(ctx, "old-data")
-if err != nil {
-    log.Printf("Delete failed: %v\n", err)
-}
-```
-
-#### List(ctx context.Context, prefix string) ([]string, error)
-
-Lists keys in the cache, optionally filtered by prefix.
-
-**Parameters:**
-
-- `ctx`: Context for cancellation and timeout
-- `prefix`: Prefix to filter keys (empty string for all keys)
-
-**Returns:**
-
-- `[]string`: List of matching keys
-- `error`: Error if operation fails
-
-**Example:**
-
-```go
-// List all keys
-allKeys, err := client.List(ctx, "")
+// Delete a value
+err := client.Delete(ctx, key)
 
 // List keys with prefix
-userKeys, err := client.List(ctx, "user:")
-sessionKeys, err := client.List(ctx, "session:")
+keys, err := client.List(ctx, prefix)
 ```
 
-#### Close() error
+#### Streaming Operations
 
-Closes the client connection. Should be called when done using the client.
-
-**Example:**
+For large values, use streaming operations:
 
 ```go
-client, err := cacheclient.New("localhost:9000")
-if err != nil {
-    log.Fatal(err)
-}
-defer client.Close() // Ensure connection is closed
+// Stream data to cache
+err := client.PutStream(ctx, key, reader, ttlSeconds)
+
+// Stream data from cache
+err := client.GetStream(ctx, key, writer)
+
+// Get byte range
+data, err := client.GetRange(ctx, key, start, end)
+
+// Stream byte range
+err := client.GetRangeStream(ctx, key, start, end, writer)
 ```
 
-### Advanced Usage
+### Routing Behavior
 
-#### Error Handling
+#### Smart Routing
+
+1. Key is hashed to determine partition
+2. Partition owner (node) is identified
+3. Request sent to appropriate node's connection pool
+4. Pool selects connection using round-robin
+
+#### Fallback Routing
+
+When smart routing fails (e.g., topology not available):
+
+1. Falls back to round-robin node selection
+2. Maintains request distribution across all nodes
+3. Continues attempting topology refresh
+
+#### Retry Logic
+
+On routing errors:
+
+1. Automatically refreshes topology
+2. Retries request once with updated routing
+3. Returns error if retry fails
+
+### Error Handling
+
+The client handles various error scenarios:
+
+- **Connection failures**: Pool removes unhealthy connections
+- **Routing errors**: Triggers topology refresh and retry
+- **Node failures**: Requests routed to remaining nodes
+- **Topology changes**: Automatic discovery and adaptation
+
+### Monitoring
+
+You can monitor cluster client behavior:
 
 ```go
-import (
-    "google.golang.org/grpc/codes"
-    "google.golang.org/grpc/status"
-)
+// Get list of connected nodes
+nodes := client.GetConnectedNodes()
 
-data, err := client.Get(ctx, "mykey")
-if err != nil {
-    if st, ok := status.FromError(err); ok {
-        switch st.Code() {
-        case codes.NotFound:
-            log.Println("Key not found")
-        case codes.DeadlineExceeded:
-            log.Println("Operation timed out")
-        case codes.Unavailable:
-            log.Println("Service unavailable")
-        default:
-            log.Printf("Operation failed: %v\n", err)
-        }
-    }
-}
+// Get node responsible for a key
+nodeID, err := client.GetNodeForKey(key)
 ```
 
-#### Context with Timeout
+### Best Practices
+
+1. **Initialize once**: Create a single ClusterClient instance and reuse it
+2. **Tune pool size**: Adjust based on your concurrency requirements
+3. **Handle errors**: Implement appropriate retry logic for your use case
+4. **Close cleanly**: Always call `Close()` to release resources
+
+### Configuration Examples
+
+#### High Throughput Configuration
 
 ```go
-// Create context with timeout
-ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-defer cancel()
-
-// Operations will fail if they take longer than 5 seconds
-err := client.Put(ctx, "key", largeData, 0)
-if err != nil {
-    if err == context.DeadlineExceeded {
-        log.Println("Operation timed out")
-    }
+config := &cacheclient.ClientConfig{
+    Addrs:               seedNodes,
+    PoolSize:         20, // High pool size for throughput
+    RefreshInterval: 10 * time.Second, // Frequent updates
 }
 ```
 
-## gRPC Clients for Other Languages
+#### Resource-Constrained Configuration
 
-The OCache gRPC service can be accessed from any language that supports gRPC. The protocol buffer definitions are in `proto/cache.proto`.
-
-### Generating Client Code
-
-```bash
-# Python
-python -m grpc_tools.protoc \
-    -I./proto \
-    --python_out=./python_client \
-    --grpc_python_out=./python_client \
-    proto/cache.proto
-
-# Java
-protoc \
-    -I./proto \
-    --java_out=./java_client \
-    --grpc-java_out=./java_client \
-    proto/cache.proto
-
-# Node.js
-grpc_tools_node_protoc \
-    --js_out=import_style=commonjs,binary:./node_client \
-    --grpc_out=./node_client \
-    --plugin=protoc-gen-grpc=`which grpc_tools_node_protoc_plugin` \
-    -I ./proto \
-    proto/cache.proto
+```go
+config := &cacheclient.ClientConfig{
+    Addrs:               seedNodes,
+    PoolSize:         2, // Minimal connections
+    RefreshInterval: 60 * time.Second, // Less frequent updates
+}
 ```
 
-### Example: Python Client
+#### Development/Testing Configuration
 
-```python
-import grpc
-import cache_pb2
-import cache_pb2_grpc
-
-# Create channel and stub
-channel = grpc.insecure_channel('localhost:9000')
-stub = cache_pb2_grpc.CacheServiceStub(channel)
-
-# Put operation
-put_request = cache_pb2.PutRequest(
-    key='python-key',
-    data=b'Hello from Python',
-    ttl_seconds=3600
-)
-stub.PutObject(put_request)
-
-# Get operation
-get_request = cache_pb2.GetRequest(key='python-key')
-response_iterator = stub.Get(get_request)
-data = b''.join([chunk.data for chunk in response_iterator])
-print(f"Retrieved: {data.decode()}")
-
-# List operation
-list_request = cache_pb2.ListRequest()
-list_response_iterator = stub.List(list_request)
-keys = []
-for chunk in list_response_iterator:
-    keys.extend(chunk.keys)
-print(f"Keys: {keys}")
+```go
+config := &cacheclient.ClientConfig{
+    Addrs:               []string{"localhost:9001"},
+    PoolSize:         1, // Single connection for debugging
+    RefreshInterval: 5 * time.Second, // Fast feedback
+}
 ```
-
-## See Also
-
-- [HTTP API Documentation](http_api.md) - REST API reference
-- [Configuration](configuration.md) - Server configuration options
-- [Benchmark Guide](benchmark.md) - Performance testing guide
-- [Testing](testing.md) - Testing strategies and tools

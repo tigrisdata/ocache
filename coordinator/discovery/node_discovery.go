@@ -15,9 +15,6 @@ const (
 
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
-
-	// defaultClusterPort is the default port for cluster communication
-	defaultClusterPort = "9090"
 )
 
 // NodeDiscovery provides an interface for discovering cluster nodes

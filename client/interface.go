@@ -1,0 +1,30 @@
+package cacheclient
+
+import (
+	"context"
+	"io"
+)
+
+// CacheClient is the common interface for both SimpleClient and ClusterClient
+type CacheClient interface {
+	// Basic operations
+	Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error
+	Get(ctx context.Context, key string) ([]byte, error)
+	Delete(ctx context.Context, key string) error
+	List(ctx context.Context, prefix string) ([]string, error)
+
+	// Streaming operations
+	PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error
+	GetStream(ctx context.Context, key string, w io.Writer) error
+
+	// Range operations
+	GetRange(ctx context.Context, key string, start, end int64) ([]byte, error)
+	GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error
+
+	// Lifecycle
+	Close() error
+
+	// Info
+	GetMode() ConnectionMode
+	GetConnectedNodes() []string
+}

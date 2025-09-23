@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/google/uuid"
-	"github.com/tigrisdata/ocache/storage/bufferpool"
+	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/utils"
 
