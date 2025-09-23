@@ -124,7 +124,7 @@ jobs:
       - name: Run benchmark - 1 MB
         run: |
           echo "=== Running benchmark with 1 MB objects ==="
-          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4--num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee 1mb-read-80-update-20.log
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee 1mb-read-80-update-20.log
 
       - name: Run benchmark - 10 MB
         run: |
