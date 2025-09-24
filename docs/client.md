@@ -7,40 +7,117 @@ OCache provides multiple client options for interacting with the cache service:
 
 ## Go Client Library
 
-The ClusterClient is a cluster-aware cache client that provides smart routing based on consistent hashing and partition ownership information. It automatically distributes requests to the appropriate nodes in the cluster and uses connection pooling for improved performance and fault tolerance.
+The Go client library provides automatic mode detection, smart routing for clusters, and connection pooling for optimal performance. It seamlessly works with both single-node and cluster deployments.
 
 ### Key Features
 
-- **Smart Routing**: Uses consistent hashing to route requests to the correct node
+- **Auto Mode Detection**: Automatically detects cluster vs single-node deployments
+- **Smart Routing**: Uses consistent hashing to route requests in cluster mode
 - **Connection Pooling**: Maintains multiple connections per node for better load distribution
 - **Automatic Topology Refresh**: Periodically updates cluster topology to handle node changes
 - **Fallback Routing**: Falls back to round-robin when smart routing is unavailable
 - **Retry Logic**: Automatically retries on routing errors with topology refresh
 
+### Connection Modes
+
+The client supports three connection modes:
+
+#### Auto Mode (Default)
+
+- Attempts to detect cluster topology service
+- Falls back to simple mode if not available
+- Best for most use cases
+
+#### Simple Mode
+
+- Direct connections to provided addresses
+- Hash-based routing for multiple addresses
+- No topology discovery
+- Good for single nodes or basic multi-server setups
+
+#### Cluster Mode
+
+- Requires topology service
+- Smart routing with consistent hashing
+- Automatic topology refresh
+- Best for production clusters
+
 ### Configuration
 
-The ClusterClient requires a configuration object that specifies connection parameters:
+The client supports flexible configuration through the ClientConfig structure:
 
 ```go
 type ClientConfig struct {
-    // List of seed node addresses to bootstrap the client
+    // List of server addresses (single or multiple)
     Addrs []string
 
-    // Number of connections to maintain per node (must be > 0)
-    PoolSize int
-
-    // Connection mode (default: "auto")
+    // Connection mode: "auto", "simple", or "cluster"
+    // - auto: Automatically detect mode (default)
+    // - simple: Direct connections without topology
+    // - cluster: Use topology service for smart routing
     Mode ConnectionMode
 
-    // How often to refresh cluster topology (default: 30s)
+    // Number of connections per address
+    // Used differently based on mode:
+    // - Simple mode: connections per provided address
+    // - Cluster mode: connections per discovered node
+    ConnectionPoolSize int
+
+    // How often to refresh cluster topology (cluster mode only)
+    // Default: 30s
     RefreshInterval time.Duration
 
-    // Optional gRPC dial options
+    // Optional gRPC dial options for custom configuration
     DialOpts []grpc.DialOption
 }
 ```
 
-### Usage Example
+### Usage Examples
+
+#### Auto Mode (Recommended)
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    cacheclient "github.com/tigrisdata/ocache/client"
+)
+
+func main() {
+    // Client auto-detects single node or cluster mode
+    config := &cacheclient.ClientConfig{
+        Addrs: []string{"localhost:9000"},
+    }
+
+    client, err := cacheclient.NewWithConfig(config)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    ctx := context.Background()
+
+    // Operations work seamlessly regardless of mode
+    err = client.Put(ctx, "key", []byte("value"), 3600)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    value, err := client.Get(ctx, "key")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    fmt.Printf("Value: %s\n", string(value))
+    fmt.Printf("Mode: %s\n", client.GetMode())
+}
+```
+
+#### Cluster Mode with Custom Configuration
 
 ```go
 package main
@@ -51,22 +128,22 @@ import (
     "time"
 
     cacheclient "github.com/tigrisdata/ocache/client"
-    "google.golang.org/grpc"
-    "google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
-    // Create configuration for the cluster client
+    // Explicitly configure for cluster mode
     config := &cacheclient.ClientConfig{
-        // Seed addresses for initial topology discovery
+        // Multiple seed addresses for discovery
         Addrs: []string{
             "localhost:9001",
             "localhost:9002",
             "localhost:9003",
         },
+        ConnectionPoolSize: 10,                // 10 connections per node
+        RefreshInterval:    15 * time.Second,  // Frequent topology updates
     }
 
-    // Create cluster client with connection pooling
+    // Create cluster-aware client
     client, err := cacheclient.NewWithConfig(config)
     if err != nil {
         panic(fmt.Sprintf("Failed to create cluster client: %v", err))
@@ -93,16 +170,6 @@ func main() {
 }
 ```
 
-### Connection Pool Size Guidelines
-
-Choosing the right pool size depends on your workload:
-
-- **Low concurrency (1-10 concurrent requests)**: 2-3 connections per node
-- **Medium concurrency (10-50 concurrent requests)**: 5-10 connections per node
-- **High concurrency (50+ concurrent requests)**: 10-20 connections per node
-
-Total connections = Number of nodes × Pool size per node
-
 ### Operations
 
 All operations support automatic routing and connection pooling:
@@ -110,17 +177,22 @@ All operations support automatic routing and connection pooling:
 #### Basic Operations
 
 ```go
+var err error
+
 // Put a value
-err := client.Put(ctx, key, data, ttlSeconds)
+err = client.Put(ctx, key, data, ttlSeconds)
 
 // Get a value
-data, err := client.Get(ctx, key)
+data, err = client.Get(ctx, key)
+
+// Get byte range
+data, err = client.GetRange(ctx, key, start, end)
 
 // Delete a value
-err := client.Delete(ctx, key)
+err = client.Delete(ctx, key)
 
 // List keys with prefix
-keys, err := client.List(ctx, prefix)
+keys, err = client.List(ctx, prefix)
 ```
 
 #### Streaming Operations
@@ -128,17 +200,16 @@ keys, err := client.List(ctx, prefix)
 For large values, use streaming operations:
 
 ```go
+var err error
+
 // Stream data to cache
-err := client.PutStream(ctx, key, reader, ttlSeconds)
+err = client.PutStream(ctx, key, reader, ttlSeconds)
 
 // Stream data from cache
-err := client.GetStream(ctx, key, writer)
-
-// Get byte range
-data, err := client.GetRange(ctx, key, start, end)
+err = client.GetStream(ctx, key, writer)
 
 // Stream byte range
-err := client.GetRangeStream(ctx, key, start, end, writer)
+err = client.GetRangeStream(ctx, key, start, end, writer)
 ```
 
 ### Routing Behavior
@@ -200,9 +271,9 @@ nodeID, err := client.GetNodeForKey(key)
 
 ```go
 config := &cacheclient.ClientConfig{
-    Addrs:               seedNodes,
-    PoolSize:         20, // High pool size for throughput
-    RefreshInterval: 10 * time.Second, // Frequent updates
+    Addrs:              seedNodes,
+    ConnectionPoolSize: 20,                // High pool size for throughput
+    RefreshInterval:    10 * time.Second,  // Frequent updates
 }
 ```
 
@@ -210,9 +281,9 @@ config := &cacheclient.ClientConfig{
 
 ```go
 config := &cacheclient.ClientConfig{
-    Addrs:               seedNodes,
-    PoolSize:         2, // Minimal connections
-    RefreshInterval: 60 * time.Second, // Less frequent updates
+    Addrs:              seedNodes,
+    ConnectionPoolSize: 2,                 // Minimal connections
+    RefreshInterval:    60 * time.Second,  // Less frequent updates
 }
 ```
 
@@ -220,8 +291,8 @@ config := &cacheclient.ClientConfig{
 
 ```go
 config := &cacheclient.ClientConfig{
-    Addrs:               []string{"localhost:9001"},
-    PoolSize:         1, // Single connection for debugging
-    RefreshInterval: 5 * time.Second, // Fast feedback
+    Addrs:              []string{"localhost:9001"},
+    Mode:               cacheclient.ModeSimple,  // Direct connection
+    ConnectionPoolSize: 1,                        // Single connection for debugging
 }
 ```

@@ -54,7 +54,6 @@ ocachecli --mode cluster --addr "node1:9001,node2:9002" <command>
 | -------------------- | -------------------------------------------------------------- | ---------------- |
 | `--addr`             | Cache server address(es), comma-separated for multiple servers | `localhost:9000` |
 | `--mode`             | Connection mode: `auto`, `simple`, or `cluster`                | `auto`           |
-| `--pool-size`        | Connection pool size per address                               | `4`              |
 | `--topology-refresh` | Topology refresh interval (cluster mode only)                  | `30s`            |
 
 ## Commands
@@ -153,10 +152,8 @@ When using the default `auto` mode:
 
 ## Connection Pooling
 
-All modes use connection pooling for better performance:
+The CLI uses connection pooling for better performance:
 
-- **Default pool size**: 4 connections per address
-- **Configurable**: Use `--pool-size` to adjust
 - **Benefits**:
   - Better load distribution
   - Reduced connection setup overhead
@@ -198,67 +195,11 @@ ocachecli --mode simple --addr "$SERVERS" get "user:123"
 
 # Force cluster mode for smart routing (requires topology service)
 ocachecli --mode cluster --addr "$SERVERS" del "user:123"
-
-# High-performance benchmark with larger pool
-ocachecli \
-  --addr "$SERVERS" \
-  --pool-size 10 \
-  bench \
-  --num-keys 100000 \
-  --num-ops 1000000 \
-  --concurrency 64 \
-  --value-size 4096 \
-  --workload "read=80,update=20"
 ```
 
 ### Performance Testing
 
-```bash
-# Test with auto mode (single server will use simple mode)
-ocachecli bench \
-  --num-keys 5000 \
-  --value-size 1024 \
-  --num-ops 50000 \
-  --concurrency 16
-
-# Test with multiple servers (auto-detects appropriate mode)
-ocachecli \
-  --addr "node1:9001,node2:9002,node3:9003" \
-  bench \
-  --num-keys 5000 \
-  --value-size 1024 \
-  --num-ops 50000 \
-  --concurrency 16
-
-# Force cluster mode for comparison
-ocachecli \
-  --mode cluster \
-  --addr "node1:9001,node2:9002,node3:9003" \
-  --pool-size 8 \
-  bench \
-  --num-keys 5000 \
-  --value-size 1024 \
-  --num-ops 50000 \
-  --concurrency 16
-```
-
-## Performance Tuning
-
-### Pool Size Guidelines
-
-Adjust `--pool-size` based on your workload:
-
-- **Low concurrency** (< 10 concurrent operations): `--pool-size 2-3`
-- **Medium concurrency** (10-50 concurrent operations): `--pool-size 4-8`
-- **High concurrency** (50+ concurrent operations): `--pool-size 8-16`
-
-Formula: `pool_size = min(expected_concurrency / 2, 16)`
-
-### Topology Refresh Interval (Cluster Mode)
-
-- **Stable cluster**: `--topology-refresh 60s`
-- **Dynamic cluster**: `--topology-refresh 10s`
-- **Development/testing**: `--topology-refresh 5s`
+See [Benchmark Guide](benchmark.md) for more details.
 
 ## Error Messages
 
@@ -307,20 +248,6 @@ ocachecli --mode simple --addr "node1:9001" put test "value"
 ocachecli --mode cluster --addr "node1:9001" put test "value"
 ```
 
-### Performance Issues
-
-```bash
-# Increase pool size for better concurrency
-ocachecli --pool-size 10 bench --concurrency 50
-
-# For cluster mode, adjust topology refresh
-ocachecli --mode cluster --topology-refresh 60s bench
-
-# Compare modes to identify bottlenecks
-ocachecli --mode simple bench --concurrency 20
-ocachecli --mode cluster bench --concurrency 20
-```
-
 ### Mode Detection Issues
 
 If auto mode isn't detecting correctly:
@@ -335,31 +262,9 @@ If auto mode isn't detecting correctly:
 - `0`: Success
 - `1`: Error (invalid arguments, connection failure, operation failure, or interrupted)
 
-## Advanced Usage
-
-### Scripting
-
-The CLI is designed to be scriptable:
-
-```bash
-#!/bin/bash
-# backup.sh - Backup all user data
-
-CACHE_SERVERS="cache1:9001,cache2:9002"
-
-# List all user keys
-keys=$(ocachecli --addr "$CACHE_SERVERS" list --prefix "user:")
-
-# Backup each key
-for key in $keys; do
-  value=$(ocachecli --addr "$CACHE_SERVERS" get "$key")
-  echo "$key=$value" >> backup.txt
-done
-```
-
 ## Summary
 
-The unified CLI provides a simple yet powerful interface for interacting with OCache:
+The CLI provides a simple yet powerful interface for interacting with OCache:
 
 - **Auto mode** by default for zero configuration
 - **Connection pooling** always enabled for better performance
