@@ -109,6 +109,23 @@ make check                 # All checks (fmt, vet, test)
   - `proto/` - Protocol buffer definitions
   - `tests/integration/` - Integration test suite
 
+**Cluster Architecture:**
+
+- **Distributed Mode:**
+
+  - Consistent hashing with 16384 partitions
+  - Coordinator service for membership management
+  - Smart client routing with topology caching
+  - Connection pooling for high throughput
+  - Heartbeat-based failure detection
+
+- **Key Cluster Components:**
+  - `coordinator/` - Cluster coordinator and topology management
+  - `coordinator/proto/` - Cluster service protobuf definitions
+  - `common/hash/` - Consistent hashing implementation
+  - `client/cluster_client.go` - Cluster-aware client
+  - `client/simple_client.go` - Direct connection client
+
 **Storage Architecture:**
 
 - **Dual Storage Strategy:**
@@ -131,6 +148,7 @@ make check                 # All checks (fmt, vet, test)
 - gRPC API with streaming support for large objects
 - HTTP REST API via grpc-gateway
 - CLI client with benchmarking capabilities
+- Cluster topology service for node discovery
 
 ## Development Notes
 
@@ -155,13 +173,29 @@ make check                 # All checks (fmt, vet, test)
 - Compactor: Migrates raw files to segments
 - Cleaner: Handles TTL expiration
 - Access Index: Updates LRU access patterns
+- Coordinator: Manages cluster membership (cluster mode)
 - All coordinate via storage layer interfaces
 
 **Configuration:**
 
 - Command-line flags only (no config files)
-- Key flags: `-disk`, `-threshold`, `-ttl`, `-max-disk-usage`
+- Key single-node flags: `-disk`, `-threshold`, `-ttl`, `-max-disk-usage`
+- Key cluster flags: `-cluster-enabled`, `-node-id`, `-cluster-addr`, `-seeds`
 - See `docs/configuration.md` for complete options
+
+**Cluster Testing:**
+
+To test cluster functionality:
+
+```bash
+# Start 3-node cluster locally
+./ocache -cluster-enabled -node-id node1 -listen-addr :9001 -cluster-addr :7001 -seeds localhost:7002,localhost:7003 &
+./ocache -cluster-enabled -node-id node2 -listen-addr :9002 -cluster-addr :7002 -seeds localhost:7001,localhost:7003 &
+./ocache -cluster-enabled -node-id node3 -listen-addr :9003 -cluster-addr :7003 -seeds localhost:7001,localhost:7002 &
+
+# Test with cluster-aware client
+./ocachecli --addr "localhost:9001,localhost:9002,localhost:9003" put test "value"
+```
 
 ## Important Development Patterns
 
