@@ -7,9 +7,11 @@ import (
 	"time"
 
 	"github.com/buraksezer/consistent"
+	zlog "github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
+
 	"github.com/tigrisdata/ocache/common/hash"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
-	"google.golang.org/grpc"
 )
 
 // nodeMember implements consistent.Member interface
@@ -27,26 +29,44 @@ type TopologyManager struct {
 	topology        *clusterpb.ClusterTopology // Current topology
 	topologyEpoch   uint64                     // Topology version
 	mu              sync.RWMutex
+	refreshInterval time.Duration
+	dialOpts        []grpc.DialOption
 }
 
 // NewTopologyManager creates a new topology manager
-func NewTopologyManager() *TopologyManager {
+func NewTopologyManager(refreshInterval time.Duration, dialOpts []grpc.DialOption) *TopologyManager {
 	return &TopologyManager{
 		partitionOwners: make(map[int32]string),
 		nodeAddresses:   make(map[string]string),
+		refreshInterval: refreshInterval,
+		dialOpts:        dialOpts,
 	}
 }
 
-// FetchTopology fetches the cluster topology from available nodes
-func (tm *TopologyManager) FetchTopology(ctx context.Context, addresses []string, dialOpts []grpc.DialOption) (*clusterpb.ClusterTopology, error) {
+// Initialize initializes the topology manager with the given seed addresses
+func (tm *TopologyManager) Initialize(ctx context.Context, seedAddrs []string) error {
+	var topology *clusterpb.ClusterTopology
+	var err error
+
 	// Try each address
-	for _, addr := range addresses {
-		topology, err := tm.fetchTopologyFromAddress(ctx, addr, dialOpts)
+	for _, addr := range seedAddrs {
+		topology, err = tm.fetchTopologyFromAddress(ctx, addr)
 		if err == nil {
-			return topology, nil
+			break
 		}
 	}
 
+	if err != nil {
+		return fmt.Errorf("failed to fetch topology from any node: %w", err)
+	}
+
+	tm.UpdateTopology(topology)
+
+	return nil
+}
+
+// FetchTopology fetches the cluster topology from available nodes
+func (tm *TopologyManager) FetchTopology(ctx context.Context) (*clusterpb.ClusterTopology, error) {
 	// If we have existing topology, try those nodes
 	tm.mu.RLock()
 	var nodeAddresses []string
@@ -56,7 +76,7 @@ func (tm *TopologyManager) FetchTopology(ctx context.Context, addresses []string
 	tm.mu.RUnlock()
 
 	for _, addr := range nodeAddresses {
-		topology, err := tm.fetchTopologyFromAddress(ctx, addr, dialOpts)
+		topology, err := tm.fetchTopologyFromAddress(ctx, addr)
 		if err == nil {
 			return topology, nil
 		}
@@ -65,9 +85,20 @@ func (tm *TopologyManager) FetchTopology(ctx context.Context, addresses []string
 	return nil, fmt.Errorf("failed to fetch topology from any node")
 }
 
+// RefreshTopology refreshes the topology
+func (tm *TopologyManager) RefreshTopology(ctx context.Context) error {
+	topology, err := tm.FetchTopology(ctx)
+	if err != nil {
+		return err
+	}
+
+	tm.UpdateTopology(topology)
+	return nil
+}
+
 // fetchTopologyFromAddress fetches topology from a specific address
-func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr string, dialOpts []grpc.DialOption) (*clusterpb.ClusterTopology, error) {
-	conn, err := grpc.DialContext(ctx, addr, dialOpts...)
+func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr string) (*clusterpb.ClusterTopology, error) {
+	conn, err := grpc.DialContext(ctx, addr, tm.dialOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -191,21 +222,27 @@ func (tm *TopologyManager) GetNodeAddresses() map[string]string {
 }
 
 // TopologyRefreshLoop periodically refreshes the cluster topology
-func TopologyRefreshLoop(ctx context.Context, tm *TopologyManager, addresses []string, dialOpts []grpc.DialOption, interval time.Duration, updateFn func()) {
-	ticker := time.NewTicker(interval)
+func (tm *TopologyManager) TopologyRefreshLoop(ctx context.Context, updateFn func()) {
+	ticker := time.NewTicker(tm.refreshInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-			topology, err := tm.FetchTopology(fetchCtx, addresses, dialOpts)
+			err := tm.RefreshTopology(fetchCtx)
 			cancel()
 
-			if err == nil {
-				if _, updated := tm.UpdateTopology(topology); updated && updateFn != nil {
-					updateFn()
-				}
+			if err != nil {
+				zlog.Error().
+					Err(err).
+					Msg("Failed to refresh topology")
+
+				continue
+			}
+
+			if updateFn != nil {
+				updateFn()
 			}
 		case <-ctx.Done():
 			return

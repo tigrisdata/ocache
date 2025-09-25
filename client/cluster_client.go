@@ -38,7 +38,7 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 
 	client := &ClusterClient{
 		conns:     make(map[string]*connection),
-		topology:  NewTopologyManager(),
+		topology:  NewTopologyManager(config.RefreshInterval, config.DialOpts),
 		config:    config,
 		seedAddrs: config.Addrs,
 		stopCh:    make(chan struct{}),
@@ -48,13 +48,13 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
 	defer cancel()
 
-	topology, err := client.topology.FetchTopology(ctx, config.Addrs, config.DialOpts)
+	err := client.topology.Initialize(ctx, config.Addrs)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch initial topology: %w", err)
+		return nil, fmt.Errorf("failed to initialize topology: %w", err)
 	}
 
 	// Initialize connections based on topology
-	if err := client.updateConnections(topology); err != nil {
+	if err := client.updateConnections(); err != nil {
 		// Clean up any created connections
 		client.Close()
 		return nil, fmt.Errorf("failed to initialize connections: %w", err)
@@ -66,31 +66,23 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 	// Start topology refresh goroutine
 	refreshCtx, cancel := context.WithCancel(context.Background())
 	client.refreshCancel = cancel
-	go TopologyRefreshLoop(refreshCtx, client.topology, client.seedAddrs, config.DialOpts, config.RefreshInterval, func() {
+	go client.topology.TopologyRefreshLoop(refreshCtx, func() {
 		// Update connections when topology changes
-		client.updateConnections(nil)
+		client.updateConnections()
 	})
 
 	return client, nil
 }
 
 // updateConnections updates connections based on current topology
-func (c *ClusterClient) updateConnections(topology *clusterpb.ClusterTopology) error {
+func (c *ClusterClient) updateConnections() error {
 	var activeNodes map[string]bool
-	var updated bool
 
-	if topology != nil {
-		activeNodes, updated = c.topology.UpdateTopology(topology)
-		if !updated {
-			return nil // No change
-		}
-	} else {
-		// Get current active nodes from topology manager
-		nodeAddrs := c.topology.GetNodeAddresses()
-		activeNodes = make(map[string]bool)
-		for _, addr := range nodeAddrs {
-			activeNodes[addr] = true
-		}
+	// Get current active nodes from topology manager
+	nodeAddrs := c.topology.GetNodeAddresses()
+	activeNodes = make(map[string]bool)
+	for _, addr := range nodeAddrs {
+		activeNodes[addr] = true
 	}
 
 	c.mu.Lock()
@@ -162,14 +154,14 @@ func (c *ClusterClient) RoundRobinRoute() (*connection, error) {
 	return conn, nil
 }
 
-// refreshTopology attempts to refresh topology and update connections
-func (c *ClusterClient) refreshTopology(ctx context.Context) bool {
+// forceRefreshTopology attempts to refresh topology and update connections
+func (c *ClusterClient) forceRefreshTopology(ctx context.Context) bool {
 	fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-	topology, err := c.topology.FetchTopology(fetchCtx, c.seedAddrs, c.config.DialOpts)
+	err := c.topology.RefreshTopology(fetchCtx)
 	cancel()
 
 	if err == nil {
-		c.updateConnections(topology)
+		c.updateConnections()
 		return true
 	}
 	return false
@@ -180,7 +172,7 @@ func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSec
 	err := c.Operations.Put(ctx, key, data, ttlSeconds)
 
 	// If we get a routing error, refresh topology and retry once
-	if isRoutingError(err) && c.refreshTopology(ctx) {
+	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
 		return c.Operations.Put(ctx, key, data, ttlSeconds)
 	}
 
@@ -237,7 +229,7 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, start,
 			// 1. It's a routing error
 			// 2. We haven't received any data yet (to avoid data corruption)
 			// 3. We have retries remaining
-			if isRoutingError(err) && len(result) == 0 && retryCount > 0 && c.refreshTopology(ctx) {
+			if isRoutingError(err) && len(result) == 0 && retryCount > 0 && c.forceRefreshTopology(ctx) {
 				return c.getDataWithRetry(ctx, key, start, end, retryCount-1)
 			}
 			return nil, err
@@ -297,7 +289,7 @@ func (c *ClusterClient) getStreamDataWithRetry(ctx context.Context, key string, 
 			// 1. It's a routing error
 			// 2. We haven't written any data yet (to avoid data corruption)
 			// 3. We have retries remaining
-			if isRoutingError(err) && bytesWritten == 0 && retryCount > 0 && c.refreshTopology(ctx) {
+			if isRoutingError(err) && bytesWritten == 0 && retryCount > 0 && c.forceRefreshTopology(ctx) {
 				return c.getStreamDataWithRetry(ctx, key, start, end, w, retryCount-1)
 			}
 			return err
@@ -316,7 +308,7 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 	err := c.Operations.Delete(ctx, key)
 
 	// Retry once with topology refresh for routing errors
-	if isRoutingError(err) && c.refreshTopology(ctx) {
+	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
 		return c.Operations.Delete(ctx, key)
 	}
 
@@ -398,12 +390,13 @@ func (c *ClusterClient) GetPartitionOwnerCount() int {
 func (c *ClusterClient) FetchTopology() (*clusterpb.ClusterTopology, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
 	defer cancel()
-	return c.topology.FetchTopology(ctx, c.seedAddrs, c.config.DialOpts)
+	return c.topology.FetchTopology(ctx)
 }
 
 // UpdateTopology manually updates the topology (exposed for testing)
 func (c *ClusterClient) UpdateTopology(topology *clusterpb.ClusterTopology) error {
-	return c.updateConnections(topology)
+	c.topology.UpdateTopology(topology)
+	return c.updateConnections()
 }
 
 // GetConnectionCount returns the number of active connections (exposed for testing)
