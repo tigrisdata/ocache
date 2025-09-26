@@ -18,6 +18,7 @@ func TestCoordinator_New(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9090",
+		ListenAddr:         "localhost:8090",
 		RingPartitionCount: 16384,
 		HeartbeatInterval:  5,
 		FailureThreshold:   3,
@@ -29,6 +30,36 @@ func TestCoordinator_New(t *testing.T) {
 	assert.Equal(t, "test-node", coord.GetLocalNodeID())
 	assert.NotNil(t, coord.GetRing())
 	assert.NotNil(t, coord.GetRouter())
+}
+
+// TestCoordinator_ConfigValidation verifies coordinator config validation
+func TestCoordinator_ConfigValidation(t *testing.T) {
+	// Test missing listen address
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:7000",
+		ListenAddr:         "", // Missing listen address
+		RingPartitionCount: 1024,
+	}
+
+	coord, err := New(config)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "listen address is required")
+	assert.Nil(t, coord)
+
+	// Test missing cluster address
+	config2 := &Config{
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "", // Invalid cluster address
+		ListenAddr:         "localhost:9000",
+		RingPartitionCount: 1024,
+	}
+
+	coord2, err := New(config2)
+	assert.Error(t, err)
+	assert.Nil(t, coord2)
 }
 
 // TestCoordinator_StartWithInvalidAddress tests invalid address validation
@@ -88,6 +119,7 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9091",
+		ListenAddr:         "localhost:8091",
 		RingPartitionCount: 1024,
 		HeartbeatInterval:  1,
 		FailureThreshold:   2,
@@ -99,8 +131,9 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 	// Test Join RPC
 	ctx := context.Background()
 	joinReq := &clusterpb.JoinRequest{
-		NodeId:  "new-node",
-		Address: "localhost:9092",
+		NodeId:        "new-node",
+		Address:       "localhost:9092",
+		ListenAddress: "localhost:8092",
 	}
 
 	joinResp, err := coord.Join(ctx, joinReq)
@@ -111,6 +144,14 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 	// Verify node was added
 	nodes := coord.GetRing().GetAllNodes()
 	assert.Len(t, nodes, 2)
+
+	// Find the new node and verify addresses
+	for _, node := range nodes {
+		if node.ID == "new-node" {
+			assert.Equal(t, "localhost:9092", node.Address, "Cluster address should be stored")
+			assert.Equal(t, "localhost:8092", node.ListenAddress, "Listen address should be stored")
+		}
+	}
 
 	// Test Heartbeat RPC
 	hbReq := &clusterpb.HeartbeatRequest{
@@ -128,6 +169,144 @@ func TestCoordinator_JoinAndHeartbeat(t *testing.T) {
 	coord.mu.RUnlock()
 	assert.True(t, exists)
 	assert.WithinDuration(t, time.Now(), lastHb, 2*time.Second)
+}
+
+// TestCoordinator_AddressSeparation verifies cluster and listen addresses are properly separated
+func TestCoordinator_NodeAddresses(t *testing.T) {
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "coordinator-node",
+		ClusterAddr:        "localhost:7001",
+		ListenAddr:         "localhost:9001",
+		RingPartitionCount: 1024,
+	}
+
+	coord, err := New(config)
+	require.NoError(t, err)
+
+	// Verify self node has both addresses
+	nodes := coord.GetRing().GetAllNodes()
+	require.Len(t, nodes, 1)
+	assert.Equal(t, "coordinator-node", nodes[0].ID)
+	assert.Equal(t, "localhost:7001", nodes[0].Address)
+	assert.Equal(t, "localhost:9001", nodes[0].ListenAddress)
+
+	// Add multiple nodes with different addresses
+	ctx := context.Background()
+
+	// Node 1
+	joinReq1 := &clusterpb.JoinRequest{
+		NodeId:        "node1",
+		Address:       "localhost:7002",
+		ListenAddress: "localhost:9002",
+	}
+	joinResp1, err := coord.Join(ctx, joinReq1)
+	require.NoError(t, err)
+	assert.True(t, joinResp1.Success)
+
+	// Node 2
+	joinReq2 := &clusterpb.JoinRequest{
+		NodeId:        "node2",
+		Address:       "localhost:7003",
+		ListenAddress: "localhost:9003",
+	}
+	joinResp2, err := coord.Join(ctx, joinReq2)
+	require.NoError(t, err)
+	assert.True(t, joinResp2.Success)
+
+	// Verify all nodes have correct addresses
+	allNodes := coord.GetRing().GetAllNodes()
+	assert.Len(t, allNodes, 3)
+
+	addressMap := make(map[string]struct {
+		clusterAddr string
+		listenAddr  string
+	})
+
+	for _, node := range allNodes {
+		addressMap[node.ID] = struct {
+			clusterAddr string
+			listenAddr  string
+		}{
+			clusterAddr: node.Address,
+			listenAddr:  node.ListenAddress,
+		}
+	}
+
+	// Verify each node has correct addresses
+	assert.Equal(t, "localhost:7001", addressMap["coordinator-node"].clusterAddr)
+	assert.Equal(t, "localhost:9001", addressMap["coordinator-node"].listenAddr)
+	assert.Equal(t, "localhost:7002", addressMap["node1"].clusterAddr)
+	assert.Equal(t, "localhost:9002", addressMap["node1"].listenAddr)
+	assert.Equal(t, "localhost:7003", addressMap["node2"].clusterAddr)
+	assert.Equal(t, "localhost:9003", addressMap["node2"].listenAddr)
+
+	// Test GetClusterState returns correct addresses
+	state, err := coord.GetClusterState(ctx, &clusterpb.Empty{})
+	require.NoError(t, err)
+	assert.Len(t, state.Nodes, 3)
+
+	for _, node := range state.Nodes {
+		if node.Id == "node1" {
+			assert.Equal(t, "localhost:7002", node.Address)
+			assert.Equal(t, "localhost:9002", node.ListenAddress)
+		}
+	}
+
+	// Test GetClusterTopology returns correct addresses
+	topology, err := coord.GetClusterTopology(ctx, &clusterpb.Empty{})
+	require.NoError(t, err)
+	assert.Len(t, topology.Nodes, 3)
+
+	for _, node := range topology.Nodes {
+		if node.Id == "node2" {
+			assert.Equal(t, "localhost:7003", node.Address)
+			assert.Equal(t, "localhost:9003", node.ListenAddress)
+		}
+	}
+}
+
+// TestCoordinator_RequiresBothAddresses verifies that nodes must provide both addresses
+func TestCoordinator_RequiresBothAddresses(t *testing.T) {
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "coordinator-node",
+		ClusterAddr:        "localhost:7100",
+		ListenAddr:         "localhost:9100",
+		RingPartitionCount: 1024,
+	}
+
+	coord, err := New(config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Test 1: Join with empty listen address should fail
+	joinReq := &clusterpb.JoinRequest{
+		NodeId:        "node-without-listen",
+		Address:       "localhost:7101",
+		ListenAddress: "", // Empty listen address
+	}
+
+	_, err = coord.Join(ctx, joinReq)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "listen address is required")
+
+	// Test 2: Join with empty cluster address should fail
+	joinReq2 := &clusterpb.JoinRequest{
+		NodeId:        "node-without-cluster",
+		Address:       "", // Empty cluster address
+		ListenAddress: "localhost:9101",
+	}
+
+	_, err = coord.Join(ctx, joinReq2)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cluster address is required")
+
+	// Test 3: Verify no nodes were added
+	nodes := coord.GetRing().GetAllNodes()
+	assert.Len(t, nodes, 1) // Only coordinator node
+	assert.Equal(t, "coordinator-node", nodes[0].ID)
 }
 
 // TestCoordinator_JoinClusterFailure tests that joinCluster returns error when all nodes fail

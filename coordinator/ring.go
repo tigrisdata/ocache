@@ -89,13 +89,21 @@ func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 	}, nil
 }
 
-// AddNode adds a new node to the cluster (true membership change)
+// AddNode adds a new node with both cluster and listen addresses
 func (r *Ring) AddNode(id, address, listenAddress string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.nodes[id]; exists {
 		return fmt.Errorf("node %s already exists in ring", id)
+	}
+
+	// Both addresses are required
+	if address == "" {
+		return fmt.Errorf("cluster address is required for node %s", id)
+	}
+	if listenAddress == "" {
+		return fmt.Errorf("listen address is required for node %s", id)
 	}
 
 	// Add to consistent hash ring

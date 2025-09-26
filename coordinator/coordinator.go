@@ -105,6 +105,11 @@ func New(config *Config) (*Coordinator, error) {
 		return nil, fmt.Errorf("invalid cluster address: %w", err)
 	}
 
+	// Validate listen address is provided
+	if config.ListenAddr == "" {
+		return nil, fmt.Errorf("listen address is required in cluster mode")
+	}
+
 	// Create node discovery
 	dnsRefreshInterval := time.Duration(config.DNSRefreshInterval) * time.Second
 	if dnsRefreshInterval <= 0 {

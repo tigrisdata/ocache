@@ -88,20 +88,141 @@ func startMockRouterServer(t *testing.T, nodeID string) (string, string, *grpc.S
 	return cacheLis.Addr().String(), clusterLis.Addr().String(), grpcClusterServer, grpcCacheServer, mockClusterService, mockCacheService
 }
 
+// TestRouter_UsesListenAddressForCacheOperations verifies router connects to listen address for cache operations
+func TestRouter_UsesListenAddressForCacheOperations(t *testing.T) {
+	// Create ring
+	ring, err := NewRing(100, "local-node")
+	require.NoError(t, err)
+
+	// Add local node
+	err = ring.AddNode("local-node", "localhost:7000", "localhost:9000")
+	require.NoError(t, err)
+
+	// Start mock servers on different ports
+	// Cache service on port that will be used as listen address
+	cacheLis, err := net.Listen("tcp", "localhost:9500")
+	require.NoError(t, err)
+	defer cacheLis.Close()
+
+	// Cluster service on port that will be used as cluster address
+	clusterLis, err := net.Listen("tcp", "localhost:7500")
+	require.NoError(t, err)
+	defer clusterLis.Close()
+
+	// Track which server gets the connection
+	var cacheServiceCalled bool
+	var clusterServiceCalled bool
+
+	// Start cache server (should receive requests)
+	grpcCacheServer := grpc.NewServer()
+	// Register tracked service
+	pb.RegisterCacheServiceServer(grpcCacheServer, &trackedCacheService{
+		mockRouterCacheService: mockRouterCacheService{},
+		called:                 &cacheServiceCalled,
+	})
+
+	go func() {
+		grpcCacheServer.Serve(cacheLis)
+	}()
+	defer grpcCacheServer.Stop()
+
+	// Start cluster server (should NOT receive cache requests)
+	grpcClusterServer := grpc.NewServer()
+	// Also register cache service on cluster port to detect wrong routing
+	pb.RegisterCacheServiceServer(grpcClusterServer, &trackedCacheService{
+		mockRouterCacheService: mockRouterCacheService{},
+		called:                 &clusterServiceCalled,
+	})
+
+	go func() {
+		grpcClusterServer.Serve(clusterLis)
+	}()
+	defer grpcClusterServer.Stop()
+
+	// Add remote node with DIFFERENT cluster and listen addresses
+	err = ring.AddNode("remote-node", "localhost:7500", "localhost:9500")
+	require.NoError(t, err)
+
+	// Create router
+	router := NewRouter(ring, "local-node")
+	defer router.Close()
+
+	// Find a key that routes to remote-node
+	var testKey string
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("test-key-%d", i)
+		node, err := ring.GetNode(key)
+		require.NoError(t, err)
+		if node.ID == "remote-node" {
+			testKey = key
+			break
+		}
+	}
+	require.NotEmpty(t, testKey, "Should find a key that routes to remote-node")
+
+	// Route to remote node
+	client, err := router.Route(testKey)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+
+	// Make a request
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := client.Delete(ctx, &pb.DeleteRequest{Key: testKey})
+	require.NoError(t, err)
+	assert.True(t, resp.Success)
+
+	// Verify the correct server was called
+	assert.True(t, cacheServiceCalled, "Cache service on listen address (9500) should be called")
+	assert.False(t, clusterServiceCalled, "Cluster service on cluster address (7500) should NOT be called")
+
+	// Verify router cached the correct address
+	stats := router.GetConnectionStats()
+	assert.Contains(t, stats, "remote-node")
+
+	// Verify the router is using the listen address by checking internal state
+	router.mu.RLock()
+	if state, exists := router.clients["remote-node"]; exists && state.conn != nil {
+		// Get the target from the connection
+		target := state.conn.Target()
+		assert.Contains(t, target, "9500", "Router should connect to listen address port 9500")
+		assert.NotContains(t, target, "7500", "Router should NOT connect to cluster address port 7500")
+	}
+	router.mu.RUnlock()
+}
+
+// Helper type to track service calls
+type trackedCacheService struct {
+	mockRouterCacheService
+	called *bool
+}
+
+func (t *trackedCacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	*t.called = true
+	return t.mockRouterCacheService.Delete(ctx, req)
+}
+
+func (t *trackedCacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	*t.called = true
+	return t.mockRouterCacheService.PutObject(ctx, req)
+}
+
 func TestRouter_BasicRouting(t *testing.T) {
 	// Create ring and add nodes
 	ring, err := NewRing(100, "local-node")
 	require.NoError(t, err)
 
 	// Add self to ring first (coordinator does this)
-	err = ring.AddNode("local-node", "localhost:9999", "localhost:9999")
+	err = ring.AddNode("local-node", "localhost:7999", "localhost:9999")
 	require.NoError(t, err)
 
 	// Start mock remote node
-	listenAddr, clusterAddr, grpcServer, _, _, _ := startMockRouterServer(t, "remote-node")
-	defer grpcServer.Stop()
+	cacheAddr, clusterAddr, grpcClusterServer, grpcCacheServer, _, _ := startMockRouterServer(t, "remote-node")
+	defer grpcClusterServer.Stop()
+	defer grpcCacheServer.Stop()
 
-	err = ring.AddNode("remote-node", listenAddr, clusterAddr)
+	err = ring.AddNode("remote-node", clusterAddr, cacheAddr)
 	require.NoError(t, err)
 
 	// Create router with custom config for faster testing
