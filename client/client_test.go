@@ -195,7 +195,7 @@ func TestClient_AutoMode(t *testing.T) {
 
 		// Set up topology
 		topology := setupSimpleTopology([]string{server.address})
-		server.cacheService.clusterTopology = topology
+		server.cacheService.SetClusterTopology(topology)
 
 		// Create client in auto mode
 		client, err := NewWithConfig(&ClientConfig{

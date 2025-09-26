@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/proto"
 )
 
 // hashKeyToPartition hashes a key to a partition number
@@ -58,6 +59,7 @@ type mockCacheServiceServer struct {
 
 	// Cluster topology for GetTopology
 	clusterTopology *clusterpb.ClusterTopology
+	clusterTopologyMu sync.RWMutex
 }
 
 func newMockCacheServiceServer() *mockCacheServiceServer {
@@ -277,9 +279,19 @@ func (m *mockCacheServiceServer) List(req *pb.ListRequest, stream pb.CacheServic
 	return nil
 }
 
+// SetClusterTopology safely sets the cluster topology
+func (m *mockCacheServiceServer) SetClusterTopology(topology *clusterpb.ClusterTopology) {
+	m.clusterTopologyMu.Lock()
+	defer m.clusterTopologyMu.Unlock()
+	m.clusterTopology = topology
+}
+
 // GetTopology returns the cluster topology (converting from ClusterService format)
 func (m *mockCacheServiceServer) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
 	m.getTopologyCallCount.Add(1)
+
+	m.clusterTopologyMu.RLock()
+	defer m.clusterTopologyMu.RUnlock()
 
 	// For single-node tests without cluster setup
 	if m.clusterTopology == nil {
@@ -288,9 +300,12 @@ func (m *mockCacheServiceServer) GetTopology(ctx context.Context, req *pb.GetTop
 		}, nil
 	}
 
-	// Return the topology directly since it's now the same type
+	// Make a deep copy to avoid race conditions
+	topologyCopy := proto.Clone(m.clusterTopology).(*clusterpb.ClusterTopology)
+
+	// Return the topology copy
 	return &pb.GetTopologyResponse{
-		Topology: m.clusterTopology,
+		Topology: topologyCopy,
 	}, nil
 }
 
@@ -509,7 +524,7 @@ func setupMultiNodeTestServers(count int) ([]*testServer, *clusterpb.ClusterTopo
 	partitionsPerNode := partitionCount / int32(count)
 	for i, server := range servers {
 		// Also set topology in cache service for GetTopology
-		server.cacheService.clusterTopology = topology
+		server.cacheService.SetClusterTopology(topology)
 
 		server.cacheService.nodeID = fmt.Sprintf("node-%d", i)
 

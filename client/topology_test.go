@@ -24,7 +24,7 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 
 	// Initial topology
 	topology1 := setupSimpleTopology([]string{server.address})
-	server.cacheService.clusterTopology = topology1
+	server.cacheService.SetClusterTopology(topology1)
 
 	// Create client with short refresh interval
 	client, err := NewWithConfig(&ClientConfig{
@@ -44,7 +44,7 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 	// Update topology with higher epoch
 	topology2 := setupSimpleTopology([]string{server.address})
 	topology2.Epoch = 2
-	server.cacheService.clusterTopology = topology2
+	server.cacheService.SetClusterTopology(topology2)
 
 	// Wait for refresh with eventual consistency check
 	assert.Eventually(t, func() bool {
@@ -54,7 +54,7 @@ func TestTopologyRefreshLoop_PeriodicUpdate(t *testing.T) {
 	// Update again
 	topology3 := setupSimpleTopology([]string{server.address})
 	topology3.Epoch = 3
-	server.cacheService.clusterTopology = topology3
+	server.cacheService.SetClusterTopology(topology3)
 
 	// Wait for another refresh with eventual consistency check
 	assert.Eventually(t, func() bool {
@@ -78,7 +78,7 @@ func TestUpdateTopology_RingUpdate(t *testing.T) {
 
 	// Initial topology with one server
 	topology1 := setupSimpleTopology([]string{server1.address})
-	server1.cacheService.clusterTopology = topology1
+	server1.cacheService.SetClusterTopology(topology1)
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
@@ -98,7 +98,7 @@ func TestUpdateTopology_RingUpdate(t *testing.T) {
 	// Update topology to include both servers
 	topology2 := setupSimpleTopology([]string{server1.address, server2.address})
 	topology2.Epoch = 2
-	server1.cacheService.clusterTopology = topology2
+	server1.cacheService.SetClusterTopology(topology2)
 
 	// Manually trigger topology update
 	if cc, ok := client.CacheClient.(*ClusterClient); ok {
@@ -131,7 +131,7 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 
 	// Initial topology with two servers
 	topology1 := setupSimpleTopology(addresses[:2])
-	servers[0].cacheService.clusterTopology = topology1
+	servers[0].cacheService.SetClusterTopology(topology1)
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
@@ -155,7 +155,7 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	// Add third server
 	topology2 := setupSimpleTopology(addresses)
 	topology2.Epoch = 2
-	servers[0].cacheService.clusterTopology = topology2
+	servers[0].cacheService.SetClusterTopology(topology2)
 
 	// Update topology
 	if cc, ok := client.CacheClient.(*ClusterClient); ok {
@@ -172,7 +172,7 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	topology3 := setupSimpleTopology(addresses)
 	topology3.Epoch = 3
 	topology3.Nodes[1].Status = clusterpb.NodeStatus_NODE_STATUS_DOWN
-	servers[0].cacheService.clusterTopology = topology3
+	servers[0].cacheService.SetClusterTopology(topology3)
 
 	// Update topology
 	if cc, ok := client.CacheClient.(*ClusterClient); ok {
@@ -198,7 +198,7 @@ func TestTopology_ConcurrentReads(t *testing.T) {
 
 	// Initial topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.cacheService.clusterTopology = topology
+	server.cacheService.SetClusterTopology(topology)
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
@@ -233,7 +233,7 @@ func TestTopology_ConcurrentReads(t *testing.T) {
 			default:
 				newTopology := setupSimpleTopology([]string{server.address})
 				newTopology.Epoch = epoch
-				server.cacheService.clusterTopology = newTopology
+				server.cacheService.SetClusterTopology(newTopology)
 				epoch++
 				time.Sleep(20 * time.Millisecond)
 			}
@@ -291,7 +291,7 @@ func TestTopology_ConcurrentWrites(t *testing.T) {
 
 	// Initial topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.cacheService.clusterTopology = topology
+	server.cacheService.SetClusterTopology(topology)
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
@@ -322,7 +322,7 @@ func TestTopology_ConcurrentWrites(t *testing.T) {
 			default:
 				newTopology := setupSimpleTopology([]string{server.address})
 				newTopology.Epoch = epoch
-				server.cacheService.clusterTopology = newTopology
+				server.cacheService.SetClusterTopology(newTopology)
 				epoch++
 				time.Sleep(20 * time.Millisecond)
 			}
@@ -375,7 +375,7 @@ func TestTopology_NodeFailure(t *testing.T) {
 	// Initial topology with all servers active
 	topology := setupSimpleTopology(addresses)
 	for _, server := range servers {
-		server.cacheService.clusterTopology = topology
+		server.cacheService.SetClusterTopology(topology)
 	}
 
 	// Create client
@@ -399,8 +399,8 @@ func TestTopology_NodeFailure(t *testing.T) {
 	topology2 := setupSimpleTopology(addresses)
 	topology2.Epoch = 2
 	topology2.Nodes[1].Status = clusterpb.NodeStatus_NODE_STATUS_DOWN
-	servers[0].cacheService.clusterTopology = topology2
-	servers[2].cacheService.clusterTopology = topology2
+	servers[0].cacheService.SetClusterTopology(topology2)
+	servers[2].cacheService.SetClusterTopology(topology2)
 
 	// Fetch and update topology
 	if cc, ok := client.CacheClient.(*ClusterClient); ok {
@@ -463,7 +463,7 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 		})
 	}
 
-	server1.cacheService.clusterTopology = topology1
+	server1.cacheService.SetClusterTopology(topology1)
 
 	// Create client
 	client, err := NewWithConfig(&ClientConfig{
@@ -501,7 +501,7 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 		})
 	}
 
-	server1.cacheService.clusterTopology = topology2
+	server1.cacheService.SetClusterTopology(topology2)
 
 	// Update topology
 	if cc, ok := client.CacheClient.(*ClusterClient); ok {
