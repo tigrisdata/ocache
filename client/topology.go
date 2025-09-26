@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/buraksezer/consistent"
-	zlog "github.com/rs/zerolog/log"
 	"google.golang.org/grpc"
 
 	"github.com/tigrisdata/ocache/common/hash"
@@ -26,6 +25,7 @@ func (n nodeMember) String() string {
 type TopologyManager struct {
 	ring            *consistent.Consistent
 	partitionOwners map[int32]string           // partition -> nodeID
+	seedAddrs       []string                   // seed addresses
 	nodeAddresses   map[string]string          // nodeID -> address
 	topology        *clusterpb.ClusterTopology // Current topology
 	topologyEpoch   uint64                     // Topology version
@@ -35,22 +35,26 @@ type TopologyManager struct {
 }
 
 // NewTopologyManager creates a new topology manager
-func NewTopologyManager(refreshInterval time.Duration, dialOpts []grpc.DialOption) *TopologyManager {
+func NewTopologyManager(seedAddrs []string, refreshInterval time.Duration, dialOpts []grpc.DialOption) *TopologyManager {
 	return &TopologyManager{
 		partitionOwners: make(map[int32]string),
 		nodeAddresses:   make(map[string]string),
+		seedAddrs:       seedAddrs,
 		refreshInterval: refreshInterval,
 		dialOpts:        dialOpts,
 	}
 }
 
 // Initialize initializes the topology manager with the given seed addresses
-func (tm *TopologyManager) Initialize(ctx context.Context, seedAddrs []string) error {
+func (tm *TopologyManager) Initialize() error {
 	var topology *clusterpb.ClusterTopology
 	var err error
 
+	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
+	defer cancel()
+
 	// Try each address
-	for _, addr := range seedAddrs {
+	for _, addr := range tm.seedAddrs {
 		topology, err = tm.fetchTopologyFromAddress(ctx, addr)
 		if err == nil {
 			break
@@ -83,18 +87,26 @@ func (tm *TopologyManager) FetchTopology(ctx context.Context) (*clusterpb.Cluste
 		}
 	}
 
-	return nil, fmt.Errorf("failed to fetch topology from any node")
+	// If we failed to fetch topology from any known node, try the seed addresses
+	for _, addr := range tm.seedAddrs {
+		topology, err := tm.fetchTopologyFromAddress(ctx, addr)
+		if err == nil {
+			return topology, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to fetch topology from any node or seed address")
 }
 
 // RefreshTopology refreshes the topology
-func (tm *TopologyManager) RefreshTopology(ctx context.Context) error {
+func (tm *TopologyManager) RefreshTopology(ctx context.Context) (bool, error) {
 	topology, err := tm.FetchTopology(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	tm.UpdateTopology(topology)
-	return nil
+	_, changed := tm.UpdateTopology(topology)
+	return changed, nil
 }
 
 // fetchTopologyFromAddress fetches topology from a specific address
@@ -243,18 +255,14 @@ func (tm *TopologyManager) TopologyRefreshLoop(ctx context.Context, updateFn fun
 		select {
 		case <-ticker.C:
 			fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-			err := tm.RefreshTopology(fetchCtx)
+			changed, err := tm.RefreshTopology(fetchCtx)
 			cancel()
 
 			if err != nil {
-				zlog.Error().
-					Err(err).
-					Msg("Failed to refresh topology")
-
 				continue
 			}
 
-			if updateFn != nil {
+			if changed && updateFn != nil {
 				updateFn()
 			}
 		case <-ctx.Done():

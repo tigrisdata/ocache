@@ -38,17 +38,14 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 
 	client := &ClusterClient{
 		conns:     make(map[string]*connection),
-		topology:  NewTopologyManager(config.RefreshInterval, config.DialOpts),
+		topology:  NewTopologyManager(config.Addrs, config.RefreshInterval, config.DialOpts),
 		config:    config,
 		seedAddrs: config.Addrs,
 		stopCh:    make(chan struct{}),
 	}
 
 	// Fetch initial topology
-	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
-	defer cancel()
-
-	err := client.topology.Initialize(ctx, config.Addrs)
+	err := client.topology.Initialize()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize topology: %w", err)
 	}
@@ -157,7 +154,7 @@ func (c *ClusterClient) RoundRobinRoute() (*connection, error) {
 // forceRefreshTopology attempts to refresh topology and update connections
 func (c *ClusterClient) forceRefreshTopology(ctx context.Context) bool {
 	fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
-	err := c.topology.RefreshTopology(fetchCtx)
+	_, err := c.topology.RefreshTopology(fetchCtx)
 	cancel()
 
 	if err == nil {
