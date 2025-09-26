@@ -159,10 +159,12 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 
 	for _, node := range topology.Nodes {
 		if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
-			// Use listen address for client connections if available, otherwise fallback to cluster address
+			// Use listen address for client connections
 			listenAddr := node.ListenAddress
 			if listenAddr == "" {
-				listenAddr = node.Address
+				// ListenAddress is required - this should not happen in properly configured clusters
+				// Skip this node as it's not properly configured
+				continue
 			}
 			activeNodes[listenAddr] = true
 			nodeAddresses[node.Id] = listenAddr
