@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 )
 
@@ -78,11 +78,11 @@ func detectMode(addrs []string, dialOpts []grpc.DialOption) ConnectionMode {
 			continue
 		}
 
-		clusterClient := clusterpb.NewClusterServiceClient(conn)
-		topology, err := clusterClient.GetClusterTopology(ctx, &clusterpb.Empty{})
+		cacheClient := pb.NewCacheServiceClient(conn)
+		resp, err := cacheClient.GetTopology(ctx, &pb.GetTopologyRequest{})
 		conn.Close()
 
-		if err == nil && topology != nil {
+		if err == nil && resp != nil && resp.Error == "" && resp.Topology != nil {
 			// Successfully fetched topology
 			return ModeCluster
 		}

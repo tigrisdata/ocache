@@ -85,6 +85,7 @@ proto: proto-api proto-storage proto-cluster
 proto-api:
 	protoc -I ./proto \
 		-I ./proto/google \
+		-I . \
 		--go_out=paths=source_relative:./proto \
 		--go-grpc_out=paths=source_relative:./proto \
 		--grpc-gateway_out=paths=source_relative:./proto \
