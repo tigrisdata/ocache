@@ -41,9 +41,10 @@ func CreateSimpleTopology(addresses []string, epoch uint64) *clusterpb.ClusterTo
 
 	for i, addr := range addresses {
 		nodes[i] = &clusterpb.NodeInfo{
-			Id:      fmt.Sprintf("node-%d", i),
-			Address: addr,
-			Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+			Id:            fmt.Sprintf("node-%d", i),
+			Address:       addr,
+			ListenAddress: addr, // For tests, use the same address for both cluster and listen
+			Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 		}
 	}
 

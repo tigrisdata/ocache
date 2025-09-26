@@ -471,11 +471,12 @@ func setupSimpleTopology(nodes []string) *clusterpb.ClusterTopology {
 
 	for i, node := range nodes {
 		nodeInfo := &clusterpb.NodeInfo{
-			Id:       fmt.Sprintf("node-%d", i),
-			Address:  node,
-			Status:   clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
-			JoinedAt: uint64(i),
-			Weight:   1.0,
+			Id:            fmt.Sprintf("node-%d", i),
+			Address:       node,
+			ListenAddress: node, // For tests, use the same address for both cluster and listen
+			Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+			JoinedAt:      uint64(i),
+			Weight:        1.0,
 		}
 		topology.Nodes = append(topology.Nodes, nodeInfo)
 
