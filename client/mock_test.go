@@ -46,14 +46,18 @@ type mockCacheServiceServer struct {
 	operationDelay map[string]int   // operation -> delay in ms
 
 	// Tracking
-	putCallCount    atomic.Int32
-	getCallCount    atomic.Int32
-	deleteCallCount atomic.Int32
-	listCallCount   atomic.Int32
+	putCallCount         atomic.Int32
+	getCallCount         atomic.Int32
+	deleteCallCount      atomic.Int32
+	listCallCount        atomic.Int32
+	getTopologyCallCount atomic.Int32
 
 	// Node ownership simulation (for cluster mode)
 	nodeID          string
 	ownedPartitions map[int32]bool
+
+	// Cluster topology for GetTopology
+	clusterTopology *clusterpb.ClusterTopology
 }
 
 func newMockCacheServiceServer() *mockCacheServiceServer {
@@ -273,6 +277,23 @@ func (m *mockCacheServiceServer) List(req *pb.ListRequest, stream pb.CacheServic
 	return nil
 }
 
+// GetTopology returns the cluster topology (converting from ClusterService format)
+func (m *mockCacheServiceServer) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
+	m.getTopologyCallCount.Add(1)
+
+	// For single-node tests without cluster setup
+	if m.clusterTopology == nil {
+		return &pb.GetTopologyResponse{
+			Error: "cluster mode not enabled",
+		}, nil
+	}
+
+	// Return the topology directly since it's now the same type
+	return &pb.GetTopologyResponse{
+		Topology: m.clusterTopology,
+	}, nil
+}
+
 // mockClusterServiceServer implements clusterpb.ClusterServiceServer for testing
 type mockClusterServiceServer struct {
 	clusterpb.UnimplementedClusterServiceServer
@@ -336,11 +357,10 @@ func (m *mockClusterServiceServer) Heartbeat(ctx context.Context, req *clusterpb
 
 // testServer manages a mock gRPC server for testing
 type testServer struct {
-	listener       *bufconn.Listener
-	grpcServer     *grpc.Server
-	cacheService   *mockCacheServiceServer
-	clusterService *mockClusterServiceServer
-	address        string
+	listener     *bufconn.Listener
+	grpcServer   *grpc.Server
+	cacheService *mockCacheServiceServer
+	address      string
 }
 
 // newTestServer creates a new in-memory test server
@@ -349,17 +369,14 @@ func newTestServer() *testServer {
 	grpcServer := grpc.NewServer()
 
 	cacheService := newMockCacheServiceServer()
-	clusterService := newMockClusterServiceServer()
 
 	pb.RegisterCacheServiceServer(grpcServer, cacheService)
-	clusterpb.RegisterClusterServiceServer(grpcServer, clusterService)
 
 	ts := &testServer{
-		listener:       listener,
-		grpcServer:     grpcServer,
-		cacheService:   cacheService,
-		clusterService: clusterService,
-		address:        "bufnet",
+		listener:     listener,
+		grpcServer:   grpcServer,
+		cacheService: cacheService,
+		address:      "bufnet",
 	}
 
 	// Start server in background
@@ -380,19 +397,15 @@ func newTestServerWithAddr() (*testServer, error) {
 	}
 
 	grpcServer := grpc.NewServer()
-
 	cacheService := newMockCacheServiceServer()
-	clusterService := newMockClusterServiceServer()
 
 	pb.RegisterCacheServiceServer(grpcServer, cacheService)
-	clusterpb.RegisterClusterServiceServer(grpcServer, clusterService)
 
 	ts := &testServer{
-		listener:       nil,
-		grpcServer:     grpcServer,
-		cacheService:   cacheService,
-		clusterService: clusterService,
-		address:        listener.Addr().String(),
+		listener:     nil,
+		grpcServer:   grpcServer,
+		cacheService: cacheService,
+		address:      listener.Addr().String(),
 	}
 
 	// Start server in background
@@ -495,7 +508,9 @@ func setupMultiNodeTestServers(count int) ([]*testServer, *clusterpb.ClusterTopo
 	partitionCount := int32(10) // Must match setupSimpleTopology
 	partitionsPerNode := partitionCount / int32(count)
 	for i, server := range servers {
-		server.clusterService.SetTopology(topology)
+		// Also set topology in cache service for GetTopology
+		server.cacheService.clusterTopology = topology
+
 		server.cacheService.nodeID = fmt.Sprintf("node-%d", i)
 
 		// Set owned partitions

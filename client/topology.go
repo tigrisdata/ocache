@@ -12,6 +12,7 @@ import (
 
 	"github.com/tigrisdata/ocache/common/hash"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	pb "github.com/tigrisdata/ocache/proto"
 )
 
 // nodeMember implements consistent.Member interface
@@ -104,8 +105,20 @@ func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr st
 	}
 	defer conn.Close()
 
-	client := clusterpb.NewClusterServiceClient(conn)
-	return client.GetClusterTopology(ctx, &clusterpb.Empty{})
+	// Use CacheService.GetTopology instead of ClusterService
+	client := pb.NewCacheServiceClient(conn)
+	resp, err := client.GetTopology(ctx, &pb.GetTopologyRequest{})
+	if err != nil {
+		return nil, err
+	}
+
+	// Check for error in response
+	if resp.Error != "" {
+		return nil, fmt.Errorf("topology error: %s", resp.Error)
+	}
+
+	// Return the topology directly since it's now the same type
+	return resp.Topology, nil
 }
 
 // UpdateTopology updates the internal state based on new topology

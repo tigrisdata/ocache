@@ -25,7 +25,7 @@ func TestRetry_AllOperations(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
@@ -241,7 +241,7 @@ func TestRetry_MaxRetryCount(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
@@ -361,7 +361,7 @@ func TestRetry_OnlyOnRoutingErrors(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
@@ -421,7 +421,7 @@ func TestRetry_NoRetryAfterPartialData(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
@@ -494,7 +494,7 @@ func TestRetry_ConcurrentRetries(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
@@ -562,7 +562,7 @@ func TestRetry_PutStream(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create client in cluster mode
 	client, err := NewWithConfig(&ClientConfig{
@@ -626,7 +626,7 @@ func TestRetry_List(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Add some test data
 	server.cacheService.data["list-key-1"] = []byte("value1")
@@ -689,7 +689,7 @@ func TestRetry_List(t *testing.T) {
 		// Update topology
 		newTopology := setupSimpleTopology([]string{server.address})
 		newTopology.Epoch = 2
-		server.clusterService.SetTopology(newTopology)
+		server.cacheService.clusterTopology = newTopology
 
 		// Force topology refresh
 		if cc, ok := client.CacheClient.(*ClusterClient); ok {
@@ -713,7 +713,7 @@ func TestRetry_GetData(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create test data
 	testData := []byte("0123456789abcdefghijklmnopqrstuvwxyz")
@@ -848,7 +848,7 @@ func TestRetry_GetRange(t *testing.T) {
 
 	// Set up topology
 	topology := setupSimpleTopology([]string{server.address})
-	server.clusterService.SetTopology(topology)
+	server.cacheService.clusterTopology = topology
 
 	// Create test data
 	testData := []byte("0123456789abcdefghijklmnopqrstuvwxyz")

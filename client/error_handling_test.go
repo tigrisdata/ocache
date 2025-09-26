@@ -193,7 +193,7 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		for i := range topology.Nodes {
 			topology.Nodes[i].Status = clusterpb.NodeStatus_NODE_STATUS_DOWN
 		}
-		server.clusterService.SetTopology(topology)
+		server.cacheService.clusterTopology = topology
 
 		// Client creation might succeed but operations should fail
 		client, err := NewWithConfig(&ClientConfig{
@@ -235,7 +235,7 @@ func TestError_ClusterModeErrors(t *testing.T) {
 			},
 			PartitionOwners: []*clusterpb.PartitionOwner{}, // No owners!
 		}
-		server.clusterService.SetTopology(topology)
+		server.cacheService.clusterTopology = topology
 
 		client, err := NewWithConfig(&ClientConfig{
 			Addrs: []string{server.address},
@@ -330,7 +330,7 @@ func TestError_ClusterDegradation(t *testing.T) {
 	// Set initial topology
 	topology := setupSimpleTopology(addresses)
 	for _, server := range servers {
-		server.clusterService.SetTopology(topology)
+		server.cacheService.clusterTopology = topology
 		server.cacheService.nodeID = "" // Disable ownership checks
 	}
 
@@ -358,8 +358,8 @@ func TestError_ClusterDegradation(t *testing.T) {
 	// Update topology to remove the down node
 	topology2 := setupSimpleTopology([]string{addresses[0], addresses[2]})
 	topology2.Epoch = 2
-	servers[0].clusterService.SetTopology(topology2)
-	servers[2].clusterService.SetTopology(topology2)
+	servers[0].cacheService.clusterTopology = topology2
+	servers[2].cacheService.clusterTopology = topology2
 
 	// Wait for topology refresh
 	time.Sleep(200 * time.Millisecond)

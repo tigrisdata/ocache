@@ -11,6 +11,7 @@ import (
 	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
@@ -297,6 +298,40 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 	}
 	metrics.RPCRequests.WithLabelValues("List", "success").Inc()
 	return nil
+}
+
+// GetTopology returns the current cluster topology (for cluster-aware clients)
+func (s *cacheService) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
+	start := time.Now()
+	defer func() {
+		metrics.RPCDuration.WithLabelValues("GetTopology").Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
+	zlog.Debug().Msg("gRPC GetTopology called")
+
+	// If coordinator is not enabled (single node mode), return an error
+	if s.coordinator == nil {
+		metrics.RPCRequests.WithLabelValues("GetTopology", "not_clustered").Inc()
+		return &pb.GetTopologyResponse{
+			Error: "cluster mode not enabled",
+		}, nil
+	}
+
+	// Get topology from coordinator
+	topology, err := s.coordinator.GetClusterTopology(ctx, &clusterpb.Empty{})
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("GetTopology", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "GetTopology").Inc()
+		return &pb.GetTopologyResponse{
+			Error: err.Error(),
+		}, nil
+	}
+
+	// Return the topology directly since we're now using the same type
+	metrics.RPCRequests.WithLabelValues("GetTopology", "success").Inc()
+	return &pb.GetTopologyResponse{
+		Topology: topology,
+	}, nil
 }
 
 // logGRPCRequest is a helper for logging gRPC requests (unary and streaming)
