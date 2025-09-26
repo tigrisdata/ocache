@@ -41,6 +41,7 @@ type Config struct {
 	Enabled            bool          // Whether the coordinator is enabled
 	MyNodeID           string        // The ID of the node
 	ClusterAddr        string        // The address the coordinator will listen on for cluster communication
+	ListenAddr         string        // The address the node listens on for client requests (Put/Get/Delete)
 	Nodes              []string      // The nodes of the cluster (can be static list or DNS name)
 	RingPartitionCount int           // The number of partitions in the hash ring
 	HeartbeatInterval  int           // The interval at which heartbeats are sent to detect node failures
@@ -174,7 +175,7 @@ func New(config *Config) (*Coordinator, error) {
 	}
 
 	// Add self to ring immediately during initialization
-	if err := ring.AddNode(config.MyNodeID, config.ClusterAddr); err != nil {
+	if err := ring.AddNode(config.MyNodeID, config.ClusterAddr, config.ListenAddr); err != nil {
 		return nil, fmt.Errorf("failed to add self to ring: %w", err)
 	}
 
@@ -363,8 +364,8 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 			continue
 		}
 
-		// Add node to our ring
-		if err := c.ring.AddNode(node.Id, node.Address); err != nil {
+		// Add node to our ring with both addresses
+		if err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
 			zlog.Warn().
 				Err(err).
 				Str("node_id", node.Id).
@@ -374,8 +375,9 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 
 	// Announce our join to the cluster
 	joinReq := &clusterpb.JoinRequest{
-		NodeId:  c.config.MyNodeID,
-		Address: c.config.ClusterAddr,
+		NodeId:        c.config.MyNodeID,
+		Address:       c.config.ClusterAddr,
+		ListenAddress: c.config.ListenAddr,
 	}
 
 	// Send join request to the node
@@ -688,11 +690,12 @@ func (c *Coordinator) tryJoinNode(node string) {
 func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*clusterpb.JoinResponse, error) {
 	zlog.Info().
 		Str("node_id", req.NodeId).
-		Str("address", req.Address).
+		Str("cluster_address", req.Address).
+		Str("listen_address", req.ListenAddress).
 		Msg("Received join request")
 
-	// Add node to ring
-	if err := c.ring.AddNode(req.NodeId, req.Address); err != nil {
+	// Add node to ring with both addresses
+	if err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress); err != nil {
 		return nil, err
 	}
 
@@ -768,10 +771,11 @@ func (c *Coordinator) GetClusterState(ctx context.Context, req *clusterpb.Empty)
 	// Convert nodes to protobuf format
 	for _, node := range nodes {
 		pbNode := &clusterpb.NodeInfo{
-			Id:       node.ID,
-			Address:  node.Address,
-			Status:   clusterpb.NodeStatus(node.Status),
-			JoinedAt: uint64(node.JoinedAt.Unix()),
+			Id:            node.ID,
+			Address:       node.Address,
+			ListenAddress: node.ListenAddress,
+			Status:        clusterpb.NodeStatus(node.Status),
+			JoinedAt:      uint64(node.JoinedAt.Unix()),
 		}
 		pbNodes = append(pbNodes, pbNode)
 	}
@@ -800,10 +804,11 @@ func (c *Coordinator) GetClusterTopology(ctx context.Context, req *clusterpb.Emp
 	// Convert nodes to protobuf format
 	for _, node := range nodes {
 		pbNode := &clusterpb.NodeInfo{
-			Id:       node.ID,
-			Address:  node.Address,
-			Status:   clusterpb.NodeStatus(node.Status),
-			JoinedAt: uint64(node.JoinedAt.Unix()),
+			Id:            node.ID,
+			Address:       node.Address,
+			ListenAddress: node.ListenAddress,
+			Status:        clusterpb.NodeStatus(node.Status),
+			JoinedAt:      uint64(node.JoinedAt.Unix()),
 		}
 		pbNodes = append(pbNodes, pbNode)
 	}

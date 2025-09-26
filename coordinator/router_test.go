@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -33,21 +34,58 @@ func (m *mockRouterClusterService) Heartbeat(ctx context.Context, req *clusterpb
 	}, nil
 }
 
-func startMockRouterServer(t *testing.T, nodeID string) (string, *grpc.Server, *mockRouterClusterService) {
-	lis, err := net.Listen("tcp", "localhost:0")
+type mockRouterCacheService struct {
+	pb.UnimplementedCacheServiceServer
+}
+
+func (m *mockRouterCacheService) Put(stream pb.CacheService_PutServer) error {
+	return stream.SendAndClose(&pb.PutResponse{Success: true})
+}
+
+func (m *mockRouterCacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	return &pb.PutResponse{Success: true}, nil
+}
+
+func (m *mockRouterCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
+	return stream.Send(&pb.GetResponse{Data: []byte("hello world")})
+}
+
+func (m *mockRouterCacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	return &pb.DeleteResponse{Success: true}, nil
+}
+
+func (m *mockRouterCacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
+	return stream.Send(&pb.ListResponse{Keys: []string{"key1", "key2"}})
+}
+
+func startMockRouterServer(t *testing.T, nodeID string) (string, string, *grpc.Server, *grpc.Server, *mockRouterClusterService, *mockRouterCacheService) {
+	clusterLis, err := net.Listen("tcp", "localhost:0")
 	require.NoError(t, err)
 
-	grpcServer := grpc.NewServer()
-	mockService := &mockRouterClusterService{nodeID: nodeID}
-	clusterpb.RegisterClusterServiceServer(grpcServer, mockService)
+	cacheLis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+
+	grpcClusterServer := grpc.NewServer()
+	mockClusterService := &mockRouterClusterService{nodeID: nodeID}
+	clusterpb.RegisterClusterServiceServer(grpcClusterServer, mockClusterService)
+
+	grpcCacheServer := grpc.NewServer()
+	mockCacheService := &mockRouterCacheService{}
+	pb.RegisterCacheServiceServer(grpcCacheServer, mockCacheService)
 
 	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
+		if err := grpcClusterServer.Serve(clusterLis); err != nil {
 			t.Logf("Mock server stopped: %v", err)
 		}
 	}()
 
-	return lis.Addr().String(), grpcServer, mockService
+	go func() {
+		if err := grpcCacheServer.Serve(cacheLis); err != nil {
+			t.Logf("Mock server stopped: %v", err)
+		}
+	}()
+
+	return cacheLis.Addr().String(), clusterLis.Addr().String(), grpcClusterServer, grpcCacheServer, mockClusterService, mockCacheService
 }
 
 func TestRouter_BasicRouting(t *testing.T) {
@@ -56,14 +94,14 @@ func TestRouter_BasicRouting(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add self to ring first (coordinator does this)
-	err = ring.AddNode("local-node", "localhost:9999")
+	err = ring.AddNode("local-node", "localhost:9999", "localhost:9999")
 	require.NoError(t, err)
 
 	// Start mock remote node
-	remoteAddr, grpcServer, _ := startMockRouterServer(t, "remote-node")
+	listenAddr, clusterAddr, grpcServer, _, _, _ := startMockRouterServer(t, "remote-node")
 	defer grpcServer.Stop()
 
-	err = ring.AddNode("remote-node", remoteAddr)
+	err = ring.AddNode("remote-node", listenAddr, clusterAddr)
 	require.NoError(t, err)
 
 	// Create router with custom config for faster testing
@@ -127,13 +165,13 @@ func TestRouter_ConnectionRetry(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start mock server that will fail initially
-	remoteAddr, grpcServer, mockService := startMockRouterServer(t, "remote-node")
+	listenAddr, clusterAddr, grpcServer, _, mockService, _ := startMockRouterServer(t, "remote-node")
 	defer grpcServer.Stop()
 
 	// Make the service fail for 100ms
 	mockService.failUntil = time.Now().Add(100 * time.Millisecond)
 
-	err = ring.AddNode("remote-node", remoteAddr)
+	err = ring.AddNode("remote-node", listenAddr, clusterAddr)
 	require.NoError(t, err)
 
 	// Create router with retry config
@@ -176,7 +214,7 @@ func TestRouter_CircuitBreaker(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add a non-existent node
-	err = ring.AddNode("dead-node", "localhost:99999")
+	err = ring.AddNode("dead-node", "localhost:77777", "localhost:99999")
 	require.NoError(t, err)
 
 	// Create router with low circuit breaker threshold
@@ -247,10 +285,10 @@ func TestRouter_RemoveClient(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start mock remote node
-	remoteAddr, grpcServer, _ := startMockRouterServer(t, "remote-node")
+	listenAddr, clusterAddr, grpcServer, _, _, _ := startMockRouterServer(t, "remote-node")
 	defer grpcServer.Stop()
 
-	err = ring.AddNode("remote-node", remoteAddr)
+	err = ring.AddNode("remote-node", listenAddr, clusterAddr)
 	require.NoError(t, err)
 
 	router := NewRouter(ring, "local-node")
@@ -288,14 +326,14 @@ func TestRouter_RefreshConnections(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start two mock nodes
-	addr1, server1, _ := startMockRouterServer(t, "node1")
+	addr1, clusterAddr1, server1, _, _, _ := startMockRouterServer(t, "node1")
 	defer server1.Stop()
-	addr2, server2, _ := startMockRouterServer(t, "node2")
+	addr2, clusterAddr2, server2, _, _, _ := startMockRouterServer(t, "node2")
 	defer server2.Stop()
 
-	err = ring.AddNode("node1", addr1)
+	err = ring.AddNode("node1", addr1, clusterAddr1)
 	require.NoError(t, err)
-	err = ring.AddNode("node2", addr2)
+	err = ring.AddNode("node2", addr2, clusterAddr2)
 	require.NoError(t, err)
 
 	router := NewRouter(ring, "local-node")
@@ -326,10 +364,10 @@ func TestRouter_GetConnectionStats(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start mock node
-	remoteAddr, grpcServer, _ := startMockRouterServer(t, "remote-node")
+	listenAddr, clusterAddr, grpcServer, _, _, _ := startMockRouterServer(t, "remote-node")
 	defer grpcServer.Stop()
 
-	err = ring.AddNode("remote-node", remoteAddr)
+	err = ring.AddNode("remote-node", listenAddr, clusterAddr)
 	require.NoError(t, err)
 
 	router := NewRouter(ring, "local-node")

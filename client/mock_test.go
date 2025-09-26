@@ -58,7 +58,7 @@ type mockCacheServiceServer struct {
 	ownedPartitions map[int32]bool
 
 	// Cluster topology for GetTopology
-	clusterTopology *clusterpb.ClusterTopology
+	clusterTopology   *clusterpb.ClusterTopology
 	clusterTopologyMu sync.RWMutex
 }
 
