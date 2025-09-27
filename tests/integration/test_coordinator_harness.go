@@ -181,14 +181,38 @@ func (h *CoordinatorTestHarness) StartAllNodes() error {
 	return nil
 }
 
-// StopAllNodes stops all nodes
+// StopAllNodes stops all nodes with proper cleanup
 func (h *CoordinatorTestHarness) StopAllNodes() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	for _, node := range h.Nodes {
-		node.Stop()
+	var wg sync.WaitGroup
+	for nodeID, node := range h.Nodes {
+		wg.Add(1)
+		go func(id string, n *CoordinatorTestNode) {
+			defer wg.Done()
+			if err := n.Stop(); err != nil {
+				h.T.Logf("Failed to stop node %s: %v", id, err)
+			}
+		}(nodeID, node)
 	}
+
+	// Wait for all nodes to stop with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All nodes stopped successfully
+	case <-time.After(10 * time.Second):
+		h.T.Log("Timeout waiting for nodes to stop")
+	}
+
+	// Clear the nodes map
+	h.Nodes = make(map[string]*CoordinatorTestNode)
 }
 
 // GetTopology gets topology from a node
