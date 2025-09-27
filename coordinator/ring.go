@@ -90,13 +90,10 @@ func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 }
 
 // AddNode adds a new node with both cluster and listen addresses
+// It is idempotent - if the node already exists with the same addresses, it returns success
 func (r *Ring) AddNode(id, address, listenAddress string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	if _, exists := r.nodes[id]; exists {
-		return fmt.Errorf("node %s already exists in ring", id)
-	}
 
 	// Both addresses are required
 	if address == "" {
@@ -104,6 +101,22 @@ func (r *Ring) AddNode(id, address, listenAddress string) error {
 	}
 	if listenAddress == "" {
 		return fmt.Errorf("listen address is required for node %s", id)
+	}
+
+	// Check if node already exists
+	if existingNode, exists := r.nodes[id]; exists {
+		// If the node exists with the same addresses, consider it a success (idempotent)
+		if existingNode.Address == address && existingNode.ListenAddress == listenAddress {
+			zlog.Debug().
+				Str("node_id", id).
+				Str("cluster_address", address).
+				Str("listen_address", listenAddress).
+				Msg("Node already exists in ring with same addresses, treating as success")
+			return nil
+		}
+		// If addresses differ, it's an error
+		return fmt.Errorf("node %s already exists with different addresses (existing: %s/%s, new: %s/%s)",
+			id, existingNode.Address, existingNode.ListenAddress, address, listenAddress)
 	}
 
 	// Add to consistent hash ring

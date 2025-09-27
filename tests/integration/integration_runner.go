@@ -99,6 +99,30 @@ func (s *WorkflowSuite) TearDownTest() {
 	// Cleanup is handled by each test individually
 }
 
+// CoordinatorSuite tests cluster coordinator functionality
+type CoordinatorSuite struct {
+	IntegrationTestSuite
+	harness *CoordinatorTestHarness
+}
+
+// SetupTest sets up for coordinator tests
+func (s *CoordinatorSuite) SetupTest() {
+	// Create a simple 3-node test harness
+	s.harness = NewCoordinatorTestHarness(s.T(), 3)
+
+	// Use default integration test config for base suite
+	config := DefaultIntegrationTestConfig()
+	s.Config = config
+	// Don't set s.Harness since we're not using storage for coordinator tests
+}
+
+// TearDownTest cleans up after each coordinator test
+func (s *CoordinatorSuite) TearDownTest() {
+	if s.harness != nil {
+		s.harness.Cleanup()
+	}
+}
+
 // StressSuite tests system under stress
 type StressSuite struct {
 	IntegrationTestSuite
@@ -131,6 +155,13 @@ func TestIntegrationWorkflow(t *testing.T) {
 	suite.Run(t, new(WorkflowSuite))
 }
 
+func TestIntegrationCoordinator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping coordinator tests in short mode")
+	}
+	suite.Run(t, new(CoordinatorSuite))
+}
+
 func TestIntegrationStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping stress tests in short mode")
@@ -145,6 +176,7 @@ func RunAllIntegrationTests(t *testing.T) {
 	t.Run("Compaction", TestIntegrationCompaction)
 	t.Run("Workflows", TestIntegrationWorkflow)
 	if !testing.Short() {
+		t.Run("Coordinator", TestIntegrationCoordinator)
 		t.Run("Stress", TestIntegrationStress)
 	}
 }
