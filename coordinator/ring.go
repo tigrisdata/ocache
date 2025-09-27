@@ -91,19 +91,20 @@ func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 
 // AddNode adds a new node with both cluster and listen addresses
 // It is idempotent - if the node already exists with the same addresses, it returns success
-func (r *Ring) AddNode(id, address, listenAddress string) error {
+func (r *Ring) AddNode(id, address, listenAddress string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	// Both addresses are required
 	if address == "" {
-		return fmt.Errorf("cluster address is required for node %s", id)
+		return false, fmt.Errorf("cluster address is required for node %s", id)
 	}
 	if listenAddress == "" {
-		return fmt.Errorf("listen address is required for node %s", id)
+		return false, fmt.Errorf("listen address is required for node %s", id)
 	}
 
 	// Check if node already exists
+	isNewNode := false
 	if existingNode, exists := r.nodes[id]; exists {
 		// If the node exists with the same addresses, consider it a success (idempotent)
 		if existingNode.Address == address && existingNode.ListenAddress == listenAddress {
@@ -112,10 +113,10 @@ func (r *Ring) AddNode(id, address, listenAddress string) error {
 				Str("cluster_address", address).
 				Str("listen_address", listenAddress).
 				Msg("Node already exists in ring with same addresses, treating as success")
-			return nil
+			return isNewNode, nil
 		}
 		// If addresses differ, it's an error
-		return fmt.Errorf("node %s already exists with different addresses (existing: %s/%s, new: %s/%s)",
+		return false, fmt.Errorf("node %s already exists with different addresses (existing: %s/%s, new: %s/%s)",
 			id, existingNode.Address, existingNode.ListenAddress, address, listenAddress)
 	}
 
@@ -136,6 +137,7 @@ func (r *Ring) AddNode(id, address, listenAddress string) error {
 
 	// Increment membership epoch (true membership change)
 	atomic.AddUint64(&r.epoch, 1)
+	isNewNode = true
 
 	zlog.Info().
 		Str("node_id", id).
@@ -144,7 +146,7 @@ func (r *Ring) AddNode(id, address, listenAddress string) error {
 		Uint64("membership_epoch", r.epoch).
 		Msg("Added node to ring")
 
-	return nil
+	return isNewNode, nil
 }
 
 // RemoveNode permanently removes a node from the cluster (true membership change)

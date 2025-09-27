@@ -13,8 +13,9 @@ func TestRing_AddNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add first node
-	err = ring.AddNode("node1", "localhost:7000", "localhost:9000")
-	assert.NoError(t, err)
+	isNewNode, err := ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	require.NoError(t, err)
+	assert.True(t, isNewNode)
 
 	// Verify node was added
 	nodes := ring.GetAllNodes()
@@ -25,15 +26,17 @@ func TestRing_AddNode(t *testing.T) {
 	assert.True(t, nodes[0].Available)
 
 	// Add second node
-	err = ring.AddNode("node2", "localhost:7001", "localhost:9001")
-	assert.NoError(t, err)
+	isNewNode, err = ring.AddNode("node2", "localhost:7001", "localhost:9001")
+	require.NoError(t, err)
+	assert.True(t, isNewNode)
 
 	nodes = ring.GetAllNodes()
 	assert.Len(t, nodes, 2)
 
 	// Try adding duplicate node
-	err = ring.AddNode("node1", "localhost:7000", "localhost:9000")
-	assert.Error(t, err)
+	isNewNode, err = ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	require.NoError(t, err)
+	assert.False(t, isNewNode)
 }
 
 func TestRing_RemoveNode(t *testing.T) {

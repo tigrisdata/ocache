@@ -180,7 +180,7 @@ func New(config *Config) (*Coordinator, error) {
 	}
 
 	// Add self to ring immediately during initialization
-	if err := ring.AddNode(config.MyNodeID, config.ClusterAddr, config.ListenAddr); err != nil {
+	if _, err := ring.AddNode(config.MyNodeID, config.ClusterAddr, config.ListenAddr); err != nil {
 		return nil, fmt.Errorf("failed to add self to ring: %w", err)
 	}
 
@@ -370,7 +370,7 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		}
 
 		// Add node to our ring with both addresses
-		if err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
+		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
 			zlog.Warn().
 				Err(err).
 				Str("node_id", node.Id).
@@ -700,19 +700,22 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 		Msg("Received join request")
 
 	// Check if this is a new node or an existing one
-	isNewNode := false
+	isNewNode, err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress)
+	if err != nil {
+		zlog.Warn().
+			Err(err).
+			Str("node_id", req.NodeId).
+			Msg("Failed to add node to ring")
 
-	// Add node to ring with both addresses
-	if err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress); err != nil {
-		// Check if it's an idempotent case (node already exists with same addresses)
-		// This is expected during broadcasts
+		return nil, err
+	}
+
+	// Check if it's an idempotent case (node already exists with same addresses)
+	if !isNewNode {
 		return &clusterpb.JoinResponse{
 			Success: true,
 			Epoch:   c.ring.GetEpoch(),
 		}, nil
-	} else {
-		// Successfully added a new node
-		isNewNode = true
 	}
 
 	// Reset last heartbeat and failure count
@@ -974,7 +977,7 @@ func (c *Coordinator) syncClusterState(nodeAddr string) error {
 	successCount := 0
 	for _, node := range state.Nodes {
 		// Add node to our ring (idempotent operation)
-		if err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
+		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
 			zlog.Warn().
 				Err(err).
 				Str("node_id", node.Id).
