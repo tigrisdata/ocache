@@ -38,12 +38,13 @@ func (s NodeStatus) String() string {
 
 // NodeInfo stores information about a node in the cluster
 type NodeInfo struct {
-	ID        string
-	Address   string
-	Status    NodeStatus
-	JoinedAt  time.Time
-	Weight    float64
-	Available bool // Tracks if node is available for routing
+	ID            string
+	Address       string // Cluster communication address (for heartbeats, etc.)
+	ListenAddress string // Service listen address for client requests (Put/Get/Delete)
+	Status        NodeStatus
+	JoinedAt      time.Time
+	Weight        float64
+	Available     bool // Tracks if node is available for routing
 }
 
 // nodeMember implements consistent.Member interface
@@ -88,13 +89,21 @@ func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 	}, nil
 }
 
-// AddNode adds a new node to the cluster (true membership change)
-func (r *Ring) AddNode(id, address string) error {
+// AddNode adds a new node with both cluster and listen addresses
+func (r *Ring) AddNode(id, address, listenAddress string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.nodes[id]; exists {
 		return fmt.Errorf("node %s already exists in ring", id)
+	}
+
+	// Both addresses are required
+	if address == "" {
+		return fmt.Errorf("cluster address is required for node %s", id)
+	}
+	if listenAddress == "" {
+		return fmt.Errorf("listen address is required for node %s", id)
 	}
 
 	// Add to consistent hash ring
@@ -103,12 +112,13 @@ func (r *Ring) AddNode(id, address string) error {
 
 	// Add to node registry
 	r.nodes[id] = &NodeInfo{
-		ID:        id,
-		Address:   address,
-		Status:    NodeStatusActive,
-		JoinedAt:  time.Now(),
-		Weight:    1.0,
-		Available: true, // New nodes start as available
+		ID:            id,
+		Address:       address,
+		ListenAddress: listenAddress,
+		Status:        NodeStatusActive,
+		JoinedAt:      time.Now(),
+		Weight:        1.0,
+		Available:     true, // New nodes start as available
 	}
 
 	// Increment membership epoch (true membership change)
@@ -116,7 +126,8 @@ func (r *Ring) AddNode(id, address string) error {
 
 	zlog.Info().
 		Str("node_id", id).
-		Str("address", address).
+		Str("cluster_address", address).
+		Str("listen_address", listenAddress).
 		Uint64("membership_epoch", r.epoch).
 		Msg("Added node to ring")
 

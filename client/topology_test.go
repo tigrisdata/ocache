@@ -437,14 +437,16 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 		Epoch: 1,
 		Nodes: []*clusterpb.NodeInfo{
 			{
-				Id:      "node-0",
-				Address: server1.address,
-				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+				Id:            "node-0",
+				Address:       server1.address,
+				ListenAddress: server1.address, // For tests, use the same address for both cluster and listen
+				Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 			{
-				Id:      "node-1",
-				Address: server2.address,
-				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+				Id:            "node-1",
+				Address:       server2.address,
+				ListenAddress: server2.address, // For tests, use the same address for both cluster and listen
+				Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 		},
 		RingConfig: &clusterpb.RingConfig{

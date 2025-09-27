@@ -13,7 +13,7 @@ func TestRing_AddNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add first node
-	err = ring.AddNode("node1", "localhost:9000")
+	err = ring.AddNode("node1", "localhost:7000", "localhost:9000")
 	assert.NoError(t, err)
 
 	// Verify node was added
@@ -25,14 +25,14 @@ func TestRing_AddNode(t *testing.T) {
 	assert.True(t, nodes[0].Available)
 
 	// Add second node
-	err = ring.AddNode("node2", "localhost:9001")
+	err = ring.AddNode("node2", "localhost:7001", "localhost:9001")
 	assert.NoError(t, err)
 
 	nodes = ring.GetAllNodes()
 	assert.Len(t, nodes, 2)
 
 	// Try adding duplicate node
-	err = ring.AddNode("node1", "localhost:9000")
+	err = ring.AddNode("node1", "localhost:7000", "localhost:9000")
 	assert.Error(t, err)
 }
 
@@ -41,8 +41,8 @@ func TestRing_RemoveNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add nodes
-	ring.AddNode("node1", "localhost:9000")
-	ring.AddNode("node2", "localhost:9001")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	ring.AddNode("node2", "localhost:7001", "localhost:9001")
 
 	// Remove node
 	err = ring.RemoveNode("node1")
@@ -62,9 +62,9 @@ func TestRing_GetNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add nodes
-	ring.AddNode("node1", "localhost:9000")
-	ring.AddNode("node2", "localhost:9001")
-	ring.AddNode("node3", "localhost:9002")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	ring.AddNode("node2", "localhost:7001", "localhost:9001")
+	ring.AddNode("node3", "localhost:7002", "localhost:9002")
 
 	// Test key distribution
 	keys := []string{"key1", "key2", "key3", "key4", "key5"}
@@ -86,8 +86,8 @@ func TestRing_IsLocal(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add nodes
-	ring.AddNode("node1", "localhost:9000")
-	ring.AddNode("node2", "localhost:9001")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	ring.AddNode("node2", "localhost:7001", "localhost:9001")
 
 	// Test various keys
 	localCount := 0
@@ -112,7 +112,7 @@ func TestRing_UpdateNodeStatus(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add node
-	ring.AddNode("node1", "localhost:9000")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
 
 	// Update status to down
 	err = ring.UpdateNodeStatus("node1", NodeStatusDown)
@@ -150,9 +150,9 @@ func TestRing_GetClosestN(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add nodes
-	ring.AddNode("node1", "localhost:9000")
-	ring.AddNode("node2", "localhost:9001")
-	ring.AddNode("node3", "localhost:9002")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	ring.AddNode("node2", "localhost:7001", "localhost:9001")
+	ring.AddNode("node3", "localhost:7002", "localhost:9002")
 
 	// Get closest nodes - requesting 2 when we have 3
 	nodes, err := ring.GetClosestN("testkey", 2)
@@ -172,7 +172,7 @@ func TestRing_EpochIncrement(t *testing.T) {
 	initialMembershipEpoch := ring.GetEpoch()
 
 	// Add node - should increment both epochs
-	ring.AddNode("node1", "localhost:9000")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
 	assert.Greater(t, ring.GetEpoch(), initialMembershipEpoch)
 
 	membershipEpoch1 := ring.GetEpoch()
@@ -195,9 +195,9 @@ func TestRing_GetNextAvailableNode(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add multiple nodes
-	ring.AddNode("node1", "localhost:9000")
-	ring.AddNode("node2", "localhost:9001")
-	ring.AddNode("node3", "localhost:9002")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	ring.AddNode("node2", "localhost:7001", "localhost:9001")
+	ring.AddNode("node3", "localhost:7002", "localhost:9002")
 
 	// Mark primary node as down
 	primary, err := ring.GetPrimaryNode("testkey")
@@ -220,9 +220,9 @@ func TestRing_AvailableNodes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add nodes
-	ring.AddNode("node1", "localhost:9000")
-	ring.AddNode("node2", "localhost:9001")
-	ring.AddNode("node3", "localhost:9002")
+	ring.AddNode("node1", "localhost:7000", "localhost:9000")
+	ring.AddNode("node2", "localhost:7001", "localhost:9001")
+	ring.AddNode("node3", "localhost:7002", "localhost:9002")
 
 	// All should be available initially
 	available := ring.GetAvailableNodes()

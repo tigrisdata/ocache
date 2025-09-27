@@ -218,12 +218,17 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		}
 	}
 
-	// Get node address from ring
+	// Get node listen address from ring
 	nodes := r.ring.GetAllNodes()
 	var nodeAddr string
 	for _, node := range nodes {
 		if node.ID == nodeID {
-			nodeAddr = node.Address
+			// Use listen address for client connections (not cluster address)
+			nodeAddr = node.ListenAddress
+			if nodeAddr == "" {
+				// Fallback to cluster address for backward compatibility
+				nodeAddr = node.Address
+			}
 			break
 		}
 	}

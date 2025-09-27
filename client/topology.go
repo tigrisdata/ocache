@@ -159,8 +159,15 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 
 	for _, node := range topology.Nodes {
 		if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
-			activeNodes[node.Address] = true
-			nodeAddresses[node.Id] = node.Address
+			// Use listen address for client connections
+			listenAddr := node.ListenAddress
+			if listenAddr == "" {
+				// ListenAddress is required - this should not happen in properly configured clusters
+				// Skip this node as it's not properly configured
+				continue
+			}
+			activeNodes[listenAddr] = true
+			nodeAddresses[node.Id] = listenAddr
 			ring.Add(nodeMember(node.Id))
 		}
 	}

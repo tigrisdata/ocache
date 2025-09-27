@@ -223,9 +223,10 @@ func TestError_ClusterModeErrors(t *testing.T) {
 			Epoch: 1,
 			Nodes: []*clusterpb.NodeInfo{
 				{
-					Id:      "node-0",
-					Address: server.address,
-					Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+					Id:            "node-0",
+					Address:       server.address,
+					ListenAddress: server.address, // For tests, use the same address for both cluster and listen
+					Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 				},
 			},
 			RingConfig: &clusterpb.RingConfig{

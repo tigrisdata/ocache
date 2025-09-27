@@ -79,6 +79,7 @@ func initializeCluster(ctx context.Context) {
 		Enabled:            true,
 		MyNodeID:           AppConfig.NodeID,
 		ClusterAddr:        AppConfig.ClusterAddr,
+		ListenAddr:         AppConfig.ListenAddr,
 		Nodes:              AppConfig.Seeds,
 		RingPartitionCount: AppConfig.PartitionCount,
 		HeartbeatInterval:  int(AppConfig.HeartbeatInterval.Seconds()),

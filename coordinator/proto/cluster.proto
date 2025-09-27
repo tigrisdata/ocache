@@ -27,10 +27,11 @@ message Empty {}
 // Node information
 message NodeInfo {
   string id = 1;
-  string address = 2;
+  string address = 2;           // Cluster communication address (for heartbeats, etc.)
   NodeStatus status = 3;
   uint64 joined_at = 4;
   double weight = 5;
+  string listen_address = 6;    // Service listen address for client requests (Put/Get/Delete)
 }
 
 // Cluster state
@@ -42,7 +43,8 @@ message ClusterState {
 // Join cluster request
 message JoinRequest {
   string node_id = 1;
-  string address = 2;
+  string address = 2;           // Cluster communication address
+  string listen_address = 3;    // Service listen address for client requests
 }
 
 // Join cluster response
