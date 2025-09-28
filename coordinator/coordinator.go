@@ -35,9 +35,6 @@ const (
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
 
-	// DefaultBroadcastInterval is the default interval for broadcasting cluster state
-	DefaultBroadcastInterval = 5 * time.Second
-
 	// DefaultBroadcastCacheTime is the default time for broadcasting cache state
 	DefaultBroadcastCacheTime = 10 * time.Second
 )
@@ -1047,7 +1044,7 @@ func (c *Coordinator) shouldSkipBroadcast(nodeID, address, listenAddress string)
 	}
 
 	// Skip if we've seen this broadcast in the last DefaultBroadcastCacheTime
-	return time.Since(lastTime) < DefaultBroadcastInterval
+	return time.Since(lastTime) < DefaultBroadcastCacheTime
 }
 
 // recordBroadcast records that a broadcast was sent
