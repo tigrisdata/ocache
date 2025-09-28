@@ -37,6 +37,9 @@ const (
 
 	// DefaultBroadcastInterval is the default interval for broadcasting cluster state
 	DefaultBroadcastInterval = 5 * time.Second
+
+	// DefaultBroadcastCacheTime is the default time for broadcasting cache state
+	DefaultBroadcastCacheTime = 10 * time.Second
 )
 
 // Config contains the configuration for the coordinator
@@ -1043,7 +1046,7 @@ func (c *Coordinator) shouldSkipBroadcast(nodeID, address, listenAddress string)
 		return false
 	}
 
-	// Skip if we've seen this broadcast in the last 5 seconds
+	// Skip if we've seen this broadcast in the last DefaultBroadcastCacheTime
 	return time.Since(lastTime) < DefaultBroadcastInterval
 }
 
@@ -1064,7 +1067,7 @@ func (c *Coordinator) recordBroadcast(nodeID, address, listenAddress string) {
 // cleanBroadcastCache removes old entries from the broadcast cache
 func (c *Coordinator) cleanBroadcastCache() {
 	// Already holding the lock
-	cutoff := time.Now().Add(-10 * time.Second)
+	cutoff := time.Now().Add(-DefaultBroadcastCacheTime)
 	for key, timestamp := range c.broadcastCache {
 		if timestamp.Before(cutoff) {
 			delete(c.broadcastCache, key)
