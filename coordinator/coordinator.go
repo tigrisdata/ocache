@@ -34,6 +34,9 @@ const (
 
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
+
+	// DefaultBroadcastInterval is the default interval for broadcasting cluster state
+	DefaultBroadcastInterval = 5 * time.Second
 )
 
 // Config contains the configuration for the coordinator
@@ -374,7 +377,7 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 			continue
 		}
 
-		// Add node to our ring with both addresses
+		// Add node to our ring
 		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
 			zlog.Warn().
 				Err(err).
@@ -710,8 +713,7 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	}
 
 	// Check for broadcast deduplication
-	broadcastKey := fmt.Sprintf("join:%s:%s:%s", req.NodeId, req.Address, req.ListenAddress)
-	if c.shouldSkipBroadcast(broadcastKey) {
+	if c.shouldSkipBroadcast(req.NodeId, req.Address, req.ListenAddress) {
 		zlog.Debug().
 			Str("node_id", req.NodeId).
 			Msg("Skipping duplicate join broadcast")
@@ -721,7 +723,7 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 		}, nil
 	}
 
-	// Add node to ring with both addresses
+	// Add node to ring
 	isNewNode, err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add node to ring: %w", err)
@@ -737,7 +739,7 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	// This prevents broadcast loops
 	if isNewNode {
 		// Mark this broadcast as sent
-		c.recordBroadcast(broadcastKey)
+		c.recordBroadcast(req.NodeId, req.Address, req.ListenAddress)
 
 		// Broadcast the join to all other nodes in the cluster
 		// This ensures all nodes learn about the new member
@@ -962,13 +964,6 @@ func (c *Coordinator) getNodeAddress(nodeID string) string {
 	return ""
 }
 
-// syncClusterState synchronizes the local cluster state with a remote node
-func (c *Coordinator) syncClusterState(nodeAddr string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return c.syncClusterStateWithContext(ctx, nodeAddr)
-}
-
 // syncClusterStateWithContext synchronizes the local cluster state with a remote node using provided context
 func (c *Coordinator) syncClusterStateWithContext(ctx context.Context, nodeAddr string) error {
 	zlog.Info().
@@ -1037,9 +1032,11 @@ func (c *Coordinator) syncClusterStateWithContext(ctx context.Context, nodeAddr 
 }
 
 // shouldSkipBroadcast checks if a broadcast should be skipped due to recent duplicate
-func (c *Coordinator) shouldSkipBroadcast(key string) bool {
+func (c *Coordinator) shouldSkipBroadcast(nodeID, address, listenAddress string) bool {
+	broadcastKey := fmt.Sprintf("%s:%s:%s", nodeID, address, listenAddress)
+
 	c.broadcastCacheMu.RLock()
-	lastTime, exists := c.broadcastCache[key]
+	lastTime, exists := c.broadcastCache[broadcastKey]
 	c.broadcastCacheMu.RUnlock()
 
 	if !exists {
@@ -1047,15 +1044,16 @@ func (c *Coordinator) shouldSkipBroadcast(key string) bool {
 	}
 
 	// Skip if we've seen this broadcast in the last 5 seconds
-	return time.Since(lastTime) < 5*time.Second
+	return time.Since(lastTime) < DefaultBroadcastInterval
 }
 
 // recordBroadcast records that a broadcast was sent
-func (c *Coordinator) recordBroadcast(key string) {
+func (c *Coordinator) recordBroadcast(nodeID, address, listenAddress string) {
 	c.broadcastCacheMu.Lock()
 	defer c.broadcastCacheMu.Unlock()
 
-	c.broadcastCache[key] = time.Now()
+	broadcastKey := fmt.Sprintf("%s:%s:%s", nodeID, address, listenAddress)
+	c.broadcastCache[broadcastKey] = time.Now()
 
 	// Clean old entries to prevent memory leak
 	if len(c.broadcastCache) > 1000 {
