@@ -1105,11 +1105,20 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 	// Limit broadcasts to prevent storms
 	maxBroadcasts := 10
 	actualBroadcasts := 0
+	
+	// Count eligible nodes (excluding self and new node)
+	eligibleNodes := 0
+	for _, node := range nodes {
+		if node.ID != c.config.MyNodeID && node.ID != newNodeID {
+			eligibleNodes++
+		}
+	}
 
 	zlog.Info().
 		Str("node_id", c.config.MyNodeID).
 		Str("new_node", newNodeID).
-		Int("broadcast_to", len(nodes)-1). // Exclude self
+		Int("eligible_nodes", eligibleNodes).
+		Int("max_broadcasts", maxBroadcasts).
 		Msg("Broadcasting join event to cluster")
 
 	for _, node := range nodes {
@@ -1120,8 +1129,10 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 
 		// Limit number of broadcasts
 		if actualBroadcasts >= maxBroadcasts {
+			remainingNodes := eligibleNodes - actualBroadcasts
 			zlog.Warn().
-				Int("skipped", len(nodes)-actualBroadcasts-2).
+				Int("sent", actualBroadcasts).
+				Int("skipped", remainingNodes).
 				Msg("Reached broadcast limit, skipping remaining nodes")
 			break
 		}
