@@ -1,11 +1,26 @@
 package integration
 
 import (
+	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/suite"
 )
+
+var logInitOnce sync.Once
+
+// InitTestLogging initializes logging for coordinator tests
+func InitTestLogging() {
+	logInitOnce.Do(func() {
+		zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+		zlog.Logger = zlog.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	})
+}
 
 // IntegrationTestSuite is the base test suite for Integration tests
 type IntegrationTestSuite struct {
@@ -44,6 +59,9 @@ type ObjectsSuite struct {
 
 // SetupTest sets up for object tests
 func (s *ObjectsSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
 	config := DefaultIntegrationTestConfig()
 	config.InlineThreshold = 64 * 1024         // 64KB
 	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
@@ -60,6 +78,9 @@ type CleanerSuite struct {
 
 // SetupTest sets up for cleaner tests
 func (s *CleanerSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = 200 * time.Millisecond // Fast cleanup for testing
 	config.MaxDiskUsage = 50 * 1024                 // 50KB limit for LRU testing
@@ -74,6 +95,9 @@ type CompactionSuite struct {
 
 // SetupTest sets up for compaction tests
 func (s *CompactionSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
 	config := DefaultIntegrationTestConfig()
 	config.CompactionInterval = 500 * time.Millisecond // Fast compaction for testing
 	config.SegmentSize = 2 * 1024 * 1024               // 2MB segments to create multiple segments during tests
@@ -88,6 +112,9 @@ type WorkflowSuite struct {
 
 // SetupTest sets up for workflow tests
 func (s *WorkflowSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
 	// Each workflow test creates its own harness with custom configuration
 	// so we don't create a harness here to avoid conflicts
 	s.Config = DefaultIntegrationTestConfig()
@@ -107,6 +134,9 @@ type CoordinatorSuite struct {
 
 // SetupTest sets up for coordinator tests
 func (s *CoordinatorSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
 	// Create a simple 3-node test harness
 	s.harness = NewCoordinatorTestHarness(s.T(), 3)
 
@@ -130,6 +160,9 @@ type StressSuite struct {
 
 // SetupTest sets up for stress tests
 func (s *StressSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
 	config := DefaultIntegrationTestConfig()
 	config.FDCacheSize = 10 // Low FD cache for stress testing
 	s.Config = config

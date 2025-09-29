@@ -330,23 +330,11 @@ test-integration-coverage: proto
 	@go tool cover -html=coverage-integration.out -o coverage-integration.html
 	@echo "Integration test coverage report generated at coverage-integration.html"
 
-.PHONY: test-integration-small
-test-integration-small:
-	@echo "Running small object integration tests..."
+.PHONY: test-integration-objects
+test-integration-objects:
+	@echo "Running small, medium, and large objects integration tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_SmallObjects) -timeout 30s ./...
-
-.PHONY: test-integration-medium
-test-integration-medium:
-	@echo "Running medium object integration tests..."
-	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_MediumObjects) -timeout 60s ./...
-
-.PHONY: test-integration-large
-test-integration-large:
-	@echo "Running large object integration tests..."
-	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_LargeObjects) -timeout 120s ./...
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Objects) -timeout 120s ./...
 
 .PHONY: test-integration-compaction
 test-integration-compaction:
@@ -460,9 +448,7 @@ help:
 	@echo "  test-e2e                    - Run end-to-end tests"
 	@echo "  test-integration            - Run integration tests (storage layer)"
 	@echo "  test-integration-short      - Run integration tests in short mode"
-	@echo "  test-integration-small      - Run small object integration tests"
-	@echo "  test-integration-medium     - Run medium object integration tests"
-	@echo "  test-integration-large      - Run large object integration tests"
+	@echo "  test-integration-objects    - Run small, medium, and large objects integration tests"
 	@echo "  test-integration-compaction - Run compaction integration tests"
 	@echo "  test-integration-cleaner    - Run cleaner integration tests (TTL and LRU)"
 	@echo "  test-integration-workflow   - Run cross-component integration tests"

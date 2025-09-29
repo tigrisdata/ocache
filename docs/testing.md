@@ -46,9 +46,7 @@ make test-integration-coverage      # With coverage report
 Specialized integration test suites:
 
 ```bash
-make test-integration-small         # Small objects (<64KB)
-make test-integration-medium        # Medium objects (64KB-16MB)
-make test-integration-large         # Large objects (>16MB)
+make test-integration-objects      # Small, medium, and large objects integration tests
 make test-integration-compaction    # Compaction behavior
 make test-integration-workflow      # Cross-component workflows
 ```
