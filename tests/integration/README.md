@@ -139,9 +139,7 @@ make test-integration
 make test-integration-short
 
 # Run specific test categories
-make test-integration-small   # Small object tests (< 64KB)
-make test-integration-medium  # Medium object tests (64KB - 16MB)
-make test-integration-large   # Large object tests (> 16MB)
+make test-integration-objects   # Small, medium, and large objects integration tests
 
 # Run with race detector
 make test-integration-race
