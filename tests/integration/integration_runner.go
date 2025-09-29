@@ -1,11 +1,28 @@
 package integration
 
 import (
+	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 	"github.com/stretchr/testify/suite"
 )
+
+var (
+	logInitOnce sync.Once
+)
+
+// InitCoordinatorTestLogging initializes logging for coordinator tests
+func InitCoordinatorTestLogging() {
+	logInitOnce.Do(func() {
+		zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+		zlog.Logger = zlog.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	})
+}
 
 // IntegrationTestSuite is the base test suite for Integration tests
 type IntegrationTestSuite struct {
@@ -107,6 +124,9 @@ type CoordinatorSuite struct {
 
 // SetupTest sets up for coordinator tests
 func (s *CoordinatorSuite) SetupTest() {
+	// Initialize logging for coordinator tests
+	InitCoordinatorTestLogging()
+
 	// Create a simple 3-node test harness
 	s.harness = NewCoordinatorTestHarness(s.T(), 3)
 

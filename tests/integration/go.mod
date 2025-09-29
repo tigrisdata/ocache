@@ -4,6 +4,7 @@ go 1.24.2
 
 require (
 	github.com/linxGnu/grocksdb v1.10.1
+	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/storage v0.0.0
@@ -25,7 +26,6 @@ require (
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
-	github.com/rs/zerolog v1.34.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
