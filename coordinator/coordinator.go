@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
@@ -731,12 +732,10 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	shouldBroadcast := isNewNode && !c.shouldSkipBroadcast(req.NodeId, req.Address, req.ListenAddress)
 
 	if shouldBroadcast {
-		// Mark this broadcast as sent
-		c.recordBroadcast(req.NodeId, req.Address, req.ListenAddress)
-
 		// Broadcast the join to all other nodes in the cluster
 		// This ensures all nodes learn about the new member
-		go c.broadcastJoin(req.NodeId, req.Address, req.ListenAddress)
+		// Note: We record the broadcast AFTER starting it to allow retries on failure
+		go c.broadcastJoinWithCacheUpdate(req.NodeId, req.Address, req.ListenAddress)
 		
 		zlog.Debug().
 			Str("node_id", req.NodeId).
@@ -817,11 +816,16 @@ func (c *Coordinator) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatReq
 						Str("from_node", req.NodeId).
 						Str("sync_addr", syncAddr).
 						Msg("Failed to sync cluster state after detecting newer epoch")
-
-					// Track sync failures for monitoring
-					c.mu.Lock()
-					c.failureCount[req.NodeId]++
-					c.mu.Unlock()
+					
+					// Note: We do NOT increment failure count here because:
+					// 1. The heartbeat itself was successful (node is alive)
+					// 2. Sync failure could be due to transient network issues
+					// 3. We don't want to mark healthy nodes as down due to sync issues
+				} else {
+					zlog.Debug().
+						Str("from_node", req.NodeId).
+						Str("sync_addr", syncAddr).
+						Msg("Successfully synced cluster state after epoch mismatch")
 				}
 			}()
 		} else {
@@ -1077,8 +1081,25 @@ func (c *Coordinator) cleanBroadcastCache() {
 	}
 }
 
+// broadcastJoinWithCacheUpdate broadcasts join and updates cache only after successful broadcasts
+func (c *Coordinator) broadcastJoinWithCacheUpdate(newNodeID, newNodeAddr, newNodeListenAddr string) {
+	// Mark as sent only after we've successfully sent at least one broadcast
+	var successfulBroadcasts int32
+	defer func() {
+		if atomic.LoadInt32(&successfulBroadcasts) > 0 {
+			c.recordBroadcast(newNodeID, newNodeAddr, newNodeListenAddr)
+			zlog.Debug().
+				Str("node_id", newNodeID).
+				Int32("successful_broadcasts", successfulBroadcasts).
+				Msg("Recorded successful broadcast in cache")
+		}
+	}()
+
+	c.broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr, &successfulBroadcasts)
+}
+
 // broadcastJoin notifies all active nodes about a new member joining
-func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr string) {
+func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr string, successCounter *int32) {
 	nodes := c.ring.GetActiveNodes()
 
 	// Limit broadcasts to prevent storms
@@ -1142,6 +1163,9 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 					Str("new_node", newNodeID).
 					Msg("Failed to broadcast join to node")
 			} else {
+				if successCounter != nil {
+					atomic.AddInt32(successCounter, 1)
+				}
 				zlog.Debug().
 					Str("target_node", targetNode.ID).
 					Str("new_node", newNodeID).
