@@ -49,6 +49,16 @@ func TestIntegration_Workflow(t *testing.T) {
 	})
 }
 
+// TestIntegration_Coordinator runs the coordinator test suite
+func TestIntegration_Coordinator(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping coordinator tests in short mode")
+	}
+	t.Run("CoordinatorSuite", func(t *testing.T) {
+		TestIntegrationCoordinator(t)
+	})
+}
+
 // TestIntegration_All runs all Integration test suites
 func TestIntegration_All(t *testing.T) {
 	if !*runAll {

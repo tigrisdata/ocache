@@ -130,6 +130,9 @@ jobs:
       - name: Run integration tests - Workflow
         run: STATIC_BUILD=true make test-integration-workflow
 
+      - name: Run integration tests - Coordinator
+        run: STATIC_BUILD=true make test-integration-coordinator
+
       - name: Run concurrent operations E2E test
         run: STATIC_BUILD=true make test-e2e-concurrent
 

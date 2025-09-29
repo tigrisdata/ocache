@@ -366,6 +366,18 @@ test-integration-workflow:
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Workflow) -timeout 300s ./...
 
+.PHONY: test-integration-coordinator
+test-integration-coordinator:
+	@echo "Running coordinator integration tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Coordinator) -timeout 600s ./...
+
+.PHONY: test-integration-coordinator-quick
+test-integration-coordinator-quick:
+	@echo "Running quick coordinator tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -short -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Coordinator) -timeout 120s ./...
+
 # Code quality targets
 .PHONY: lint
 lint:
@@ -454,6 +466,8 @@ help:
 	@echo "  test-integration-compaction - Run compaction integration tests"
 	@echo "  test-integration-cleaner    - Run cleaner integration tests (TTL and LRU)"
 	@echo "  test-integration-workflow   - Run cross-component integration tests"
+	@echo "  test-integration-coordinator - Run coordinator/cluster integration tests"
+	@echo "  test-integration-coordinator-quick - Run quick coordinator tests"
 	@echo "  test-integration-race       - Run integration tests with race detector"
 	@echo "  test-integration-coverage   - Run integration tests with coverage"
 	@echo "  bench                       - Run benchmarks"

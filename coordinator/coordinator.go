@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
@@ -34,6 +35,9 @@ const (
 
 	// DefaultDNSRefreshInterval is the default interval for DNS refresh
 	DefaultDNSRefreshInterval = 30 * time.Second
+
+	// DefaultBroadcastCacheTime is the default time for broadcasting cache state
+	DefaultBroadcastCacheTime = 10 * time.Second
 )
 
 // Config contains the configuration for the coordinator
@@ -74,6 +78,10 @@ type Coordinator struct {
 	failureCount      map[string]int
 	lastHeartbeat     map[string]time.Time // Last heartbeat time for each node
 	mu                sync.RWMutex
+
+	// Broadcast deduplication
+	broadcastCache   map[string]time.Time // Track recent broadcasts to prevent loops
+	broadcastCacheMu sync.RWMutex
 
 	// Lifecycle management
 	grpcServer *grpc.Server
@@ -175,12 +183,13 @@ func New(config *Config) (*Coordinator, error) {
 		failureThreshold:  failureThreshold,
 		failureCount:      make(map[string]int),
 		lastHeartbeat:     make(map[string]time.Time),
+		broadcastCache:    make(map[string]time.Time),
 		stopCh:            make(chan struct{}),
 		errCh:             make(chan error, 1), // Buffered to prevent blocking
 	}
 
 	// Add self to ring immediately during initialization
-	if err := ring.AddNode(config.MyNodeID, config.ClusterAddr, config.ListenAddr); err != nil {
+	if _, err := ring.AddNode(config.MyNodeID, config.ClusterAddr, config.ListenAddr); err != nil {
 		return nil, fmt.Errorf("failed to add self to ring: %w", err)
 	}
 
@@ -369,8 +378,8 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 			continue
 		}
 
-		// Add node to our ring with both addresses
-		if err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
+		// Add node to our ring
+		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
 			zlog.Warn().
 				Err(err).
 				Str("node_id", node.Id).
@@ -699,9 +708,15 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 		Str("listen_address", req.ListenAddress).
 		Msg("Received join request")
 
+	// Validate addresses
+	if req.NodeId == "" || req.Address == "" || req.ListenAddress == "" {
+		return nil, fmt.Errorf("invalid join request: missing required fields")
+	}
+
 	// Add node to ring with both addresses
-	if err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress); err != nil {
-		return nil, err
+	isNewNode, err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add node to ring: %w", err)
 	}
 
 	// Reset last heartbeat and failure count
@@ -709,6 +724,31 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	c.lastHeartbeat[req.NodeId] = time.Now()
 	c.failureCount[req.NodeId] = 0
 	c.mu.Unlock()
+
+	// Check if we should broadcast this join
+	// We broadcast only if:
+	// 1. This is genuinely a new node (not already in ring)
+	// 2. We haven't recently broadcast this same join (deduplication)
+	shouldBroadcast := isNewNode && !c.shouldSkipBroadcast(req.NodeId, req.Address, req.ListenAddress)
+
+	if shouldBroadcast {
+		// Broadcast the join to all other nodes in the cluster
+		// This ensures all nodes learn about the new member
+		// Note: We record the broadcast AFTER starting it to allow retries on failure
+		go c.broadcastJoinWithCacheUpdate(req.NodeId, req.Address, req.ListenAddress)
+
+		zlog.Debug().
+			Str("node_id", req.NodeId).
+			Msg("Broadcasting join to cluster")
+	} else if !isNewNode {
+		zlog.Debug().
+			Str("node_id", req.NodeId).
+			Msg("Node already in ring, skipping broadcast")
+	} else {
+		zlog.Debug().
+			Str("node_id", req.NodeId).
+			Msg("Recent duplicate broadcast detected, skipping re-broadcast")
+	}
 
 	return &clusterpb.JoinResponse{
 		Success: true,
@@ -748,14 +788,51 @@ func (c *Coordinator) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatReq
 	// Record heartbeat success
 	c.recordSuccess(req.NodeId)
 
-	// Check if heartbeat epoch is newer
-	if req.Epoch > c.ring.GetEpoch() {
-		// Log if heartbeat epoch is newer
+	// Check if heartbeat epoch is newer and trigger sync
+	localEpoch := c.ring.GetEpoch()
+	if req.Epoch > localEpoch {
 		zlog.Info().
 			Str("from_node", req.NodeId).
-			Uint64("local_epoch", c.ring.GetEpoch()).
+			Uint64("local_epoch", localEpoch).
 			Uint64("remote_epoch", req.Epoch).
-			Msg("Received heartbeat with newer membership epoch, may need to sync")
+			Msg("Received heartbeat with newer membership epoch, triggering sync")
+
+		// Get the node's address from our ring to sync with it
+		// Do this atomically to avoid race conditions
+		nodeAddr := c.getNodeAddress(req.NodeId)
+
+		if nodeAddr != "" {
+			// Trigger async sync to avoid blocking heartbeat response
+			// Use a copy of the address to avoid any potential race
+			syncAddr := nodeAddr
+			go func() {
+				// Add timeout to prevent hanging
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+
+				if err := c.syncClusterStateWithContext(ctx, syncAddr); err != nil {
+					zlog.Warn().
+						Err(err).
+						Str("from_node", req.NodeId).
+						Str("sync_addr", syncAddr).
+						Msg("Failed to sync cluster state after detecting newer epoch")
+
+					// Note: We do NOT increment failure count here because:
+					// 1. The heartbeat itself was successful (node is alive)
+					// 2. Sync failure could be due to transient network issues
+					// 3. We don't want to mark healthy nodes as down due to sync issues
+				} else {
+					zlog.Debug().
+						Str("from_node", req.NodeId).
+						Str("sync_addr", syncAddr).
+						Msg("Successfully synced cluster state after epoch mismatch")
+				}
+			}()
+		} else {
+			zlog.Warn().
+				Str("node_id", req.NodeId).
+				Msg("Received heartbeat from unknown node with newer epoch")
+		}
 	}
 
 	return &clusterpb.HeartbeatResponse{
@@ -883,4 +960,240 @@ func (c *Coordinator) GetNodeForKey(key string) (*NodeInfo, error) {
 // GetLocalNodeID returns the ID of the local node
 func (c *Coordinator) GetLocalNodeID() string {
 	return c.config.MyNodeID
+}
+
+// getNodeAddress safely retrieves a node's address from the ring
+func (c *Coordinator) getNodeAddress(nodeID string) string {
+	nodes := c.ring.GetAllNodes()
+	for _, node := range nodes {
+		if node.ID == nodeID {
+			return node.Address
+		}
+	}
+	return ""
+}
+
+// syncClusterStateWithContext synchronizes the local cluster state with a remote node using provided context
+func (c *Coordinator) syncClusterStateWithContext(ctx context.Context, nodeAddr string) error {
+	zlog.Info().
+		Str("node_id", c.config.MyNodeID).
+		Str("sync_with", nodeAddr).
+		Msg("Syncing cluster state with remote node")
+
+	conn, err := grpc.DialContext(ctx, nodeAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to connect to node %s: %w", nodeAddr, err)
+	}
+	defer conn.Close()
+
+	client := clusterpb.NewClusterServiceClient(conn)
+
+	// Get current cluster state from the remote node
+	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
+	if err != nil {
+		return fmt.Errorf("failed to get cluster state from node %s: %w", nodeAddr, err)
+	}
+
+	zlog.Debug().
+		Str("node_id", c.config.MyNodeID).
+		Str("sync_with", nodeAddr).
+		Int("node_count", len(state.Nodes)).
+		Uint64("remote_epoch", state.Epoch).
+		Uint64("local_epoch", c.ring.GetEpoch()).
+		Msg("Received cluster state from remote node")
+
+	// Only sync if remote epoch is newer
+	if state.Epoch <= c.ring.GetEpoch() {
+		zlog.Debug().
+			Str("node_id", c.config.MyNodeID).
+			Uint64("remote_epoch", state.Epoch).
+			Uint64("local_epoch", c.ring.GetEpoch()).
+			Msg("Remote epoch not newer, skipping sync")
+		return nil
+	}
+
+	// Apply the state to our local ring
+	successCount := 0
+	for _, node := range state.Nodes {
+		// Add node to our ring (idempotent operation)
+		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
+			zlog.Warn().
+				Err(err).
+				Str("node_id", node.Id).
+				Msg("Failed to add node during sync")
+		} else {
+			successCount++
+		}
+	}
+
+	zlog.Info().
+		Str("node_id", c.config.MyNodeID).
+		Str("sync_with", nodeAddr).
+		Int("nodes_synced", successCount).
+		Int("total_nodes", len(state.Nodes)).
+		Uint64("new_epoch", c.ring.GetEpoch()).
+		Msg("Completed cluster state sync")
+
+	return nil
+}
+
+// shouldSkipBroadcast checks if a broadcast should be skipped due to recent duplicate
+func (c *Coordinator) shouldSkipBroadcast(nodeID, address, listenAddress string) bool {
+	broadcastKey := fmt.Sprintf("%s:%s:%s", nodeID, address, listenAddress)
+
+	c.broadcastCacheMu.RLock()
+	lastTime, exists := c.broadcastCache[broadcastKey]
+	c.broadcastCacheMu.RUnlock()
+
+	if !exists {
+		return false
+	}
+
+	// Skip if we've seen this broadcast in the last DefaultBroadcastCacheTime
+	return time.Since(lastTime) < DefaultBroadcastCacheTime
+}
+
+// recordBroadcast records that a broadcast was sent
+func (c *Coordinator) recordBroadcast(nodeID, address, listenAddress string) {
+	c.broadcastCacheMu.Lock()
+	defer c.broadcastCacheMu.Unlock()
+
+	broadcastKey := fmt.Sprintf("%s:%s:%s", nodeID, address, listenAddress)
+	c.broadcastCache[broadcastKey] = time.Now()
+
+	// Clean old entries to prevent memory leak
+	if len(c.broadcastCache) > 1000 {
+		c.cleanBroadcastCache()
+	}
+}
+
+// cleanBroadcastCache removes old entries from the broadcast cache
+func (c *Coordinator) cleanBroadcastCache() {
+	// Already holding the lock
+	cutoff := time.Now().Add(-DefaultBroadcastCacheTime)
+	for key, timestamp := range c.broadcastCache {
+		if timestamp.Before(cutoff) {
+			delete(c.broadcastCache, key)
+		}
+	}
+}
+
+// broadcastJoinWithCacheUpdate broadcasts join and updates cache only after successful broadcasts
+func (c *Coordinator) broadcastJoinWithCacheUpdate(newNodeID, newNodeAddr, newNodeListenAddr string) {
+	// Mark as sent only after we've successfully sent at least one broadcast
+	var successfulBroadcasts int32
+	var wg sync.WaitGroup
+
+	c.broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr, &successfulBroadcasts, &wg)
+
+	// Wait for all broadcasts to complete
+	wg.Wait()
+
+	// Now check if any were successful
+	if atomic.LoadInt32(&successfulBroadcasts) > 0 {
+		c.recordBroadcast(newNodeID, newNodeAddr, newNodeListenAddr)
+		zlog.Debug().
+			Str("node_id", newNodeID).
+			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
+			Msg("Recorded successful broadcast in cache")
+	}
+}
+
+// broadcastJoin notifies all active nodes about a new member joining
+func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr string, successCounter *int32, wg *sync.WaitGroup) {
+	nodes := c.ring.GetActiveNodes()
+
+	// Limit broadcasts to prevent storms
+	maxBroadcasts := 10
+	actualBroadcasts := 0
+
+	// Count eligible nodes (excluding self and new node)
+	eligibleNodes := 0
+	for _, node := range nodes {
+		if node.ID != c.config.MyNodeID && node.ID != newNodeID {
+			eligibleNodes++
+		}
+	}
+
+	zlog.Info().
+		Str("node_id", c.config.MyNodeID).
+		Str("new_node", newNodeID).
+		Int("eligible_nodes", eligibleNodes).
+		Int("max_broadcasts", maxBroadcasts).
+		Msg("Broadcasting join event to cluster")
+
+	for _, node := range nodes {
+		// Skip self and the new node
+		if node.ID == c.config.MyNodeID || node.ID == newNodeID {
+			continue
+		}
+
+		// Limit number of broadcasts
+		if actualBroadcasts >= maxBroadcasts {
+			remainingNodes := eligibleNodes - actualBroadcasts
+			zlog.Warn().
+				Int("sent", actualBroadcasts).
+				Int("skipped", remainingNodes).
+				Msg("Reached broadcast limit, skipping remaining nodes")
+			break
+		}
+		actualBroadcasts++
+
+		// Add to WaitGroup before launching goroutine
+		if wg != nil {
+			wg.Add(1)
+		}
+
+		// Broadcast asynchronously to avoid blocking
+		go func(targetNode *NodeInfo) {
+			if wg != nil {
+				defer wg.Done()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			conn, err := grpc.DialContext(ctx, targetNode.Address,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithBlock(),
+			)
+			if err != nil {
+				zlog.Warn().
+					Err(err).
+					Str("target_node", targetNode.ID).
+					Str("new_node", newNodeID).
+					Msg("Failed to connect for join broadcast")
+				return
+			}
+			defer conn.Close()
+
+			client := clusterpb.NewClusterServiceClient(conn)
+
+			// Send join request to propagate the new member
+			joinReq := &clusterpb.JoinRequest{
+				NodeId:        newNodeID,
+				Address:       newNodeAddr,
+				ListenAddress: newNodeListenAddr,
+			}
+
+			_, err = client.Join(ctx, joinReq)
+			if err != nil {
+				zlog.Warn().
+					Err(err).
+					Str("target_node", targetNode.ID).
+					Str("new_node", newNodeID).
+					Msg("Failed to broadcast join to node")
+			} else {
+				if successCounter != nil {
+					atomic.AddInt32(successCounter, 1)
+				}
+				zlog.Debug().
+					Str("target_node", targetNode.ID).
+					Str("new_node", newNodeID).
+					Msg("Successfully broadcast join to node")
+			}
+		}(node)
+	}
 }
