@@ -712,18 +712,7 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 		return nil, fmt.Errorf("invalid join request: missing required fields")
 	}
 
-	// Check for broadcast deduplication
-	if c.shouldSkipBroadcast(req.NodeId, req.Address, req.ListenAddress) {
-		zlog.Debug().
-			Str("node_id", req.NodeId).
-			Msg("Skipping duplicate join broadcast")
-		return &clusterpb.JoinResponse{
-			Success: true,
-			Epoch:   c.ring.GetEpoch(),
-		}, nil
-	}
-
-	// Add node to ring
+	// Add node to ring with both addresses
 	isNewNode, err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add node to ring: %w", err)
@@ -735,15 +724,31 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	c.failureCount[req.NodeId] = 0
 	c.mu.Unlock()
 
-	// Only broadcast if this is genuinely a new node joining
-	// This prevents broadcast loops
-	if isNewNode {
+	// Check if we should broadcast this join
+	// We broadcast only if:
+	// 1. This is genuinely a new node (not already in ring)
+	// 2. We haven't recently broadcast this same join (deduplication)
+	shouldBroadcast := isNewNode && !c.shouldSkipBroadcast(req.NodeId, req.Address, req.ListenAddress)
+
+	if shouldBroadcast {
 		// Mark this broadcast as sent
 		c.recordBroadcast(req.NodeId, req.Address, req.ListenAddress)
 
 		// Broadcast the join to all other nodes in the cluster
 		// This ensures all nodes learn about the new member
 		go c.broadcastJoin(req.NodeId, req.Address, req.ListenAddress)
+		
+		zlog.Debug().
+			Str("node_id", req.NodeId).
+			Msg("Broadcasting join to cluster")
+	} else if !isNewNode {
+		zlog.Debug().
+			Str("node_id", req.NodeId).
+			Msg("Node already in ring, skipping broadcast")
+	} else {
+		zlog.Debug().
+			Str("node_id", req.NodeId).
+			Msg("Recent duplicate broadcast detected, skipping re-broadcast")
 	}
 
 	return &clusterpb.JoinResponse{
