@@ -736,7 +736,7 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 		// This ensures all nodes learn about the new member
 		// Note: We record the broadcast AFTER starting it to allow retries on failure
 		go c.broadcastJoinWithCacheUpdate(req.NodeId, req.Address, req.ListenAddress)
-		
+
 		zlog.Debug().
 			Str("node_id", req.NodeId).
 			Msg("Broadcasting join to cluster")
@@ -816,7 +816,7 @@ func (c *Coordinator) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatReq
 						Str("from_node", req.NodeId).
 						Str("sync_addr", syncAddr).
 						Msg("Failed to sync cluster state after detecting newer epoch")
-					
+
 					// Note: We do NOT increment failure count here because:
 					// 1. The heartbeat itself was successful (node is alive)
 					// 2. Sync failure could be due to transient network issues
@@ -1085,27 +1085,31 @@ func (c *Coordinator) cleanBroadcastCache() {
 func (c *Coordinator) broadcastJoinWithCacheUpdate(newNodeID, newNodeAddr, newNodeListenAddr string) {
 	// Mark as sent only after we've successfully sent at least one broadcast
 	var successfulBroadcasts int32
-	defer func() {
-		if atomic.LoadInt32(&successfulBroadcasts) > 0 {
-			c.recordBroadcast(newNodeID, newNodeAddr, newNodeListenAddr)
-			zlog.Debug().
-				Str("node_id", newNodeID).
-				Int32("successful_broadcasts", successfulBroadcasts).
-				Msg("Recorded successful broadcast in cache")
-		}
-	}()
+	var wg sync.WaitGroup
 
-	c.broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr, &successfulBroadcasts)
+	c.broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr, &successfulBroadcasts, &wg)
+
+	// Wait for all broadcasts to complete
+	wg.Wait()
+
+	// Now check if any were successful
+	if atomic.LoadInt32(&successfulBroadcasts) > 0 {
+		c.recordBroadcast(newNodeID, newNodeAddr, newNodeListenAddr)
+		zlog.Debug().
+			Str("node_id", newNodeID).
+			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
+			Msg("Recorded successful broadcast in cache")
+	}
 }
 
 // broadcastJoin notifies all active nodes about a new member joining
-func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr string, successCounter *int32) {
+func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr string, successCounter *int32, wg *sync.WaitGroup) {
 	nodes := c.ring.GetActiveNodes()
 
 	// Limit broadcasts to prevent storms
 	maxBroadcasts := 10
 	actualBroadcasts := 0
-	
+
 	// Count eligible nodes (excluding self and new node)
 	eligibleNodes := 0
 	for _, node := range nodes {
@@ -1138,8 +1142,16 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 		}
 		actualBroadcasts++
 
+		// Add to WaitGroup before launching goroutine
+		if wg != nil {
+			wg.Add(1)
+		}
+
 		// Broadcast asynchronously to avoid blocking
 		go func(targetNode *NodeInfo) {
+			if wg != nil {
+				defer wg.Done()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
