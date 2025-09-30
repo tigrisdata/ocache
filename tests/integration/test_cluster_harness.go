@@ -773,7 +773,17 @@ func metricsUnaryInterceptor(metrics *NodeMetrics) grpc.UnaryServerInterceptor {
 // metricsStreamInterceptor tracks metrics for streaming RPC calls
 func metricsStreamInterceptor(metrics *NodeMetrics) grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		// Wrap the stream to intercept messages
+		// Track operation initiation based on method
+		if metrics != nil {
+			switch info.FullMethod {
+			case "/cache.CacheService/Get":
+				metrics.ReadsHandled.Add(1)
+			case "/cache.CacheService/Put":
+				metrics.WritesHandled.Add(1)
+			}
+		}
+
+		// Wrap the stream to intercept messages for byte/key counting
 		wrapped := &metricsServerStream{
 			ServerStream: ss,
 			metrics:      metrics,
@@ -786,8 +796,9 @@ func metricsStreamInterceptor(metrics *NodeMetrics) grpc.StreamServerInterceptor
 // metricsServerStream wraps grpc.ServerStream to track metrics
 type metricsServerStream struct {
 	grpc.ServerStream
-	metrics *NodeMetrics
-	method  string
+	metrics    *NodeMetrics
+	method     string
+	keyTracked bool // Track if we've already counted the key for this stream
 }
 
 func (s *metricsServerStream) SendMsg(m interface{}) error {
@@ -803,12 +814,16 @@ func (s *metricsServerStream) SendMsg(m interface{}) error {
 func (s *metricsServerStream) RecvMsg(m interface{}) error {
 	err := s.ServerStream.RecvMsg(m)
 
-	// Track Put (upload) metrics
+	// Track Put (upload) byte counts and key storage
 	if s.method == "/cache.CacheService/Put" {
 		if putReq, ok := m.(*pb.PutRequest); ok && s.metrics != nil && err == nil {
-			s.metrics.WritesHandled.Add(1)
+			// WritesHandled already tracked in interceptor at stream initiation
 			s.metrics.BytesWritten.Add(int64(len(putReq.Data)))
-			s.metrics.KeysStored.Add(1)
+			// Track key storage once per stream (first message with non-empty key)
+			if putReq.Key != "" && !s.keyTracked {
+				s.metrics.KeysStored.Add(1)
+				s.keyTracked = true
+			}
 		}
 	}
 
