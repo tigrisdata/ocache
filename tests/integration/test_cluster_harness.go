@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,17 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+// NodeMetrics tracks metrics for a single cluster node
+type NodeMetrics struct {
+	NodeID         string
+	KeysStored     atomic.Int64 // Keys stored on this node
+	WritesHandled  atomic.Int64 // Put operations handled
+	ReadsHandled   atomic.Int64 // Get operations handled
+	DeletesHandled atomic.Int64 // Delete operations handled
+	BytesWritten   atomic.Int64
+	BytesRead      atomic.Int64
+}
+
 // ClusterServerNode represents a full cache server node with storage and coordinator
 type ClusterServerNode struct {
 	NodeID          string
@@ -33,6 +45,7 @@ type ClusterServerNode struct {
 	Storage         *storage.Storage
 	ClusterConn     *grpc.ClientConn
 	ClusterSvc      clusterpb.ClusterServiceClient
+	Metrics         *NodeMetrics
 	ctx             context.Context
 	cancel          context.CancelFunc
 	listener        net.Listener
@@ -96,6 +109,7 @@ type ClusterTestHarness struct {
 	NodeCount   int
 	Config      IntegrationTestConfig
 	Metrics     *TestMetrics
+	NodeMetrics map[string]*NodeMetrics // Per-node metrics
 	mu          sync.RWMutex
 	stopMetrics chan struct{}
 	clientAddrs []string
@@ -110,6 +124,7 @@ func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestCo
 		NodeCount:   nodeCount,
 		Config:      config,
 		Metrics:     &TestMetrics{StartTime: time.Now()},
+		NodeMetrics: make(map[string]*NodeMetrics),
 		stopMetrics: make(chan struct{}),
 	}
 }
@@ -200,6 +215,11 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		return nil, fmt.Errorf("failed to start coordinator: %w", err)
 	}
 
+	// Create node metrics
+	nodeMetrics := &NodeMetrics{
+		NodeID: nodeID,
+	}
+
 	// Create gRPC server with cache service
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(128*1024*1024),
@@ -207,7 +227,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	)
 
 	// Register cache service with node-specific storage instance
-	cacheService := newTestCacheService(coord, stor)
+	cacheService := newTestCacheService(coord, stor, nodeMetrics)
 	pb.RegisterCacheServiceServer(grpcServer, cacheService)
 
 	// Start gRPC server
@@ -259,6 +279,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		Storage:         stor,
 		ClusterConn:     clusterConn,
 		ClusterSvc:      clusterpb.NewClusterServiceClient(clusterConn),
+		Metrics:         nodeMetrics,
 		ctx:             ctx,
 		cancel:          cancel,
 		listener:        listener,
@@ -267,6 +288,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 
 	h.mu.Lock()
 	h.Nodes[nodeID] = node
+	h.NodeMetrics[nodeID] = nodeMetrics
 	h.mu.Unlock()
 
 	return node, nil
@@ -539,6 +561,132 @@ func (h *ClusterTestHarness) Cleanup() {
 	h.StopAllNodes()
 }
 
+// GetNodeForKey returns which node should own a given key based on consistent hashing
+func (h *ClusterTestHarness) GetNodeForKey(key string) (*ClusterServerNode, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	// Use any node's coordinator to determine owner
+	for _, node := range h.Nodes {
+		if node.Coordinator == nil {
+			continue
+		}
+		ring := node.Coordinator.GetRing()
+		if ring == nil {
+			continue
+		}
+		primaryNode, err := ring.GetPrimaryNode(key)
+		if err != nil {
+			return nil, err
+		}
+		return h.Nodes[primaryNode.ID], nil
+	}
+	return nil, fmt.Errorf("no nodes available")
+}
+
+// VerifyKeyDistribution checks if keys are distributed correctly across nodes
+// Returns map[nodeID][]keys showing expected distribution
+func (h *ClusterTestHarness) VerifyKeyDistribution(keys []string) (map[string][]string, error) {
+	distribution := make(map[string][]string)
+
+	for _, key := range keys {
+		node, err := h.GetNodeForKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get node for key %s: %w", key, err)
+		}
+		distribution[node.NodeID] = append(distribution[node.NodeID], key)
+	}
+
+	return distribution, nil
+}
+
+// GetDistributionStats returns statistics about workload distribution across nodes
+func (h *ClusterTestHarness) GetDistributionStats() *DistributionStats {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	stats := &DistributionStats{
+		NodeCount: h.NodeCount,
+		PerNode:   make(map[string]NodeDistribution),
+	}
+
+	for nodeID, metrics := range h.NodeMetrics {
+		// Count actual keys stored on this node
+		var keyCount int64
+		if node, exists := h.Nodes[nodeID]; exists && node.Storage != nil {
+			keys, err := node.Storage.ListKeys("")
+			if err == nil {
+				keyCount = int64(len(keys))
+			}
+		}
+
+		stats.PerNode[nodeID] = NodeDistribution{
+			KeyCount:     keyCount,
+			WriteCount:   metrics.WritesHandled.Load(),
+			ReadCount:    metrics.ReadsHandled.Load(),
+			DeleteCount:  metrics.DeletesHandled.Load(),
+			BytesWritten: metrics.BytesWritten.Load(),
+			BytesRead:    metrics.BytesRead.Load(),
+		}
+	}
+
+	// Calculate balance metrics
+	stats.CalculateBalance()
+	return stats
+}
+
+// GetPartitionDistribution shows how partitions are mapped to nodes
+// Returns map[nodeID][]partitionIDs
+func (h *ClusterTestHarness) GetPartitionDistribution() map[string][]int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	distribution := make(map[string][]int)
+
+	// Use first node's coordinator to get full ring
+	for _, node := range h.Nodes {
+		if node.Coordinator == nil {
+			continue
+		}
+		ring := node.Coordinator.GetRing()
+		if ring == nil {
+			continue
+		}
+
+		// Get all nodes from ring
+		allNodes := ring.GetAllNodes()
+
+		// For each node, determine which partitions it owns
+		// We'll sample partitions to avoid checking all 16384
+		sampleSize := 1000
+		for i := 0; i < sampleSize; i++ {
+			partitionKey := fmt.Sprintf("__partition_sample_%d__", i)
+			owner, err := ring.GetPrimaryNode(partitionKey)
+			if err == nil && owner != nil {
+				distribution[owner.ID] = append(distribution[owner.ID], i)
+			}
+		}
+
+		// Normalize counts based on sampling
+		for nodeID := range distribution {
+			count := len(distribution[nodeID])
+			estimated := int(float64(count) * 16384.0 / float64(sampleSize))
+			distribution[nodeID] = []int{estimated} // Store estimated partition count
+		}
+
+		// Populate distribution for all nodes (even if they have 0)
+		for _, nodeInfo := range allNodes {
+			if _, exists := distribution[nodeInfo.ID]; !exists {
+				distribution[nodeInfo.ID] = []int{0}
+			}
+		}
+
+		break // Only need one node's view
+	}
+
+	return distribution
+}
+
 // PrintMetrics prints test metrics
 func (h *ClusterTestHarness) PrintMetrics() {
 	endTime := h.Metrics.EndTime
@@ -557,6 +705,28 @@ func (h *ClusterTestHarness) PrintMetrics() {
 	fmt.Printf("Inline Objects: %d\n", h.Metrics.InlineObjects.Load())
 	fmt.Printf("Raw File Objects: %d\n", h.Metrics.RawFileObjects.Load())
 	fmt.Printf("Error Count: %d\n", h.Metrics.ErrorCount.Load())
+
+	// Print per-node distribution
+	stats := h.GetDistributionStats()
+	if len(stats.PerNode) > 0 {
+		fmt.Printf("\n=== Per-Node Distribution ===\n")
+		for nodeID, dist := range stats.PerNode {
+			fmt.Printf("Node %s:\n", nodeID)
+			fmt.Printf("  Keys Stored: %d\n", dist.KeyCount)
+			fmt.Printf("  Writes: %d\n", dist.WriteCount)
+			fmt.Printf("  Reads: %d\n", dist.ReadCount)
+			fmt.Printf("  Deletes: %d\n", dist.DeleteCount)
+			fmt.Printf("  Bytes Written: %d\n", dist.BytesWritten)
+			fmt.Printf("  Bytes Read: %d\n", dist.BytesRead)
+		}
+
+		fmt.Printf("\n=== Balance Metrics ===\n")
+		fmt.Printf("Balance Score: %.2f/100\n", stats.BalanceScore)
+		fmt.Printf("Key Count Std Dev: %.2f\n", stats.KeyCountStdDev)
+		fmt.Printf("Max/Min Key Ratio: %.2fx\n", stats.MaxMinKeyRatio)
+		fmt.Printf("Write Count Std Dev: %.2f\n", stats.WriteCountStdDev)
+	}
+
 	fmt.Printf("========================================\n")
 }
 
@@ -574,10 +744,11 @@ func (h *ClusterTestHarness) GetTempDir() string {
 }
 
 // newTestCacheService creates a cache service for testing
-func newTestCacheService(coord *coordinator.Coordinator, stor *storage.Storage) pb.CacheServiceServer {
+func newTestCacheService(coord *coordinator.Coordinator, stor *storage.Storage, metrics *NodeMetrics) pb.CacheServiceServer {
 	return &testCacheService{
 		coordinator: coord,
 		storage:     stor,
+		nodeMetrics: metrics,
 	}
 }
 
@@ -586,6 +757,7 @@ type testCacheService struct {
 	pb.UnimplementedCacheServiceServer
 	coordinator *coordinator.Coordinator
 	storage     *storage.Storage
+	nodeMetrics *NodeMetrics
 }
 
 // Put implements streaming Put for the cache service
@@ -631,6 +803,13 @@ func (s *testCacheService) Put(stream pb.CacheService_PutServer) error {
 		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 	}
 
+	// Track metrics
+	if s.nodeMetrics != nil {
+		s.nodeMetrics.WritesHandled.Add(1)
+		s.nodeMetrics.BytesWritten.Add(int64(buf.Len()))
+		s.nodeMetrics.KeysStored.Add(1)
+	}
+
 	return stream.SendAndClose(&pb.PutResponse{Success: true})
 }
 
@@ -648,6 +827,13 @@ func (s *testCacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*
 	err := s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
 	if err != nil {
 		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	// Track metrics
+	if s.nodeMetrics != nil {
+		s.nodeMetrics.WritesHandled.Add(1)
+		s.nodeMetrics.BytesWritten.Add(int64(len(req.Data)))
+		s.nodeMetrics.KeysStored.Add(1)
 	}
 
 	return &pb.PutResponse{Success: true}, nil
@@ -674,9 +860,11 @@ func (s *testCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetSer
 
 	// Stream data back
 	buf := make([]byte, 32*1024)
+	var totalBytes int64
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
+			totalBytes += int64(n)
 			if err := stream.Send(&pb.GetResponse{
 				Data: buf[:n],
 			}); err != nil {
@@ -691,6 +879,12 @@ func (s *testCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetSer
 		}
 	}
 
+	// Track metrics
+	if s.nodeMetrics != nil {
+		s.nodeMetrics.ReadsHandled.Add(1)
+		s.nodeMetrics.BytesRead.Add(totalBytes)
+	}
+
 	return nil
 }
 
@@ -703,6 +897,11 @@ func (s *testCacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*
 	err := s.storage.DeleteKey(req.Key)
 	if err != nil {
 		return nil, err
+	}
+
+	// Track metrics
+	if s.nodeMetrics != nil {
+		s.nodeMetrics.DeletesHandled.Add(1)
 	}
 
 	return &pb.DeleteResponse{Success: true}, nil

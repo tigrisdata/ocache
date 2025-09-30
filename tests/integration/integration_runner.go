@@ -182,8 +182,8 @@ func (s *ClusterSuite) SetupTest() {
 // TearDownTest cleans up after each cluster object test
 func (s *ClusterSuite) TearDownTest() {
 	if s.Harness != nil {
-		s.Harness.Cleanup()
-		s.Harness.PrintMetrics()
+		s.Harness.PrintMetrics() // Print metrics while storage is still open
+		s.Harness.Cleanup()       // Cleanup after metrics are collected
 	}
 }
 
