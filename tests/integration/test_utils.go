@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -377,6 +378,16 @@ func (h *IntegrationTestHarness) PrintMetrics() {
 	fmt.Printf("=======================\n")
 }
 
+// GetTempDir returns the temporary directory path for the test
+func (h *IntegrationTestHarness) GetTempDir() string {
+	return h.TempDir
+}
+
+// GetStorage returns the storage instance (implements TestStorageAccess)
+func (h *IntegrationTestHarness) GetStorage() interface{} {
+	return h.Storage
+}
+
 // StorageStats holds storage statistics
 type StorageStats struct {
 	TotalKeys      int
@@ -388,4 +399,134 @@ type StorageStats struct {
 	RawFileCount   int
 	SegmentCount   int
 	TotalDiskUsage int64
+}
+
+// NodeDistribution holds distribution metrics for a single node
+type NodeDistribution struct {
+	KeyCount     int64
+	WriteCount   int64
+	ReadCount    int64
+	DeleteCount  int64
+	BytesWritten int64
+	BytesRead    int64
+	Partitions   []int
+}
+
+// DistributionStats holds statistics about workload distribution across cluster nodes
+type DistributionStats struct {
+	NodeCount        int
+	PerNode          map[string]NodeDistribution
+	KeyCountStdDev   float64 // Standard deviation of keys per node
+	WriteCountStdDev float64 // Std dev of writes
+	MaxMinKeyRatio   float64 // Ratio of max to min keys
+	BalanceScore     float64 // 0-100, 100 = perfectly balanced
+}
+
+// CalculateBalance computes balance metrics for distribution stats
+func (s *DistributionStats) CalculateBalance() {
+	if len(s.PerNode) == 0 {
+		s.BalanceScore = 0
+		return
+	}
+
+	// Calculate key count statistics
+	var totalKeys, minKeys, maxKeys int64
+	var keyCounts []float64
+	first := true
+
+	for _, dist := range s.PerNode {
+		totalKeys += dist.KeyCount
+		keyCounts = append(keyCounts, float64(dist.KeyCount))
+
+		if first {
+			minKeys = dist.KeyCount
+			maxKeys = dist.KeyCount
+			first = false
+		} else {
+			if dist.KeyCount < minKeys {
+				minKeys = dist.KeyCount
+			}
+			if dist.KeyCount > maxKeys {
+				maxKeys = dist.KeyCount
+			}
+		}
+	}
+
+	// Calculate standard deviation for keys
+	if len(keyCounts) > 0 {
+		mean := float64(totalKeys) / float64(len(keyCounts))
+		var sumSquares float64
+		for _, count := range keyCounts {
+			diff := count - mean
+			sumSquares += diff * diff
+		}
+		s.KeyCountStdDev = math.Sqrt(sumSquares / float64(len(keyCounts)))
+	}
+
+	// Calculate write count standard deviation
+	var writeCounts []float64
+	for _, dist := range s.PerNode {
+		writeCounts = append(writeCounts, float64(dist.WriteCount))
+	}
+	if len(writeCounts) > 0 {
+		var totalWrites float64
+		for _, count := range writeCounts {
+			totalWrites += count
+		}
+		mean := totalWrites / float64(len(writeCounts))
+		var sumSquares float64
+		for _, count := range writeCounts {
+			diff := count - mean
+			sumSquares += diff * diff
+		}
+		s.WriteCountStdDev = math.Sqrt(sumSquares / float64(len(writeCounts)))
+	}
+
+	// Calculate max/min ratio
+	if minKeys > 0 {
+		s.MaxMinKeyRatio = float64(maxKeys) / float64(minKeys)
+	} else if maxKeys > 0 {
+		s.MaxMinKeyRatio = math.Inf(1)
+	} else {
+		s.MaxMinKeyRatio = 1.0
+	}
+
+	// Calculate balance score (0-100)
+	// Perfect balance = 100, completely unbalanced = 0
+	// Based on coefficient of variation (CV = stddev / mean)
+	if totalKeys > 0 {
+		mean := float64(totalKeys) / float64(len(keyCounts))
+		if mean > 0 {
+			cv := s.KeyCountStdDev / mean
+			// Convert CV to score: lower CV = higher score
+			// CV of 0 = 100, CV of 1 = 0
+			s.BalanceScore = math.Max(0, math.Min(100, 100*(1-cv)))
+		} else {
+			s.BalanceScore = 100
+		}
+	} else {
+		s.BalanceScore = 100 // No data = perfectly balanced trivially
+	}
+}
+
+// AssertEvenDistribution verifies that workload is reasonably distributed across nodes
+// threshold: max acceptable deviation from perfect balance (e.g., 0.2 = 20% deviation)
+func AssertEvenDistribution(t *testing.T, stats *DistributionStats, threshold float64) {
+	t.Helper()
+
+	// Check if balance score meets threshold
+	minAcceptable := (1.0 - threshold) * 100
+	require.GreaterOrEqual(t, stats.BalanceScore, minAcceptable,
+		"Distribution balance score %.2f below threshold %.2f (min acceptable: %.2f)",
+		stats.BalanceScore, threshold*100, minAcceptable)
+
+	// Print distribution details
+	t.Logf("Distribution Stats:")
+	t.Logf("  Balance Score: %.2f/100", stats.BalanceScore)
+	t.Logf("  Key Count Std Dev: %.2f", stats.KeyCountStdDev)
+	t.Logf("  Max/Min Key Ratio: %.2fx", stats.MaxMinKeyRatio)
+	for nodeID, dist := range stats.PerNode {
+		t.Logf("  Node %s: %d keys, %d writes, %d reads",
+			nodeID, dist.KeyCount, dist.WriteCount, dist.ReadCount)
+	}
 }

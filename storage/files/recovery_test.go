@@ -27,11 +27,11 @@ func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, func()) {
 	require.NoError(t, err)
 
 	// Initialize metadata DB with nil merge operator
-	meta, err := metadata.NewMetaDB(tmpDir, 0, nil)
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil, nil)
 	require.NoError(t, err)
 
 	cleanup := func() {
-		metadata.CloseMetaDB()
+		meta.Close()
 		os.RemoveAll(tmpDir)
 	}
 

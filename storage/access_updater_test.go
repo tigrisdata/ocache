@@ -168,9 +168,10 @@ func TestAccessUpdater_UpdatesOldBucketedEntry(t *testing.T) {
 	updater.Start()
 	defer updater.Stop()
 
-	// First update
-	updater.UpdateNow("test-key-bucket-update")
-	time.Sleep(500 * time.Millisecond)
+	// First update with specific timestamp
+	firstTime := time.Now().Unix()
+	updater.Update("test-key-bucket-update", firstTime)
+	updater.Flush()
 
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
@@ -190,12 +191,11 @@ func TestAccessUpdater_UpdatesOldBucketedEntry(t *testing.T) {
 	require.True(t, slice.Exists())
 	slice.Free()
 
-	// Simulate time passing for one key
-	updater.accessTimeLRU.Add("test-key-bucket-update", time.Now().Add(-6*time.Minute).Unix())
-
-	// Second update should delete old entry and create new one
-	updater.UpdateNow("test-key-bucket-update")
-	time.Sleep(500 * time.Millisecond)
+	// Second update with timestamp 6 minutes later (simulate time passing)
+	// This ensures the bucket key timestamp is actually different
+	secondTime := firstTime + 6*60 // 6 minutes in seconds
+	updater.Update("test-key-bucket-update", secondTime)
+	updater.Flush()
 
 	// Get the new bucket key
 	slice2, err := storage.meta.Handle().Get(ro, bucketIndexKey)

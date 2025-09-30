@@ -6,7 +6,7 @@ const (
 	DefaultPartitionCount = 16384
 
 	// DefaultReplicationFactor is the default number of virtual nodes per physical node
-	DefaultReplicationFactor = 20
+	DefaultReplicationFactor = 100
 
 	// DefaultLoad is the default load factor for bounded loads
 	DefaultLoad = 1.25

@@ -2,6 +2,7 @@ package segment
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -13,6 +14,15 @@ func TestSegmentReservation(t *testing.T) {
 	tmpDir := t.TempDir()
 	segPath := filepath.Join(tmpDir, "test.seg")
 	seg := NewSegment(segPath, 0, 0, 0, 1024*1024)
+
+	// Open a file for the segment to match production usage
+	// In production, segments always have files before being reserved
+	f, err := os.Create(segPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	seg.SetOpenFile(f)
 
 	// Test initial state - not reserved
 	if seg.IsReserved() {

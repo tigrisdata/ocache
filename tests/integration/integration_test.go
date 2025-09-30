@@ -6,10 +6,7 @@ import (
 	"testing"
 )
 
-var (
-	runAll    = flag.Bool("all", false, "Run all Integration tests including stress tests")
-	runStress = flag.Bool("stress", false, "Run stress tests")
-)
+var runAll = flag.Bool("all", false, "Run all Integration tests")
 
 func TestMain(m *testing.M) {
 	flag.Parse()
@@ -56,6 +53,13 @@ func TestIntegration_Coordinator(t *testing.T) {
 	}
 	t.Run("CoordinatorSuite", func(t *testing.T) {
 		TestIntegrationCoordinator(t)
+	})
+}
+
+// TestIntegration_Cluster runs the cluster test suite
+func TestIntegration_Cluster(t *testing.T) {
+	t.Run("ClusterSuite", func(t *testing.T) {
+		TestIntegrationCluster(t)
 	})
 }
 

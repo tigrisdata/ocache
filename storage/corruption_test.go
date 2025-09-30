@@ -25,7 +25,7 @@ func createCorruptionTestStorage(t *testing.T, tmpDir string) *Storage {
 		CompactionInterval: 0, // Disable compaction for tests
 		CleanupInterval:    0, // Disable cleanup for tests
 	}
-	stor, err := newStorageWithConfig(config)
+	stor, err := NewStorageWithConfig(config)
 	require.NoError(t, err)
 	return stor
 }

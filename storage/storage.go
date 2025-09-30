@@ -143,15 +143,15 @@ func GetStorage() *Storage {
 
 // InitStorageWithConfig initializes storage with a config struct
 func InitStorageWithConfig(config *StorageConfig) {
-	s, err := newStorageWithConfig(config)
+	s, err := NewStorageWithConfig(config)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to open storage")
 	}
 	storage = s
 }
 
-// newStorageWithConfig initializes RocksDB inside diskPath and returns a Storage instance
-func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
+// NewStorageWithConfig creates a new isolated Storage instance with the given config.
+func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
 		zlog.Error().Err(err).Str("path", config.DiskPath).Msg("storage: failed to create data directory")
@@ -166,7 +166,8 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		rocksConfig.BlockCacheSize = config.MetadataCacheSize
 	}
 
-	meta, err := metadata.NewMetaDBWithConfig(config.DiskPath, config.TTL, mergeOp, rocksConfig)
+	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances
+	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp, rocksConfig)
 	if err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to open metadata DB")
 		return nil, storageErrors.NewInternalError("Init", err)
@@ -206,6 +207,7 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Configure compactor with recompaction if enabled
 	compactorConfig := &compaction.CompactorConfig{
+		MetaDB:                  meta,
 		FileManager:             fileManager,
 		SegmentManager:          segmentManager,
 		DeletionQueue:           deletionQueue,
@@ -292,32 +294,44 @@ func newStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	return s, nil
 }
 
-// Close closes the storage
+// Close closes this storage instance and releases all resources.
+// This is safe to call on isolated instances created with NewStorageWithConfig.
+func (s *Storage) Close() {
+	// Stop background services
+	if s.syncMonitor != nil {
+		s.syncMonitor.Stop()
+	}
+	if s.accessUpdater != nil {
+		s.accessUpdater.Stop()
+	}
+	if s.cleaner != nil {
+		s.cleaner.Close()
+	}
+	if s.compactor != nil {
+		s.compactor.Close()
+	}
+	if s.deletionQueue != nil {
+		s.deletionQueue.Stop()
+	}
+
+	// Close the segment manager
+	if s.segmentManager != nil {
+		s.segmentManager.Close()
+	}
+
+	// Close the metadata DB
+	if s.meta != nil {
+		s.meta.Close()
+	}
+}
+
+// CloseStorage closes the singleton storage instance
 func CloseStorage() {
 	if storage == nil {
 		return
 	}
-
-	// Stop background services
-	if storage.syncMonitor != nil {
-		storage.syncMonitor.Stop()
-	}
-	if storage.accessUpdater != nil {
-		storage.accessUpdater.Stop()
-	}
-	storage.cleaner.Close()
-	if storage.compactor != nil {
-		storage.compactor.Close()
-	}
-	if storage.deletionQueue != nil {
-		storage.deletionQueue.Stop()
-	}
-
-	// Close the segment manager
-	storage.segmentManager.Close()
-
-	// Close the metadata DB
-	metadata.CloseMetaDB()
+	storage.Close()
+	storage = nil
 }
 
 // ListKeys returns all non-expired keys in the RocksDB instance that match the given prefix

@@ -161,7 +161,7 @@ func (a *accessUpdater) timeGateUpdate(update accessUpdate) {
 	// Only add to the batch if the key in LRU cache is more than delay old
 	// or if the key is not in the LRU cache
 	accessTime, ok := a.accessTimeLRU.Peek(update.key)
-	if (ok && time.Since(time.Unix(accessTime, 0)) > a.delay) || !ok {
+	if (ok && time.Unix(update.time, 0).Sub(time.Unix(accessTime, 0)) > a.delay) || !ok {
 		a.addToBatch(update)
 
 		// Also add the key to the LRU cache so that it is marked as most recently used

@@ -25,7 +25,7 @@ func InitTestLogging() {
 // IntegrationTestSuite is the base test suite for Integration tests
 type IntegrationTestSuite struct {
 	suite.Suite
-	Harness *IntegrationTestHarness
+	Harness TestHarnessInterface
 	Config  IntegrationTestConfig
 }
 
@@ -153,20 +153,38 @@ func (s *CoordinatorSuite) TearDownTest() {
 	}
 }
 
-// StressSuite tests system under stress
-type StressSuite struct {
+// ClusterSuite tests object operations in cluster mode
+type ClusterSuite struct {
 	IntegrationTestSuite
 }
 
-// SetupTest sets up for stress tests
-func (s *StressSuite) SetupTest() {
+// SetupTest sets up for cluster object tests
+func (s *ClusterSuite) SetupTest() {
 	// Initialize logging for tests
 	InitTestLogging()
 
 	config := DefaultIntegrationTestConfig()
-	config.FDCacheSize = 10 // Low FD cache for stress testing
+	config.InlineThreshold = 64 * 1024         // 64KB
+	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
+	config.SegmentSize = 256 * 1024 * 1024     // 256MB
+	config.CompactionInterval = 1 * time.Second
 	s.Config = config
-	s.Harness = NewIntegrationTestHarness(s.T(), config)
+
+	// Create cluster harness with 3 nodes
+	clusterHarness := NewClusterTestHarness(s.T(), 3, config)
+	err := clusterHarness.StartAllNodes()
+	if err != nil {
+		s.T().Fatalf("Failed to start cluster: %v", err)
+	}
+	s.Harness = clusterHarness
+}
+
+// TearDownTest cleans up after each cluster object test
+func (s *ClusterSuite) TearDownTest() {
+	if s.Harness != nil {
+		s.Harness.PrintMetrics() // Print metrics while storage is still open
+		s.Harness.Cleanup()       // Cleanup after metrics are collected
+	}
 }
 
 // Test suite runners
@@ -176,18 +194,22 @@ func TestIntegrationObjects(t *testing.T) {
 	suite.Run(t, new(ObjectsSuite))
 }
 
+// TestIntegrationCleaner runs the cleaner test suite
 func TestIntegrationCleaner(t *testing.T) {
 	suite.Run(t, new(CleanerSuite))
 }
 
+// TestIntegrationCompaction runs the compaction test suite
 func TestIntegrationCompaction(t *testing.T) {
 	suite.Run(t, new(CompactionSuite))
 }
 
+// TestIntegrationWorkflow runs the workflow test suite
 func TestIntegrationWorkflow(t *testing.T) {
 	suite.Run(t, new(WorkflowSuite))
 }
 
+// TestIntegrationCoordinator runs the coordinator test suite
 func TestIntegrationCoordinator(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping coordinator tests in short mode")
@@ -195,21 +217,22 @@ func TestIntegrationCoordinator(t *testing.T) {
 	suite.Run(t, new(CoordinatorSuite))
 }
 
-func TestIntegrationStress(t *testing.T) {
+// TestIntegrationCluster runs the cluster object test suite
+func TestIntegrationCluster(t *testing.T) {
 	if testing.Short() {
-		t.Skip("Skipping stress tests in short mode")
+		t.Skip("Skipping cluster tests in short mode")
 	}
-	suite.Run(t, new(StressSuite))
+	suite.Run(t, new(ClusterSuite))
 }
 
 // Helper function to run all Integration tests
 func RunAllIntegrationTests(t *testing.T) {
-	t.Run("Objects", TestIntegrationObjects) // Consolidated objects tests
+	t.Run("Objects", TestIntegrationObjects)
 	t.Run("Cleaner", TestIntegrationCleaner)
 	t.Run("Compaction", TestIntegrationCompaction)
 	t.Run("Workflows", TestIntegrationWorkflow)
 	if !testing.Short() {
 		t.Run("Coordinator", TestIntegrationCoordinator)
-		t.Run("Stress", TestIntegrationStress)
+		t.Run("Cluster", TestIntegrationCluster)
 	}
 }

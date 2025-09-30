@@ -14,45 +14,22 @@ func (m *MetaDB) Handle() *grocksdb.DB {
 	return m.handle
 }
 
-var metaDB *MetaDB
-
-// NewMetaDB initializes the global metadata DB with optimized configuration
-// for 4KB values with prefixes. It should be called exactly once during
-// Storage initialization.
-func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator) (*MetaDB, error) {
-	if metaDB != nil {
-		return metaDB, nil
+// Close closes this MetaDB instance.
+// This is safe to call on isolated instances.
+func (m *MetaDB) Close() {
+	if m != nil && m.handle != nil {
+		m.handle.Close()
 	}
-
-	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB with optimized configuration")
-
-	// Use optimized configuration for 4KB values with prefixes
-	config := DefaultRocksDBConfig()
-	LogConfiguration(config)
-
-	opts := CreateOptions(config, mergeOp)
-
-	dbPath := diskPath + "/rocksdb"
-	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)
-	if err != nil {
-		return nil, err
-	}
-
-	metaDB = &MetaDB{handle: db}
-
-	zlog.Info().Msg("metadata DB created with optimized configuration")
-
-	return metaDB, nil
 }
 
-// NewMetaDBWithConfig initializes the global metadata DB with custom configuration.
-// It should be called exactly once during Storage initialization.
-func NewMetaDBWithConfig(diskPath string, ttl int, mergeOp grocksdb.MergeOperator, config *RocksDBConfig) (*MetaDB, error) {
-	if metaDB != nil {
-		return metaDB, nil
-	}
+// NewMetaDB creates a new isolated MetaDB instance with custom configuration.
+// The caller is responsible for calling Close() on the returned instance.
+func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator, config *RocksDBConfig) (*MetaDB, error) {
+	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating isolated metadata DB instance with custom configuration")
 
-	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB with custom configuration")
+	if config == nil {
+		config = DefaultRocksDBConfig()
+	}
 
 	LogConfiguration(config)
 	opts := CreateOptions(config, mergeOp)
@@ -63,26 +40,9 @@ func NewMetaDBWithConfig(diskPath string, ttl int, mergeOp grocksdb.MergeOperato
 		return nil, err
 	}
 
-	metaDB = &MetaDB{handle: db}
+	instance := &MetaDB{handle: db}
 
-	zlog.Info().Msg("metadata DB created with custom configuration")
+	zlog.Info().Msg("isolated metadata DB instance created with custom configuration")
 
-	return metaDB, nil
-}
-
-// GetMetaDB returns the global RocksDB instance used for metadata operations.
-func GetMetaDB() *MetaDB { return metaDB }
-
-// CloseMetaDB closes the global RocksDB instance used for metadata operations.
-func CloseMetaDB() {
-	if metaDB == nil {
-		return
-	}
-	zlog.Info().Msg("closing metadata DB")
-
-	metaDB.handle.Close()
-
-	zlog.Info().Msg("metadata DB closed")
-
-	metaDB = nil
+	return instance, nil
 }

@@ -32,12 +32,12 @@ func defaultDeletionQueueConfig() deletion.Config {
 	}
 }
 
-func setupTestEnvironment(t *testing.T) (string, *files.FileManager, *segment.Manager, func()) {
+func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, *files.FileManager, *segment.Manager, func()) {
 	tmpDir, err := os.MkdirTemp("", "compactor-test-*")
 	require.NoError(t, err)
 
 	// Initialize metadata DB with nil merge operator
-	_, err = metadata.NewMetaDB(tmpDir, 0, nil)
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil, nil)
 	require.NoError(t, err)
 
 	// Initialize FD cache
@@ -52,19 +52,25 @@ func setupTestEnvironment(t *testing.T) (string, *files.FileManager, *segment.Ma
 	require.NoError(t, err)
 
 	cleanup := func() {
-		metadata.CloseMetaDB()
+		meta.Close()
 		os.RemoveAll(tmpDir)
 	}
 
-	return tmpDir, fm, sm, cleanup
+	return tmpDir, meta, fm, sm, cleanup
 }
 
 func TestCompactorStartClose(t *testing.T) {
-	_, fm, sm, cleanup := setupTestEnvironment(t)
+	_, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	meta := metadata.GetMetaDB()
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, 100*time.Millisecond)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                100 * time.Millisecond,
+	})
 
 	// Start the compactor
 	c.Start()
@@ -161,11 +167,17 @@ func TestParseFileIndexRow(t *testing.T) {
 }
 
 func TestEnsureCapacity(t *testing.T) {
-	_, fm, sm, cleanup := setupTestEnvironment(t)
+	_, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	meta := metadata.GetMetaDB()
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Get initial segment
 	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
@@ -188,11 +200,17 @@ func TestEnsureCapacity(t *testing.T) {
 }
 
 func TestCopyFileIntoSegment(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	meta := metadata.GetMetaDB()
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create a test file
 	testData := []byte("test data content")
@@ -229,11 +247,17 @@ func TestCopyFileIntoSegment(t *testing.T) {
 }
 
 func TestCommit(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	meta := metadata.GetMetaDB()
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create test files to delete
 	testFiles := []string{
@@ -273,11 +297,17 @@ func TestCommit(t *testing.T) {
 }
 
 func TestCompactFiles(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
-	meta := metadata.GetMetaDB()
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create test files
 	testData1 := []byte("test data 1")
@@ -359,11 +389,17 @@ func TestCompactFiles(t *testing.T) {
 }
 
 func TestCompactFilesWithMissingFile(t *testing.T) {
-	_, fm, sm, cleanup := setupTestEnvironment(t)
+	_, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Add file index entry for non-existent file
 	idxKey, idxVal := PrepareEntryForCompaction("key1", "/non/existent/file")
@@ -383,15 +419,21 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 }
 
 func TestCompactFilesWithMissingMetadata(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
 	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
-	c := NewCompactor(fm, sm, deletionQueue, 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletionQueue,
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create a test file
 	testFile := filepath.Join(tmpDir, "files", "file.dat")
@@ -427,11 +469,17 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 }
 
 func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create multiple test files
 	files := make([]string, 3)
@@ -483,12 +531,18 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 }
 
 func TestCompactionLoopConcurrency(t *testing.T) {
-	_, fm, sm, cleanup := setupTestEnvironment(t)
+	_, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
 	// Test that multiple Start calls are safe
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, 50*time.Millisecond)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                50 * time.Millisecond,
+	})
 
 	// Start the compactor once
 	c.Start()
@@ -505,11 +559,17 @@ func TestCompactionLoopConcurrency(t *testing.T) {
 }
 
 func TestCompactFilesWithBadMetadata(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create a test file
 	testFile := filepath.Join(tmpDir, "files", "file.dat")
@@ -537,15 +597,22 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 }
 
 func TestSegmentRotationOnlyWhenFull(t *testing.T) {
-	tmpDir, fm, _, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, _, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
+
 	// Create segment manager with a specific size (1MB for testing)
 	segmentSize := int64(1024 * 1024)
 	sm, err := segment.NewManager(tmpDir, segmentSize)
 	require.NoError(t, err)
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 10*1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 10 * 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Calculate sizes for test entries
 	// We'll create entries that should fill the segment without causing premature rotation
@@ -642,15 +709,22 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 }
 
 func TestSegmentRotationWithMixedSizes(t *testing.T) {
-	tmpDir, fm, _, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, _, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
+
 	// Create segment manager with smaller size for easier testing
 	segmentSize := int64(512 * 1024) // 512KB
 	sm, err := segment.NewManager(tmpDir, segmentSize)
 	require.NoError(t, err)
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 10*1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 10 * 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create entries with varying sizes
 	sizes := []int64{
@@ -724,10 +798,17 @@ func TestSegmentRotationWithMixedSizes(t *testing.T) {
 }
 
 func TestCopyFileIntoSegmentError(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
-	_ = NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+
+	_ = NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create a test file with no read permissions
 	testFile := filepath.Join(tmpDir, "unreadable.dat")
@@ -744,11 +825,17 @@ func TestCopyFileIntoSegmentError(t *testing.T) {
 }
 
 func TestCompactFilesWithCorruptedFile(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
-	c := NewCompactor(fm, sm, deletion.NewQueue(meta, defaultDeletionQueueConfig()), 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create test files with mismatched sizes
 	actualData := []byte("actual data content")
@@ -797,15 +884,21 @@ func TestCompactFilesWithCorruptedFile(t *testing.T) {
 }
 
 func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-	meta := metadata.GetMetaDB()
 
 	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
 	deletionQueue.Start()
 	defer deletionQueue.Stop()
 
-	c := NewCompactor(fm, sm, deletionQueue, 1024*1024, time.Second)
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                  meta,
+		FileManager:             fm,
+		SegmentManager:          sm,
+		DeletionQueue:           deletionQueue,
+		MaxBytesPerCompactRound: 1024 * 1024,
+		Interval:                time.Second,
+	})
 
 	// Create mix of valid and corrupted files
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -891,14 +984,13 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 
 // TestConcurrentCompaction tests compaction with multiple threads
 func TestConcurrentCompaction(t *testing.T) {
-	tmpDir, fm, sm, cleanup := setupTestEnvironment(t)
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-
-	meta := metadata.GetMetaDB()
 
 	// Create compactor with multiple threads
 	numThreads := 4
 	compactorConfig := &CompactorConfig{
+		MetaDB:                  meta,
 		FileManager:             fm,
 		SegmentManager:          sm,
 		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
