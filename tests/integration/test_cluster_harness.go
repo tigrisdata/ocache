@@ -750,18 +750,16 @@ func metricsUnaryInterceptor(metrics *NodeMetrics) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
 
-		// Track metrics based on method
-		switch info.FullMethod {
-		case "/cache.CacheService/PutObject":
-			if metrics != nil {
+		// Only track metrics if operation succeeded
+		if err == nil && metrics != nil {
+			switch info.FullMethod {
+			case "/cache.CacheService/PutObject":
 				if putReq, ok := req.(*pb.PutRequest); ok {
 					metrics.WritesHandled.Add(1)
 					metrics.BytesWritten.Add(int64(len(putReq.Data)))
 					metrics.KeysStored.Add(1)
 				}
-			}
-		case "/cache.CacheService/Delete":
-			if metrics != nil {
+			case "/cache.CacheService/Delete":
 				metrics.DeletesHandled.Add(1)
 			}
 		}
@@ -773,23 +771,31 @@ func metricsUnaryInterceptor(metrics *NodeMetrics) grpc.UnaryServerInterceptor {
 // metricsStreamInterceptor tracks metrics for streaming RPC calls
 func metricsStreamInterceptor(metrics *NodeMetrics) grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		// Track operation initiation based on method
-		if metrics != nil {
-			switch info.FullMethod {
-			case "/cache.CacheService/Get":
-				metrics.ReadsHandled.Add(1)
-			case "/cache.CacheService/Put":
-				metrics.WritesHandled.Add(1)
-			}
-		}
-
 		// Wrap the stream to intercept messages for byte/key counting
 		wrapped := &metricsServerStream{
 			ServerStream: ss,
 			metrics:      metrics,
 			method:       info.FullMethod,
 		}
-		return handler(srv, wrapped)
+
+		// Execute the handler
+		err := handler(srv, wrapped)
+
+		// Only track operation counts if the handler succeeded
+		if err == nil && metrics != nil {
+			switch info.FullMethod {
+			case "/cache.CacheService/Get":
+				metrics.ReadsHandled.Add(1)
+			case "/cache.CacheService/Put":
+				metrics.WritesHandled.Add(1)
+				// Track key storage for successful Put operations
+				if wrapped.keyTracked {
+					metrics.KeysStored.Add(1)
+				}
+			}
+		}
+
+		return err
 	}
 }
 
@@ -814,14 +820,12 @@ func (s *metricsServerStream) SendMsg(m interface{}) error {
 func (s *metricsServerStream) RecvMsg(m interface{}) error {
 	err := s.ServerStream.RecvMsg(m)
 
-	// Track Put (upload) byte counts and key storage
+	// Track Put (upload) byte counts
 	if s.method == "/cache.CacheService/Put" {
 		if putReq, ok := m.(*pb.PutRequest); ok && s.metrics != nil && err == nil {
-			// WritesHandled already tracked in interceptor at stream initiation
 			s.metrics.BytesWritten.Add(int64(len(putReq.Data)))
-			// Track key storage once per stream (first message with non-empty key)
+			// Mark that we've seen a key (for tracking in the interceptor on success)
 			if putReq.Key != "" && !s.keyTracked {
-				s.metrics.KeysStored.Add(1)
 				s.keyTracked = true
 			}
 		}
