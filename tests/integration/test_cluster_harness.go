@@ -191,6 +191,9 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 
 	// Start coordinator
 	if err := coord.Start(ctx); err != nil {
+		// Even though Start failed, we need to call Stop() to cleanup
+		// any resources that were successfully initialized (like the gRPC server)
+		coord.Stop() // This is safe even if Start() partially failed
 		cancel()
 		stor.Close()
 		os.RemoveAll(tmpDir)
@@ -631,6 +634,25 @@ func (s *testCacheService) Put(stream pb.CacheService_PutServer) error {
 	return stream.SendAndClose(&pb.PutResponse{Success: true})
 }
 
+// PutObject implements unary Put for the cache service (used by REST API)
+func (s *testCacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	if req.Key == "" {
+		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
+	}
+
+	// Store in node-specific storage instance
+	if s.storage == nil {
+		return &pb.PutResponse{Success: false, Error: "storage not initialized"}, nil
+	}
+
+	err := s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
+	if err != nil {
+		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
+	}
+
+	return &pb.PutResponse{Success: true}, nil
+}
+
 // Get implements streaming Get for the cache service
 func (s *testCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	if s.storage == nil {
@@ -705,4 +727,27 @@ func (s *testCacheService) List(req *pb.ListRequest, stream pb.CacheService_List
 	}
 
 	return nil
+}
+
+// GetTopology returns the current cluster topology (for cluster-aware clients)
+func (s *testCacheService) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
+	// If coordinator is not enabled (single node mode), return an error
+	if s.coordinator == nil {
+		return &pb.GetTopologyResponse{
+			Error: "cluster mode not enabled",
+		}, nil
+	}
+
+	// Get topology from coordinator
+	topology, err := s.coordinator.GetClusterTopology(ctx, &clusterpb.Empty{})
+	if err != nil {
+		return &pb.GetTopologyResponse{
+			Error: err.Error(),
+		}, nil
+	}
+
+	// Return the topology directly
+	return &pb.GetTopologyResponse{
+		Topology: topology,
+	}, nil
 }

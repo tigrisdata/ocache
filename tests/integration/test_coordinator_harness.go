@@ -130,6 +130,9 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 
 	// Start coordinator
 	if err := coord.Start(ctx); err != nil {
+		// Even though Start failed, we need to call Stop() to cleanup
+		// any resources that were successfully initialized (like the gRPC server)
+		coord.Stop() // This is safe even if Start() partially failed
 		cancel()
 		return nil, fmt.Errorf("failed to start coordinator: %w", err)
 	}

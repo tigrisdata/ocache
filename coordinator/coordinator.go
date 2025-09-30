@@ -237,6 +237,11 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	// Join cluster
 	zlog.Debug().Msg("Attempting to join cluster")
 	if err := c.joinCluster(); err != nil {
+		// Cleanup: stop the gRPC server we started before returning error
+		if c.grpcServer != nil {
+			c.grpcServer.Stop() // Use Stop() not GracefulStop() since we're in error state
+		}
+		c.wg.Wait() // Wait for serve goroutine to exit
 		return fmt.Errorf("failed to join cluster: %w", err)
 	}
 
