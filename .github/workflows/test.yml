@@ -127,6 +127,9 @@ jobs:
       - name: Run integration tests - Coordinator
         run: STATIC_BUILD=true make test-integration-coordinator
 
+      - name: Run integration tests - Cluster
+        run: STATIC_BUILD=true make test-integration-cluster
+
       - name: Run concurrent operations E2E test
         run: STATIC_BUILD=true make test-e2e-concurrent
 

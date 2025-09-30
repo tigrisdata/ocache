@@ -106,7 +106,7 @@ func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestCo
 	return &ClusterTestHarness{
 		T:           t,
 		Nodes:       make(map[string]*ClusterServerNode),
-		BasePort:    28000, // Use different port range than coordinator tests
+		BasePort:    30000, // Use separate port range to avoid conflicts (coordinator uses 27000-28002)
 		NodeCount:   nodeCount,
 		Config:      config,
 		Metrics:     &TestMetrics{StartTime: time.Now()},
