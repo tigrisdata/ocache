@@ -9,7 +9,6 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
-	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -116,7 +115,7 @@ func (s *cacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 
 	// Start storage.Put in a goroutine
 	go func() {
-		errCh <- stor.GetStorage().Put(key, pr, ttl)
+		errCh <- s.storage.Put(key, pr, ttl)
 	}()
 
 	// Write the first chunk's data if any
@@ -200,7 +199,7 @@ func (s *cacheService) handleClusteredPutObject(ctx context.Context, req *pb.Put
 
 	// Handle locally
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "PutObject", req.Key, func() error {
-		return stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
+		return s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
@@ -267,7 +266,7 @@ func (s *cacheService) handleLocalGet(req *pb.GetRequest, stream pb.CacheService
 	var found bool
 	err := retry.DoWithKey(stream.Context(), retry.DefaultConfig(), "Get", req.Key, func() error {
 		var getErr error
-		r, found, getErr = stor.GetStorage().Get(req.Key, req.Start, req.End)
+		r, found, getErr = s.storage.Get(req.Key, req.Start, req.End)
 		return getErr
 	})
 	if err != nil {
@@ -344,7 +343,7 @@ func (s *cacheService) handleClusteredDelete(ctx context.Context, req *pb.Delete
 
 	// Handle locally
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "Delete", req.Key, func() error {
-		return stor.GetStorage().DeleteKey(req.Key)
+		return s.storage.DeleteKey(req.Key)
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Delete", "error").Inc()

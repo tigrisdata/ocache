@@ -565,7 +565,7 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 		// Close the current harness (this closes storage properly)
 		if harness.cleanup != nil {
 			// Just close storage, don't delete temp directory
-			storage.CloseStorage()
+			harness.Storage.Close()
 			// Wait for shutdown to complete
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -580,7 +580,7 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 		}
 
 		// Re-initialize storage with same directory (simulates cache warming)
-		storage.InitStorageWithConfig(&storage.StorageConfig{
+		s, err := storage.NewStorageWithConfig(&storage.StorageConfig{
 			DiskPath:           tempDir,
 			TTL:                0,
 			InlineThreshold:    int(testConfig.InlineThreshold),
@@ -591,9 +591,10 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 			CompactionInterval: testConfig.CompactionInterval,
 			CompactionThreads:  testConfig.CompactionThreads,
 		})
+		require.NoError(t, err)
 
 		// Get the new storage instance
-		newHarness.Storage = storage.GetStorage()
+		newHarness.Storage = s
 		require.NotNil(t, newHarness.Storage, "Storage should be initialized after restart")
 
 		// Replace the old harness with the new one
@@ -695,6 +696,6 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 
 	// Cleanup after cache warming test
 	// Manually clean up since we replaced the harness
-	storage.CloseStorage()
+	harness.Storage.Close()
 	os.RemoveAll(tempDir)
 }

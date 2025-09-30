@@ -31,12 +31,14 @@ import (
 type cacheService struct {
 	pb.UnimplementedCacheServiceServer
 	coordinator *coordinator.Coordinator
+	storage     *stor.Storage
 }
 
 // newCacheService creates a new cache service, optionally with clustering support
-func newCacheService(coord *coordinator.Coordinator) *cacheService {
+func newCacheService(coord *coordinator.Coordinator, storage *stor.Storage) *cacheService {
 	return &cacheService{
 		coordinator: coord,
+		storage:     storage,
 	}
 }
 
@@ -79,7 +81,7 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	go func() {
 		// Note: We don't retry streaming Put operations at service layer since
 		// the client would need to resend the entire stream
-		errCh <- stor.GetStorage().Put(key, pr, ttl)
+		errCh <- s.storage.Put(key, pr, ttl)
 	}()
 
 	// Write the first chunk's data if any
@@ -158,7 +160,7 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	// Use the same logic as the streaming Put, but for a single chunk
 	// Wrap with retry logic for retryable errors
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "PutObject", req.Key, func() error {
-		return stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
+		return s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
@@ -192,7 +194,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	var found bool
 	err := retry.DoWithKey(stream.Context(), retry.DefaultConfig(), "Get", req.Key, func() error {
 		var getErr error
-		r, found, getErr = stor.GetStorage().Get(req.Key, req.Start, req.End)
+		r, found, getErr = s.storage.Get(req.Key, req.Start, req.End)
 		return getErr
 	})
 	if err != nil {
@@ -257,7 +259,7 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	}
 
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "Delete", req.Key, func() error {
-		return stor.GetStorage().DeleteKey(req.Key)
+		return s.storage.DeleteKey(req.Key)
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Delete", "error").Inc()
@@ -281,7 +283,7 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 	var keys []string
 	err := retry.Do(stream.Context(), retry.DefaultConfig(), "ListKeys", func() error {
 		var listErr error
-		keys, listErr = stor.GetStorage().ListKeys(req.Prefix)
+		keys, listErr = s.storage.ListKeys(req.Prefix)
 		return listErr
 	})
 	if err != nil {
@@ -394,7 +396,7 @@ func grpcStreamLoggingInterceptor(
 	return err
 }
 
-func startGRPCServer() {
+func startGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage) {
 	// If request logging is enabled, add the interceptors to the gRPC server
 	var opts []grpc.ServerOption
 	if AppConfig.RequestLogging {
@@ -411,7 +413,7 @@ func startGRPCServer() {
 
 	grpcServer := grpc.NewServer(opts...)
 	// Create service with coordinator if clustering is enabled
-	service := newCacheService(globalCoordinator)
+	service := newCacheService(coord, storage)
 	pb.RegisterCacheServiceServer(grpcServer, service)
 
 	lis, err := net.Listen("tcp", AppConfig.ListenAddr)

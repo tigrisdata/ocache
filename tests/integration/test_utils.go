@@ -82,7 +82,7 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 	require.NoError(t, err)
 
 	// Initialize storage
-	storage.InitStorageWithConfig(&storage.StorageConfig{
+	s, err := storage.NewStorageWithConfig(&storage.StorageConfig{
 		DiskPath:           tmpDir,
 		TTL:                0,
 		InlineThreshold:    int(config.InlineThreshold),
@@ -97,9 +97,7 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 		CleanupInterval:    config.CleanupInterval,
 		AccessUpdateDelay:  config.AccessUpdateDelay,
 	})
-
-	s := storage.GetStorage()
-	require.NotNil(t, s)
+	require.NoError(t, err)
 
 	h := &IntegrationTestHarness{
 		T:           t,
@@ -112,7 +110,7 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 
 	h.cleanup = func() {
 		close(h.stopMetrics)
-		storage.CloseStorage()
+		s.Close()
 		os.RemoveAll(tmpDir)
 	}
 
