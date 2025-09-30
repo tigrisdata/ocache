@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"context"
@@ -35,7 +35,7 @@ func setupTestStorage(t *testing.T) *stor.Storage {
 
 func TestCacheService_PutObjectAndGet(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &cacheService{
+	svc := &CacheService{
 		storage: s,
 	}
 	key := "testkey"
@@ -76,7 +76,7 @@ func (m *mockGetServer) Context() context.Context {
 
 func TestCacheService_Delete(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &cacheService{
+	svc := &CacheService{
 		storage: s,
 	}
 	key := "delkey"
@@ -96,7 +96,7 @@ func TestCacheService_Delete(t *testing.T) {
 
 func TestCacheService_List(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &cacheService{
+	svc := &CacheService{
 		storage: s,
 	}
 	ctx := context.Background()
@@ -119,7 +119,7 @@ func TestCacheService_List(t *testing.T) {
 
 func TestCacheService_ListWithPrefix(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &cacheService{
+	svc := &CacheService{
 		storage: s,
 	}
 	ctx := context.Background()
@@ -212,7 +212,7 @@ func (m *mockListServer) Context() context.Context {
 
 func TestCacheService_Put_TTL(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &cacheService{
+	svc := &CacheService{
 		storage: s,
 	}
 	key := "ttlkey"
@@ -255,7 +255,7 @@ func TestCacheService_GetTopology_ErrorHandling(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := &cacheService{
+			svc := &CacheService{
 				storage:     s,
 				coordinator: tc.coordinator,
 			}

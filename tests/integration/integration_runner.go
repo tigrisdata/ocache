@@ -183,7 +183,7 @@ func (s *ClusterSuite) SetupTest() {
 func (s *ClusterSuite) TearDownTest() {
 	if s.Harness != nil {
 		s.Harness.PrintMetrics() // Print metrics while storage is still open
-		s.Harness.Cleanup()       // Cleanup after metrics are collected
+		s.Harness.Cleanup()      // Cleanup after metrics are collected
 	}
 }
 

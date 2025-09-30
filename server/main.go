@@ -13,6 +13,7 @@ import (
 	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
+	"github.com/tigrisdata/ocache/server/service"
 	stor "github.com/tigrisdata/ocache/storage"
 )
 
@@ -132,8 +133,8 @@ func initializeStorage() *stor.Storage {
 
 // startUserServices starts the user-facing gRPC and HTTP gateway services
 func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
-	go startGRPCServer(coord, storage)                  // Start gRPC server in goroutine
-	go startGRPCGatewayServer(*listenAddr, *listenHTTP) // Start grpc-gateway on different address
+	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging) // Start gRPC server in goroutine
+	go service.StartGRPCGatewayServer(*listenAddr, *listenHTTP)              // Start grpc-gateway on different address
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error
