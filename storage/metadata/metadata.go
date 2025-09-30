@@ -14,38 +14,17 @@ func (m *MetaDB) Handle() *grocksdb.DB {
 	return m.handle
 }
 
-var metaDB *MetaDB
-
-// NewMetaDB initializes the global metadata DB with optimized configuration
-// for 4KB values with prefixes. It should be called exactly once during
-// Storage initialization.
-func NewMetaDB(diskPath string, ttl int, mergeOp grocksdb.MergeOperator) (*MetaDB, error) {
-	if metaDB != nil {
-		return metaDB, nil
+// Close closes this MetaDB instance.
+// This is safe to call on isolated instances.
+func (m *MetaDB) Close() {
+	if m != nil && m.handle != nil {
+		m.handle.Close()
 	}
-
-	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB with optimized configuration")
-
-	// Use optimized configuration for 4KB values with prefixes
-	config := DefaultRocksDBConfig()
-	LogConfiguration(config)
-
-	opts := CreateOptions(config, mergeOp)
-
-	dbPath := diskPath + "/rocksdb"
-	db, err := grocksdb.OpenDbWithTTL(opts, dbPath, ttl)
-	if err != nil {
-		return nil, err
-	}
-
-	metaDB = &MetaDB{handle: db}
-
-	zlog.Info().Msg("metadata DB created with optimized configuration")
-
-	return metaDB, nil
 }
 
-// NewMetaDBWithConfig initializes the global metadata DB with custom configuration.
+var metaDB *MetaDB
+
+// NewMetaDBWithConfig initializes the global metadata DB with optional custom configuration.
 // It should be called exactly once during Storage initialization.
 func NewMetaDBWithConfig(diskPath string, ttl int, mergeOp grocksdb.MergeOperator, config *RocksDBConfig) (*MetaDB, error) {
 	if metaDB != nil {
@@ -53,6 +32,10 @@ func NewMetaDBWithConfig(diskPath string, ttl int, mergeOp grocksdb.MergeOperato
 	}
 
 	zlog.Info().Str("diskPath", diskPath).Int("ttl", ttl).Msg("creating metadata DB with custom configuration")
+
+	if config == nil {
+		config = DefaultRocksDBConfig()
+	}
 
 	LogConfiguration(config)
 	opts := CreateOptions(config, mergeOp)
@@ -80,7 +63,7 @@ func CloseMetaDB() {
 	}
 	zlog.Info().Msg("closing metadata DB")
 
-	metaDB.handle.Close()
+	metaDB.Close()
 
 	zlog.Info().Msg("metadata DB closed")
 

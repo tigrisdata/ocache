@@ -12,7 +12,7 @@ func TestNewMetaDB(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil) // nil merge operator for test
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil) // nil merge operator for test
 	if err != nil {
 		t.Fatalf("NewMetaDB failed: %v", err)
 	}
@@ -36,12 +36,12 @@ func TestNewMetaDB_Singleton(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db1, err := NewMetaDB(diskPath, ttl, nil) // nil merge operator
+	db1, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil) // nil merge operator
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	db2, err := NewMetaDB(diskPath, ttl, nil) // nil merge operator
+	db2, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil) // nil merge operator
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestGetMetaDB(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	_, err := NewMetaDB(diskPath, ttl, nil)
+	_, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestMetaDB_Handle(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestCloseMetaDB(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	_, err := NewMetaDB(diskPath, ttl, nil)
+	_, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestMetaDB_BasicOperations(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestMetaDB_MultiplePutGet(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestMetaDB_Overwrite(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestMetaDB_EmptyKey(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +324,7 @@ func TestMetaDB_LargeValue(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestMetaDB_Persistence(t *testing.T) {
 	diskPath := t.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestMetaDB_Persistence(t *testing.T) {
 	CloseMetaDB()
 
 	metaDB = nil
-	db2, err := NewMetaDB(diskPath, ttl, nil)
+	db2, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func BenchmarkMetaDB_Put(b *testing.B) {
 	diskPath := b.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -455,7 +455,7 @@ func BenchmarkMetaDB_Get(b *testing.B) {
 	diskPath := b.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func BenchmarkMetaDB_Delete(b *testing.B) {
 	diskPath := b.TempDir()
 	ttl := 3600
 
-	db, err := NewMetaDB(diskPath, ttl, nil)
+	db, err := NewMetaDBWithConfig(diskPath, ttl, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

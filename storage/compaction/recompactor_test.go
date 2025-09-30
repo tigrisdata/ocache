@@ -25,7 +25,7 @@ func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, 
 
 	// Initialize metadata DB with merge operator
 	mergeOp := merge.NewMultiplexOperator()
-	meta, err := metadata.NewMetaDB(tmpDir, 0, mergeOp)
+	meta, err := metadata.NewMetaDBWithConfig(tmpDir, 0, mergeOp, nil)
 	require.NoError(t, err)
 
 	// Initialize segment manager

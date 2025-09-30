@@ -1,6 +1,6 @@
 package integration
 
-// ClusterObjectsSuite uses the same tests as ObjectsSuite since they share
+// CoordinatorObjectsSuite uses the same tests as ObjectsSuite since they share
 // the TestHarnessInterface. The tests are defined in objects_test.go.
 
 // Test_Objects_BasicFlow - inherited from ObjectsSuite via embedding

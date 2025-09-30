@@ -69,7 +69,7 @@ func (n *ClusterServerNode) Stop() error {
 	}
 
 	if n.Storage != nil {
-		storage.CloseStorage()
+		n.Storage.Close()
 	}
 
 	if n.TempDir != "" {
@@ -144,7 +144,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		}
 	}
 
-	// Initialize storage for this node
+	// Initialize isolated storage instance for this node
 	storageConfig := &storage.StorageConfig{
 		DiskPath:           tmpDir,
 		TTL:                0,
@@ -160,8 +160,11 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		CleanupInterval:    h.Config.CleanupInterval,
 		AccessUpdateDelay:  h.Config.AccessUpdateDelay,
 	}
-	storage.InitStorageWithConfig(storageConfig)
-	stor := storage.GetStorage()
+	stor, err := storage.NewStorageWithConfig(storageConfig)
+	if err != nil {
+		os.RemoveAll(tmpDir)
+		return nil, fmt.Errorf("failed to initialize storage: %w", err)
+	}
 
 	// Create coordinator config
 	coordConfig := &coordinator.Config{
@@ -178,7 +181,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	// Create coordinator
 	coord, err := coordinator.New(coordConfig)
 	if err != nil {
-		storage.CloseStorage()
+		stor.Close()
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("failed to create coordinator: %w", err)
 	}
@@ -189,7 +192,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	// Start coordinator
 	if err := coord.Start(ctx); err != nil {
 		cancel()
-		storage.CloseStorage()
+		stor.Close()
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("failed to start coordinator: %w", err)
 	}
@@ -200,8 +203,8 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		grpc.MaxSendMsgSize(128*1024*1024),
 	)
 
-	// Register cache service (using internal function from server package)
-	cacheService := newTestCacheService(coord)
+	// Register cache service with node-specific storage instance
+	cacheService := newTestCacheService(coord, stor)
 	pb.RegisterCacheServiceServer(grpcServer, cacheService)
 
 	// Start gRPC server
@@ -209,7 +212,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	if err != nil {
 		coord.Stop()
 		cancel()
-		storage.CloseStorage()
+		stor.Close()
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("failed to listen on %s: %w", listenAddr, err)
 	}
@@ -238,7 +241,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		grpcServer.Stop()
 		coord.Stop()
 		cancel()
-		storage.CloseStorage()
+		stor.Close()
 		os.RemoveAll(tmpDir)
 		return nil, fmt.Errorf("failed to connect to cluster service: %w", err)
 	}
@@ -568,14 +571,18 @@ func (h *ClusterTestHarness) GetTempDir() string {
 }
 
 // newTestCacheService creates a cache service for testing
-func newTestCacheService(coord *coordinator.Coordinator) pb.CacheServiceServer {
-	return &testCacheService{coordinator: coord}
+func newTestCacheService(coord *coordinator.Coordinator, stor *storage.Storage) pb.CacheServiceServer {
+	return &testCacheService{
+		coordinator: coord,
+		storage:     stor,
+	}
 }
 
 // testCacheService is a minimal cache service implementation for testing
 type testCacheService struct {
 	pb.UnimplementedCacheServiceServer
 	coordinator *coordinator.Coordinator
+	storage     *storage.Storage
 }
 
 // Put implements streaming Put for the cache service
@@ -611,13 +618,12 @@ func (s *testCacheService) Put(stream pb.CacheService_PutServer) error {
 		buf.Write(chunk.Data)
 	}
 
-	// Store in storage
-	stor := storage.GetStorage()
-	if stor == nil {
+	// Store in node-specific storage instance
+	if s.storage == nil {
 		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: "storage not initialized"})
 	}
 
-	err = stor.Put(key, bytes.NewReader(buf.Bytes()), ttl)
+	err = s.storage.Put(key, bytes.NewReader(buf.Bytes()), ttl)
 	if err != nil {
 		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
 	}
@@ -627,12 +633,11 @@ func (s *testCacheService) Put(stream pb.CacheService_PutServer) error {
 
 // Get implements streaming Get for the cache service
 func (s *testCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
-	stor := storage.GetStorage()
-	if stor == nil {
+	if s.storage == nil {
 		return fmt.Errorf("storage not initialized")
 	}
 
-	reader, exists, err := stor.Get(req.Key, req.Start, req.End)
+	reader, exists, err := s.storage.Get(req.Key, req.Start, req.End)
 	if err != nil {
 		return err
 	}
@@ -669,12 +674,11 @@ func (s *testCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetSer
 
 // Delete implements Delete for the cache service
 func (s *testCacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	stor := storage.GetStorage()
-	if stor == nil {
+	if s.storage == nil {
 		return nil, fmt.Errorf("storage not initialized")
 	}
 
-	err := stor.DeleteKey(req.Key)
+	err := s.storage.DeleteKey(req.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -684,12 +688,11 @@ func (s *testCacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*
 
 // List implements streaming List for the cache service
 func (s *testCacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
-	stor := storage.GetStorage()
-	if stor == nil {
+	if s.storage == nil {
 		return fmt.Errorf("storage not initialized")
 	}
 
-	keys, err := stor.ListKeys(req.Prefix)
+	keys, err := s.storage.ListKeys(req.Prefix)
 	if err != nil {
 		return err
 	}

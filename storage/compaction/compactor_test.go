@@ -37,7 +37,7 @@ func setupTestEnvironment(t *testing.T) (string, *files.FileManager, *segment.Ma
 	require.NoError(t, err)
 
 	// Initialize metadata DB with nil merge operator
-	_, err = metadata.NewMetaDB(tmpDir, 0, nil)
+	_, err = metadata.NewMetaDBWithConfig(tmpDir, 0, nil, nil)
 	require.NoError(t, err)
 
 	// Initialize FD cache

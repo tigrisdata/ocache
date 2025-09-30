@@ -16,7 +16,7 @@ import (
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {
 	tmpDir := t.TempDir()
-	meta, err := metadata.NewMetaDB(tmpDir, 0, nil) // nil merge operator for tests
+	meta, err := metadata.NewMetaDBWithConfig(tmpDir, 0, nil, nil) // nil merge operator for tests
 	require.NoError(t, err)
 
 	config := Config{
@@ -48,7 +48,7 @@ func TestQueue_AddAndProcess(t *testing.T) {
 	}
 
 	for _, file := range testFiles {
-		err := os.WriteFile(file, []byte("test"), 0644)
+		err := os.WriteFile(file, []byte("test"), 0o644)
 		require.NoError(t, err)
 	}
 
@@ -75,7 +75,7 @@ func TestQueue_Deduplication(t *testing.T) {
 	// Create a test file
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "duplicate.txt")
-	err := os.WriteFile(testFile, []byte("test"), 0644)
+	err := os.WriteFile(testFile, []byte("test"), 0o644)
 	require.NoError(t, err)
 
 	// Add the same file multiple times
@@ -135,7 +135,7 @@ func TestQueue_ConcurrentAdd(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			file := filepath.Join(tmpDir, fmt.Sprintf("concurrent_%d.txt", idx))
-			err := os.WriteFile(file, []byte("test"), 0644)
+			err := os.WriteFile(file, []byte("test"), 0o644)
 			require.NoError(t, err)
 			err = queue.Add(file)
 			require.NoError(t, err)
@@ -165,7 +165,7 @@ func TestQueue_BackgroundProcessing(t *testing.T) {
 	// Create and add test files
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "background.txt")
-	err := os.WriteFile(testFile, []byte("test"), 0644)
+	err := os.WriteFile(testFile, []byte("test"), 0o644)
 	require.NoError(t, err)
 
 	err = queue.Add(testFile)
@@ -186,7 +186,7 @@ func TestQueue_LockedFile(t *testing.T) {
 	// Create a test file
 	tmpDir := t.TempDir()
 	testFile := filepath.Join(tmpDir, "locked.txt")
-	err := os.WriteFile(testFile, []byte("test"), 0644)
+	err := os.WriteFile(testFile, []byte("test"), 0o644)
 	require.NoError(t, err)
 
 	// Lock the file using the file lock manager
@@ -272,7 +272,7 @@ func TestQueue_GetQueueDepth(t *testing.T) {
 
 func TestQueue_ContextCancellation(t *testing.T) {
 	tmpDir := t.TempDir()
-	meta, err := metadata.NewMetaDB(tmpDir, 0, nil) // nil merge operator for tests
+	meta, err := metadata.NewMetaDBWithConfig(tmpDir, 0, nil, nil) // nil merge operator for tests
 	require.NoError(t, err)
 	defer metadata.CloseMetaDB()
 

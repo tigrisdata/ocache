@@ -25,7 +25,7 @@ func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThresh
 		FragThreshold:       DefaultFragmentationThreshold,
 		DisableRecompaction: true,
 	}
-	s, err := newStorageWithConfig(config)
+	s, err := NewStorageWithConfig(config)
 	require.NoError(t, err, "failed to create storage")
 
 	cleanup := func() {
