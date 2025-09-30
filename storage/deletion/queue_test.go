@@ -16,7 +16,7 @@ import (
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {
 	tmpDir := t.TempDir()
-	meta, err := metadata.NewMetaDBWithConfig(tmpDir, 0, nil, nil) // nil merge operator for tests
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil, nil) // nil merge operator for tests
 	require.NoError(t, err)
 
 	config := Config{
@@ -29,7 +29,7 @@ func setupTestQueue(t *testing.T) (*Queue, func()) {
 
 	cleanup := func() {
 		queue.Stop()
-		metadata.CloseMetaDB()
+		meta.Close()
 	}
 
 	return queue, cleanup
@@ -272,9 +272,9 @@ func TestQueue_GetQueueDepth(t *testing.T) {
 
 func TestQueue_ContextCancellation(t *testing.T) {
 	tmpDir := t.TempDir()
-	meta, err := metadata.NewMetaDBWithConfig(tmpDir, 0, nil, nil) // nil merge operator for tests
+	meta, err := metadata.NewMetaDB(tmpDir, 0, nil, nil) // nil merge operator for tests
 	require.NoError(t, err)
-	defer metadata.CloseMetaDB()
+	defer meta.Close()
 
 	config := Config{
 		BatchSize:       10,

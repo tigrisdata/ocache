@@ -49,6 +49,7 @@ const (
 
 // CompactorConfig contains configuration for the compactor
 type CompactorConfig struct {
+	MetaDB                  *metadata.MetaDB
 	FileManager             *files.FileManager
 	SegmentManager          *segment.Manager
 	DeletionQueue           *deletion.Queue
@@ -91,25 +92,6 @@ type Compactor struct {
 	wg     sync.WaitGroup
 }
 
-// NewCompactor creates a new Compactor bound to the provided FileManager and
-// Segment Manager.
-func NewCompactor(fm *files.FileManager, sm *segment.Manager, deletionQueue *deletion.Queue, maxBytes int64, interval time.Duration) *Compactor {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Compactor{
-		fm:                      fm,
-		sm:                      sm,
-		meta:                    metadata.GetMetaDB(),
-		fdCache:                 fd.GetFdCache(),
-		deletionQueue:           deletionQueue,
-		maxBytesPerCompactRound: maxBytes,
-		interval:                interval,
-		compactionThreads:       1,   // Default to single thread
-		recompactor:             nil, // Will be set with NewCompactorWithConfig
-		ctx:                     ctx,
-		cancel:                  cancel,
-	}
-}
-
 // NewCompactorWithConfig creates a new compactor with configuration
 func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -121,9 +103,9 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 	}
 
 	c := &Compactor{
+		meta:                    cfg.MetaDB,
 		fm:                      cfg.FileManager,
 		sm:                      cfg.SegmentManager,
-		meta:                    metadata.GetMetaDB(),
 		fdCache:                 fd.GetFdCache(),
 		deletionQueue:           cfg.DeletionQueue,
 		maxBytesPerCompactRound: cfg.MaxBytesPerCompactRound,
@@ -135,7 +117,7 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 
 	// Set up recompactor if configured
 	if cfg.EnableRecompaction && cfg.FragThreshold > 0 {
-		c.recompactor = NewSegmentRecompactor(cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge, cfg.MinSegments)
+		c.recompactor = NewSegmentRecompactor(cfg.MetaDB, cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge, cfg.MinSegments)
 	}
 
 	return c

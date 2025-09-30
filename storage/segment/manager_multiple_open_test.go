@@ -19,7 +19,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	defer manager.Close()
 
 	// Acquire first segment
-	seg1, err := manager.AcquireOpenSegmentWithReservation("test", 0)
+	seg1, err := manager.AcquireOpenSegmentWithReservation("test-caller1", 0)
 	if err != nil {
 		t.Fatalf("Failed to acquire first segment: %v", err)
 	}
@@ -41,6 +41,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 		largeData[i] = byte(i % 256)
 	}
 	tempFile1.Write(largeData)
+	tempFile1.Seek(0, 0) // Reset file pointer to beginning
 
 	vm1 := &pb.ValueMessage{
 		ValueType:   pb.ValueType_RAW_FILE,
@@ -56,7 +57,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	}
 
 	// Now acquire another segment - should get a new one since first is nearly full
-	seg2, err := manager.AcquireOpenSegmentWithReservation("test", 200*1024) // Request 200KB
+	seg2, err := manager.AcquireOpenSegmentWithReservation("test-caller2", 200*1024) // Request 200KB
 	if err != nil {
 		t.Fatalf("Failed to acquire second segment: %v", err)
 	}
@@ -86,6 +87,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	defer os.Remove(tempFile2.Name())
 	defer tempFile2.Close()
 	tempFile2.WriteString("segment 2 data")
+	tempFile2.Seek(0, 0) // Reset file pointer to beginning
 
 	vm2 := &pb.ValueMessage{
 		ValueType:   pb.ValueType_RAW_FILE,
@@ -125,7 +127,7 @@ func TestManager_MultipleConcurrentOpenSegments(t *testing.T) {
 	}
 
 	// Acquire new segment after finalizing the first one
-	seg3, err := manager.AcquireOpenSegmentWithReservation("test", 0)
+	seg3, err := manager.AcquireOpenSegmentWithReservation("test-caller3", 0)
 	if err != nil {
 		t.Fatalf("Failed to acquire third segment: %v", err)
 	}

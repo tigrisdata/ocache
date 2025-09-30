@@ -25,7 +25,7 @@ func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, 
 
 	// Initialize metadata DB with merge operator
 	mergeOp := merge.NewMultiplexOperator()
-	meta, err := metadata.NewMetaDBWithConfig(tmpDir, 0, mergeOp, nil)
+	meta, err := metadata.NewMetaDB(tmpDir, 0, mergeOp, nil)
 	require.NoError(t, err)
 
 	// Initialize segment manager
@@ -42,7 +42,7 @@ func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, 
 	deletionQueue.Start()
 
 	// Create recompactor with 0 age for testing
-	recompactor := NewSegmentRecompactor(sm, deletionQueue, 0.5, 0, 3)
+	recompactor := NewSegmentRecompactor(meta, sm, deletionQueue, 0.5, 0, 3)
 
 	cleanup := func() {
 		sm.Close()

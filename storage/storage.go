@@ -166,7 +166,8 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		rocksConfig.BlockCacheSize = config.MetadataCacheSize
 	}
 
-	meta, err := metadata.NewMetaDBWithConfig(config.DiskPath, config.TTL, mergeOp, rocksConfig)
+	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances
+	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp, rocksConfig)
 	if err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to open metadata DB")
 		return nil, storageErrors.NewInternalError("Init", err)
@@ -206,6 +207,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Configure compactor with recompaction if enabled
 	compactorConfig := &compaction.CompactorConfig{
+		MetaDB:                  meta,
 		FileManager:             fileManager,
 		SegmentManager:          segmentManager,
 		DeletionQueue:           deletionQueue,

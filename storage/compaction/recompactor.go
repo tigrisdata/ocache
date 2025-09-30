@@ -37,10 +37,10 @@ type SegmentRecompactor struct {
 }
 
 // NewSegmentRecompactor creates a new segment recompactor
-func NewSegmentRecompactor(sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int) *SegmentRecompactor {
+func NewSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int) *SegmentRecompactor {
 	return &SegmentRecompactor{
 		sm:            sm,
-		meta:          metadata.GetMetaDB(),
+		meta:          meta,
 		deletionQueue: deletionQueue,
 		fragThreshold: fragThreshold,
 		minSegmentAge: minSegmentAge,
