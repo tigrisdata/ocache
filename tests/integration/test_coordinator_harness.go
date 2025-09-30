@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
@@ -333,53 +332,6 @@ func (h *CoordinatorTestHarness) IsConverged() bool {
 	}
 
 	return true
-}
-
-// VerifyPartitionDistribution verifies partition distribution across nodes
-func (h *CoordinatorTestHarness) VerifyPartitionDistribution(t *testing.T) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	// Get topology from any running node
-	var topology *clusterpb.ClusterTopology
-	for _, node := range h.Nodes {
-		if !node.IsRunning() {
-			continue
-		}
-
-		var err error
-		topology, err = h.GetTopology(node.NodeID)
-		require.NoError(t, err)
-		break
-	}
-
-	require.NotNil(t, topology, "No topology available")
-	require.NotNil(t, topology.RingConfig, "Ring config missing")
-
-	// Check partition count
-	require.Equal(t, int32(hash.DefaultPartitionCount), topology.RingConfig.PartitionCount)
-
-	// Build distribution
-	distribution := make(map[string]int32)
-	for _, owner := range topology.PartitionOwners {
-		distribution[owner.NodeId]++
-	}
-
-	// Verify all nodes have partitions
-	require.Equal(t, h.NodeCount, len(distribution))
-
-	// Check balance (allow ±20% deviation for consistent hashing)
-	// Consistent hashing doesn't guarantee perfect balance
-	expectedPerNode := hash.DefaultPartitionCount / h.NodeCount
-	for nodeID, count := range distribution {
-		diff := int(count) - expectedPerNode
-		if diff < 0 {
-			diff = -diff
-		}
-		deviation := float64(diff) / float64(expectedPerNode)
-		require.LessOrEqual(t, deviation, 0.2,
-			"Node %s has unbalanced partitions: %d (expected ~%d)", nodeID, count, expectedPerNode)
-	}
 }
 
 // Cleanup cleans up the test harness

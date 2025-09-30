@@ -25,11 +25,6 @@ func (s *CoordinatorSuite) Test_Coordinator_BasicFormation() {
 		assert.Equal(s.T(), 3, len(topology.Nodes),
 			"Node %s should see 3 nodes", nodeID)
 	}
-
-	// TODO: Improve partition distribution balance
-	// For now, we skip this check as consistent hashing
-	// doesn't guarantee perfect balance with small node counts
-	// s.harness.VerifyPartitionDistribution(s.T())
 }
 
 // Test_Coordinator_NodeJoin tests a node joining existing cluster using CoordinatorSuite
