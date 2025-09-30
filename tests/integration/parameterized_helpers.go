@@ -86,8 +86,8 @@ func RunParameterizedTest(t *testing.T, testName string, cases []TestCase) {
 }
 
 // RunObjectSizeTests runs parameterized tests for object size operations
-func RunObjectSizeTests(t *testing.T, harness *IntegrationTestHarness, cases []ObjectSizeTestCase,
-	operation func(t *testing.T, h *IntegrationTestHarness, tc ObjectSizeTestCase),
+func RunObjectSizeTests(t *testing.T, harness TestHarnessInterface, cases []ObjectSizeTestCase,
+	operation func(t *testing.T, h TestHarnessInterface, tc ObjectSizeTestCase),
 ) {
 	for _, tc := range cases {
 		t.Run(tc.Name, func(t *testing.T) {
@@ -104,26 +104,26 @@ type ObjectOperationSteps struct {
 }
 
 // PutObject stores the object
-func (ops *ObjectOperationSteps) PutObject(t *testing.T, h *IntegrationTestHarness) {
+func (ops *ObjectOperationSteps) PutObject(t *testing.T, h TestHarnessInterface) {
 	err := h.PutObject(ops.Key, ops.Data, ops.TTL)
 	require.NoError(t, err, "Failed to put object with key %s", ops.Key)
 }
 
 // GetAndVerify retrieves the object and verifies data integrity
-func (ops *ObjectOperationSteps) GetAndVerify(t *testing.T, h *IntegrationTestHarness) {
+func (ops *ObjectOperationSteps) GetAndVerify(t *testing.T, h TestHarnessInterface) {
 	retrieved, err := h.GetObject(ops.Key)
 	require.NoError(t, err, "Failed to get object with key %s", ops.Key)
 	VerifyDataIntegrity(t, ops.Data, retrieved)
 }
 
 // DeleteObject removes the object
-func (ops *ObjectOperationSteps) DeleteObject(t *testing.T, h *IntegrationTestHarness) {
+func (ops *ObjectOperationSteps) DeleteObject(t *testing.T, h TestHarnessInterface) {
 	err := h.DeleteObject(ops.Key)
 	require.NoError(t, err, "Failed to delete object with key %s", ops.Key)
 }
 
 // VerifyDeleted confirms the object no longer exists
-func (ops *ObjectOperationSteps) VerifyDeleted(t *testing.T, h *IntegrationTestHarness) {
+func (ops *ObjectOperationSteps) VerifyDeleted(t *testing.T, h TestHarnessInterface) {
 	_, err := h.GetObject(ops.Key)
 	require.Error(t, err, "Object with key %s should not exist after deletion", ops.Key)
 }
@@ -235,7 +235,7 @@ type TTLTestCase struct {
 }
 
 // RunTTLTests runs parameterized TTL expiration tests
-func RunTTLTests(t *testing.T, h *IntegrationTestHarness, cases []TTLTestCase) {
+func RunTTLTests(t *testing.T, h TestHarnessInterface, cases []TTLTestCase) {
 	// Store all objects
 	for _, tc := range cases {
 		data := GenerateRandomData(tc.Size)
@@ -274,7 +274,7 @@ type LRUTestCase struct {
 }
 
 // RunLRUTests runs parameterized LRU eviction tests
-func RunLRUTests(t *testing.T, h *IntegrationTestHarness, maxDiskUsage int64, cases []LRUTestCase) {
+func RunLRUTests(t *testing.T, h TestHarnessInterface, maxDiskUsage int64, cases []LRUTestCase) {
 	// Note: The test should already have a properly configured harness with disk limit set
 
 	// Store all objects
@@ -283,12 +283,16 @@ func RunLRUTests(t *testing.T, h *IntegrationTestHarness, maxDiskUsage int64, ca
 		err := h.PutObject(tc.Key, data, 0)
 		require.NoError(t, err, "Failed to store object %s", tc.Key)
 
-		// Set access time
-		h.SetAccessTime(tc.Key, tc.AccessTime)
+		// Set access time (only for single-node tests with storage access)
+		if storageAccess, ok := h.(TestStorageAccess); ok {
+			storageAccess.SetAccessTime(tc.Key, tc.AccessTime)
+		}
 	}
 
-	// Flush access updates and wait for eviction
-	h.FlushAccessUpdates()
+	// Flush access updates and wait for eviction (only for single-node tests)
+	if storageAccess, ok := h.(TestStorageAccess); ok {
+		storageAccess.FlushAccessUpdates()
+	}
 	time.Sleep(5 * time.Second) // Give more time for eviction to occur
 
 	// Verify eviction
@@ -311,7 +315,7 @@ type UpdateTestCase struct {
 }
 
 // RunUpdateTests runs parameterized update tests
-func RunUpdateTests(t *testing.T, h *IntegrationTestHarness, cases []UpdateTestCase) {
+func RunUpdateTests(t *testing.T, h TestHarnessInterface, cases []UpdateTestCase) {
 	for _, tc := range cases {
 		// Store initial object
 		initialData := GenerateRandomData(tc.InitialSize)
@@ -343,7 +347,7 @@ type EdgeCaseTest struct {
 }
 
 // RunEdgeCaseTests runs parameterized edge case tests
-func RunEdgeCaseTests(t *testing.T, h *IntegrationTestHarness, cases []EdgeCaseTest) {
+func RunEdgeCaseTests(t *testing.T, h TestHarnessInterface, cases []EdgeCaseTest) {
 	for _, tc := range cases {
 		// If Data is nil, generate it based on Size
 		data := tc.Data
@@ -376,7 +380,7 @@ type CompactionTestCase struct {
 }
 
 // RunCompactionTests runs parameterized compaction tests
-func RunCompactionTests(t *testing.T, h *IntegrationTestHarness, cases []CompactionTestCase) {
+func RunCompactionTests(t *testing.T, h TestHarnessInterface, cases []CompactionTestCase) {
 	for _, tc := range cases {
 		// Create objects
 		keys := make([]string, tc.NumObjects)
@@ -394,7 +398,7 @@ func RunCompactionTests(t *testing.T, h *IntegrationTestHarness, cases []Compact
 
 		// Verify storage state
 		if tc.ExpectSegments {
-			VerifySegmentsExist(t, h.TempDir, 1)
+			VerifySegmentsExist(t, h.GetTempDir(), 1)
 		}
 
 		if !tc.ExpectRawFiles {

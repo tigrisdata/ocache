@@ -8,8 +8,23 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/storage"
 	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
+
+// Helper functions for cleaner tests that need direct storage access
+
+func setAccessTime(h TestHarnessInterface, key string, timestamp int64) {
+	if storageAccess, ok := h.(TestStorageAccess); ok {
+		storageAccess.SetAccessTime(key, timestamp)
+	}
+}
+
+func flushAccessUpdates(h TestHarnessInterface) {
+	if storageAccess, ok := h.(TestStorageAccess); ok {
+		storageAccess.FlushAccessUpdates()
+	}
+}
 
 // Test_Cleaner_AutoTriggerTTL tests that TTL cleanup automatically triggers
 // after the configured interval and removes expired objects
@@ -85,13 +100,17 @@ func (s *CleanerSuite) Test_CleanerLoop_LRUEviction() {
 		err := s.Harness.PutObject(key, data, 0) // No TTL
 		require.NoError(t, err, "Failed to store object %d", i)
 
-		// Set access time so older items get evicted first
+		// Set access time so older items get evicted first (only for single-node tests)
 		// Earlier items get older timestamps
-		s.Harness.SetAccessTime(key, baseTime-int64(numObjects-i))
+		if storageAccess, ok := s.Harness.(TestStorageAccess); ok {
+			storageAccess.SetAccessTime(key, baseTime-int64(numObjects-i))
+		}
 	}
 
-	// Flush access updates
-	s.Harness.FlushAccessUpdates()
+	// Flush access updates (only for single-node tests)
+	if storageAccess, ok := s.Harness.(TestStorageAccess); ok {
+		storageAccess.FlushAccessUpdates()
+	}
 
 	// Record initial state
 	initialStats := s.Harness.GetStorageStats()
@@ -217,7 +236,7 @@ func (s *CleanerSuite) Test_CleanerLoop_MixedWorkload() {
 		data := GenerateRandomData(4 * 1024) // 4KB
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		s.Harness.SetAccessTime(key, baseTime-int64(i)) // Recent access
+		setAccessTime(s.Harness, key, baseTime-int64(i)) // Recent access
 
 		// Infrequently accessed (old timestamps)
 		key = fmt.Sprintf("mixed-infrequent-%d", i)
@@ -225,10 +244,10 @@ func (s *CleanerSuite) Test_CleanerLoop_MixedWorkload() {
 		data = GenerateRandomData(4 * 1024) // 4KB
 		err = s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		s.Harness.SetAccessTime(key, baseTime-int64(1000+i)) // Old access
+		setAccessTime(s.Harness, key, baseTime-int64(1000+i)) // Old access
 	}
 
-	s.Harness.FlushAccessUpdates()
+	flushAccessUpdates(s.Harness)
 
 	// Initial state
 	initialStats := s.Harness.GetStorageStats()
@@ -475,11 +494,11 @@ func (s *CleanerSuite) Test_CleanerLoop_Performance() {
 		// Set access times for LRU testing
 		if ttl == 0 {
 			accessTime := time.Now().Unix() - int64(numObjects-i)
-			s.Harness.SetAccessTime(key, accessTime)
+			setAccessTime(s.Harness, key, accessTime)
 		}
 	}
 
-	s.Harness.FlushAccessUpdates()
+	flushAccessUpdates(s.Harness)
 	writeTime := time.Since(startTime)
 	t.Logf("Wrote %d objects (%.2f MB) in %v", numObjects, float64(totalSize)/(1024*1024), writeTime)
 
@@ -525,9 +544,9 @@ func (s *CleanerSuite) Test_CleanerLoop_Performance() {
 	require.Less(t, ttlRemaining, 10, "Too many TTL objects remaining")
 
 	// Verify disk usage is under limit (with tolerance for metadata)
-	diskUsage := s.Harness.calculateDiskUsage()
+	finalStats := s.Harness.GetStorageStats()
 	t.Logf("  - Final disk usage: %.2f MB (limit: %.2f MB)",
-		float64(diskUsage)/(1024*1024), float64(config.MaxDiskUsage)/(1024*1024))
+		float64(finalStats.DiskUsage)/(1024*1024), float64(config.MaxDiskUsage)/(1024*1024))
 }
 
 // Test_CleanerLoop_SelectiveEviction tests that LRU eviction is selective
@@ -555,7 +574,7 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 		data := GenerateRandomData(500) // 500 bytes (inline)
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_INLINE)
+		VerifyStorageType(t, s.Harness.GetTempDir(), key, storagepb.ValueType_INLINE)
 	}
 
 	// Medium raw file objects with old access times
@@ -567,8 +586,8 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 		data := GenerateRandomData(8 * 1024) // 8KB (raw file)
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		s.Harness.SetAccessTime(key, baseTime-int64(1000+i)) // Very old access
-		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
+		setAccessTime(s.Harness, key, baseTime-int64(1000+i)) // Very old access
+		VerifyStorageType(t, s.Harness.GetTempDir(), key, storagepb.ValueType_RAW_FILE)
 	}
 
 	// Medium raw file objects with recent access times
@@ -579,11 +598,11 @@ func (s *CleanerSuite) Test_CleanerLoop_SelectiveEviction() {
 		data := GenerateRandomData(8 * 1024) // 8KB (raw file)
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
-		s.Harness.SetAccessTime(key, baseTime-int64(i)) // Recent access
-		VerifyStorageType(t, s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
+		setAccessTime(s.Harness, key, baseTime-int64(i)) // Recent access
+		VerifyStorageType(t, s.Harness.GetTempDir(), key, storagepb.ValueType_RAW_FILE)
 	}
 
-	s.Harness.FlushAccessUpdates()
+	flushAccessUpdates(s.Harness)
 
 	// Initial state
 	initialStats := s.Harness.GetStorageStats()
@@ -662,9 +681,9 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 
 		// Initially, lower indices have older access times
 		// Space them out by 10 seconds each to ensure clear ordering
-		s.Harness.SetAccessTime(key, baseTime+int64(i)*10)
+		setAccessTime(s.Harness, key, baseTime+int64(i)*10)
 	}
-	s.Harness.FlushAccessUpdates()
+	flushAccessUpdates(s.Harness)
 
 	// Verify all keys exist initially
 	for i := 0; i < numObjects; i++ {
@@ -683,9 +702,9 @@ func (s *CleanerSuite) Test_CleanerLoop_AccessPatternUpdate() {
 		require.NoError(t, err)
 		// Explicitly set very recent access time with proper spacing
 		// Add seconds to ensure ordering within the new bucket
-		s.Harness.SetAccessTime(keys[i], newTime+int64(i*10))
+		setAccessTime(s.Harness, keys[i], newTime+int64(i*10))
 	}
-	s.Harness.FlushAccessUpdates()
+	flushAccessUpdates(s.Harness)
 
 	// Add more objects to exceed disk limit and trigger eviction
 	t.Log("Phase 2: Adding more objects to trigger eviction")
@@ -834,7 +853,7 @@ func (s *CleanerSuite) Test_CleanerLoop_SegmentedObjects() {
 	time.Sleep(2 * time.Second)
 
 	// Verify some objects are in segments
-	segmentDir := filepath.Join(s.Harness.TempDir, "segments")
+	segmentDir := filepath.Join(s.Harness.GetTempDir(), "segments")
 	segments, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
 	require.Greater(t, len(segments), 0, "Segments should be created")
 
@@ -923,27 +942,31 @@ func (s *CleanerSuite) Test_Cleaner_DiskUsageLimit() {
 		require.NoError(s.T(), err)
 
 		// Set access time so older items get evicted first
-		s.Harness.SetAccessTime(key, baseTime-int64(50-i))
+		setAccessTime(s.Harness, key, baseTime-int64(50-i))
 	}
 
 	// Flush and wait for eviction
-	s.Harness.FlushAccessUpdates()
+	flushAccessUpdates(s.Harness)
 	time.Sleep(3 * time.Second)
 
-	// Count remaining keys
-	keys, err := s.Harness.Storage.ListKeys("")
-	require.NoError(s.T(), err)
+	// Count remaining keys (only for single-node tests with direct storage access)
+	if storageAccess, ok := s.Harness.(TestStorageAccess); ok {
+		if stor, ok := storageAccess.GetStorage().(*storage.Storage); ok {
+			keys, err := stor.ListKeys("")
+			require.NoError(s.T(), err)
 
-	diskKeysFound := 0
-	for _, key := range keys {
-		if len(key) >= 4 && key[:4] == "disk" {
-			diskKeysFound++
+			diskKeysFound := 0
+			for _, key := range keys {
+				if len(key) >= 4 && key[:4] == "disk" {
+					diskKeysFound++
+				}
+			}
+
+			// Should have evicted about half the keys to stay under limit
+			require.Less(s.T(), diskKeysFound, 30, "Should have evicted keys to stay under disk limit")
+			require.Greater(s.T(), diskKeysFound, 15, "Should still have some keys")
 		}
 	}
-
-	// Should have evicted about half the keys to stay under limit
-	require.Less(s.T(), diskKeysFound, 30, "Should have evicted keys to stay under disk limit")
-	require.Greater(s.T(), diskKeysFound, 15, "Should still have some keys")
 
 	// Verify newer keys are retained
 	for i := 45; i < 50; i++ {

@@ -377,6 +377,16 @@ func (h *IntegrationTestHarness) PrintMetrics() {
 	fmt.Printf("=======================\n")
 }
 
+// GetTempDir returns the temporary directory path for the test
+func (h *IntegrationTestHarness) GetTempDir() string {
+	return h.TempDir
+}
+
+// GetStorage returns the storage instance (implements TestStorageAccess)
+func (h *IntegrationTestHarness) GetStorage() interface{} {
+	return h.Storage
+}
+
 // StorageStats holds storage statistics
 type StorageStats struct {
 	TotalKeys      int

@@ -25,7 +25,7 @@ func InitTestLogging() {
 // IntegrationTestSuite is the base test suite for Integration tests
 type IntegrationTestSuite struct {
 	suite.Suite
-	Harness *IntegrationTestHarness
+	Harness TestHarnessInterface
 	Config  IntegrationTestConfig
 }
 
@@ -153,6 +153,40 @@ func (s *CoordinatorSuite) TearDownTest() {
 	}
 }
 
+// ClusterObjectsSuite tests object operations in cluster mode
+type ClusterObjectsSuite struct {
+	IntegrationTestSuite
+}
+
+// SetupTest sets up for cluster object tests
+func (s *ClusterObjectsSuite) SetupTest() {
+	// Initialize logging for tests
+	InitTestLogging()
+
+	config := DefaultIntegrationTestConfig()
+	config.InlineThreshold = 64 * 1024         // 64KB
+	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
+	config.SegmentSize = 256 * 1024 * 1024     // 256MB
+	config.CompactionInterval = 1 * time.Second
+	s.Config = config
+
+	// Create cluster harness with 3 nodes
+	clusterHarness := NewClusterTestHarness(s.T(), 3, config)
+	err := clusterHarness.StartAllNodes()
+	if err != nil {
+		s.T().Fatalf("Failed to start cluster: %v", err)
+	}
+	s.Harness = clusterHarness
+}
+
+// TearDownTest cleans up after each cluster object test
+func (s *ClusterObjectsSuite) TearDownTest() {
+	if s.Harness != nil {
+		s.Harness.Cleanup()
+		s.Harness.PrintMetrics()
+	}
+}
+
 // StressSuite tests system under stress
 type StressSuite struct {
 	IntegrationTestSuite
@@ -193,6 +227,13 @@ func TestIntegrationCoordinator(t *testing.T) {
 		t.Skip("Skipping coordinator tests in short mode")
 	}
 	suite.Run(t, new(CoordinatorSuite))
+}
+
+func TestIntegrationClusterObjects(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping cluster object tests in short mode")
+	}
+	suite.Run(t, new(ClusterObjectsSuite))
 }
 
 func TestIntegrationStress(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/storage"
 	storagepb "github.com/tigrisdata/ocache/storage/proto"
 )
 
@@ -34,7 +35,7 @@ func (s *ObjectsSuite) Test_Objects_BasicFlow() {
 		{Name: "large-100MB", Size: 100 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
 	}
 
-	RunObjectSizeTests(s.T(), s.Harness, testCases, func(t *testing.T, h *IntegrationTestHarness, tc ObjectSizeTestCase) {
+	RunObjectSizeTests(s.T(), s.Harness, testCases, func(t *testing.T, h TestHarnessInterface, tc ObjectSizeTestCase) {
 		key := fmt.Sprintf("object-%s", tc.Name)
 		data := GenerateRandomData(tc.Size)
 
@@ -49,7 +50,7 @@ func (s *ObjectsSuite) Test_Objects_BasicFlow() {
 		ops.PutObject(t, h)
 
 		// Verify storage type while object exists
-		VerifyStorageType(t, h.TempDir, key, tc.ExpectedType)
+		VerifyStorageType(t, h.GetTempDir(), key, tc.ExpectedType)
 
 		// Retrieve and verify
 		ops.GetAndVerify(t, h)
@@ -106,6 +107,12 @@ func (s *ObjectsSuite) Test_Objects_UpdateExisting() {
 
 // Test_Objects_LRUEviction tests LRU eviction for objects of different sizes
 func (s *ObjectsSuite) Test_Objects_LRUEviction() {
+	// Skip for cluster tests as LRU eviction behavior is more complex in distributed mode
+	if _, ok := s.Harness.(*ClusterTestHarness); ok {
+		s.T().Skip("Skipping LRU test for cluster mode")
+		return
+	}
+
 	// Reconfigure with low disk limit
 	s.Harness.Cleanup()
 	s.Config.MaxDiskUsage = 300 * 1024                // 300KB limit - lower to ensure eviction triggers
@@ -127,9 +134,13 @@ func (s *ObjectsSuite) Test_Objects_LRUEviction() {
 
 	RunLRUTests(s.T(), s.Harness, 300*1024, testCases)
 
-	// Verify eviction stats
-	_, evicted := s.Harness.Storage.CleanerStats()
-	assert.GreaterOrEqual(s.T(), evicted, int64(1), "Should have evicted at least one object")
+	// Verify eviction stats (only for single-node tests with direct storage access)
+	if storageAccess, ok := s.Harness.(TestStorageAccess); ok {
+		if stor, ok := storageAccess.GetStorage().(*storage.Storage); ok {
+			_, evicted := stor.CleanerStats()
+			assert.GreaterOrEqual(s.T(), evicted, int64(1), "Should have evicted at least one object")
+		}
+	}
 }
 
 // Test_Objects_MixedSizes tests operations with mixed object sizes
@@ -239,7 +250,7 @@ func (s *ObjectsSuite) Test_Objects_CompactionBehavior() {
 
 	// Initially all should be raw files
 	for _, key := range keys {
-		VerifyStorageType(s.T(), s.Harness.TempDir, key, storagepb.ValueType_RAW_FILE)
+		VerifyStorageType(s.T(), s.Harness.GetTempDir(), key, storagepb.ValueType_RAW_FILE)
 	}
 
 	// Wait for compaction
@@ -263,6 +274,12 @@ func (s *ObjectsSuite) Test_Objects_CompactionBehavior() {
 
 // Test_Objects_MixedTTL tests mixed TTL behavior across object sizes
 func (s *ObjectsSuite) Test_Objects_MixedTTL() {
+	// Skip for cluster tests as they have more complex setup
+	if _, ok := s.Harness.(*ClusterTestHarness); ok {
+		s.T().Skip("Skipping TTL reconfiguration test for cluster mode")
+		return
+	}
+
 	// Ensure clean harness with default configuration
 	s.Harness.Cleanup()
 	s.Config = DefaultIntegrationTestConfig()
