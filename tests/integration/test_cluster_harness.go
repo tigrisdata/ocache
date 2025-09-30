@@ -1,10 +1,8 @@
 package integration
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +16,7 @@ import (
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/service"
 	"github.com/tigrisdata/ocache/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -220,14 +219,17 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		NodeID: nodeID,
 	}
 
-	// Create gRPC server with cache service
+	// Create gRPC server with metrics interceptors and cache service
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(128*1024*1024),
 		grpc.MaxSendMsgSize(128*1024*1024),
+		grpc.UnaryInterceptor(metricsUnaryInterceptor(nodeMetrics)),
+		grpc.StreamInterceptor(metricsStreamInterceptor(nodeMetrics)),
 	)
 
 	// Register cache service with node-specific storage instance
-	cacheService := newTestCacheService(coord, stor, nodeMetrics)
+	// We use a lightweight test wrapper to enable per-node storage isolation
+	cacheService := service.NewCacheService(coord, stor)
 	pb.RegisterCacheServiceServer(grpcServer, cacheService)
 
 	// Start gRPC server
@@ -743,210 +745,91 @@ func (h *ClusterTestHarness) GetTempDir() string {
 	return ""
 }
 
-// newTestCacheService creates a cache service for testing
-func newTestCacheService(coord *coordinator.Coordinator, stor *storage.Storage, metrics *NodeMetrics) pb.CacheServiceServer {
-	return &testCacheService{
-		coordinator: coord,
-		storage:     stor,
-		nodeMetrics: metrics,
-	}
-}
+// metricsUnaryInterceptor tracks metrics for unary RPC calls
+func metricsUnaryInterceptor(metrics *NodeMetrics) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		resp, err := handler(ctx, req)
 
-// testCacheService is a minimal cache service implementation for testing
-type testCacheService struct {
-	pb.UnimplementedCacheServiceServer
-	coordinator *coordinator.Coordinator
-	storage     *storage.Storage
-	nodeMetrics *NodeMetrics
-}
-
-// Put implements streaming Put for the cache service
-func (s *testCacheService) Put(stream pb.CacheService_PutServer) error {
-	// Read the first chunk to get key and ttl
-	firstChunk, err := stream.Recv()
-	if err != nil {
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
-	}
-
-	key := firstChunk.Key
-	ttl := int(firstChunk.TtlSeconds)
-
-	if key == "" {
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: "missing key"})
-	}
-
-	// Collect all data from stream
-	var buf bytes.Buffer
-	if len(firstChunk.Data) > 0 {
-		buf.Write(firstChunk.Data)
-	}
-
-	// Read remaining chunks
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
-		}
-		buf.Write(chunk.Data)
-	}
-
-	// Store in node-specific storage instance
-	if s.storage == nil {
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: "storage not initialized"})
-	}
-
-	err = s.storage.Put(key, bytes.NewReader(buf.Bytes()), ttl)
-	if err != nil {
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
-	}
-
-	// Track metrics
-	if s.nodeMetrics != nil {
-		s.nodeMetrics.WritesHandled.Add(1)
-		s.nodeMetrics.BytesWritten.Add(int64(buf.Len()))
-		s.nodeMetrics.KeysStored.Add(1)
-	}
-
-	return stream.SendAndClose(&pb.PutResponse{Success: true})
-}
-
-// PutObject implements unary Put for the cache service (used by REST API)
-func (s *testCacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
-	if req.Key == "" {
-		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
-	}
-
-	// Store in node-specific storage instance
-	if s.storage == nil {
-		return &pb.PutResponse{Success: false, Error: "storage not initialized"}, nil
-	}
-
-	err := s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
-	if err != nil {
-		return &pb.PutResponse{Success: false, Error: err.Error()}, nil
-	}
-
-	// Track metrics
-	if s.nodeMetrics != nil {
-		s.nodeMetrics.WritesHandled.Add(1)
-		s.nodeMetrics.BytesWritten.Add(int64(len(req.Data)))
-		s.nodeMetrics.KeysStored.Add(1)
-	}
-
-	return &pb.PutResponse{Success: true}, nil
-}
-
-// Get implements streaming Get for the cache service
-func (s *testCacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
-	if s.storage == nil {
-		return fmt.Errorf("storage not initialized")
-	}
-
-	reader, exists, err := s.storage.Get(req.Key, req.Start, req.End)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("key not found: %s", req.Key)
-	}
-
-	// Close reader if it's a ReadCloser
-	if rc, ok := reader.(io.ReadCloser); ok {
-		defer rc.Close()
-	}
-
-	// Stream data back
-	buf := make([]byte, 32*1024)
-	var totalBytes int64
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			totalBytes += int64(n)
-			if err := stream.Send(&pb.GetResponse{
-				Data: buf[:n],
-			}); err != nil {
-				return err
+		// Only track metrics if operation succeeded
+		if err == nil && metrics != nil {
+			switch info.FullMethod {
+			case "/cache.CacheService/PutObject":
+				if putReq, ok := req.(*pb.PutRequest); ok {
+					metrics.WritesHandled.Add(1)
+					metrics.BytesWritten.Add(int64(len(putReq.Data)))
+					metrics.KeysStored.Add(1)
+				}
+			case "/cache.CacheService/Delete":
+				metrics.DeletesHandled.Add(1)
 			}
 		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
 
-	// Track metrics
-	if s.nodeMetrics != nil {
-		s.nodeMetrics.ReadsHandled.Add(1)
-		s.nodeMetrics.BytesRead.Add(totalBytes)
+		return resp, err
 	}
-
-	return nil
 }
 
-// Delete implements Delete for the cache service
-func (s *testCacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
-	if s.storage == nil {
-		return nil, fmt.Errorf("storage not initialized")
-	}
+// metricsStreamInterceptor tracks metrics for streaming RPC calls
+func metricsStreamInterceptor(metrics *NodeMetrics) grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		// Wrap the stream to intercept messages for byte/key counting
+		wrapped := &metricsServerStream{
+			ServerStream: ss,
+			metrics:      metrics,
+			method:       info.FullMethod,
+		}
 
-	err := s.storage.DeleteKey(req.Key)
-	if err != nil {
-		return nil, err
-	}
+		// Execute the handler
+		err := handler(srv, wrapped)
 
-	// Track metrics
-	if s.nodeMetrics != nil {
-		s.nodeMetrics.DeletesHandled.Add(1)
-	}
+		// Only track operation counts if the handler succeeded
+		if err == nil && metrics != nil {
+			switch info.FullMethod {
+			case "/cache.CacheService/Get":
+				metrics.ReadsHandled.Add(1)
+			case "/cache.CacheService/Put":
+				metrics.WritesHandled.Add(1)
+				// Track key storage for successful Put operations
+				if wrapped.keyTracked {
+					metrics.KeysStored.Add(1)
+				}
+			}
+		}
 
-	return &pb.DeleteResponse{Success: true}, nil
-}
-
-// List implements streaming List for the cache service
-func (s *testCacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
-	if s.storage == nil {
-		return fmt.Errorf("storage not initialized")
-	}
-
-	keys, err := s.storage.ListKeys(req.Prefix)
-	if err != nil {
 		return err
 	}
+}
 
-	// Stream keys back in batches
-	for _, key := range keys {
-		if err := stream.Send(&pb.ListResponse{Keys: []string{key}}); err != nil {
-			return err
+// metricsServerStream wraps grpc.ServerStream to track metrics
+type metricsServerStream struct {
+	grpc.ServerStream
+	metrics    *NodeMetrics
+	method     string
+	keyTracked bool // Track if we've already counted the key for this stream
+}
+
+func (s *metricsServerStream) SendMsg(m interface{}) error {
+	// Track Get (download) metrics
+	if s.method == "/cache.CacheService/Get" {
+		if getResp, ok := m.(*pb.GetResponse); ok && s.metrics != nil {
+			s.metrics.BytesRead.Add(int64(len(getResp.Data)))
+		}
+	}
+	return s.ServerStream.SendMsg(m)
+}
+
+func (s *metricsServerStream) RecvMsg(m interface{}) error {
+	err := s.ServerStream.RecvMsg(m)
+
+	// Track Put (upload) byte counts
+	if s.method == "/cache.CacheService/Put" {
+		if putReq, ok := m.(*pb.PutRequest); ok && s.metrics != nil && err == nil {
+			s.metrics.BytesWritten.Add(int64(len(putReq.Data)))
+			// Mark that we've seen a key (for tracking in the interceptor on success)
+			if putReq.Key != "" && !s.keyTracked {
+				s.keyTracked = true
+			}
 		}
 	}
 
-	return nil
-}
-
-// GetTopology returns the current cluster topology (for cluster-aware clients)
-func (s *testCacheService) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
-	// If coordinator is not enabled (single node mode), return an error
-	if s.coordinator == nil {
-		return &pb.GetTopologyResponse{
-			Error: "cluster mode not enabled",
-		}, nil
-	}
-
-	// Get topology from coordinator
-	topology, err := s.coordinator.GetClusterTopology(ctx, &clusterpb.Empty{})
-	if err != nil {
-		return &pb.GetTopologyResponse{
-			Error: err.Error(),
-		}, nil
-	}
-
-	// Return the topology directly
-	return &pb.GetTopologyResponse{
-		Topology: topology,
-	}, nil
+	return err
 }

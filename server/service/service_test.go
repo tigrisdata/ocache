@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"context"
@@ -6,15 +6,16 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 )
 
-func setupTestStorage(t *testing.T) {
+func setupTestStorage(t *testing.T) *stor.Storage {
 	dir := t.TempDir()
-	stor.InitStorageWithConfig(&stor.StorageConfig{
+	s, err := stor.NewStorageWithConfig(&stor.StorageConfig{
 		DiskPath:           dir,
 		TTL:                3600,
 		InlineThreshold:    1024,
@@ -25,14 +26,18 @@ func setupTestStorage(t *testing.T) {
 		FragThreshold:      0.5,
 		CompactionInterval: 100 * time.Millisecond,
 	})
+	require.NoError(t, err)
 	t.Cleanup(func() {
-		stor.CloseStorage()
+		s.Close()
 	})
+	return s
 }
 
 func TestCacheService_PutObjectAndGet(t *testing.T) {
-	setupTestStorage(t)
-	svc := &cacheService{}
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
+	}
 	key := "testkey"
 	value := []byte("hello world")
 	ctx := context.Background()
@@ -70,8 +75,10 @@ func (m *mockGetServer) Context() context.Context {
 }
 
 func TestCacheService_Delete(t *testing.T) {
-	setupTestStorage(t)
-	svc := &cacheService{}
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
+	}
 	key := "delkey"
 	value := []byte("bye")
 	ctx := context.Background()
@@ -88,8 +95,10 @@ func TestCacheService_Delete(t *testing.T) {
 }
 
 func TestCacheService_List(t *testing.T) {
-	setupTestStorage(t)
-	svc := &cacheService{}
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
+	}
 	ctx := context.Background()
 	keys := []string{"a", "b", "c"}
 	for _, k := range keys {
@@ -109,8 +118,10 @@ func TestCacheService_List(t *testing.T) {
 }
 
 func TestCacheService_ListWithPrefix(t *testing.T) {
-	setupTestStorage(t)
-	svc := &cacheService{}
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
+	}
 	ctx := context.Background()
 
 	// Create test keys with different prefixes
@@ -200,8 +211,10 @@ func (m *mockListServer) Context() context.Context {
 }
 
 func TestCacheService_Put_TTL(t *testing.T) {
-	setupTestStorage(t)
-	svc := &cacheService{}
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
+	}
 	key := "ttlkey"
 	value := []byte("with ttl")
 	ctx := context.Background()
@@ -226,7 +239,7 @@ func TestCacheService_Put_TTL(t *testing.T) {
 
 // TestCacheService_GetTopology_ErrorHandling tests GetTopology error handling
 func TestCacheService_GetTopology_ErrorHandling(t *testing.T) {
-	setupTestStorage(t)
+	s := setupTestStorage(t)
 
 	testCases := []struct {
 		name          string
@@ -242,7 +255,8 @@ func TestCacheService_GetTopology_ErrorHandling(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc := &cacheService{
+			svc := &CacheService{
+				storage:     s,
 				coordinator: tc.coordinator,
 			}
 
@@ -307,7 +321,7 @@ func (m *mockCoordinator) GetClusterTopology(ctx context.Context, req *clusterpb
 
 // TestCacheService_GetTopology_MockCoordinator tests GetTopology with a mock coordinator
 func TestCacheService_GetTopology_MockCoordinator(t *testing.T) {
-	setupTestStorage(t)
+	_ = setupTestStorage(t)
 
 	testCases := []struct {
 		name           string

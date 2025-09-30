@@ -18,7 +18,7 @@ func TestTTLCleanup(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Initialize storage with short cleanup interval for testing
-	InitStorageWithConfig(&StorageConfig{
+	s, err := NewStorageWithConfig(&StorageConfig{
 		DiskPath:           tmpDir,
 		TTL:                0,
 		InlineThreshold:    100,
@@ -29,10 +29,9 @@ func TestTTLCleanup(t *testing.T) {
 		CompactionInterval: 100 * time.Millisecond,
 		CleanupInterval:    100 * time.Millisecond,
 	})
-	defer CloseStorage()
+	require.NoError(t, err)
+	defer s.Close()
 
-	s := GetStorage()
-	require.NotNil(t, s)
 	require.NotNil(t, s.cleaner)
 
 	// Add some keys with short TTL
@@ -82,7 +81,7 @@ func TestLRUEviction(t *testing.T) {
 
 	// Initialize storage with disk usage limit
 	maxDiskUsage := int64(1000) // 1KB limit
-	InitStorageWithConfig(&StorageConfig{
+	s, err := NewStorageWithConfig(&StorageConfig{
 		DiskPath:           tmpDir,
 		TTL:                0,
 		InlineThreshold:    100,
@@ -93,10 +92,9 @@ func TestLRUEviction(t *testing.T) {
 		CompactionInterval: 100 * time.Millisecond,
 		CleanupInterval:    100 * time.Millisecond,
 	})
-	defer CloseStorage()
+	require.NoError(t, err)
+	defer s.Close()
 
-	s := GetStorage()
-	require.NotNil(t, s)
 	require.NotNil(t, s.cleaner)
 
 	// Add keys with specific access times to ensure predictable LRU behavior
@@ -187,7 +185,7 @@ func TestDiskUsageTracking(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Initialize storage with short cleanup interval for testing
-	InitStorageWithConfig(&StorageConfig{
+	s, err := NewStorageWithConfig(&StorageConfig{
 		DiskPath:           tmpDir,
 		TTL:                0,
 		InlineThreshold:    100,
@@ -198,10 +196,9 @@ func TestDiskUsageTracking(t *testing.T) {
 		CompactionInterval: 100 * time.Millisecond,
 		CleanupInterval:    100 * time.Millisecond,
 	})
-	defer CloseStorage()
+	require.NoError(t, err)
+	defer s.Close()
 
-	s := GetStorage()
-	require.NotNil(t, s)
 	require.NotNil(t, s.cleaner)
 
 	// Wait for cleaner initialization to complete

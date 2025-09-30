@@ -134,22 +134,6 @@ type Storage struct {
 	syncMonitor      *files.SyncMonitor    // Passive monitor for file sync tracking
 }
 
-var storage *Storage
-
-// GetStorage returns the singleton Storage instance
-func GetStorage() *Storage {
-	return storage
-}
-
-// InitStorageWithConfig initializes storage with a config struct
-func InitStorageWithConfig(config *StorageConfig) {
-	s, err := NewStorageWithConfig(config)
-	if err != nil {
-		zlog.Fatal().Err(err).Msg("failed to open storage")
-	}
-	storage = s
-}
-
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
 func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Create the data directory if it doesn't exist
@@ -323,15 +307,6 @@ func (s *Storage) Close() {
 	if s.meta != nil {
 		s.meta.Close()
 	}
-}
-
-// CloseStorage closes the singleton storage instance
-func CloseStorage() {
-	if storage == nil {
-		return
-	}
-	storage.Close()
-	storage = nil
 }
 
 // ListKeys returns all non-expired keys in the RocksDB instance that match the given prefix

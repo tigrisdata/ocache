@@ -13,6 +13,7 @@ import (
 	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
+	"github.com/tigrisdata/ocache/server/service"
 	stor "github.com/tigrisdata/ocache/storage"
 )
 
@@ -51,9 +52,6 @@ var (
 	failureThreshold  = flag.Int("failure-threshold", coordinator.DefaultFailureThreshold, "Number of failed heartbeats before marking node down")
 
 	seeds []string
-
-	// Global coordinator instance
-	globalCoordinator *coordinator.Coordinator
 )
 
 func configureLogger() {
@@ -70,9 +68,9 @@ func configureLogger() {
 }
 
 // initializeCluster sets up the cluster coordinator if clustering is enabled
-func initializeCluster(ctx context.Context) {
+func initializeCluster(ctx context.Context) *coordinator.Coordinator {
 	if !AppConfig.ClusterEnabled {
-		return
+		return nil
 	}
 
 	coordConfig := &coordinator.Config{
@@ -87,12 +85,12 @@ func initializeCluster(ctx context.Context) {
 	}
 
 	var err error
-	globalCoordinator, err = coordinator.New(coordConfig)
+	coord, err := coordinator.New(coordConfig)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("Failed to create coordinator")
 	}
 
-	if err := globalCoordinator.Start(ctx); err != nil {
+	if err := coord.Start(ctx); err != nil {
 		zlog.Fatal().Err(err).Msg("Failed to start coordinator")
 	}
 
@@ -101,10 +99,12 @@ func initializeCluster(ctx context.Context) {
 		Str("cluster_addr", AppConfig.ClusterAddr).
 		Int("seeds", len(AppConfig.Seeds)).
 		Msg("Cluster coordinator started")
+
+	return coord
 }
 
 // initializeStorage sets up the storage layer
-func initializeStorage() {
+func initializeStorage() *stor.Storage {
 	storageConfig := &stor.StorageConfig{
 		DiskPath:            AppConfig.DiskPath,
 		TTL:                 AppConfig.TTL,
@@ -122,32 +122,38 @@ func initializeStorage() {
 		CleanupInterval:     AppConfig.TTLCleanupInterval,
 		MetadataCacheSize:   AppConfig.MetadataCacheSize,
 	}
-	stor.InitStorageWithConfig(storageConfig)
+
+	s, err := stor.NewStorageWithConfig(storageConfig)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("failed to open storage")
+	}
+
+	return s
 }
 
 // startUserServices starts the user-facing gRPC and HTTP gateway services
-func startUserServices() {
-	go startGRPCServer()                                // Start gRPC server in goroutine
-	go startGRPCGatewayServer(*listenAddr, *listenHTTP) // Start grpc-gateway on different address
+func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
+	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging) // Start gRPC server in goroutine
+	go service.StartGRPCGatewayServer(*listenAddr, *listenHTTP)              // Start grpc-gateway on different address
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error
-func waitForShutdown(ctx context.Context, cancel context.CancelFunc) {
+func waitForShutdown(cancel context.CancelFunc, coord *coordinator.Coordinator) {
 	// Handle graceful shutdown on SIGINT/SIGTERM.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	// Create coordinator error channel if coordinator is enabled
-	var coordinatorErrCh <-chan error
-	if globalCoordinator != nil {
-		coordinatorErrCh = globalCoordinator.ErrorChan()
+	var coordErrCh <-chan error
+	if coord != nil {
+		coordErrCh = coord.ErrorChan()
 	}
 
 	// Wait for shutdown signal or fatal coordinator error
 	select {
 	case sig := <-sigChan:
 		zlog.Info().Str("signal", sig.String()).Msg("Received shutdown signal, shutting down...")
-	case err := <-coordinatorErrCh:
+	case err := <-coordErrCh:
 		if err != nil {
 			zlog.Error().Err(err).Msg("Coordinator reported fatal error, shutting down...")
 		}
@@ -158,16 +164,16 @@ func waitForShutdown(ctx context.Context, cancel context.CancelFunc) {
 }
 
 // performShutdown handles graceful shutdown of all components
-func performShutdown() {
+func performShutdown(coord *coordinator.Coordinator, storage *stor.Storage) {
 	// Close coordinator if enabled
-	if globalCoordinator != nil {
-		if err := globalCoordinator.Stop(); err != nil {
+	if coord != nil {
+		if err := coord.Stop(); err != nil {
 			zlog.Error().Err(err).Msg("Error stopping coordinator")
 		}
 	}
 
 	// Close storage (flush segments, close RocksDB, etc.)
-	stor.CloseStorage()
+	storage.Close()
 
 	zlog.Info().Msg("Shutdown complete")
 }
@@ -182,19 +188,19 @@ func RunServer() {
 	zlog.Info().Msg("Prometheus metrics initialized")
 
 	// Set up internal cluster communication if enabled
-	initializeCluster(ctx)
+	coord := initializeCluster(ctx)
 
 	// Initialize the storage layer
-	initializeStorage()
+	storage := initializeStorage()
 
 	// Start gRPC and HTTP gateway for client requests
-	startUserServices()
+	startUserServices(coord, storage)
 
 	// Wait for shutdown signal
-	waitForShutdown(ctx, cancel)
+	waitForShutdown(cancel, coord)
 
 	// Perform graceful shutdown
-	performShutdown()
+	performShutdown(coord, storage)
 }
 
 func main() {

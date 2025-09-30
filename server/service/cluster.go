@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"bytes"
@@ -9,14 +9,13 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
-	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 // handleClusteredPut handles Put requests in cluster mode
-func (s *cacheService) handleClusteredPut(stream pb.CacheService_PutServer) error {
+func (s *CacheService) handleClusteredPut(stream pb.CacheService_PutServer) error {
 	// Read the first chunk to get the key
 	firstChunk, err := stream.Recv()
 	if err != nil {
@@ -51,7 +50,7 @@ func (s *cacheService) handleClusteredPut(stream pb.CacheService_PutServer) erro
 }
 
 // forwardStreamingPut forwards a streaming Put request to a remote node
-func (s *cacheService) forwardStreamingPut(localStream pb.CacheService_PutServer, client pb.CacheServiceClient, firstChunk *pb.PutRequest) error {
+func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer, client pb.CacheServiceClient, firstChunk *pb.PutRequest) error {
 	ctx := localStream.Context()
 
 	// Create a streaming Put call to the remote node
@@ -107,7 +106,7 @@ func (s *cacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 }
 
 // handleLocalPut processes a Put request locally
-func (s *cacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChunk *pb.PutRequest) error {
+func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChunk *pb.PutRequest) error {
 	key := firstChunk.Key
 	ttl := int(firstChunk.TtlSeconds)
 
@@ -116,7 +115,7 @@ func (s *cacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 
 	// Start storage.Put in a goroutine
 	go func() {
-		errCh <- stor.GetStorage().Put(key, pr, ttl)
+		errCh <- s.storage.Put(key, pr, ttl)
 	}()
 
 	// Write the first chunk's data if any
@@ -167,7 +166,7 @@ func (s *cacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 }
 
 // handleClusteredPutObject handles unary PutObject requests in cluster mode
-func (s *cacheService) handleClusteredPutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (s *CacheService) handleClusteredPutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("PutObject", "invalid").Inc()
 		return &pb.PutResponse{Success: false, Error: "missing key"}, nil
@@ -200,7 +199,7 @@ func (s *cacheService) handleClusteredPutObject(ctx context.Context, req *pb.Put
 
 	// Handle locally
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "PutObject", req.Key, func() error {
-		return stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
+		return s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
@@ -213,7 +212,7 @@ func (s *cacheService) handleClusteredPutObject(ctx context.Context, req *pb.Put
 }
 
 // handleClusteredGet handles Get requests in cluster mode
-func (s *cacheService) handleClusteredGet(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
+func (s *CacheService) handleClusteredGet(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	// Check if this node owns the key
 	if !s.coordinator.IsLocal(req.Key) {
 		// Forward to the correct node
@@ -232,7 +231,7 @@ func (s *cacheService) handleClusteredGet(req *pb.GetRequest, stream pb.CacheSer
 }
 
 // forwardStreamingGet forwards a streaming Get request to a remote node
-func (s *cacheService) forwardStreamingGet(req *pb.GetRequest, localStream pb.CacheService_GetServer, client pb.CacheServiceClient) error {
+func (s *CacheService) forwardStreamingGet(req *pb.GetRequest, localStream pb.CacheService_GetServer, client pb.CacheServiceClient) error {
 	ctx := localStream.Context()
 
 	// Create a streaming Get call to the remote node
@@ -262,12 +261,12 @@ func (s *cacheService) forwardStreamingGet(req *pb.GetRequest, localStream pb.Ca
 }
 
 // handleLocalGet processes a Get request locally
-func (s *cacheService) handleLocalGet(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
+func (s *CacheService) handleLocalGet(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	var r io.Reader
 	var found bool
 	err := retry.DoWithKey(stream.Context(), retry.DefaultConfig(), "Get", req.Key, func() error {
 		var getErr error
-		r, found, getErr = stor.GetStorage().Get(req.Key, req.Start, req.End)
+		r, found, getErr = s.storage.Get(req.Key, req.Start, req.End)
 		return getErr
 	})
 	if err != nil {
@@ -311,7 +310,7 @@ func (s *cacheService) handleLocalGet(req *pb.GetRequest, stream pb.CacheService
 }
 
 // handleClusteredDelete handles Delete requests in cluster mode
-func (s *cacheService) handleClusteredDelete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+func (s *CacheService) handleClusteredDelete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("Delete", "invalid").Inc()
 		return &pb.DeleteResponse{Success: false, Error: "missing key"}, nil
@@ -344,7 +343,7 @@ func (s *cacheService) handleClusteredDelete(ctx context.Context, req *pb.Delete
 
 	// Handle locally
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "Delete", req.Key, func() error {
-		return stor.GetStorage().DeleteKey(req.Key)
+		return s.storage.DeleteKey(req.Key)
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Delete", "error").Inc()

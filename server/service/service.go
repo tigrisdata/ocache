@@ -1,4 +1,4 @@
-package main
+package service
 
 import (
 	"bytes"
@@ -27,21 +27,23 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// cacheService implements pb.CacheServiceServer
-type cacheService struct {
+// CacheService implements pb.CacheServiceServer
+type CacheService struct {
 	pb.UnimplementedCacheServiceServer
 	coordinator *coordinator.Coordinator
+	storage     *stor.Storage
 }
 
-// newCacheService creates a new cache service, optionally with clustering support
-func newCacheService(coord *coordinator.Coordinator) *cacheService {
-	return &cacheService{
+// NewCacheService creates a new cache service, optionally with clustering support
+func NewCacheService(coord *coordinator.Coordinator, storage *stor.Storage) *CacheService {
+	return &CacheService{
 		coordinator: coord,
+		storage:     storage,
 	}
 }
 
 // Streaming Put for large values
-func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
+func (s *CacheService) Put(stream pb.CacheService_PutServer) error {
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("Put").Observe(float64(time.Since(start).Milliseconds()))
@@ -79,7 +81,7 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 	go func() {
 		// Note: We don't retry streaming Put operations at service layer since
 		// the client would need to resend the entire stream
-		errCh <- stor.GetStorage().Put(key, pr, ttl)
+		errCh <- s.storage.Put(key, pr, ttl)
 	}()
 
 	// Write the first chunk's data if any
@@ -137,7 +139,7 @@ func (s *cacheService) Put(stream pb.CacheService_PutServer) error {
 }
 
 // PutObject implements the unary REST/HTTP endpoint for cache put
-func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (s *CacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("PutObject").Observe(float64(time.Since(start).Milliseconds()))
@@ -158,7 +160,7 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	// Use the same logic as the streaming Put, but for a single chunk
 	// Wrap with retry logic for retryable errors
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "PutObject", req.Key, func() error {
-		return stor.GetStorage().Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
+		return s.storage.Put(req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds))
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
@@ -172,7 +174,7 @@ func (s *cacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 }
 
 // Streaming Get for large values with byte-range support
-func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
+func (s *CacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer) error {
 	startTime := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("Get").Observe(float64(time.Since(startTime).Milliseconds()))
@@ -192,7 +194,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	var found bool
 	err := retry.DoWithKey(stream.Context(), retry.DefaultConfig(), "Get", req.Key, func() error {
 		var getErr error
-		r, found, getErr = stor.GetStorage().Get(req.Key, req.Start, req.End)
+		r, found, getErr = s.storage.Get(req.Key, req.Start, req.End)
 		return getErr
 	})
 	if err != nil {
@@ -237,7 +239,7 @@ func (s *cacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 }
 
 // Delete implementation
-func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+func (s *CacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("Delete").Observe(float64(time.Since(start).Milliseconds()))
@@ -257,7 +259,7 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 	}
 
 	err := retry.DoWithKey(ctx, retry.DefaultConfig(), "Delete", req.Key, func() error {
-		return stor.GetStorage().DeleteKey(req.Key)
+		return s.storage.DeleteKey(req.Key)
 	})
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Delete", "error").Inc()
@@ -270,7 +272,7 @@ func (s *cacheService) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.D
 }
 
 // Streaming List implementation
-func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
+func (s *CacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("List").Observe(float64(time.Since(start).Milliseconds()))
@@ -281,7 +283,7 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 	var keys []string
 	err := retry.Do(stream.Context(), retry.DefaultConfig(), "ListKeys", func() error {
 		var listErr error
-		keys, listErr = stor.GetStorage().ListKeys(req.Prefix)
+		keys, listErr = s.storage.ListKeys(req.Prefix)
 		return listErr
 	})
 	if err != nil {
@@ -301,7 +303,7 @@ func (s *cacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServ
 }
 
 // GetTopology returns the current cluster topology (for cluster-aware clients)
-func (s *cacheService) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
+func (s *CacheService) GetTopology(ctx context.Context, req *pb.GetTopologyRequest) (*pb.GetTopologyResponse, error) {
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("GetTopology").Observe(float64(time.Since(start).Milliseconds()))
@@ -394,10 +396,10 @@ func grpcStreamLoggingInterceptor(
 	return err
 }
 
-func startGRPCServer() {
+func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, listenAddr string, requestLogging bool) {
 	// If request logging is enabled, add the interceptors to the gRPC server
 	var opts []grpc.ServerOption
-	if AppConfig.RequestLogging {
+	if requestLogging {
 		opts = append(opts,
 			grpc.UnaryInterceptor(grpcLoggingInterceptor),
 			grpc.StreamInterceptor(grpcStreamLoggingInterceptor),
@@ -411,20 +413,20 @@ func startGRPCServer() {
 
 	grpcServer := grpc.NewServer(opts...)
 	// Create service with coordinator if clustering is enabled
-	service := newCacheService(globalCoordinator)
+	service := NewCacheService(coord, storage)
 	pb.RegisterCacheServiceServer(grpcServer, service)
 
-	lis, err := net.Listen("tcp", AppConfig.ListenAddr)
+	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to listen for gRPC")
 	}
-	zlog.Info().Msgf("gRPC server listening on %s", AppConfig.ListenAddr)
+	zlog.Info().Msgf("gRPC server listening on %s", listenAddr)
 	if err := grpcServer.Serve(lis); err != nil {
 		zlog.Fatal().Err(err).Msg("gRPC server failed")
 	}
 }
 
-func startGRPCGatewayServer(grpcAddr string, listenHTTP string) {
+func StartGRPCGatewayServer(grpcAddr string, listenHTTP string) {
 	ctx := context.Background()
 	mux := http.NewServeMux()
 
