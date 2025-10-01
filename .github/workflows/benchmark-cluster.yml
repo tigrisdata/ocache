@@ -161,8 +161,8 @@ jobs:
           for i in {1..60}; do
             echo "Checking cluster convergence (attempt $i/60)..."
 
-            NODESTATUS=$(curl -s http://localhost:8001/v1/topology | jq -r '.topology.nodes[].status')
-            if echo "$NODESTATUS" | grep -q "NODE_STATUS_ACTIVE"; then
+            NODESTATUS=$(curl -s http://localhost:8001/v1/topology | jq -r '.topology.nodes[].status' | grep -c NODE_STATUS_ACTIVE)
+            if [ "$NODESTATUS" -eq 3 ]; then
               echo "Cluster converged"
               CONVERGED=true
               break
