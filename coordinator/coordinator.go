@@ -38,6 +38,9 @@ const (
 
 	// DefaultBroadcastCacheTime is the default time for broadcasting cache state
 	DefaultBroadcastCacheTime = 10 * time.Second
+
+	// DefaultSyncTimeout is the default timeout for syncing with other nodes
+	DefaultSyncTimeout = 10 * time.Second
 )
 
 // Config contains the configuration for the coordinator
@@ -52,6 +55,7 @@ type Config struct {
 	FailureThreshold   int           // The number of consecutive failures before a node is marked as down
 	AllowLocalhost     bool          // Whether to restrict to localhost addresses (for testing)
 	DNSRefreshInterval int           // The interval at which DNS node discovery is performed (seconds)
+	SyncTimeout        int           // The timeout for syncing with other nodes (seconds)
 	RouterConfig       *RouterConfig // Configuration for the Router (optional, uses defaults if nil)
 }
 
@@ -77,6 +81,7 @@ type Coordinator struct {
 	failureThreshold  int
 	failureCount      map[string]int
 	lastHeartbeat     map[string]time.Time // Last heartbeat time for each node
+	syncTimeout       time.Duration
 	mu                sync.RWMutex
 
 	// Broadcast deduplication
@@ -173,6 +178,11 @@ func New(config *Config) (*Coordinator, error) {
 		failureThreshold = DefaultFailureThreshold
 	}
 
+	syncTimeout := time.Duration(config.SyncTimeout) * time.Second
+	if syncTimeout == 0 {
+		syncTimeout = DefaultSyncTimeout
+	}
+
 	coord := &Coordinator{
 		config:            config,
 		nodeDiscovery:     nodeDiscovery,
@@ -181,6 +191,7 @@ func New(config *Config) (*Coordinator, error) {
 		router:            router,
 		heartbeatInterval: heartbeatInterval,
 		failureThreshold:  failureThreshold,
+		syncTimeout:       syncTimeout,
 		failureCount:      make(map[string]int),
 		lastHeartbeat:     make(map[string]time.Time),
 		broadcastCache:    make(map[string]time.Time),
@@ -299,23 +310,31 @@ func (c *Coordinator) joinCluster() error {
 	nodes := c.currentNodes
 	c.nodesMu.RUnlock()
 
-	// If no resolved nodes, we're the bootstrap node
-	if len(nodes) == 0 {
+	// Filter out self from the seed list to avoid attempting to sync with ourselves
+	otherNodes := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node != c.config.ClusterAddr {
+			otherNodes = append(otherNodes, node)
+		}
+	}
+
+	// If no other nodes after filtering, we're the bootstrap node
+	if len(otherNodes) == 0 {
 		zlog.Info().
 			Str("node_id", c.config.MyNodeID).
-			Msg("Starting as bootstrap node")
+			Msg("Starting as bootstrap node (no other seeds available)")
 		return nil
 	}
 
 	// Try to sync with all the nodes to get the cluster state
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
-		Strs("nodes", nodes).
+		Strs("nodes", otherNodes).
 		Str("discovery_mode", string(c.nodeDiscovery.Mode())).
 		Msg("Attempting to sync with nodes")
 
 	var lastErr error
-	for _, node := range nodes {
+	for _, node := range otherNodes {
 		if err := c.syncWithNode(node); err != nil {
 			zlog.Warn().
 				Err(err).
@@ -332,11 +351,14 @@ func (c *Coordinator) joinCluster() error {
 		return nil
 	}
 
-	// All node sync attempts failed
-	if lastErr != nil {
-		return fmt.Errorf("failed to sync with any node, last error: %w", lastErr)
-	}
-	return fmt.Errorf("failed to sync with any node")
+	// All node sync attempts failed - this is acceptable if we're the first node starting up
+	// Fall back to bootstrap mode
+	zlog.Warn().
+		Err(lastErr).
+		Str("node_id", c.config.MyNodeID).
+		Int("attempted_seeds", len(otherNodes)).
+		Msg("Failed to sync with any seed node, starting as bootstrap node")
+	return nil
 }
 
 // syncWithNode gets cluster state from node and announces our join to the cluster
@@ -346,7 +368,7 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		Str("node", nodeAddr).
 		Msg("Syncing with node")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), c.syncTimeout)
 	defer cancel()
 
 	conn, err := grpc.DialContext(ctx, nodeAddr,
