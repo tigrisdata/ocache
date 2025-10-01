@@ -1,0 +1,231 @@
+name: Benchmark Cluster
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+
+env:
+  GO_VERSION: "1.21"
+  ROCKSDB_VERSION: "10.4.2"
+
+jobs:
+  benchmark-cluster:
+    strategy:
+      matrix:
+        os: [namespace-profile-ubuntu-2404-medium]
+        include:
+          - os: namespace-profile-ubuntu-2404-medium
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl libgflags-dev \
+            libsnappy-dev liblz4-dev libzstd-dev jq zlib1g-dev libbz2-dev netcat-openbsd
+
+      - name: Set OS name
+        id: os-name
+        run: |
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Cache RocksDB static artifact
+        uses: actions/cache@v4
+        id: cache-rocksdb-static
+        with:
+          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+
+      - name: Download pre-built RocksDB artifact
+        if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
+        run: |
+          # Try to download from GitHub releases first
+          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
+
+          if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
+            echo "Downloaded pre-built artifact from release"
+          else
+            echo "Pre-built artifact not found, building from source..."
+            ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
+            OS=${{ steps.os-name.outputs.os_name }} \
+            ARCH=${{ matrix.arch }} \
+            make build-rocksdb-static
+            mv rocksdb-static/rocksdb-static-*.tar.gz .
+          fi
+
+      - name: Extract RocksDB static artifact
+        run: |
+          mkdir -p rocksdb-static/artifact
+          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          ls -la rocksdb-static/artifact/
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Generate proto files
+        run: make proto
+
+      - name: Build server and CLI
+        run: STATIC_BUILD=true make all
+
+      - name: Create temp directories for cluster nodes
+        run: |
+          mkdir -p /tmp/ocache-cluster/node1
+          mkdir -p /tmp/ocache-cluster/node2
+          mkdir -p /tmp/ocache-cluster/node3
+
+      - name: Start 3-node cluster
+        run: |
+          echo "Starting 3-node OCache cluster with sequential bootstrap..."
+
+          # Start node 1 as bootstrap (no seeds)
+          echo "Starting node1 (bootstrap)..."
+          ./ocache -cluster-enabled -node-id node1 -disk /tmp/ocache-cluster/node1 -listen-addr :9001 -listen-http :8001 -cluster-addr :7001 > node1.log 2>&1 &
+          echo $! > node1.pid
+
+          # Wait for node1 to be ready
+          for i in {1..30}; do
+            if nc -z localhost 9001 2>/dev/null; then
+              echo "Node1 is ready"
+              break
+            fi
+            echo "Waiting for node1 to start..."
+            sleep 1
+          done
+          sleep 1
+
+          # Start node 2 with node1 as seed
+          echo "Starting node2..."
+          ./ocache -cluster-enabled -node-id node2 -disk /tmp/ocache-cluster/node2 -listen-addr :9002 -listen-http :8002 -cluster-addr :7002 -seeds localhost:7001 > node2.log 2>&1 &
+          echo $! > node2.pid
+
+          # Wait for node2 to be ready
+          for i in {1..30}; do
+            if nc -z localhost 9002 2>/dev/null; then
+              echo "Node2 is ready"
+              break
+            fi
+            echo "Waiting for node2 to start..."
+            sleep 1
+          done
+          sleep 1
+
+          # Start node 3 with node1 and node2 as seeds
+          echo "Starting node3..."
+          ./ocache -cluster-enabled -node-id node3 -disk /tmp/ocache-cluster/node3 -listen-addr :9003 -listen-http :8003 -cluster-addr :7003 -seeds localhost:7001,localhost:7002 > node3.log 2>&1 &
+          echo $! > node3.pid
+
+          # Wait for node3 to be ready
+          for i in {1..30}; do
+            if nc -z localhost 9003 2>/dev/null; then
+              echo "Node3 is ready"
+              break
+            fi
+            echo "Waiting for node3 to start..."
+            sleep 1
+          done
+
+      - name: Wait for cluster convergence
+        run: |
+          echo "Waiting for cluster to converge (all nodes see each other)..."
+
+          # Poll until all 3 nodes are reported as active members
+          CONVERGED=false
+          for i in {1..60}; do
+            echo "Checking cluster convergence (attempt $i/60)..."
+
+            NODESTATUS=$(curl -s http://localhost:8001/v1/topology | jq -r '.topology.nodes[].status' | grep -c NODE_STATUS_ACTIVE)
+            if [ "$NODESTATUS" -eq 3 ]; then
+              echo "Cluster converged"
+              CONVERGED=true
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$CONVERGED" = false ]; then
+            echo "ERROR: Cluster failed to converge within 60 seconds"
+            echo "=== Node1 log tail ==="
+            tail -50 node1.log
+            echo "=== Node2 log tail ==="
+            tail -50 node2.log
+            echo "=== Node3 log tail ==="
+            tail -50 node3.log
+            exit 1
+          fi
+
+          echo "Cluster is fully converged and ready for benchmarks"
+
+      - name: Run cluster benchmark - 100 bytes
+        run: |
+          echo "=== Running cluster benchmark with 100 byte objects ==="
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 100000 --value-size 100 --workload "read=80,update=20" --no-progress | tee cluster-100-byte-read-80-update-20.log
+
+      - name: Run cluster benchmark - 100 KB
+        run: |
+          echo "=== Running cluster benchmark with 100 KB objects ==="
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 100000 --value-size 102400 --workload "read=80,update=20" --no-progress | tee cluster-100kb-read-80-update-20.log
+
+      - name: Run cluster benchmark - 1 MB
+        run: |
+          echo "=== Running cluster benchmark with 1 MB objects ==="
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee cluster-1mb-read-80-update-20.log
+
+      - name: Run cluster benchmark - 10 MB
+        run: |
+          echo "=== Running cluster benchmark with 10 MB objects ==="
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 10000 --value-size 10485760 --workload "read=80,update=20" --no-progress | tee cluster-10mb-read-80-update-20.log
+
+      - name: Stop cluster nodes
+        if: always()
+        run: |
+          echo "Stopping cluster nodes..."
+          if [ -f node1.pid ]; then kill $(cat node1.pid) 2>/dev/null || true; fi
+          if [ -f node2.pid ]; then kill $(cat node2.pid) 2>/dev/null || true; fi
+          if [ -f node3.pid ]; then kill $(cat node3.pid) 2>/dev/null || true; fi
+          rm -f node*.pid
+
+      - name: Upload cluster logs (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-node-logs-${{ matrix.os }}
+          path: |
+            node*.log
+
+      - name: Upload cluster benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-benchmark-results-${{ matrix.os }}
+          path: |
+            cluster-*.log
+            *.out

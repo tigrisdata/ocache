@@ -1,4 +1,4 @@
-name: Benchmark
+name: Benchmark Single Node
 
 on:
   push:
@@ -21,7 +21,7 @@ env:
   ROCKSDB_VERSION: "10.4.2"
 
 jobs:
-  benchmark:
+  benchmark-single:
     strategy:
       matrix:
         os: [namespace-profile-ubuntu-2404-medium]
@@ -141,7 +141,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results-${{ matrix.os }}
+          name: single-node-benchmark-results-${{ matrix.os }}
           path: |
             *.log
             *.out
