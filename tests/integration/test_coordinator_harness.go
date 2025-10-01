@@ -87,24 +87,15 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 	clusterAddr := fmt.Sprintf("localhost:%d", clusterPort)
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
 
-	// Build seed list - for first node, use empty seeds
-	// For subsequent nodes, use addresses of existing nodes
+	// Build seed list
 	var seeds []string
-	h.mu.RLock()
-	numExistingNodes := len(h.Nodes)
-	h.mu.RUnlock()
 
-	if numExistingNodes > 0 {
-		// Add addresses of other nodes (they may or may not be running)
-		for i := 0; i < h.NodeCount; i++ {
-			seedPort := h.BasePort + i
-			seedAddr := fmt.Sprintf("localhost:%d", seedPort)
-			if seedAddr != clusterAddr {
-				seeds = append(seeds, seedAddr)
-			}
-		}
+	// Add addresses of other nodes (they may or may not be running)
+	for i := 0; i < h.NodeCount; i++ {
+		seedPort := h.BasePort + i
+		seedAddr := fmt.Sprintf("localhost:%d", seedPort)
+		seeds = append(seeds, seedAddr)
 	}
-	// For the first node, seeds will be empty and it will bootstrap itself
 
 	// Create coordinator config
 	config := &coordinator.Config{
@@ -116,6 +107,7 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 		RingPartitionCount: hash.DefaultPartitionCount,
 		HeartbeatInterval:  1, // 1 second for faster testing
 		FailureThreshold:   3,
+		SyncTimeout:        1, // 1 second for faster testing
 	}
 
 	// Create coordinator

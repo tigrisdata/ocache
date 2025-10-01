@@ -144,18 +144,10 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 
 	// Build seed list
 	var seeds []string
-	h.mu.RLock()
-	numExistingNodes := len(h.Nodes)
-	h.mu.RUnlock()
-
-	if numExistingNodes > 0 {
-		for i := 0; i < h.NodeCount; i++ {
-			seedClusterPort := h.BasePort + 1000 + i
-			seedAddr := fmt.Sprintf("localhost:%d", seedClusterPort)
-			if seedAddr != clusterAddr {
-				seeds = append(seeds, seedAddr)
-			}
-		}
+	for i := 0; i < h.NodeCount; i++ {
+		seedClusterPort := h.BasePort + 1000 + i
+		seedAddr := fmt.Sprintf("localhost:%d", seedClusterPort)
+		seeds = append(seeds, seedAddr)
 	}
 
 	// Initialize isolated storage instance for this node
@@ -190,6 +182,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		RingPartitionCount: hash.DefaultPartitionCount,
 		HeartbeatInterval:  1, // 1 second for faster testing
 		FailureThreshold:   3,
+		SyncTimeout:        1, // 1 second for faster testing
 	}
 
 	// Create coordinator
