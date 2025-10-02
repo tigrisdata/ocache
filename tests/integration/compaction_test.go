@@ -128,7 +128,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 	for i := 0; i < 3; i++ {
 		key := fmt.Sprintf("selective-large-%d", i)
 		largeKeys = append(largeKeys, key)
-		data := GenerateRandomData(20 * 1024 * 1024) // 20MB
+		data := GenerateRandomData(65 * 1024 * 1024) // 65MB - exceeds 64MB compact threshold
 
 		err := s.Harness.PutObject(key, data, 0)
 		require.NoError(t, err)
@@ -179,7 +179,7 @@ func (s *CompactionSuite) Test_CompactionLoop_SelectiveCompaction() {
 		VerifyStorageType(t, s.Harness.GetTempDir(), key, storagepb.ValueType_RAW_FILE)
 		data, err := s.Harness.GetObject(key)
 		require.NoError(t, err)
-		require.Equal(t, 20*1024*1024, len(data))
+		require.Equal(t, 65*1024*1024, len(data))
 
 		// Verify still no compaction entry (only for single-node tests)
 		if storageAccess, ok := s.Harness.(TestStorageAccess); ok {

@@ -26,8 +26,9 @@ import (
 
 func defaultDeletionQueueConfig() deletion.Config {
 	return deletion.Config{
-		BatchSize: 1000,
-		PruneAge:  24 * time.Hour,
+		BatchSize:       1000,
+		ProcessInterval: time.Second,
+		PruneAge:        24 * time.Hour,
 	}
 }
 

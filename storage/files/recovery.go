@@ -266,8 +266,8 @@ func (proc *streamingProcessor) streamEntries() error {
 		key := it.Key()
 		value := it.Value()
 
-		// Parse key to get filepath and userKey
-		filepath, userKey, ok := keys.ParseCompactionIndexRow(key.Data(), value.Data())
+		// Parse key to get userKey and filepath
+		userKey, filepath, ok := keys.ParseCompactionIndexRow(key.Data(), value.Data())
 		if !ok {
 			zlog.Warn().
 				Str("key", string(key.Data())).

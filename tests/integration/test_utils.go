@@ -174,6 +174,13 @@ func (h *IntegrationTestHarness) PutObject(key string, data []byte, ttl int64) e
 	return nil
 }
 
+// PutObjectStream stores a large object using streaming API
+func (h *IntegrationTestHarness) PutObjectStream(key string, data []byte, ttl int64) error {
+	// For single-node tests, PutObject already uses streaming internally
+	// via Storage.Put which reads from io.Reader
+	return h.PutObject(key, data, ttl)
+}
+
 // GetObject retrieves an object from the cache
 func (h *IntegrationTestHarness) GetObject(key string) ([]byte, error) {
 	h.Metrics.TotalReads.Add(1)

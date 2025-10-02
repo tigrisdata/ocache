@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -467,6 +468,30 @@ func (h *ClusterTestHarness) PutObject(key string, data []byte, ttl int64) error
 	defer cancel()
 
 	err := h.Client.Put(ctx, key, data, ttl)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return err
+	}
+
+	// Track object type based on size
+	if int64(len(data)) <= h.Config.InlineThreshold {
+		h.Metrics.InlineObjects.Add(1)
+	} else {
+		h.Metrics.RawFileObjects.Add(1)
+	}
+
+	return nil
+}
+
+// PutObjectStream stores a large object using streaming API (for objects >128MB)
+func (h *ClusterTestHarness) PutObjectStream(key string, data []byte, ttl int64) error {
+	h.Metrics.TotalWrites.Add(1)
+	h.Metrics.BytesWritten.Add(int64(len(data)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Longer timeout for large objects
+	defer cancel()
+
+	err := h.Client.PutStream(ctx, key, bytes.NewReader(data), ttl)
 	if err != nil {
 		h.Metrics.ErrorCount.Add(1)
 		return err
