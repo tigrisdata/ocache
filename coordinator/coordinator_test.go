@@ -869,9 +869,10 @@ func (m *mockClusterService) GetClusterState(ctx context.Context, req *clusterpb
 		Epoch: 1,
 		Nodes: []*clusterpb.NodeInfo{
 			{
-				Id:      "mock-node",
-				Address: "localhost:9999",
-				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+				Id:            "mock-node",
+				Address:       "localhost:9999",
+				ListenAddress: "localhost:8999",
+				Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 		},
 	}, nil
