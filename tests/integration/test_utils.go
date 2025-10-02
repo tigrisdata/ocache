@@ -20,10 +20,10 @@ type IntegrationTestConfig struct {
 	InlineThreshold        int64         // Threshold for inline storage (default 64KB)
 	CompactThreshold       int64         // Threshold for compaction (default 16MB)
 	SegmentSize            int64         // Maximum segment size (default 256MB)
-	CompactionInterval     time.Duration // How often compaction runs
 	CompactionThreads      int           // Number of compaction threads
 	RecompactMinSegmentAge time.Duration // Minimum age for segment recompaction
 	RecompactMinSegments   int           // Minimum number of segments for recompaction
+	RecompactionInterval   time.Duration // How often compaction runs
 	CleanupInterval        time.Duration // How often cleanup runs
 	AccessUpdateDelay      time.Duration // How often access time is updated
 	MaxDiskUsage           int64         // Maximum disk usage for LRU eviction
@@ -34,9 +34,9 @@ type IntegrationTestConfig struct {
 func DefaultIntegrationTestConfig() IntegrationTestConfig {
 	return IntegrationTestConfig{
 		InlineThreshold:        64 * 1024,              // 64KB
-		CompactThreshold:       16 * 1024 * 1024,       // 16MB
+		CompactThreshold:       64 * 1024 * 1024,       // 64MB
 		SegmentSize:            256 * 1024 * 1024,      // 256MB
-		CompactionInterval:     1 * time.Second,        // Fast for testing
+		RecompactionInterval:   1 * time.Second,        // Fast for testing
 		CompactionThreads:      1,                      // Default to single thread
 		RecompactMinSegmentAge: 30 * time.Second,       // Default to 30 seconds
 		RecompactMinSegments:   2,                      // Default to 2 segments
@@ -83,19 +83,19 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 
 	// Initialize storage
 	s, err := storage.NewStorageWithConfig(&storage.StorageConfig{
-		DiskPath:           tmpDir,
-		TTL:                0,
-		InlineThreshold:    int(config.InlineThreshold),
-		CompactThreshold:   config.CompactThreshold,
-		SegmentSize:        config.SegmentSize,
-		FdCacheSize:        config.FDCacheSize,
-		MaxDiskUsage:       config.MaxDiskUsage,
-		CompactionInterval: config.CompactionInterval,
-		CompactionThreads:  config.CompactionThreads,
-		MinSegmentAge:      config.RecompactMinSegmentAge,
-		MinSegments:        config.RecompactMinSegments,
-		CleanupInterval:    config.CleanupInterval,
-		AccessUpdateDelay:  config.AccessUpdateDelay,
+		DiskPath:             tmpDir,
+		TTL:                  0,
+		InlineThreshold:      int(config.InlineThreshold),
+		CompactThreshold:     config.CompactThreshold,
+		SegmentSize:          config.SegmentSize,
+		FdCacheSize:          config.FDCacheSize,
+		MaxDiskUsage:         config.MaxDiskUsage,
+		CompactionThreads:    config.CompactionThreads,
+		MinSegmentAge:        config.RecompactMinSegmentAge,
+		MinSegments:          config.RecompactMinSegments,
+		CleanupInterval:      config.CleanupInterval,
+		AccessUpdateDelay:    config.AccessUpdateDelay,
+		RecompactionInterval: config.RecompactionInterval,
 	})
 	require.NoError(t, err)
 

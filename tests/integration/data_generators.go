@@ -58,7 +58,7 @@ func GenerateMediumObjects(count int) []TestObject {
 		5 * 1024 * 1024,  // 5MB
 		10 * 1024 * 1024, // 10MB
 		16*1024*1024 - 1, // Just under 16MB
-		16 * 1024 * 1024, // Exactly 16MB (boundary)
+		64 * 1024 * 1024, // Exactly 64MB (boundary)
 	}
 
 	for i := 0; i < count; i++ {
@@ -67,9 +67,9 @@ func GenerateMediumObjects(count int) []TestObject {
 		if i < len(sizes) {
 			size = sizes[i]
 		} else {
-			// Random size between 64KB and 16MB
+			// Random size between 64KB and 64MB
 			minSize := int64(64*1024 + 1)
-			maxSize := int64(16 * 1024 * 1024)
+			maxSize := int64(64 * 1024 * 1024)
 			size = minSize + int64(i*100000)%(maxSize-minSize)
 		}
 

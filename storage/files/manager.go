@@ -35,13 +35,16 @@ func (rc *fileReadCloser) Close() error {
 
 // FileManager manages all files in the files directory
 type FileManager struct {
-	filesPath string // path to the files directory
+	filesPath        string // path to the files directory
+	compactThreshold int64  // files larger than this are never compacted and must be fsynced
 
 	fdCache *fd.FdCache // descriptor cache shared across readers
 }
 
 // NewFileManager creates a new FileManager for managing files.
-func NewFileManager(basePath string) (*FileManager, error) {
+// The compactThreshold parameter determines which files need to be fsynced immediately
+// (files larger than this threshold are never compacted).
+func NewFileManager(basePath string, compactThreshold int64) (*FileManager, error) {
 	filesPath := filepath.Join(basePath, "files")
 
 	zlog.Info().Str("filesPath", filesPath).Msg("creating files manager")
@@ -52,7 +55,8 @@ func NewFileManager(basePath string) (*FileManager, error) {
 	}
 
 	fm := &FileManager{
-		filesPath: filesPath,
+		filesPath:        filesPath,
+		compactThreshold: compactThreshold,
 	}
 
 	// Instantiate a bounded descriptor cache that reuses FileManager's lock provider
@@ -96,8 +100,18 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 
 	checksum := hash.Sum32()
 
-	// Sync() causes significant latency (10-50ms) regardless of file size
-	// We choose to not sync here to avoid latency for writes
+	// Large files (>compactThreshold) are never compacted and remain as raw files permanently.
+	// These files must be fsynced immediately to ensure durability since they won't be
+	// migrated to segments (which are always fsynced on finalization).
+	// Medium-sized files (<=compactThreshold) are tracked in the compaction index and will be
+	// migrated to segments, so we skip fsync to avoid write latency.
+	if bytesWritten > fm.compactThreshold {
+		if err := file.Sync(); err != nil {
+			os.Remove(filePath)
+			return "", 0, 0, utils.WrapError("failed to sync large file", key, err)
+		}
+		zlog.Debug().Str("key", key).Str("path", filePath).Int64("bytes", bytesWritten).Msg("fileManager: fsynced large file")
+	}
 
 	zlog.Debug().Str("key", key).Str("path", filePath).Int64("bytes", bytesWritten).Msg("fileManager: completed write")
 	return filePath, checksum, bytesWritten, nil

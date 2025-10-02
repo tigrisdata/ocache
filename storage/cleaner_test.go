@@ -19,15 +19,14 @@ func TestTTLCleanup(t *testing.T) {
 
 	// Initialize storage with short cleanup interval for testing
 	s, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath:           tmpDir,
-		TTL:                0,
-		InlineThreshold:    100,
-		CompactThreshold:   1024 * 1024,
-		SegmentSize:        256 * 1024 * 1024,
-		FdCacheSize:        100,
-		MaxDiskUsage:       0,
-		CompactionInterval: 100 * time.Millisecond,
-		CleanupInterval:    100 * time.Millisecond,
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  100,
+		CompactThreshold: 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		FdCacheSize:      100,
+		MaxDiskUsage:     0,
+		CleanupInterval:  100 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	defer s.Close()
@@ -82,15 +81,14 @@ func TestLRUEviction(t *testing.T) {
 	// Initialize storage with disk usage limit
 	maxDiskUsage := int64(1000) // 1KB limit
 	s, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath:           tmpDir,
-		TTL:                0,
-		InlineThreshold:    100,
-		CompactThreshold:   1024 * 1024,
-		SegmentSize:        256 * 1024 * 1024,
-		FdCacheSize:        100,
-		MaxDiskUsage:       maxDiskUsage,
-		CompactionInterval: 100 * time.Millisecond,
-		CleanupInterval:    100 * time.Millisecond,
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  100,
+		CompactThreshold: 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		FdCacheSize:      100,
+		MaxDiskUsage:     maxDiskUsage,
+		CleanupInterval:  100 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	defer s.Close()
@@ -186,15 +184,14 @@ func TestDiskUsageTracking(t *testing.T) {
 
 	// Initialize storage with short cleanup interval for testing
 	s, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath:           tmpDir,
-		TTL:                0,
-		InlineThreshold:    100,
-		CompactThreshold:   1024 * 1024,
-		SegmentSize:        256 * 1024 * 1024,
-		FdCacheSize:        100,
-		MaxDiskUsage:       0,
-		CompactionInterval: 100 * time.Millisecond,
-		CleanupInterval:    100 * time.Millisecond,
+		DiskPath:         tmpDir,
+		TTL:              0,
+		InlineThreshold:  100,
+		CompactThreshold: 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		FdCacheSize:      100,
+		MaxDiskUsage:     0,
+		CleanupInterval:  100 * time.Millisecond,
 	})
 	require.NoError(t, err)
 	defer s.Close()

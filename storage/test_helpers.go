@@ -20,7 +20,6 @@ func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThresh
 		SegmentSize:         segmentSize,
 		FdCacheSize:         fdCacheSize,
 		MaxDiskUsage:        maxDiskUsage,
-		CompactionInterval:  DefaultCompactionInterval,
 		FragThreshold:       DefaultFragmentationThreshold,
 		DisableRecompaction: true,
 	}

@@ -22,17 +22,17 @@ func (s *ObjectsSuite) Test_Objects_BasicFlow() {
 		{Name: "small-63KB", Size: 63 * 1024, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
 		{Name: "small-64KB", Size: 64 * 1024, ExpectedType: storagepb.ValueType_INLINE, Category: "small"},
 
-		// Medium objects (64KB-16MB) - stored as raw files, eligible for compaction
+		// Medium objects (64KB-64MB) - stored as raw files, eligible for compaction
 		{Name: "medium-65KB", Size: 65 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
 		{Name: "medium-100KB", Size: 100 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
 		{Name: "medium-1MB", Size: 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
 		{Name: "medium-10MB", Size: 10 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
-		{Name: "medium-16MB", Size: 16 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
+		{Name: "medium-64MB", Size: 64 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "medium"},
 
-		// Large objects (> 16MB) - permanent raw files, never compacted
-		{Name: "large-17MB", Size: 17 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
-		{Name: "large-50MB", Size: 50 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
+		// Large objects (> 64MB) - permanent raw files, never compacted
+		{Name: "large-65MB", Size: 65 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
 		{Name: "large-100MB", Size: 100 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
+		{Name: "large-200MB", Size: 200 * 1024 * 1024, ExpectedType: storagepb.ValueType_RAW_FILE, Category: "large"},
 	}
 
 	RunObjectSizeTests(s.T(), s.Harness, testCases, func(t *testing.T, h TestHarnessInterface, tc ObjectSizeTestCase) {

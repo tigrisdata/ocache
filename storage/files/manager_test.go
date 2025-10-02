@@ -17,7 +17,7 @@ import (
 func TestNewFileManager(t *testing.T) {
 	basePath := t.TempDir()
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("NewFileManager failed: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestNewFileManager_ExistingDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatalf("NewFileManager failed: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestFileManager_Write(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestFileManager_WriteLargeFile(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestFileManager_Read(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestFileManager_ReadInvalidPath(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestFileManager_ReadNonExistent(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestFileManager_Remove(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestFileManager_RemoveNonExistent(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestFileManager_ConcurrentWrites(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestFileManager_ConcurrentReadsOfSameFile(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestFileManager_ConcurrentOperations(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -487,7 +487,7 @@ func TestFileManager_WriteReadRemoveFlow(t *testing.T) {
 	basePath := t.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +539,7 @@ func BenchmarkFileManager_Write(b *testing.B) {
 	basePath := b.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -560,7 +560,7 @@ func BenchmarkFileManager_Read(b *testing.B) {
 	basePath := b.TempDir()
 	_ = fd.NewFdCache(100)
 
-	fm, err := NewFileManager(basePath)
+	fm, err := NewFileManager(basePath, 64*1024*1024)
 	if err != nil {
 		b.Fatal(err)
 	}

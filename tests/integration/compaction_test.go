@@ -498,7 +498,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_BasicFragmentation() {
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
 	config.RecompactMinSegments = 1
@@ -645,7 +645,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ConcurrentAccess() {
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
 	config.RecompactMinSegments = 1
@@ -764,7 +764,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_MultipleCompactors() {
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
 	config.RecompactMinSegments = 1
@@ -864,7 +864,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
 	config.RecompactMinSegments = 1
@@ -1076,7 +1076,7 @@ func (s *CompactionSuite) Test_SegmentRecompaction_Recovery() {
 	// Re-create harness with the environment variable set
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.SegmentSize = 2 * 1024 * 1024
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
 	config.RecompactMinSegments = 1
@@ -1182,7 +1182,7 @@ func (s *CompactionSuite) Test_CompactionLoop_MultiThreaded() {
 	// Reinitialize with multiple compaction threads
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.CompactionThreads = 4         // Use 4 compaction threads
 	config.SegmentSize = 2 * 1024 * 1024 // 2MB segments
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
@@ -1398,7 +1398,7 @@ func (s *CompactionSuite) Test_CompactionLoop_WorkDistribution() {
 	// Reinitialize with multiple compaction threads
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 1 * time.Second
+	config.RecompactionInterval = 1 * time.Second
 	config.CompactionThreads = 3         // Use 3 threads for easier verification
 	config.SegmentSize = 5 * 1024 * 1024 // 5MB segments
 	s.Config = config

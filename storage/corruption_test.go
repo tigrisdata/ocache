@@ -17,13 +17,12 @@ import (
 // Helper function to create minimal storage config for testing corruption
 func createCorruptionTestStorage(t *testing.T, tmpDir string) *Storage {
 	config := &StorageConfig{
-		DiskPath:           tmpDir,
-		MaxDiskUsage:       100 * 1024 * 1024,
-		InlineThreshold:    64 * 1024,
-		CompactThreshold:   16 * 1024 * 1024,
-		SegmentSize:        256 * 1024 * 1024,
-		CompactionInterval: 0, // Disable compaction for tests
-		CleanupInterval:    0, // Disable cleanup for tests
+		DiskPath:         tmpDir,
+		MaxDiskUsage:     100 * 1024 * 1024,
+		InlineThreshold:  64 * 1024,
+		CompactThreshold: 16 * 1024 * 1024,
+		SegmentSize:      256 * 1024 * 1024,
+		CleanupInterval:  0, // Disable cleanup for tests
 	}
 	stor, err := NewStorageWithConfig(config)
 	require.NoError(t, err)

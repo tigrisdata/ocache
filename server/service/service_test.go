@@ -15,15 +15,14 @@ import (
 func setupTestStorage(t *testing.T) *stor.Storage {
 	dir := t.TempDir()
 	s, err := stor.NewStorageWithConfig(&stor.StorageConfig{
-		DiskPath:           dir,
-		TTL:                3600,
-		InlineThreshold:    1024,
-		CompactThreshold:   4096,
-		SegmentSize:        16 * 1024 * 1024,
-		FdCacheSize:        1000,
-		MaxDiskUsage:       1024 * 1024 * 1024,
-		FragThreshold:      0.5,
-		CompactionInterval: 100 * time.Millisecond,
+		DiskPath:         dir,
+		TTL:              3600,
+		InlineThreshold:  1024,
+		CompactThreshold: 4096,
+		SegmentSize:      16 * 1024 * 1024,
+		FdCacheSize:      1000,
+		MaxDiskUsage:     1024 * 1024 * 1024,
+		FragThreshold:    0.5,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() {

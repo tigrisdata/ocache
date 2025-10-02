@@ -19,7 +19,7 @@ func (s *WorkflowSuite) Test_Workflow_MixedObjectSizes() {
 	t := s.T()
 	// Create a dedicated harness for this test
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 2 * time.Second
+	config.RecompactionInterval = 2 * time.Second
 	config.CleanupInterval = 2 * time.Second
 	config.MaxDiskUsage = 0 // No disk limit to avoid LRU eviction
 	harness := NewIntegrationTestHarness(t, config)
@@ -344,7 +344,7 @@ func (s *WorkflowSuite) Test_Workflow_BackgroundProcessCoordination() {
 	t := s.T()
 	// Create a dedicated harness with fast background processes
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.CleanupInterval = 500 * time.Millisecond
 	config.MaxDiskUsage = 200 * 1024 * 1024 // 200MB limit
 	harness := NewIntegrationTestHarness(t, config)
@@ -581,15 +581,15 @@ func (s *WorkflowSuite) Test_Workflow_CacheWarming() {
 
 		// Re-initialize storage with same directory (simulates cache warming)
 		s, err := storage.NewStorageWithConfig(&storage.StorageConfig{
-			DiskPath:           tempDir,
-			TTL:                0,
-			InlineThreshold:    int(testConfig.InlineThreshold),
-			CompactThreshold:   testConfig.CompactThreshold,
-			SegmentSize:        testConfig.SegmentSize,
-			FdCacheSize:        testConfig.FDCacheSize,
-			MaxDiskUsage:       testConfig.MaxDiskUsage,
-			CompactionInterval: testConfig.CompactionInterval,
-			CompactionThreads:  testConfig.CompactionThreads,
+			DiskPath:             tempDir,
+			TTL:                  0,
+			InlineThreshold:      int(testConfig.InlineThreshold),
+			CompactThreshold:     testConfig.CompactThreshold,
+			SegmentSize:          testConfig.SegmentSize,
+			FdCacheSize:          testConfig.FDCacheSize,
+			MaxDiskUsage:         testConfig.MaxDiskUsage,
+			CompactionThreads:    testConfig.CompactionThreads,
+			RecompactionInterval: testConfig.RecompactionInterval,
 		})
 		require.NoError(t, err)
 

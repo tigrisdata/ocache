@@ -152,19 +152,19 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 
 	// Initialize isolated storage instance for this node
 	storageConfig := &storage.StorageConfig{
-		DiskPath:           tmpDir,
-		TTL:                0,
-		InlineThreshold:    int(h.Config.InlineThreshold),
-		CompactThreshold:   h.Config.CompactThreshold,
-		SegmentSize:        h.Config.SegmentSize,
-		FdCacheSize:        h.Config.FDCacheSize,
-		MaxDiskUsage:       h.Config.MaxDiskUsage,
-		CompactionInterval: h.Config.CompactionInterval,
-		CompactionThreads:  h.Config.CompactionThreads,
-		MinSegmentAge:      h.Config.RecompactMinSegmentAge,
-		MinSegments:        h.Config.RecompactMinSegments,
-		CleanupInterval:    h.Config.CleanupInterval,
-		AccessUpdateDelay:  h.Config.AccessUpdateDelay,
+		DiskPath:             tmpDir,
+		TTL:                  0,
+		InlineThreshold:      int(h.Config.InlineThreshold),
+		CompactThreshold:     h.Config.CompactThreshold,
+		SegmentSize:          h.Config.SegmentSize,
+		FdCacheSize:          h.Config.FDCacheSize,
+		MaxDiskUsage:         h.Config.MaxDiskUsage,
+		CompactionThreads:    h.Config.CompactionThreads,
+		MinSegmentAge:        h.Config.RecompactMinSegmentAge,
+		MinSegments:          h.Config.RecompactMinSegments,
+		RecompactionInterval: h.Config.RecompactionInterval,
+		CleanupInterval:      h.Config.CleanupInterval,
+		AccessUpdateDelay:    h.Config.AccessUpdateDelay,
 	}
 	stor, err := storage.NewStorageWithConfig(storageConfig)
 	if err != nil {

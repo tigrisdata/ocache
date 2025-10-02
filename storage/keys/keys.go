@@ -51,6 +51,23 @@ func MakeCompactionKey(ts int64, key string) []byte {
 	return fmt.Appendf(nil, CompactionIndexKeyFormat, ts, key)
 }
 
+// ParseCompactionIndexRow extracts userKey, filePath and size from RocksDB file-index
+// key/value pairs. Returns ok=false when the row does not follow the expected
+// format.
+func ParseCompactionIndexRow(k, v []byte) (userKey, filePath string, ok bool) {
+	// Key format: CompactionIndexKeyFormat (!compact/<ts>|<userKey>)
+	pipeIdx := bytes.IndexByte(k, '|')
+	if pipeIdx <= 0 {
+		return
+	}
+	userKey = string(k[pipeIdx+1:])
+
+	// Value format: <filePath>
+	filePath = string(v)
+	ok = true
+	return
+}
+
 // ExtractUserKey removes the metadata prefix from a metadata key to get the original user key
 func ExtractUserKey(metadataKey []byte) string {
 	key := string(metadataKey)
