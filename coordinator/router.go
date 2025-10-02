@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -268,6 +269,24 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	client := pb.NewCacheServiceClient(conn)
 	state.client = client
 	state.conn = conn
+
+	// Check connection state after brief delay to allow state to settle
+	// Since we use non-blocking dial, we need to verify the connection is actually healthy
+	time.Sleep(10 * time.Millisecond)
+	connState := conn.GetState()
+	if connState == connectivity.TransientFailure || connState == connectivity.Shutdown {
+		r.recordFailureAndOpenCircuit(state)
+
+		zlog.Warn().
+			Str("node_id", nodeID).
+			Str("address", nodeAddr).
+			Str("state", connState.String()).
+			Msg("Connection is in failed state")
+
+		return nil, NewConnectionFailedError(nodeID, nodeAddr,
+			fmt.Errorf("connection in failed state: %s", connState))
+	}
+
 	atomic.StoreInt32(&state.failureCount, 0) // Reset failure count on successful connection
 
 	zlog.Debug().

@@ -140,6 +140,11 @@ func isDNSName(name string) bool {
 		return false
 	}
 
+	// Check if it's an IP address first - IPs are not DNS names
+	if net.ParseIP(name) != nil {
+		return false
+	}
+
 	// Check for invalid characters
 	if strings.ContainsAny(name, " \t\r\n") {
 		return false
