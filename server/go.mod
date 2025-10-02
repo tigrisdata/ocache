@@ -9,8 +9,6 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/coordinator v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/storage v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.72.2
 )

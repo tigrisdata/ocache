@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buraksezer/consistent"
@@ -21,6 +22,12 @@ func (n nodeMember) String() string {
 	return string(n)
 }
 
+// routingCacheEntry represents a cached routing decision
+type routingCacheEntry struct {
+	address string
+	epoch   uint64
+}
+
 // TopologyManager manages cluster topology for ClusterClient
 type TopologyManager struct {
 	ring            *consistent.Consistent
@@ -32,6 +39,12 @@ type TopologyManager struct {
 	mu              sync.RWMutex
 	refreshInterval time.Duration
 	dialOpts        []grpc.DialOption
+
+	// Routing cache to reduce lock contention
+	routingCache       sync.Map // map[string]*routingCacheEntry
+	cacheHits          atomic.Uint64
+	cacheMisses        atomic.Uint64
+	cacheInvalidations atomic.Uint64
 }
 
 // NewTopologyManager creates a new topology manager
@@ -138,8 +151,9 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	// Check if topology has changed
-	if tm.topologyEpoch >= topology.Epoch {
+	// Check if topology has changed (use atomic load for consistency)
+	currentEpoch := atomic.LoadUint64(&tm.topologyEpoch)
+	if currentEpoch >= topology.Epoch {
 		return nil, false // No change
 	}
 
@@ -181,15 +195,39 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 	tm.partitionOwners = partitionOwners
 	tm.nodeAddresses = nodeAddresses
 	tm.topology = topology
-	tm.topologyEpoch = topology.Epoch
+
+	// Atomically update epoch - this invalidates all cached routing entries
+	atomic.StoreUint64(&tm.topologyEpoch, topology.Epoch)
+
+	// Clear routing cache on topology change
+	// Note: We don't need to explicitly clear sync.Map as stale entries
+	// will be detected via epoch mismatch and updated on next access
+	// But we track this for metrics
+	tm.cacheInvalidations.Add(1)
 
 	return activeNodes, true
 }
 
 // GetNodeForKey returns the node address for a given key
+// Uses a lock-free cache for hot keys to reduce lock contention
 func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
+	// Fast path: check cache first (lock-free)
+	currentEpoch := atomic.LoadUint64(&tm.topologyEpoch)
+	if cached, ok := tm.routingCache.Load(key); ok {
+		entry := cached.(*routingCacheEntry)
+		// Validate cache entry against current epoch
+		if entry.epoch == currentEpoch {
+			tm.cacheHits.Add(1)
+			return entry.address, nil
+		}
+		// Stale entry, will be refreshed below
+	}
+
+	// Slow path: acquire lock and compute routing
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
+
+	tm.cacheMisses.Add(1)
 
 	if tm.ring == nil {
 		return "", fmt.Errorf("ring not initialized")
@@ -210,14 +248,18 @@ func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
 		return "", fmt.Errorf("no address for node %s", nodeID)
 	}
 
+	// Update cache with current epoch (lock-free)
+	tm.routingCache.Store(key, &routingCacheEntry{
+		address: addr,
+		epoch:   tm.topologyEpoch,
+	})
+
 	return addr, nil
 }
 
 // GetTopologyEpoch returns the current topology epoch
 func (tm *TopologyManager) GetTopologyEpoch() uint64 {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.topologyEpoch
+	return atomic.LoadUint64(&tm.topologyEpoch)
 }
 
 // HasRing returns true if the consistent hash ring is initialized
@@ -275,5 +317,33 @@ func (tm *TopologyManager) TopologyRefreshLoop(ctx context.Context, updateFn fun
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// RoutingCacheStats contains statistics about routing cache performance
+type RoutingCacheStats struct {
+	Hits          uint64
+	Misses        uint64
+	Invalidations uint64
+	HitRate       float64
+}
+
+// GetRoutingCacheStats returns statistics about the routing cache
+func (tm *TopologyManager) GetRoutingCacheStats() RoutingCacheStats {
+	hits := tm.cacheHits.Load()
+	misses := tm.cacheMisses.Load()
+	invalidations := tm.cacheInvalidations.Load()
+
+	var hitRate float64
+	total := hits + misses
+	if total > 0 {
+		hitRate = float64(hits) / float64(total) * 100.0
+	}
+
+	return RoutingCacheStats{
+		Hits:          hits,
+		Misses:        misses,
+		Invalidations: invalidations,
+		HitRate:       hitRate,
 	}
 }

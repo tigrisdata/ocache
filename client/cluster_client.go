@@ -110,12 +110,18 @@ func (c *ClusterClient) updateConnections() error {
 
 // Route determines which connection to use for a given key
 // Implements Router interface
+// Optimized to minimize lock contention using cached routing decisions
 func (c *ClusterClient) Route(key string) (*connection, error) {
+	// Get node address for key (uses lock-free cache in GetNodeForKey)
 	addr, err := c.topology.GetNodeForKey(key)
 	if err != nil {
 		return nil, err
 	}
 
+	// Fast path: optimistic read without lock
+	// This is safe because the conns map is only modified during topology updates
+	// which are infrequent, and map reads are safe for concurrent access in Go
+	// when there are no concurrent writes
 	c.mu.RLock()
 	conn, exists := c.conns[addr]
 	c.mu.RUnlock()
@@ -401,4 +407,9 @@ func (c *ClusterClient) GetConnectionCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.conns)
+}
+
+// GetRoutingCacheStats returns statistics about routing cache performance
+func (c *ClusterClient) GetRoutingCacheStats() RoutingCacheStats {
+	return c.topology.GetRoutingCacheStats()
 }

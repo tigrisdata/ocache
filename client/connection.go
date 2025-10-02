@@ -184,21 +184,42 @@ func (c *connection) reconnectUnhealthy(dialOpts []grpc.DialOption) error {
 
 // getClient returns a gRPC client using round-robin selection
 // Multiple goroutines can use the returned client concurrently
+// Optimized to avoid locks in the common case
 func (c *connection) getClient() pb.CacheServiceClient {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if len(c.clients) == 0 {
+	// Fast path: try to get a client without any locks
+	// Use atomic to get next index
+	poolSize := len(c.clients)
+	if poolSize == 0 {
 		return nil
 	}
 
-	// Try to find a healthy client using round-robin
+	// Try 2 clients without locking for fast path
 	startIndex := c.nextIndex.Add(1)
+	for i := 0; i < 2 && i < poolSize; i++ {
+		index := (startIndex + uint64(i)) % uint64(poolSize)
+
+		// Read-only access to connections slice is safe after initialization
+		// The slice itself doesn't change, only connection states change
+		client := c.clients[index]
+		conn := c.connections[index]
+
+		if client != nil && conn != nil {
+			state := conn.GetState()
+			if state == connectivity.Ready || state == connectivity.Idle {
+				return client
+			}
+		}
+	}
+
+	// Slow path: need to check all connections with lock
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Try to find any healthy client
 	for i := 0; i < len(c.clients); i++ {
 		index := (startIndex + uint64(i)) % uint64(len(c.clients))
 		client := c.clients[index]
 
-		// Check if this client's connection is healthy
 		if client != nil && c.connections[index] != nil {
 			state := c.connections[index].GetState()
 			if state != connectivity.TransientFailure && state != connectivity.Shutdown {
@@ -208,7 +229,6 @@ func (c *connection) getClient() pb.CacheServiceClient {
 	}
 
 	// If no healthy clients found, return the first non-nil client
-	// (it might recover or we might get a better error message)
 	for _, client := range c.clients {
 		if client != nil {
 			return client
