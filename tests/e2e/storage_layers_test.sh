@@ -48,7 +48,6 @@ echo "  - Large objects (>16MB): Permanent raw files"
 start_server "$TEST_NAME" "false" \
   -disk /tmp/ocache-storage-test \
   -threshold 65536 \
-  -compaction-interval 10s \
   -segment-size 16777216 \
   -v
 
@@ -560,7 +559,6 @@ echo "Restarting server..."
 start_server "$TEST_NAME" "false" \
   -disk /tmp/ocache-storage-test \
   -threshold 65536 \
-  -compaction-interval 10s \
   -segment-size 16777216 \
   -v
 

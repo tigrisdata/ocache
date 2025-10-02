@@ -228,7 +228,6 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 // Returns the number of files processed.
 func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
 	start := time.Now()
-	zlog.Debug().Int("worker", workerID).Msg("compactor: starting file compaction")
 
 	// Track compaction run
 	metrics.CompactionRuns.Inc()

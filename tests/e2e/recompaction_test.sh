@@ -30,7 +30,6 @@ echo
 start_server "recompaction" "true" \
   -disk /tmp/ocache-recompaction-test \
   -threshold 65536 \
-  -compaction-interval 5s \
   -segment-size 1048576 \
   -fragmentation-threshold 0.3 \
   -recompaction-min-segment-age 100ms \
@@ -337,7 +336,6 @@ echo "Restarting server..."
 start_server "recompaction" "false" \
   -disk /tmp/ocache-recompaction-test \
   -threshold 65536 \
-  -compaction-interval 5s \
   -segment-size 1048576 \
   -fragmentation-threshold 0.3 \
   -recompaction-min-segment-age 100ms \

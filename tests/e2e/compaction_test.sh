@@ -29,7 +29,6 @@ echo
 start_server "compaction" "true" \
   -disk /tmp/ocache-compaction-test \
   -threshold 65536 \
-  -compaction-interval 5s \
   -segment-size 1048576 \
   -v
 
@@ -317,7 +316,6 @@ echo "Restarting server..."
 start_server "compaction" "false" \
   -disk /tmp/ocache-compaction-test \
   -threshold 65536 \
-  -compaction-interval 5s \
   -v
 
 # Check key count after restart
