@@ -404,8 +404,3 @@ func (c *ClusterClient) GetConnectionCount() int {
 	defer c.mu.RUnlock()
 	return len(c.conns)
 }
-
-// GetRoutingCacheStats returns statistics about routing cache performance
-func (c *ClusterClient) GetRoutingCacheStats() RoutingCacheStats {
-	return c.topology.GetRoutingCacheStats()
-}
