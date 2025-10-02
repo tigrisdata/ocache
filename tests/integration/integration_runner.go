@@ -64,9 +64,9 @@ func (s *ObjectsSuite) SetupTest() {
 
 	config := DefaultIntegrationTestConfig()
 	config.InlineThreshold = 64 * 1024         // 64KB
-	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
+	config.CompactThreshold = 64 * 1024 * 1024 // 64MB
 	config.SegmentSize = 256 * 1024 * 1024     // 256MB
-	config.CompactionInterval = 1 * time.Second
+	config.RecompactionInterval = 1 * time.Second
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
 }
@@ -99,8 +99,8 @@ func (s *CompactionSuite) SetupTest() {
 	InitTestLogging()
 
 	config := DefaultIntegrationTestConfig()
-	config.CompactionInterval = 500 * time.Millisecond // Fast compaction for testing
-	config.SegmentSize = 2 * 1024 * 1024               // 2MB segments to create multiple segments during tests
+	config.RecompactionInterval = 500 * time.Millisecond // Fast compaction for testing
+	config.SegmentSize = 2 * 1024 * 1024                 // 2MB segments to create multiple segments during tests
 	s.Config = config
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
 }
@@ -165,9 +165,9 @@ func (s *ClusterSuite) SetupTest() {
 
 	config := DefaultIntegrationTestConfig()
 	config.InlineThreshold = 64 * 1024         // 64KB
-	config.CompactThreshold = 16 * 1024 * 1024 // 16MB
+	config.CompactThreshold = 64 * 1024 * 1024 // 64MB
 	config.SegmentSize = 256 * 1024 * 1024     // 256MB
-	config.CompactionInterval = 1 * time.Second
+	config.RecompactionInterval = 1 * time.Second
 	s.Config = config
 
 	// Create cluster harness with 3 nodes

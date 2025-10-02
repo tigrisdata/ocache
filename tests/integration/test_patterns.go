@@ -396,7 +396,7 @@ var CommonTestScenarios = struct {
 		{Name: "100KB", Size: 100 * 1024, Category: "medium"},
 		{Name: "1MB", Size: 1024 * 1024, Category: "medium"},
 		{Name: "10MB", Size: 10 * 1024 * 1024, Category: "medium"},
-		{Name: "16MB", Size: 16 * 1024 * 1024, Category: "medium"},
+		{Name: "64MB", Size: 64 * 1024 * 1024, Category: "medium"},
 	},
 	LargeObjects: []ObjectSizeTestCase{
 		{Name: "20MB", Size: 20 * 1024 * 1024, Category: "large"},

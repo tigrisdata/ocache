@@ -28,15 +28,14 @@ const (
 	resultBufferSize = 10000
 )
 
-// syncEntryInfo holds a sync entry with its parsed components
-type syncEntryInfo struct {
-	Key       []byte
-	Timestamp int64
-	FilePath  string
-	Value     *pb.SyncEntry
+// compactionEntryInfo holds a compaction entry with its parsed components
+type compactionEntryInfo struct {
+	Key      []byte
+	UserKey  string
+	FilePath string
 }
 
-// RecoveryManager handles startup recovery and validation of files with pending syncs
+// RecoveryManager handles startup recovery and validation of files in the compaction index
 type RecoveryManager struct {
 	meta       *metadata.MetaDB
 	filesPath  string
@@ -52,7 +51,7 @@ func NewRecoveryManager(meta *metadata.MetaDB, filesPath string) *RecoveryManage
 	}
 }
 
-// RecoverOnStartup validates all files with pending syncs and cleans up corrupted files
+// RecoverOnStartup validates all files in the compaction index and cleans up corrupted files
 func (r *RecoveryManager) RecoverOnStartup() error {
 	zlog.Info().Msg("files.recovery: starting startup recovery")
 	startTime := time.Now()
@@ -94,11 +93,11 @@ func (r *RecoveryManager) RecoverOnStartup() error {
 	return nil
 }
 
-// processEntriesStreaming processes sync entries in a streaming fashion without loading all into memory
+// processEntriesStreaming processes compaction entries in a streaming fashion without loading all into memory
 func (r *RecoveryManager) processEntriesStreaming() (*RecoveryStats, error) {
 	proc := &streamingProcessor{
 		r:       r,
-		entries: make(chan *syncEntryInfo, entryBufferSize),
+		entries: make(chan *compactionEntryInfo, entryBufferSize),
 		results: make(chan *ValidationResult, resultBufferSize),
 		stats:   &RecoveryStats{},
 		errChan: make(chan error, 1),
@@ -151,27 +150,32 @@ func (r *RecoveryManager) processEntriesStreaming() (*RecoveryStats, error) {
 	}
 }
 
-// validateEntry validates a single sync entry
-func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult {
+// validateEntry validates a single compaction entry
+func (r *RecoveryManager) validateEntry(entry *compactionEntryInfo) *ValidationResult {
 	result := &ValidationResult{
-		SyncKey:  entry.Key,
+		SyncKey:  entry.Key, // Actually compaction key, but reusing field name
 		FilePath: entry.FilePath,
 	}
 
+	// Construct metadata key from user key
+	metadataKey := string(keys.MakeMetadataKey(entry.UserKey))
+
 	// Fetch metadata
-	metadata, err := utils.GetMetadata(r.meta, entry.Value.MetadataKey)
+	metadata, err := utils.GetMetadata(r.meta, metadataKey)
 	if err != nil {
 		// Check if it's specifically metadata not found
 		if errors.Is(err, utils.ErrMetadataNotFound) {
 			zlog.Warn().
 				Str("filepath", entry.FilePath).
-				Str("metadata_key", entry.Value.MetadataKey).
-				Msg("files.recovery: orphaned sync entry (metadata not found)")
+				Str("userKey", entry.UserKey).
+				Str("metadata_key", metadataKey).
+				Msg("files.recovery: orphaned compaction entry (metadata not found)")
 			result.Status = StatusOrphaned
 			return result
 		}
 		zlog.Warn().
 			Str("filepath", entry.FilePath).
+			Str("userKey", entry.UserKey).
 			Err(err).
 			Msg("files.recovery: failed to fetch metadata")
 		result.Status = StatusCorrupted
@@ -183,8 +187,9 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 	if metadata.ValueType != pb.ValueType_RAW_FILE {
 		zlog.Debug().
 			Str("filepath", entry.FilePath).
+			Str("userKey", entry.UserKey).
 			Str("value_type", metadata.ValueType.String()).
-			Msg("files.recovery: stale sync entry (not raw file)")
+			Msg("files.recovery: stale compaction entry (not raw file)")
 		result.Status = StatusStale
 		return result
 	}
@@ -193,7 +198,8 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 		zlog.Debug().
 			Str("old_file", entry.FilePath).
 			Str("new_file", metadata.RawFilePath).
-			Msg("files.recovery: stale sync entry (metadata updated)")
+			Str("userKey", entry.UserKey).
+			Msg("files.recovery: stale compaction entry (metadata updated)")
 		result.Status = StatusStale
 		return result
 	}
@@ -203,11 +209,12 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 	if err != nil {
 		zlog.Warn().
 			Str("filepath", entry.FilePath).
-			Str("key", entry.Value.MetadataKey).
+			Str("userKey", entry.UserKey).
+			Str("key", metadataKey).
 			Err(err).
 			Msg("files.recovery: file missing")
 		result.Status = StatusMissing
-		result.MetadataKey = entry.Value.MetadataKey
+		result.MetadataKey = metadataKey
 		result.Error = err
 		return result
 	}
@@ -216,33 +223,35 @@ func (r *RecoveryManager) validateEntry(entry *syncEntryInfo) *ValidationResult 
 	if stat.Size() != metadata.ValueLength {
 		zlog.Error().
 			Str("filepath", entry.FilePath).
-			Str("key", entry.Value.MetadataKey).
+			Str("userKey", entry.UserKey).
+			Str("key", metadataKey).
 			Int64("expected_size", metadata.ValueLength).
 			Int64("actual_size", stat.Size()).
 			Msg("files.recovery: file corrupted (size mismatch)")
 		result.Status = StatusCorrupted
-		result.MetadataKey = entry.Value.MetadataKey
+		result.MetadataKey = metadataKey
 		return result
 	}
 
 	// File is valid
 	zlog.Debug().
 		Str("filepath", entry.FilePath).
+		Str("userKey", entry.UserKey).
 		Msg("files.recovery: file validated successfully")
 	result.Status = StatusValid
 	return result
 }
 
-// streamingProcessor handles streaming processing of sync entries
+// streamingProcessor handles streaming processing of compaction entries
 type streamingProcessor struct {
 	r       *RecoveryManager
-	entries chan *syncEntryInfo
+	entries chan *compactionEntryInfo
 	results chan *ValidationResult
 	stats   *RecoveryStats
 	errChan chan error
 }
 
-// streamEntries reads sync entries from RocksDB and sends them to the processing channel
+// streamEntries reads compaction entries from RocksDB and sends them to the processing channel
 func (proc *streamingProcessor) streamEntries() error {
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
@@ -250,43 +259,29 @@ func (proc *streamingProcessor) streamEntries() error {
 	it := proc.r.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	prefix := []byte(keys.SyncIndexPrefix)
+	prefix := []byte(keys.CompactionIndexPrefix)
 	entriesStreamed := 0
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		key := it.Key()
 		value := it.Value()
 
-		// Parse key
-		timestamp, filepath, err := keys.ParseSyncKey(key.Data())
-		if err != nil {
+		// Parse key to get userKey and filepath
+		userKey, filepath, ok := keys.ParseCompactionIndexRow(key.Data(), value.Data())
+		if !ok {
 			zlog.Warn().
 				Str("key", string(key.Data())).
-				Err(err).
-				Msg("files.recovery: failed to parse sync key")
-			key.Free()
-			value.Free()
-			continue
-		}
-
-		// Decode value
-		entry, err := DecodeSyncEntry(value.Data())
-		if err != nil {
-			zlog.Warn().
-				Str("key", string(key.Data())).
-				Err(err).
-				Msg("files.recovery: failed to decode sync entry")
+				Msg("files.recovery: failed to parse compaction key")
 			key.Free()
 			value.Free()
 			continue
 		}
 
 		// Send to processing channel
-		proc.entries <- &syncEntryInfo{
-			Key:       bytes.Clone(key.Data()),
-			Timestamp: timestamp,
-			FilePath:  filepath,
-			Value:     entry,
+		proc.entries <- &compactionEntryInfo{
+			Key:      bytes.Clone(key.Data()),
+			UserKey:  userKey,
+			FilePath: filepath,
 		}
 
 		key.Free()
@@ -341,8 +336,8 @@ func (proc *streamingProcessor) resultsCollector() {
 		}
 
 		// Add ALL results to deletion batch
-		// After recovery, we remove all sync entries regardless of status
-		// Valid entries mean files are good and have been synced (after restart)
+		// After recovery, we remove all compaction entries regardless of status
+		// Valid entries mean files are good and can be safely tracked for compaction
 		// Invalid entries need cleanup
 		batch = append(batch, result)
 
@@ -382,8 +377,8 @@ func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) 
 	defer writeBatch.Destroy()
 
 	for _, result := range batch {
-		// Always remove sync entry
-		writeBatch.Delete(result.SyncKey)
+		// Always remove compaction entry
+		writeBatch.Delete(result.SyncKey) // SyncKey field repurposed to hold compaction key
 
 		switch result.Status {
 		case StatusCorrupted, StatusOrphaned, StatusMissing:

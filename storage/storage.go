@@ -37,7 +37,7 @@ const (
 	DefaultInlineThreshold = 64 * 1024 // 64KB
 
 	// Default compact threshold (bytes) for objects that are compacted to segments
-	DefaultCompactThreshold = 16 * 1024 * 1024 // 16MB
+	DefaultCompactThreshold = 64 * 1024 * 1024 // 64MB
 
 	// Default segment size (bytes)
 	DefaultSegmentSize = 256 * 1024 * 1024 // 256MB
@@ -48,10 +48,8 @@ const (
 	// Default max disk usage (bytes)
 	DefaultMaxDiskUsage = 0
 
-	// Default compaction thresholds
-	DefaultMaxBytesPerCompactRound = 1 << 30 // 1GB
-	DefaultCompactionInterval      = 30 * time.Second
-	DefaultCompactionThreads       = 1 // Default to single thread for backwards compatibility
+	// Default compaction threads
+	DefaultCompactionThreads = 1 // Default to single thread for backwards compatibility
 
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
@@ -66,9 +64,10 @@ const (
 
 	// Default segment recompaction settings
 	DefaultRecompactionDisabled          = false
-	DefaultFragmentationThreshold        = 0.5           // Recompact when dead space exceeds 50%
-	DefaultMinSegmentAgeForRecompaction  = 2 * time.Hour // Don't recompact segments younger than 2 hours (ensures they're cold)
-	DefaultMinSegmentsBeforeRecompaction = 2             // Minimum number of segments required for recompaction
+	DefaultFragmentationThreshold        = 0.5             // Recompact when dead space exceeds 50%
+	DefaultMinSegmentAgeForRecompaction  = 2 * time.Hour   // Don't recompact segments younger than 2 hours (ensures they're cold)
+	DefaultMinSegmentsBeforeRecompaction = 2               // Minimum number of segments required for recompaction
+	DefaultRecompactionInterval          = 1 * time.Minute // Interval between segment recompaction runs
 
 	// Default delete queue settings
 	DeleteProcessInterval = time.Second    // Interval between batch processing
@@ -80,21 +79,21 @@ const (
 
 // StorageConfig holds all configuration parameters for initializing storage
 type StorageConfig struct {
-	DiskPath            string        // Directory for on-disk cache data
-	TTL                 int           // Default TTL when no key-level TTL is set (seconds)
-	InlineThreshold     int           // Threshold for small objects that are inlined in RocksDB (bytes)
-	CompactThreshold    int64         // Objects less than this size are compacted to segments (bytes)
-	SegmentSize         int64         // Segment size (bytes)
-	FdCacheSize         int           // Size of the file descriptor cache
-	MaxDiskUsage        int64         // Maximum disk usage in bytes (0 = unlimited)
-	CompactionInterval  time.Duration // Compaction interval
-	CompactionThreads   int           // Number of compaction threads
-	FragThreshold       float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
-	MinSegmentAge       time.Duration // Minimum age for segment recompaction
-	MinSegments         int           // Minimum number of segments for recompaction
-	DisableRecompaction bool          // Disable automatic segment recompaction
-	CleanupInterval     time.Duration // Cleanup interval
-	AccessUpdateDelay   time.Duration // Access update delay
+	DiskPath             string        // Directory for on-disk cache data
+	TTL                  int           // Default TTL when no key-level TTL is set (seconds)
+	InlineThreshold      int           // Threshold for small objects that are inlined in RocksDB (bytes)
+	CompactThreshold     int64         // Objects less than this size are compacted to segments (bytes)
+	SegmentSize          int64         // Segment size (bytes)
+	FdCacheSize          int           // Size of the file descriptor cache
+	MaxDiskUsage         int64         // Maximum disk usage in bytes (0 = unlimited)
+	CompactionThreads    int           // Number of compaction threads
+	FragThreshold        float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
+	MinSegmentAge        time.Duration // Minimum age for segment recompaction
+	MinSegments          int           // Minimum number of segments for recompaction
+	DisableRecompaction  bool          // Disable automatic segment recompaction
+	RecompactionInterval time.Duration // Interval between segment recompaction runs
+	CleanupInterval      time.Duration // Cleanup interval
+	AccessUpdateDelay    time.Duration // Access update delay
 
 	// RocksDB-specific configuration
 	MetadataCacheSize int64 // RocksDB Block cache size in bytes (0 = use default)
@@ -131,7 +130,6 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
-	syncMonitor      *files.SyncMonitor    // Passive monitor for file sync tracking
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -168,7 +166,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	// Initialize the file manager
-	fileManager, err := files.NewFileManager(config.DiskPath)
+	fileManager, err := files.NewFileManager(config.DiskPath, config.CompactThreshold)
 	if err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to create file manager")
 		return nil, storageErrors.NewInternalError("Init", err)
@@ -191,17 +189,11 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Configure compactor with recompaction if enabled
 	compactorConfig := &compaction.CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fileManager,
-		SegmentManager:          segmentManager,
-		DeletionQueue:           deletionQueue,
-		MaxBytesPerCompactRound: DefaultMaxBytesPerCompactRound,
-		Interval:                DefaultCompactionInterval,
-		CompactionThreads:       DefaultCompactionThreads,
-	}
-
-	if config.CompactionInterval > 0 {
-		compactorConfig.Interval = config.CompactionInterval
+		MetaDB:            meta,
+		FileManager:       fileManager,
+		SegmentManager:    segmentManager,
+		DeletionQueue:     deletionQueue,
+		CompactionThreads: DefaultCompactionThreads,
 	}
 
 	if config.CompactionThreads > 0 {
@@ -223,6 +215,11 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		compactorConfig.MinSegmentAge = config.MinSegmentAge
 		if config.MinSegmentAge <= 0 {
 			compactorConfig.MinSegmentAge = DefaultMinSegmentAgeForRecompaction
+		}
+
+		compactorConfig.RecompactionInterval = config.RecompactionInterval
+		if config.RecompactionInterval <= 0 {
+			compactorConfig.RecompactionInterval = DefaultRecompactionInterval
 		}
 
 		zlog.Info().Float64("threshold", compactorConfig.FragThreshold).Msg("Segment recompaction enabled")
@@ -270,11 +267,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 			Msg("storage: started async access updater for LRU tracking")
 	}
 
-	// Initialize and start the passive sync monitor
-	s.syncMonitor = files.NewSyncMonitor(meta, deletionQueue, 30*time.Second)
-	s.syncMonitor.Start()
-	zlog.Info().Msg("storage: started passive sync monitor")
-
 	return s, nil
 }
 
@@ -282,9 +274,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 // This is safe to call on isolated instances created with NewStorageWithConfig.
 func (s *Storage) Close() {
 	// Stop background services
-	if s.syncMonitor != nil {
-		s.syncMonitor.Stop()
-	}
 	if s.accessUpdater != nil {
 		s.accessUpdater.Stop()
 	}
@@ -759,17 +748,6 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Store the metadata in the database with the metadata prefix
 	metaKey := keys.MakeMetadataKey(key)
 	batch.Put(metaKey, val)
-
-	// Add sync tracking for raw files
-	if filePath != "" {
-		syncKey := keys.MakeSyncKey(filePath)
-		syncEntry := &pb.SyncEntry{
-			MetadataKey: string(metaKey),
-			Timestamp:   time.Now().Unix(),
-		}
-		syncVal, _ := files.EncodeSyncEntry(syncEntry)
-		batch.Put(syncKey, syncVal)
-	}
 
 	// Add access time index entry for LRU tracking only if max disk usage is set
 	if s.cleaner.maxDiskUsage > 0 {

@@ -65,14 +65,9 @@ func TestRecoveryDeletesCorruptedFiles(t *testing.T) {
 	vmBytes, _ := proto.Marshal(vm)
 	batch.Put(metaKey, vmBytes)
 
-	// Add sync entry
-	syncKey := keys.MakeSyncKey(testFile)
-	syncEntry := &pb.SyncEntry{
-		MetadataKey: string(metaKey),
-		Timestamp:   time.Now().Unix(),
-	}
-	syncVal, _ := EncodeSyncEntry(syncEntry)
-	batch.Put(syncKey, syncVal)
+	// Add compaction entry
+	compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), "corrupted-key")
+	batch.Put(compactionKey, []byte(testFile))
 
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
@@ -93,10 +88,10 @@ func TestRecoveryDeletesCorruptedFiles(t *testing.T) {
 	assert.False(t, slice.Exists(), "Metadata should be deleted for corrupted file")
 	slice.Free()
 
-	// Verify sync entry was removed
-	syncSlice, _ := meta.Handle().Get(ro, syncKey)
-	assert.False(t, syncSlice.Exists(), "Sync entry should be removed")
-	syncSlice.Free()
+	// Verify compaction entry was removed
+	compactionSlice, _ := meta.Handle().Get(ro, compactionKey)
+	assert.False(t, compactionSlice.Exists(), "Compaction entry should be removed")
+	compactionSlice.Free()
 }
 
 func TestRecoveryHandlesStaleEntries(t *testing.T) {
@@ -127,14 +122,9 @@ func TestRecoveryHandlesStaleEntries(t *testing.T) {
 	vmBytes, _ := proto.Marshal(vm)
 	batch.Put(metaKey, vmBytes)
 
-	// Add stale sync entry for OLD file
-	syncKey := keys.MakeSyncKey(oldFile)
-	syncEntry := &pb.SyncEntry{
-		MetadataKey: string(metaKey),
-		Timestamp:   time.Now().Unix(),
-	}
-	syncVal, _ := EncodeSyncEntry(syncEntry)
-	batch.Put(syncKey, syncVal)
+	// Add stale compaction entry for OLD file
+	compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), "test-key")
+	batch.Put(compactionKey, []byte(oldFile))
 
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
@@ -144,12 +134,12 @@ func TestRecoveryHandlesStaleEntries(t *testing.T) {
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
-	// Verify stale sync entry was removed
+	// Verify stale compaction entry was removed
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
-	syncSlice, _ := meta.Handle().Get(ro, syncKey)
-	assert.False(t, syncSlice.Exists(), "Stale sync entry should be removed")
-	syncSlice.Free()
+	compactionSlice, _ := meta.Handle().Get(ro, compactionKey)
+	assert.False(t, compactionSlice.Exists(), "Stale compaction entry should be removed")
+	compactionSlice.Free()
 
 	// Verify metadata still exists and points to new file
 	metaSlice, _ := meta.Handle().Get(ro, metaKey)
@@ -178,19 +168,14 @@ func TestRecoveryHandlesOrphanedFiles(t *testing.T) {
 	err := os.WriteFile(orphanFile, []byte("orphan data"), 0o644)
 	require.NoError(t, err)
 
-	// Add sync entry without corresponding metadata
+	// Add compaction entry without corresponding metadata
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
-	syncKey := keys.MakeSyncKey(orphanFile)
-	syncEntry := &pb.SyncEntry{
-		MetadataKey: string(keys.MakeMetadataKey("nonexistent-key")),
-		Timestamp:   time.Now().Unix(),
-	}
-	syncVal, _ := EncodeSyncEntry(syncEntry)
-	batch.Put(syncKey, syncVal)
+	compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), "nonexistent-key")
+	batch.Put(compactionKey, []byte(orphanFile))
 
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
@@ -200,12 +185,12 @@ func TestRecoveryHandlesOrphanedFiles(t *testing.T) {
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
-	// Verify sync entry was removed
+	// Verify compaction entry was removed
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
-	syncSlice, _ := meta.Handle().Get(ro, syncKey)
-	assert.False(t, syncSlice.Exists(), "Orphaned sync entry should be removed")
-	syncSlice.Free()
+	compactionSlice, _ := meta.Handle().Get(ro, compactionKey)
+	assert.False(t, compactionSlice.Exists(), "Orphaned compaction entry should be removed")
+	compactionSlice.Free()
 }
 
 func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
@@ -233,15 +218,10 @@ func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
 	vmBytes, _ := proto.Marshal(vm)
 	batch.Put(metaKey, vmBytes)
 
-	// Add OLD sync entry (simulate >30s old)
+	// Add OLD compaction entry (simulate >1 hour old)
 	oldTimestamp := time.Now().Add(-time.Hour).UnixNano()
-	syncKey := []byte(fmt.Sprintf("%s%020d/%s", keys.SyncIndexPrefix, oldTimestamp, testFile))
-	syncEntry := &pb.SyncEntry{
-		MetadataKey: string(metaKey),
-		Timestamp:   time.Now().Add(-time.Hour).Unix(),
-	}
-	syncVal, _ := EncodeSyncEntry(syncEntry)
-	batch.Put(syncKey, syncVal)
+	compactionKey := keys.MakeCompactionKey(oldTimestamp, "old-key")
+	batch.Put(compactionKey, []byte(testFile))
 
 	err = meta.Handle().Write(wo, batch)
 	require.NoError(t, err)
@@ -257,14 +237,14 @@ func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
 
 	// Verify corrupted file was deleted
 	_, err = os.Stat(testFile)
-	assert.True(t, os.IsNotExist(err), "Corrupted file should be deleted even if sync entry is old")
+	assert.True(t, os.IsNotExist(err), "Corrupted file should be deleted even if compaction entry is old")
 
-	// Verify sync entry was removed
+	// Verify compaction entry was removed
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
-	syncSlice, _ := meta.Handle().Get(ro, syncKey)
-	assert.False(t, syncSlice.Exists(), "Sync entry should be removed")
-	syncSlice.Free()
+	compactionSlice, _ := meta.Handle().Get(ro, compactionKey)
+	assert.False(t, compactionSlice.Exists(), "Compaction entry should be removed")
+	compactionSlice.Free()
 }
 
 func TestParallelRecovery(t *testing.T) {
@@ -298,13 +278,8 @@ func TestParallelRecovery(t *testing.T) {
 			vmBytes, _ := proto.Marshal(vm)
 			batch.Put(metaKey, vmBytes)
 
-			syncKey := keys.MakeSyncKey(filePath)
-			syncEntry := &pb.SyncEntry{
-				MetadataKey: string(metaKey),
-				Timestamp:   time.Now().Unix(),
-			}
-			syncVal, _ := EncodeSyncEntry(syncEntry)
-			batch.Put(syncKey, syncVal)
+			compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), fmt.Sprintf("key%d", i))
+			batch.Put(compactionKey, []byte(filePath))
 		} else if i%3 == 1 {
 			// Corrupted files (size mismatch)
 			data := []byte("short")
@@ -320,13 +295,8 @@ func TestParallelRecovery(t *testing.T) {
 			vmBytes, _ := proto.Marshal(vm)
 			batch.Put(metaKey, vmBytes)
 
-			syncKey := keys.MakeSyncKey(filePath)
-			syncEntry := &pb.SyncEntry{
-				MetadataKey: string(metaKey),
-				Timestamp:   time.Now().Unix(),
-			}
-			syncVal, _ := EncodeSyncEntry(syncEntry)
-			batch.Put(syncKey, syncVal)
+			compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), fmt.Sprintf("key%d", i))
+			batch.Put(compactionKey, []byte(filePath))
 		} else {
 			// Stale entries (metadata points elsewhere)
 			// Create the file but metadata points to different file
@@ -343,13 +313,8 @@ func TestParallelRecovery(t *testing.T) {
 			vmBytes, _ := proto.Marshal(vm)
 			batch.Put(metaKey, vmBytes)
 
-			syncKey := keys.MakeSyncKey(filePath)
-			syncEntry := &pb.SyncEntry{
-				MetadataKey: string(metaKey),
-				Timestamp:   time.Now().Unix(),
-			}
-			syncVal, _ := EncodeSyncEntry(syncEntry)
-			batch.Put(syncKey, syncVal)
+			compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), fmt.Sprintf("key%d", i))
+			batch.Put(compactionKey, []byte(filePath))
 		}
 
 		err := meta.Handle().Write(wo, batch)
@@ -361,18 +326,18 @@ func TestParallelRecovery(t *testing.T) {
 	err := recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
-	// Verify all sync entries were removed after recovery
+	// Verify all compaction entries were removed after recovery
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 	it := meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	syncCount := 0
-	prefix := []byte(keys.SyncIndexPrefix)
+	compactionCount := 0
+	prefix := []byte(keys.CompactionIndexPrefix)
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		syncCount++
+		compactionCount++
 	}
-	assert.Equal(t, 0, syncCount, "All sync entries should be removed after recovery")
+	assert.Equal(t, 0, compactionCount, "All compaction entries should be removed after recovery")
 
 	// Verify corrupted files were deleted
 	for i := 1; i < numFiles; i += 3 {

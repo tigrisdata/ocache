@@ -8,6 +8,7 @@ import (
 type TestHarnessInterface interface {
 	// Object operations
 	PutObject(key string, data []byte, ttl int64) error
+	PutObjectStream(key string, data []byte, ttl int64) error // For large objects >128MB
 	GetObject(key string) ([]byte, error)
 	DeleteObject(key string) error
 

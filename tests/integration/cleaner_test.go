@@ -825,7 +825,7 @@ func (s *CleanerSuite) Test_CleanerLoop_SegmentedObjects() {
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = 500 * time.Millisecond
-	config.CompactionInterval = 500 * time.Millisecond
+	config.RecompactionInterval = 500 * time.Millisecond
 	config.MaxDiskUsage = 5 * 1024 * 1024 // 5MB limit - increased to avoid aggressive LRU eviction
 	config.SegmentSize = 2 * 1024 * 1024  // 2MB segments
 	s.Config = config

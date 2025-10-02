@@ -44,7 +44,7 @@ func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, *files.FileMa
 	_ = fd.NewFdCache(100)
 
 	// Initialize file manager
-	fm, err := files.NewFileManager(tmpDir)
+	fm, err := files.NewFileManager(tmpDir, 64*1024*1024)
 	require.NoError(t, err)
 
 	// Initialize segment manager
@@ -64,12 +64,10 @@ func TestCompactorStartClose(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                100 * time.Millisecond,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Start the compactor
@@ -158,7 +156,7 @@ func TestParseFileIndexRow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			userKey, filePath, ok := parseFileIndexRow(tt.key, tt.value)
+			userKey, filePath, ok := keys.ParseCompactionIndexRow(tt.key, tt.value)
 			assert.Equal(t, tt.wantOk, ok)
 			assert.Equal(t, tt.wantKey, userKey)
 			assert.Equal(t, tt.wantPath, filePath)
@@ -171,12 +169,10 @@ func TestEnsureCapacity(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Get initial segment
@@ -204,12 +200,10 @@ func TestCopyFileIntoSegment(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create a test file
@@ -251,12 +245,10 @@ func TestCommit(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create test files to delete
@@ -301,12 +293,10 @@ func TestCompactFiles(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create test files
@@ -355,7 +345,7 @@ func TestCompactFiles(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Verify index entries were deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -393,12 +383,10 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Add file index entry for non-existent file
@@ -409,7 +397,7 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 
 	// Run compaction - should handle missing file gracefully
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -427,12 +415,10 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 	defer deletionQueue.Stop()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletionQueue,
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletionQueue,
 	})
 
 	// Create a test file
@@ -448,7 +434,7 @@ func TestCompactFilesWithMissingMetadata(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Verify index entry was deleted
 	ro := grocksdb.NewDefaultReadOptions()
@@ -473,12 +459,10 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create multiple test files
@@ -511,7 +495,7 @@ func TestCompactFilesWithMaxBytesLimit(t *testing.T) {
 	// The limit is checked after processing, so 150 bytes means it will process 2 files (200 bytes)
 	// and stop before the third
 	ctx := context.Background()
-	c.CompactFiles(ctx, 150, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Check how many index entries remain (unprocessed files)
 	ro := grocksdb.NewDefaultReadOptions()
@@ -536,12 +520,10 @@ func TestCompactionLoopConcurrency(t *testing.T) {
 
 	// Test that multiple Start calls are safe
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                50 * time.Millisecond,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Start the compactor once
@@ -563,12 +545,10 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create a test file
@@ -589,7 +569,7 @@ func TestCompactFilesWithBadMetadata(t *testing.T) {
 
 	// Run compaction - should handle bad metadata gracefully
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// File should still exist as we couldn't process it
 	_, err = os.Stat(testFile)
@@ -606,12 +586,10 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 	require.NoError(t, err)
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 10 * 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Calculate sizes for test entries
@@ -663,7 +641,7 @@ func TestSegmentRotationOnlyWhenFull(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 10*1024*1024, 0) // High limit to not stop early
+	c.CompactFiles(ctx, 0) // High limit to not stop early
 
 	// Check how many segments were created
 	numSegments := sm.GetSegmentCount()
@@ -718,12 +696,10 @@ func TestSegmentRotationWithMixedSizes(t *testing.T) {
 	require.NoError(t, err)
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 10 * 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create entries with varying sizes
@@ -769,7 +745,7 @@ func TestSegmentRotationWithMixedSizes(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 10*1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Verify segments were created appropriately
 	numSegments := sm.GetSegmentCount()
@@ -802,12 +778,10 @@ func TestCopyFileIntoSegmentError(t *testing.T) {
 	defer cleanup()
 
 	_ = NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create a test file with no read permissions
@@ -829,12 +803,10 @@ func TestCompactFilesWithCorruptedFile(t *testing.T) {
 	defer cleanup()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
 	// Create test files with mismatched sizes
@@ -863,7 +835,7 @@ func TestCompactFilesWithCorruptedFile(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Verify that the compaction index entry was removed (corruption detected)
 	ro := grocksdb.NewDefaultReadOptions()
@@ -892,12 +864,10 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 	defer deletionQueue.Stop()
 
 	c := NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletionQueue,
-		MaxBytesPerCompactRound: 1024 * 1024,
-		Interval:                time.Second,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletionQueue,
 	})
 
 	// Create mix of valid and corrupted files
@@ -945,7 +915,7 @@ func TestCompactFilesWithMultipleCorruptions(t *testing.T) {
 
 	// Run compaction
 	ctx := context.Background()
-	c.CompactFiles(ctx, 1024*1024, 0)
+	c.CompactFiles(ctx, 0)
 
 	// Check results
 	ro := grocksdb.NewDefaultReadOptions()
@@ -990,13 +960,12 @@ func TestConcurrentCompaction(t *testing.T) {
 	// Create compactor with multiple threads
 	numThreads := 4
 	compactorConfig := &CompactorConfig{
-		MetaDB:                  meta,
-		FileManager:             fm,
-		SegmentManager:          sm,
-		DeletionQueue:           deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-		MaxBytesPerCompactRound: 10 * 1024 * 1024,
-		Interval:                100 * time.Millisecond,
-		CompactionThreads:       numThreads,
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+
+		CompactionThreads: numThreads,
 	}
 	c := NewCompactorWithConfig(compactorConfig)
 

@@ -105,8 +105,17 @@ type ObjectOperationSteps struct {
 
 // PutObject stores the object
 func (ops *ObjectOperationSteps) PutObject(t *testing.T, h TestHarnessInterface) {
-	err := h.PutObject(ops.Key, ops.Data, ops.TTL)
-	require.NoError(t, err, "Failed to put object with key %s", ops.Key)
+	// Use streaming for objects larger than 128MB to avoid gRPC message size limit
+	const grpcMaxMessageSize = 128 * 1024 * 1024 // 128MB
+
+	var err error
+	if len(ops.Data) > grpcMaxMessageSize {
+		err = h.PutObjectStream(ops.Key, ops.Data, ops.TTL)
+		require.NoError(t, err, "Failed to put large object via stream with key %s", ops.Key)
+	} else {
+		err = h.PutObject(ops.Key, ops.Data, ops.TTL)
+		require.NoError(t, err, "Failed to put object with key %s", ops.Key)
+	}
 }
 
 // GetAndVerify retrieves the object and verifies data integrity

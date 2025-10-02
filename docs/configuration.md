@@ -39,7 +39,6 @@ OCache can be configured through command-line flags when starting the server.
 
 | Flag                            | Type     | Default | Description                                                |
 | ------------------------------- | -------- | ------- | ---------------------------------------------------------- |
-| `-compaction-interval`          | duration | 5m      | Interval between compaction runs                           |
 | `-compaction-threads`           | int      | 2       | Number of concurrent compaction threads                    |
 | `-fragmentation-threshold`      | float64  | 0.3     | Segment fragmentation threshold for recompaction (0.0-1.0) |
 | `-recompaction-min-segment-age` | duration | 1h      | Minimum age for a segment before recompaction              |
