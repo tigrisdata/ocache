@@ -26,6 +26,7 @@ func (n nodeMember) String() string {
 type TopologyManager struct {
 	ring atomic.Value // *consistent.Consistent
 
+	partitionOwners map[int32]string           // partition -> nodeID (from coordinator)
 	seedAddrs       []string                   // seed addresses
 	nodeAddresses   map[string]string          // nodeID -> address
 	topology        *clusterpb.ClusterTopology // Current topology
@@ -38,6 +39,7 @@ type TopologyManager struct {
 // NewTopologyManager creates a new topology manager
 func NewTopologyManager(seedAddrs []string, refreshInterval time.Duration, dialOpts []grpc.DialOption) (*TopologyManager, error) {
 	tm := &TopologyManager{
+		partitionOwners: make(map[int32]string),
 		nodeAddresses:   make(map[string]string),
 		seedAddrs:       seedAddrs,
 		refreshInterval: refreshInterval,
@@ -157,6 +159,7 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 	ring := consistent.New(nil, cfg)
 
 	// Build partition ownership map and node addresses
+	partitionOwners := make(map[int32]string)
 	nodeAddresses := make(map[string]string)
 	activeNodes := make(map[string]bool)
 
@@ -175,11 +178,17 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		}
 	}
 
+	// Build explicit partition ownership from coordinator
+	for _, owner := range topology.PartitionOwners {
+		partitionOwners[owner.PartitionId] = owner.NodeId
+	}
+
 	// Update state
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
 	tm.ring.Store(ring)
+	tm.partitionOwners = partitionOwners
 	tm.nodeAddresses = nodeAddresses
 	tm.topology = topology
 
@@ -191,21 +200,26 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 
 // GetNodeForKey returns the node address for a given key
 func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
+	// Get ring for partition computation (lock-free read)
 	ring := tm.GetRing()
 	if ring == nil {
 		return "", fmt.Errorf("ring not initialized")
 	}
 
-	nodeID := ring.LocateKey([]byte(key))
-	if nodeID == nil {
-		return "", fmt.Errorf("no node for key %s", key)
-	}
+	// Compute partition from key using consistent hash
+	partition := int32(ring.FindPartitionID([]byte(key)))
 
+	// Look up explicit partition owner from coordinator
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
+	nodeID, exists := tm.partitionOwners[partition]
+	if !exists {
+		return "", fmt.Errorf("no owner for partition %d", partition)
+	}
+
 	// Get address for node
-	addr, exists := tm.nodeAddresses[nodeID.String()]
+	addr, exists := tm.nodeAddresses[nodeID]
 	if !exists {
 		return "", fmt.Errorf("no address for node %s", nodeID)
 	}
@@ -229,15 +243,11 @@ func (tm *TopologyManager) GetTopologyEpoch() uint64 {
 
 // GetPartitionOwner returns the node ID that owns the given partition
 func (tm *TopologyManager) GetPartitionOwner(partitionID int) string {
-	ring := tm.GetRing()
-	if ring == nil {
-		return ""
-	}
-	owner := ring.GetPartitionOwner(partitionID)
-	if owner == nil {
-		return ""
-	}
-	return owner.String()
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	// Return explicit partition owner from coordinator
+	return tm.partitionOwners[int32(partitionID)]
 }
 
 // GetNodeAddresses returns all node addresses
