@@ -146,20 +146,18 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		return nil, false // No change
 	}
 
-	// Create new ring
-	cfg := consistent.Config{
-		PartitionCount:    int(topology.RingConfig.PartitionCount),
-		ReplicationFactor: int(topology.RingConfig.ReplicationFactor),
-		Load:              topology.RingConfig.Load,
-		Hasher:            hash.Hasher{},
-	}
-	ring := consistent.New(nil, cfg)
+	// Check if RingConfig changed (under RLock)
+	tm.mu.RLock()
+	currentTopology := tm.topology
+	ringConfigChanged := currentTopology == nil ||
+		currentTopology.RingConfig.PartitionCount != topology.RingConfig.PartitionCount ||
+		currentTopology.RingConfig.ReplicationFactor != topology.RingConfig.ReplicationFactor ||
+		currentTopology.RingConfig.Load != topology.RingConfig.Load
+	tm.mu.RUnlock()
 
-	// Build partition ownership map and node addresses
-	partitionOwners := make(map[int32]partitionOwner)
-	nodeAddresses := make(map[string]string)
+	// Build active nodes and addresses (no lock needed)
 	activeNodes := make(map[string]bool)
-
+	nodeAddresses := make(map[string]string)
 	for _, node := range topology.Nodes {
 		if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
 			// Use listen address for client connections
@@ -169,13 +167,13 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 				// Skip this node as it's not properly configured
 				continue
 			}
-			activeNodes[listenAddr] = true
+			activeNodes[node.Id] = true
 			nodeAddresses[node.Id] = listenAddr
-			ring.Add(nodeMember(node.Id))
 		}
 	}
 
-	// Build explicit partition ownership from coordinator
+	// Build partition owners cache
+	partitionOwners := make(map[int32]partitionOwner)
 	for _, owner := range topology.PartitionOwners {
 		partitionOwners[owner.PartitionId] = partitionOwner{
 			nodeID:  owner.NodeId,
@@ -183,15 +181,58 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		}
 	}
 
-	// Update state
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
+	if ringConfigChanged {
+		// Create new ring from scratch (rare case - RingConfig changed)
+		cfg := consistent.Config{
+			PartitionCount:    int(topology.RingConfig.PartitionCount),
+			ReplicationFactor: int(topology.RingConfig.ReplicationFactor),
+			Load:              topology.RingConfig.Load,
+			Hasher:            hash.Hasher{},
+		}
+		newRing := consistent.New(nil, cfg)
 
-	tm.ring = ring
-	tm.partitionOwners = partitionOwners
-	tm.topology = topology
+		// Add all active nodes to new ring
+		for nodeID := range activeNodes {
+			newRing.Add(nodeMember(nodeID))
+		}
 
-	// Atomically update epoch - this invalidates all cached routing entries
+		// Update everything under write lock
+		tm.mu.Lock()
+		tm.ring = newRing
+		tm.partitionOwners = partitionOwners
+		tm.topology = topology
+		tm.mu.Unlock()
+
+	} else {
+		// Modify existing ring (common case - only nodes changed)
+		// ring.Add/Remove are thread-safe - operate on tm.ring directly!
+
+		// Get current members
+		nodesToRemove := make(map[string]bool)
+		for _, member := range tm.ring.GetMembers() {
+			if !activeNodes[member.String()] {
+				nodesToRemove[member.String()] = true
+			}
+		}
+
+		// Remove departed nodes (thread-safe)
+		for nodeID := range nodesToRemove {
+			tm.ring.Remove(nodeID)
+		}
+
+		// Add new nodes (thread-safe)
+		for nodeID := range activeNodes {
+			tm.ring.Add(nodeMember(nodeID))
+		}
+
+		// Only update maps and topology - ring already modified!
+		tm.mu.Lock()
+		tm.partitionOwners = partitionOwners
+		tm.topology = topology
+		tm.mu.Unlock()
+	}
+
+	// Atomically update epoch
 	atomic.StoreUint64(&tm.topologyEpoch, topology.Epoch)
 
 	return activeNodes, true
@@ -199,17 +240,11 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 
 // GetNodeForKey returns the node address for a given key
 func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
-	// Get ring for partition computation
+	// Compute partitionID from key using consistent hash
+	partitionID := int32(tm.ring.FindPartitionID([]byte(key)))
+
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
-
-	ring := tm.ring
-	if ring == nil {
-		return "", fmt.Errorf("ring not initialized")
-	}
-
-	// Compute partitionID from key using consistent hash
-	partitionID := int32(ring.FindPartitionID([]byte(key)))
 
 	node, exists := tm.partitionOwners[partitionID]
 	if !exists {
