@@ -608,6 +608,11 @@ func (c *Coordinator) verifyLastHeartbeat() {
 	now := time.Now()
 
 	for nodeID, lastSeen := range c.lastHeartbeat {
+		// Skip checking our own heartbeat
+		if nodeID == c.config.MyNodeID {
+			continue
+		}
+
 		// Check if heartbeat timeout exceeded
 		if now.Sub(lastSeen) > timeout {
 			zlog.Warn().
