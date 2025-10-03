@@ -240,11 +240,11 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 
 // GetNodeForKey returns the node address for a given key
 func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
-	// Compute partitionID from key using consistent hash
-	partitionID := int32(tm.ring.FindPartitionID([]byte(key)))
-
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
+
+	// Compute partitionID from key using consistent hash
+	partitionID := int32(tm.ring.FindPartitionID([]byte(key)))
 
 	node, exists := tm.partitionOwners[partitionID]
 	if !exists {

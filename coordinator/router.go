@@ -305,14 +305,16 @@ func (r *Router) getConnectionHealth(state *clientState, nodeID string) error {
 	}
 
 	// Check connection state
+	error := fmt.Errorf("client state not set for node %s", nodeID)
 	if state.conn != nil {
 		connState := state.conn.GetState()
 		if connState != connectivity.Shutdown && connState != connectivity.TransientFailure {
 			return nil
 		}
+		error = fmt.Errorf("connection state is %s for node %s", connState.String(), nodeID)
 	}
 
-	return fmt.Errorf("client state not set for node %s", nodeID)
+	return error
 }
 
 // isCircuitOpen checks if the circuit breaker is open for a client
