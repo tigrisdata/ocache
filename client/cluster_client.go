@@ -36,18 +36,18 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 
 	config.SetDefaults()
 
+	// Fetch initial topology
+	topology, err := NewTopologyManager(config.Addrs, config.RefreshInterval, config.DialOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create topology manager: %w", err)
+	}
+
 	client := &ClusterClient{
 		conns:     make(map[string]*connection),
-		topology:  NewTopologyManager(config.Addrs, config.RefreshInterval, config.DialOpts),
+		topology:  topology,
 		config:    config,
 		seedAddrs: config.Addrs,
 		stopCh:    make(chan struct{}),
-	}
-
-	// Fetch initial topology
-	err := client.topology.Initialize()
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize topology: %w", err)
 	}
 
 	// Initialize connections based on topology
@@ -378,22 +378,17 @@ func (c *ClusterClient) GetTopologyEpoch() uint64 {
 	return c.topology.GetTopologyEpoch()
 }
 
-// HasRing returns true if the consistent hash ring is initialized
-func (c *ClusterClient) HasRing() bool {
-	return c.topology.HasRing()
-}
-
 // GetPartitionOwner returns the node ID that owns the given partition
-func (c *ClusterClient) GetPartitionOwner(partitionID int32) string {
+func (c *ClusterClient) GetPartitionOwner(partitionID int) string {
 	return c.topology.GetPartitionOwner(partitionID)
 }
 
-// GetPartitionOwnerCount returns the number of partition owners
-func (c *ClusterClient) GetPartitionOwnerCount() int {
-	return c.topology.GetPartitionOwnerCount()
-}
-
 // Test helper methods - exposed for testing only
+
+// GetRing returns the consistent hash ring
+func (c *ClusterClient) HasRing() bool {
+	return c.topology.GetRing() != nil
+}
 
 // FetchTopology fetches the current topology (exposed for testing)
 func (c *ClusterClient) FetchTopology() (*clusterpb.ClusterTopology, error) {
