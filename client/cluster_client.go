@@ -378,9 +378,13 @@ func (c *ClusterClient) GetTopologyEpoch() uint64 {
 	return c.topology.GetTopologyEpoch()
 }
 
-// GetPartitionOwner returns the node ID that owns the given partition
-func (c *ClusterClient) GetPartitionOwner(partitionID int) string {
-	return c.topology.GetPartitionOwner(partitionID)
+// GetPartitionOwnerID returns the node ID that owns the given partition
+func (c *ClusterClient) GetPartitionOwnerID(partitionID int32) string {
+	owner := c.topology.GetPartitionOwner(partitionID)
+	if owner == nil {
+		return ""
+	}
+	return owner.nodeID
 }
 
 // Test helper methods - exposed for testing only
