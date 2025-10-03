@@ -107,7 +107,7 @@ jobs:
 
           # Start node 1 as bootstrap (no seeds)
           echo "Starting node1 (bootstrap)..."
-          ./ocache -cluster-enabled -node-id node1 -disk /tmp/ocache-cluster/node1 -listen-addr :9001 -listen-http :8001 -cluster-addr :7001 > node1.log 2>&1 &
+          ./ocache -cluster-enabled -node-id node1 -disk /tmp/ocache-cluster/node1 -listen-addr :9001 -listen-http :8001 -cluster-addr :7001 -seeds localhost:7001,localhost:7002,localhost:7003 > node1.log 2>&1 &
           echo $! > node1.pid
 
           # Wait for node1 to be ready
@@ -123,7 +123,7 @@ jobs:
 
           # Start node 2 with node1 as seed
           echo "Starting node2..."
-          ./ocache -cluster-enabled -node-id node2 -disk /tmp/ocache-cluster/node2 -listen-addr :9002 -listen-http :8002 -cluster-addr :7002 -seeds localhost:7001 > node2.log 2>&1 &
+          ./ocache -cluster-enabled -node-id node2 -disk /tmp/ocache-cluster/node2 -listen-addr :9002 -listen-http :8002 -cluster-addr :7002 -seeds localhost:7001,localhost:7002,localhost:7003 > node2.log 2>&1 &
           echo $! > node2.pid
 
           # Wait for node2 to be ready
@@ -139,7 +139,7 @@ jobs:
 
           # Start node 3 with node1 and node2 as seeds
           echo "Starting node3..."
-          ./ocache -cluster-enabled -node-id node3 -disk /tmp/ocache-cluster/node3 -listen-addr :9003 -listen-http :8003 -cluster-addr :7003 -seeds localhost:7001,localhost:7002 > node3.log 2>&1 &
+          ./ocache -cluster-enabled -node-id node3 -disk /tmp/ocache-cluster/node3 -listen-addr :9003 -listen-http :8003 -cluster-addr :7003 -seeds localhost:7001,localhost:7002,localhost:7003 > node3.log 2>&1 &
           echo $! > node3.pid
 
           # Wait for node3 to be ready
@@ -187,22 +187,22 @@ jobs:
       - name: Run cluster benchmark - 100 bytes
         run: |
           echo "=== Running cluster benchmark with 100 byte objects ==="
-          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 100000 --value-size 100 --workload "read=80,update=20" --no-progress | tee cluster-100-byte-read-80-update-20.log
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 8 --num-ops 100000 --value-size 100 --workload "read=80,update=20" --no-progress | tee cluster-100-byte-read-80-update-20.log
 
       - name: Run cluster benchmark - 100 KB
         run: |
           echo "=== Running cluster benchmark with 100 KB objects ==="
-          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 100000 --value-size 102400 --workload "read=80,update=20" --no-progress | tee cluster-100kb-read-80-update-20.log
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 8 --num-ops 100000 --value-size 102400 --workload "read=80,update=20" --no-progress | tee cluster-100kb-read-80-update-20.log
 
       - name: Run cluster benchmark - 1 MB
         run: |
           echo "=== Running cluster benchmark with 1 MB objects ==="
-          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee cluster-1mb-read-80-update-20.log
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 8 --num-ops 10000 --value-size 1048576 --workload "read=80,update=20" --no-progress | tee cluster-1mb-read-80-update-20.log
 
       - name: Run cluster benchmark - 10 MB
         run: |
           echo "=== Running cluster benchmark with 10 MB objects ==="
-          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 10000 --value-size 10485760 --workload "read=80,update=20" --no-progress | tee cluster-10mb-read-80-update-20.log
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 8 --num-ops 10000 --value-size 10485760 --workload "read=80,update=20" --no-progress | tee cluster-10mb-read-80-update-20.log
 
       - name: Stop cluster nodes
         if: always()
