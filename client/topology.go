@@ -177,13 +177,12 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 
 	// Update state
 	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
 	tm.ring = ring
 	tm.partitionOwners = partitionOwners
 	tm.nodeAddresses = nodeAddresses
 	tm.topology = topology
-
-	tm.mu.Unlock()
 
 	// Atomically update epoch - this invalidates all cached routing entries
 	atomic.StoreUint64(&tm.topologyEpoch, topology.Epoch)
