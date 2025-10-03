@@ -199,6 +199,11 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, start,
 		return nil, err
 	}
 
+	client := conn.getClient()
+	if client == nil {
+		return nil, fmt.Errorf("no healthy connections available")
+	}
+
 	// Build request with optional range parameters
 	req := &pb.GetRequest{Key: key}
 	if start != 0 || end != 0 {
@@ -206,7 +211,7 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, start,
 		req.End = end
 	}
 
-	stream, err := conn.getClient().Get(ctx, req)
+	stream, err := client.Get(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -259,6 +264,11 @@ func (c *ClusterClient) getStreamDataWithRetry(ctx context.Context, key string, 
 		return err
 	}
 
+	client := conn.getClient()
+	if client == nil {
+		return fmt.Errorf("no healthy connections available")
+	}
+
 	// Build request with optional range parameters
 	req := &pb.GetRequest{Key: key}
 	if start != 0 || end != 0 {
@@ -266,7 +276,7 @@ func (c *ClusterClient) getStreamDataWithRetry(ctx context.Context, key string, 
 		req.End = end
 	}
 
-	stream, err := conn.getClient().Get(ctx, req)
+	stream, err := client.Get(ctx, req)
 	if err != nil {
 		return err
 	}
