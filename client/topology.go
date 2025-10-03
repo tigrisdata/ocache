@@ -191,8 +191,11 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 }
 
 // GetNodeForKey returns the node address for a given key
-// Uses a lock-free cache for hot keys to reduce lock contention
 func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
+	// Acquire read lock to protect access to tm.ring and related maps
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
 	if tm.ring == nil {
 		return "", fmt.Errorf("ring not initialized")
 	}
@@ -201,9 +204,6 @@ func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
 	partition := int32(tm.ring.FindPartitionID([]byte(key)))
 
 	// Get node for partition
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-
 	nodeID, exists := tm.partitionOwners[partition]
 	if !exists {
 		return "", fmt.Errorf("no owner for partition %d", partition)
