@@ -347,6 +347,19 @@ func (r *Ring) IsNodeAvailable(nodeID string) bool {
 	return false
 }
 
+// GetNodeStatus returns the status of a specific node
+func (r *Ring) GetNodeStatus(id string) (NodeStatus, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	node, exists := r.nodes[id]
+	if !exists {
+		return NodeStatusDown, fmt.Errorf("node %s not found", id)
+	}
+
+	return node.Status, nil
+}
+
 // GetPartitionForKey returns the partition for the key
 func (r *Ring) GetPartitionForKey(key string) int {
 	return r.ch.FindPartitionID([]byte(key))

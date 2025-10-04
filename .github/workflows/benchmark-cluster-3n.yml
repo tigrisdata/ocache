@@ -1,4 +1,4 @@
-name: Benchmark Cluster
+name: Benchmark Cluster 3-Node
 
 on:
   push:
@@ -21,7 +21,7 @@ env:
   ROCKSDB_VERSION: "10.4.2"
 
 jobs:
-  benchmark-cluster:
+  benchmark-cluster-3n:
     strategy:
       matrix:
         os: [namespace-profile-ubuntu-2404-medium]
@@ -105,8 +105,8 @@ jobs:
         run: |
           echo "Starting 3-node OCache cluster with sequential bootstrap..."
 
-          # Start node 1 as bootstrap (no seeds)
-          echo "Starting node1 (bootstrap)..."
+          # Start node 1
+          echo "Starting node1..."
           ./ocache -cluster-enabled -node-id node1 -disk /tmp/ocache-cluster/node1 -listen-addr :9001 -listen-http :8001 -cluster-addr :7001 -seeds localhost:7001,localhost:7002,localhost:7003 > node1.log 2>&1 &
           echo $! > node1.pid
 
@@ -121,7 +121,7 @@ jobs:
           done
           sleep 1
 
-          # Start node 2 with node1 as seed
+          # Start node 2
           echo "Starting node2..."
           ./ocache -cluster-enabled -node-id node2 -disk /tmp/ocache-cluster/node2 -listen-addr :9002 -listen-http :8002 -cluster-addr :7002 -seeds localhost:7001,localhost:7002,localhost:7003 > node2.log 2>&1 &
           echo $! > node2.pid
@@ -137,7 +137,7 @@ jobs:
           done
           sleep 1
 
-          # Start node 3 with node1 and node2 as seeds
+          # Start node 3
           echo "Starting node3..."
           ./ocache -cluster-enabled -node-id node3 -disk /tmp/ocache-cluster/node3 -listen-addr :9003 -listen-http :8003 -cluster-addr :7003 -seeds localhost:7001,localhost:7002,localhost:7003 > node3.log 2>&1 &
           echo $! > node3.pid
@@ -217,7 +217,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cluster-node-logs-${{ matrix.os }}
+          name: cluster-3n-node-logs-${{ matrix.os }}
           path: |
             node*.log
 
@@ -225,7 +225,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cluster-benchmark-results-${{ matrix.os }}
+          name: cluster-3n-benchmark-results-${{ matrix.os }}
           path: |
             cluster-*.log
             *.out
