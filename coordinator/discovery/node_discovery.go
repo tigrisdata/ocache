@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -42,7 +43,7 @@ func CreateNodeDiscovery(nodes []string, dnsRefreshInterval time.Duration) (Node
 		return NewStaticNodeDiscovery([]string{})
 	}
 
-	// Check if it's a single node that might be DNS
+	// Check if it's a single node that might be DNS service name
 	if len(nodes) == 1 {
 		node := nodes[0]
 
@@ -58,14 +59,18 @@ func CreateNodeDiscovery(nodes []string, dnsRefreshInterval time.Duration) (Node
 			return nil, err
 		}
 
-		// If the host part is a DNS name, use DNS discovery
-		if isDNSName(host) {
-			// Use DNS discovery with the parsed port
+		// DNS discovery is used for service discovery patterns (e.g., Kubernetes headless services)
+		// where a DNS name resolves to multiple IPs that change over time.
+		// A hostname with an explicit port is treated as a static address, even if it uses DNS.
+		// Only use DNS discovery for multi-label DNS names (e.g., "service.namespace.svc.cluster.local")
+		// that are likely service names, not simple hostnames.
+		if isDNSName(host) && strings.Contains(host, ".") {
+			// Use DNS discovery for multi-label DNS names (likely service names)
 			return NewDNSNodeDiscovery(host, port, dnsRefreshInterval)
 		}
 	}
 
-	// Use static discovery for multiple nodes or single static node
+	// Use static discovery for multiple nodes, single static nodes, or simple hostnames
 	return NewStaticNodeDiscovery(nodes)
 }
 

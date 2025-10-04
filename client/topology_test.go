@@ -479,9 +479,8 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 	defer client.Close()
 
 	// Verify initial partition ownership
-	assert.Equal(t, 10, client.GetPartitionOwnerCount())
 	for i := int32(0); i < 10; i++ {
-		assert.Equal(t, "node-0", client.GetPartitionOwner(i))
+		assert.Equal(t, "node-0", client.GetPartitionOwnerID(i))
 	}
 
 	// Rebalance - move half partitions to node-1
@@ -515,10 +514,10 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 
 	// Verify partition reassignment
 	for i := int32(0); i < 5; i++ {
-		assert.Equal(t, "node-0", client.GetPartitionOwner(i))
+		assert.Equal(t, "node-0", client.GetPartitionOwnerID(i))
 	}
 	for i := int32(5); i < 10; i++ {
-		assert.Equal(t, "node-1", client.GetPartitionOwner(i))
+		assert.Equal(t, "node-1", client.GetPartitionOwnerID(i))
 	}
 }
 

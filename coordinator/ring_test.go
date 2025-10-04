@@ -21,7 +21,8 @@ func TestRing_AddNode(t *testing.T) {
 	nodes := ring.GetAllNodes()
 	assert.Len(t, nodes, 1)
 	assert.Equal(t, "node1", nodes[0].ID)
-	assert.Equal(t, "localhost:9000", nodes[0].Address)
+	assert.Equal(t, "localhost:7000", nodes[0].Address)
+	assert.Equal(t, "localhost:9000", nodes[0].ListenAddress)
 	assert.Equal(t, NodeStatusActive, nodes[0].Status)
 	assert.True(t, nodes[0].Available)
 

@@ -158,11 +158,23 @@ func (c *Compactor) fileCompactionLoop(workerID int) {
 
 	zlog.Info().Int("worker", workerID).Msg("compactor: starting file compaction worker")
 
+	lastProcessed := int64(0)
+	lastBytesCopied := int64(0)
+
+	logTicker := time.NewTicker(30 * time.Second)
+	defer logTicker.Stop()
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			zlog.Info().Int("worker", workerID).Msg("compactor: file compaction worker stopping")
 			return
+		case <-logTicker.C:
+			if lastProcessed > 0 && lastBytesCopied > 0 {
+				zlog.Info().Int("worker", workerID).Int64("processed", lastProcessed).Int64("bytesCopied", lastBytesCopied).Msg("compactor: file compaction worker progress")
+				lastProcessed = 0
+				lastBytesCopied = 0
+			}
 		default:
 			// Check if context is already cancelled before starting compaction
 			if c.ctx.Err() != nil {
@@ -170,7 +182,9 @@ func (c *Compactor) fileCompactionLoop(workerID int) {
 			}
 
 			// Process available compaction entries (no byte limit - compact until segment is full or index is empty)
-			processed := c.CompactFiles(c.ctx, workerID)
+			processed, bytesCopied := c.CompactFiles(c.ctx, workerID)
+			lastProcessed += int64(processed)
+			lastBytesCopied += bytesCopied
 
 			// If no work was done, sleep briefly to avoid tight loop
 			if processed == 0 {
@@ -226,7 +240,7 @@ func PrepareEntryForCompaction(key, filePath string) ([]byte, []byte) {
 // The workerID is used to partition work across multiple workers.
 // Compaction continues until the current segment is full or there are no more entries.
 // Returns the number of files processed.
-func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
+func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64) {
 	start := time.Now()
 
 	// Track compaction run
@@ -250,7 +264,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
 	seg, err := c.sm.AcquireOpenSegmentWithReservation(workerCallerID, 0)
 	if err != nil {
 		zlog.Error().Err(err).Int("worker", workerID).Msg("compactor: acquire open segment")
-		return 0
+		return 0, 0
 	}
 	// Use a closure to ensure we release the final segment, not the initial one
 	defer func() {
@@ -283,7 +297,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
 		if err := ctx.Err(); err != nil {
 			zlog.Debug().Msg("compactor: interrupted by cancellation")
 			// Don't attempt to commit when cancelled - just return
-			return processed
+			return processed, bytesCopied
 		}
 		k := it.Key().Data()
 		v := it.Value().Data()
@@ -357,7 +371,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
 		if err := c.compactEntry(ctx, entry, &seg, workerCallerID, wb); err != nil {
 			if err == context.Canceled {
 				zlog.Debug().Msg("compactor: compaction cancelled")
-				return processed
+				return processed, bytesCopied
 			}
 			// Check if it's a file size mismatch error
 			var sizeMismatchErr *ErrFileSizeMismatch
@@ -395,7 +409,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
 		if err != context.Canceled {
 			zlog.Error().Err(err).Msg("compactor: commit failed")
 		}
-		return processed
+		return processed, bytesCopied
 	}
 
 	// Record compaction metrics
@@ -404,10 +418,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) int {
 	metrics.CompactionFilesCompacted.Add(float64(processed))
 	metrics.CompactionBytesCompacted.Add(float64(bytesCopied))
 
-	if processed > 0 {
-		zlog.Info().Int("worker", workerID).Int("migrated", processed).Dur("duration_ms", duration).Int64("bytes", bytesCopied).Msg("compactor: finished file compaction")
-	}
-	return processed
+	return processed, bytesCopied
 }
 
 // compactionEntry represents a single entry to be compacted

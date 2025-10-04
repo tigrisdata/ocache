@@ -5,6 +5,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 // ConnectionMode defines how the client connects to servers
@@ -34,6 +35,10 @@ const (
 	ConnectionErrorWindow = 30 * time.Second
 	// DefaultConnectionPoolSize is the default number of connections per address
 	DefaultConnectionPoolSize = 4
+	// DefaultKeepaliveTime is the default keepalive time for client connections
+	DefaultKeepaliveTime = 30 * time.Second
+	// DefaultKeepaliveTimeout is the default keepalive timeout for client connections
+	DefaultKeepaliveTimeout = 10 * time.Second
 )
 
 // ClientConfig contains configuration for the unified Client
@@ -63,8 +68,16 @@ func (c *ClientConfig) SetDefaults() {
 
 // DefaultDialOptions returns the default gRPC dial options
 func DefaultDialOptions() []grpc.DialOption {
+	// Configure keepalive parameters to match server-side configuration
+	keepaliveParams := keepalive.ClientParameters{
+		Time:                DefaultKeepaliveTime,
+		Timeout:             DefaultKeepaliveTimeout,
+		PermitWithoutStream: true,
+	}
+
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepaliveParams),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(MaxMessageSize),
 			grpc.MaxCallSendMsgSize(MaxMessageSize),

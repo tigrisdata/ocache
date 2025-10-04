@@ -115,18 +115,10 @@ func (c *Client) HasRing() bool {
 	return false
 }
 
-// GetPartitionOwner returns the node ID that owns the given partition (cluster mode only)
-func (c *Client) GetPartitionOwner(partitionID int32) string {
+// GetPartitionOwnerID returns the node ID that owns the given partition (cluster mode only)
+func (c *Client) GetPartitionOwnerID(partitionID int32) string {
 	if cc, ok := c.CacheClient.(*ClusterClient); ok {
-		return cc.GetPartitionOwner(partitionID)
+		return cc.GetPartitionOwnerID(partitionID)
 	}
 	return ""
-}
-
-// GetPartitionOwnerCount returns the number of partition owners (cluster mode only)
-func (c *Client) GetPartitionOwnerCount() int {
-	if cc, ok := c.CacheClient.(*ClusterClient); ok {
-		return cc.GetPartitionOwnerCount()
-	}
-	return 0
 }

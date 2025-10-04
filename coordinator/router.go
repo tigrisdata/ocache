@@ -2,6 +2,8 @@ package coordinator
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -173,21 +175,10 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		Msg("Checking if client exists and is healthy")
 
 	if exists && state != nil {
-		// Check if circuit breaker is open
-		if r.isCircuitOpen(state) {
-			zlog.Warn().
-				Str("node_id", nodeID).
-				Msg("Circuit breaker open for node")
-
-			return nil, NewCircuitBreakerOpenError(nodeID)
-		}
-
-		// Check connection state
-		if state.conn != nil {
-			connState := state.conn.GetState()
-			if connState != connectivity.Shutdown && connState != connectivity.TransientFailure {
-				return state.client, nil
-			}
+		if err := r.getConnectionHealth(state, nodeID); err == nil {
+			return state.client, nil
+		} else if errors.Is(err, ErrCircuitBreakerOpen) {
+			return nil, err
 		}
 	}
 
@@ -202,19 +193,10 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	// Double-check after acquiring write lock
 	state, exists = r.clients[nodeID]
 	if exists && state != nil {
-		if r.isCircuitOpen(state) {
-			zlog.Warn().
-				Str("node_id", nodeID).
-				Msg("Circuit breaker open for node")
-
-			return nil, NewCircuitBreakerOpenError(nodeID)
-		}
-
-		if state.conn != nil {
-			connState := state.conn.GetState()
-			if connState != connectivity.Shutdown && connState != connectivity.TransientFailure {
-				return state.client, nil
-			}
+		if err := r.getConnectionHealth(state, nodeID); err == nil {
+			return state.client, nil
+		} else if errors.Is(err, ErrCircuitBreakerOpen) {
+			return nil, err
 		}
 	}
 
@@ -223,12 +205,8 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	var nodeAddr string
 	for _, node := range nodes {
 		if node.ID == nodeID {
-			// Use listen address for client connections (not cluster address)
+			// Use listen address for client connections
 			nodeAddr = node.ListenAddress
-			if nodeAddr == "" {
-				// Fallback to cluster address for backward compatibility
-				nodeAddr = node.Address
-			}
 			break
 		}
 	}
@@ -252,7 +230,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		state.conn.Close()
 	}
 
-	// Create new connection with keepalive and without blocking
+	// Create new connection with keepalive
 	conn, err := r.createConnection(nodeAddr)
 	if err != nil {
 		r.recordFailureAndOpenCircuit(state)
@@ -268,6 +246,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	client := pb.NewCacheServiceClient(conn)
 	state.client = client
 	state.conn = conn
+
 	atomic.StoreInt32(&state.failureCount, 0) // Reset failure count on successful connection
 
 	zlog.Debug().
@@ -302,14 +281,40 @@ func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
 			grpc.MaxCallRecvMsgSize(r.config.MaxRecvMsgSize),
 			grpc.MaxCallSendMsgSize(r.config.MaxSendMsgSize),
 		),
-		// Remove WithBlock() - connection will be established lazily
+		grpc.WithBlock(),
 	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gRPC client for node %s: %w", address, err)
+	}
 
 	zlog.Debug().
 		Str("address", address).
-		Msg("Created connection")
+		Msg("Created connection to node")
 
-	return conn, err
+	return conn, nil
+}
+
+func (r *Router) getConnectionHealth(state *clientState, nodeID string) error {
+	// Check if circuit breaker is open
+	if r.isCircuitOpen(state) {
+		zlog.Warn().
+			Str("node_id", nodeID).
+			Msg("Circuit breaker open for node")
+
+		return NewCircuitBreakerOpenError(nodeID)
+	}
+
+	// Check connection state
+	error := fmt.Errorf("client state not set for node %s", nodeID)
+	if state.conn != nil {
+		connState := state.conn.GetState()
+		if connState != connectivity.Shutdown && connState != connectivity.TransientFailure {
+			return nil
+		}
+		error = fmt.Errorf("connection state is %s for node %s", connState.String(), nodeID)
+	}
+
+	return error
 }
 
 // isCircuitOpen checks if the circuit breaker is open for a client

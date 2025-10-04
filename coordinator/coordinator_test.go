@@ -85,6 +85,7 @@ func TestCoordinator_PortAlreadyInUse(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "node1",
 		ClusterAddr:        "localhost:9324",
+		ListenAddr:         "localhost:9325",
 		RingPartitionCount: 1024,
 	}
 
@@ -103,6 +104,7 @@ func TestCoordinator_PortAlreadyInUse(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "node2",
 		ClusterAddr:        "localhost:9324", // Same port
+		ListenAddr:         "localhost:9325",
 		RingPartitionCount: 1024,
 	}
 
@@ -290,7 +292,7 @@ func TestCoordinator_RequiresBothAddresses(t *testing.T) {
 
 	_, err = coord.Join(ctx, joinReq)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "listen address is required")
+	assert.Contains(t, err.Error(), "invalid join request: missing required fields")
 
 	// Test 2: Join with empty cluster address should fail
 	joinReq2 := &clusterpb.JoinRequest{
@@ -301,7 +303,7 @@ func TestCoordinator_RequiresBothAddresses(t *testing.T) {
 
 	_, err = coord.Join(ctx, joinReq2)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "cluster address is required")
+	assert.Contains(t, err.Error(), "invalid join request: missing required fields")
 
 	// Test 3: Verify no nodes were added
 	nodes := coord.GetRing().GetAllNodes()
@@ -309,16 +311,18 @@ func TestCoordinator_RequiresBothAddresses(t *testing.T) {
 	assert.Equal(t, "coordinator-node", nodes[0].ID)
 }
 
-// TestCoordinator_JoinClusterFailure tests that joinCluster returns error when all nodes fail
+// TestCoordinator_JoinClusterFailure tests that node starts as bootstrap node if it can't sync with any nodes
 func TestCoordinator_JoinClusterFailure(t *testing.T) {
 	config := &Config{
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:19200",
+		ListenAddr:         "localhost:19201",
 		Nodes:              []string{"invalid-node1:9999", "invalid-node2:9999"}, // Invalid nodes
 		RingPartitionCount: 10,
 		HeartbeatInterval:  1,
 		FailureThreshold:   2,
+		SyncTimeout:        1,
 	}
 
 	coord, err := New(config)
@@ -328,10 +332,15 @@ func TestCoordinator_JoinClusterFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Start should fail because we can't sync with any nodes
+	// Start should not fail if we can't sync with any nodes
+	// we will start as bootstrap node
 	err = coord.Start(ctx)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to sync with any node")
+	assert.NoError(t, err)
+
+	// verify we are a bootstrap node
+	nodes := coord.GetRing().GetAllNodes()
+	assert.Len(t, nodes, 1) // Only coordinator node
+	assert.Equal(t, "test-node", nodes[0].ID)
 }
 
 // TestCoordinator_JoinClusterWithNodes tests joining cluster with nodes
@@ -341,6 +350,7 @@ func TestCoordinator_JoinClusterWithNodes(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "node1",
 		ClusterAddr:        "localhost:9301",
+		ListenAddr:         "localhost:8301",
 		RingPartitionCount: 1024,
 	}
 
@@ -362,6 +372,7 @@ func TestCoordinator_JoinClusterWithNodes(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "node2",
 		ClusterAddr:        "localhost:9302",
+		ListenAddr:         "localhost:8302",
 		Nodes:              []string{"localhost:9301"},
 		RingPartitionCount: 1024,
 	}
@@ -386,6 +397,7 @@ func TestCoordinator_Leave(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9093",
+		ListenAddr:         "localhost:8093",
 		RingPartitionCount: 1024,
 	}
 
@@ -396,8 +408,9 @@ func TestCoordinator_Leave(t *testing.T) {
 
 	// Add a node
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "leaving-node",
-		Address: "localhost:9094",
+		NodeId:        "leaving-node",
+		Address:       "localhost:9094",
+		ListenAddress: "localhost:8094",
 	})
 	require.NoError(t, err)
 
@@ -420,6 +433,7 @@ func TestCoordinator_HeartbeatWithEpochMismatch(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9303",
+		ListenAddr:         "localhost:8303",
 		RingPartitionCount: 1024,
 	}
 
@@ -445,6 +459,7 @@ func TestCoordinator_VerifyLastHeartbeat(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9306",
+		ListenAddr:         "localhost:8306",
 		RingPartitionCount: 1024,
 		HeartbeatInterval:  1,
 		FailureThreshold:   2,
@@ -456,8 +471,9 @@ func TestCoordinator_VerifyLastHeartbeat(t *testing.T) {
 	// Add a node
 	ctx := context.Background()
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "timeout-node",
-		Address: "localhost:9307",
+		NodeId:        "timeout-node",
+		Address:       "localhost:9307",
+		ListenAddress: "localhost:8307",
 	})
 	require.NoError(t, err)
 
@@ -487,6 +503,7 @@ func TestCoordinator_GetClusterState(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9095",
+		ListenAddr:         "localhost:8095",
 		RingPartitionCount: 1024,
 	}
 
@@ -497,14 +514,16 @@ func TestCoordinator_GetClusterState(t *testing.T) {
 
 	// Add some nodes
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "node1",
-		Address: "localhost:9096",
+		NodeId:        "node1",
+		Address:       "localhost:9096",
+		ListenAddress: "localhost:8096",
 	})
 	require.NoError(t, err)
 
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "node2",
-		Address: "localhost:9097",
+		NodeId:        "node2",
+		Address:       "localhost:9097",
+		ListenAddress: "localhost:8097",
 	})
 	require.NoError(t, err)
 
@@ -529,6 +548,7 @@ func TestCoordinator_GetClusterTopology(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9095",
+		ListenAddr:         "localhost:8095",
 		RingPartitionCount: 128, // Use smaller count for testing
 	}
 
@@ -539,14 +559,16 @@ func TestCoordinator_GetClusterTopology(t *testing.T) {
 
 	// Add some nodes
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "node1",
-		Address: "localhost:9096",
+		NodeId:        "node1",
+		Address:       "localhost:9096",
+		ListenAddress: "localhost:8096",
 	})
 	require.NoError(t, err)
 
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "node2",
-		Address: "localhost:9097",
+		NodeId:        "node2",
+		Address:       "localhost:9097",
+		ListenAddress: "localhost:8097",
 	})
 	require.NoError(t, err)
 
@@ -561,7 +583,7 @@ func TestCoordinator_GetClusterTopology(t *testing.T) {
 	// Verify ring configuration
 	assert.NotNil(t, topology.RingConfig)
 	assert.Equal(t, int32(128), topology.RingConfig.PartitionCount)
-	assert.Equal(t, int32(20), topology.RingConfig.ReplicationFactor)
+	assert.Equal(t, int32(100), topology.RingConfig.ReplicationFactor)
 	assert.Equal(t, 1.25, topology.RingConfig.Load)
 
 	// Verify partition ownership
@@ -596,6 +618,7 @@ func TestCoordinator_FailureDetection(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9098",
+		ListenAddr:         "localhost:8098",
 		RingPartitionCount: 1024,
 		HeartbeatInterval:  1,
 		FailureThreshold:   2,
@@ -607,8 +630,9 @@ func TestCoordinator_FailureDetection(t *testing.T) {
 	// Add a node
 	ctx := context.Background()
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "failing-node",
-		Address: "localhost:9099",
+		NodeId:        "failing-node",
+		Address:       "localhost:9099",
+		ListenAddress: "localhost:8099",
 	})
 	require.NoError(t, err)
 
@@ -646,6 +670,7 @@ func TestCoordinator_GetLocalNodeID(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "my-special-node",
 		ClusterAddr:        "localhost:9325",
+		ListenAddr:         "localhost:8325",
 		RingPartitionCount: 1024,
 	}
 
@@ -660,6 +685,7 @@ func TestCoordinator_IsLocal(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "local-node",
 		ClusterAddr:        "localhost:9099",
+		ListenAddr:         "localhost:8099",
 		RingPartitionCount: 1024,
 	}
 
@@ -669,8 +695,9 @@ func TestCoordinator_IsLocal(t *testing.T) {
 	// Add another node
 	ctx := context.Background()
 	_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-		NodeId:  "remote-node",
-		Address: "localhost:9100",
+		NodeId:        "remote-node",
+		Address:       "localhost:9100",
+		ListenAddress: "localhost:8100",
 	})
 	require.NoError(t, err)
 
@@ -695,6 +722,7 @@ func TestCoordinator_GetNodeForKey(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9308",
+		ListenAddr:         "localhost:8308",
 		RingPartitionCount: 1024,
 	}
 
@@ -705,8 +733,9 @@ func TestCoordinator_GetNodeForKey(t *testing.T) {
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
 		_, err = coord.Join(ctx, &clusterpb.JoinRequest{
-			NodeId:  fmt.Sprintf("node-%d", i),
-			Address: fmt.Sprintf("localhost:930%d", 9+i),
+			NodeId:        fmt.Sprintf("node-%d", i),
+			Address:       fmt.Sprintf("localhost:930%d", 9+i),
+			ListenAddress: fmt.Sprintf("localhost:830%d", 8+i),
 		})
 		require.NoError(t, err)
 	}
@@ -735,6 +764,7 @@ func TestCoordinator_ConcurrentOperations(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9313",
+		ListenAddr:         "localhost:8313",
 		RingPartitionCount: 1024,
 	}
 
@@ -748,8 +778,9 @@ func TestCoordinator_ConcurrentOperations(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		go func(id int) {
 			_, err := coord.Join(ctx, &clusterpb.JoinRequest{
-				NodeId:  fmt.Sprintf("node-%d", id),
-				Address: fmt.Sprintf("localhost:931%d", 4+id),
+				NodeId:        fmt.Sprintf("node-%d", id),
+				Address:       fmt.Sprintf("localhost:931%d", 4+id),
+				ListenAddress: fmt.Sprintf("localhost:831%d", 3+id),
 			})
 			assert.NoError(t, err)
 			done <- true
@@ -792,6 +823,7 @@ func TestCoordinator_RouteError(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9326",
+		ListenAddr:         "localhost:8326",
 		RingPartitionCount: 1024,
 	}
 
@@ -837,9 +869,10 @@ func (m *mockClusterService) GetClusterState(ctx context.Context, req *clusterpb
 		Epoch: 1,
 		Nodes: []*clusterpb.NodeInfo{
 			{
-				Id:      "mock-node",
-				Address: "localhost:9999",
-				Status:  clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
+				Id:            "mock-node",
+				Address:       "localhost:9999",
+				ListenAddress: "localhost:8999",
+				Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 		},
 	}, nil
@@ -865,6 +898,7 @@ func TestCoordinator_SyncWithNodeSuccess(t *testing.T) {
 		Enabled:            true,
 		MyNodeID:           "test-node",
 		ClusterAddr:        "localhost:9328",
+		ListenAddr:         "localhost:8328",
 		Nodes:              []string{"localhost:9327"},
 		RingPartitionCount: 1024,
 	}

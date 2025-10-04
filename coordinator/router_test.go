@@ -370,20 +370,13 @@ func TestRouter_CircuitBreaker(t *testing.T) {
 	}
 	require.NotEmpty(t, deadKey)
 
-	// First attempts should work (creates connection without blocking)
-	// The connection will be in a connecting state
-	_, err = router.Route(deadKey)
-	assert.NoError(t, err)
-
-	// Wait a bit for connection to realize it's failed
-	time.Sleep(200 * time.Millisecond)
-
 	// Try multiple times to trigger circuit breaker
-	// Note: Circuit breaker tracks failures, not connection attempts
-	// Since we're using non-blocking dial, we need to check connection state
-	for i := 0; i < config.CircuitBreakerThreshold+1; i++ {
-		router.Route(deadKey)
-		time.Sleep(50 * time.Millisecond)
+	// With the fix, connection failures are detected immediately via state check
+	// Each attempt should fail and increment the failure counter
+	for i := 0; i < config.CircuitBreakerThreshold; i++ {
+		_, err = router.Route(deadKey)
+		// Expect error due to connection failure
+		assert.Error(t, err)
 	}
 
 	// Circuit should be open now

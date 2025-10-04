@@ -9,7 +9,9 @@ require (
 	github.com/tigrisdata/ocache/client v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/coordinator v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/server v0.0.0-00010101000000-000000000000
 	github.com/tigrisdata/ocache/storage v0.0.0
 	google.golang.org/grpc v1.72.2
 )
@@ -52,3 +54,5 @@ replace github.com/tigrisdata/ocache/common => ../../common
 replace github.com/tigrisdata/ocache/client => ../../client
 
 replace github.com/tigrisdata/ocache/coordinator => ../../coordinator
+
+replace github.com/tigrisdata/ocache/coordinator/proto => ../../coordinator/proto

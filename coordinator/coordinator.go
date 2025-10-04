@@ -608,8 +608,28 @@ func (c *Coordinator) verifyLastHeartbeat() {
 	now := time.Now()
 
 	for nodeID, lastSeen := range c.lastHeartbeat {
+		// Skip checking our own heartbeat
+		if nodeID == c.config.MyNodeID {
+			continue
+		}
+
 		// Check if heartbeat timeout exceeded
 		if now.Sub(lastSeen) > timeout {
+			// Check current node status to avoid redundant updates
+			status, err := c.ring.GetNodeStatus(nodeID)
+			if err != nil {
+				zlog.Debug().
+					Err(err).
+					Str("node_id", nodeID).
+					Msg("Failed to get node status, skipping heartbeat timeout check")
+				continue
+			}
+
+			// Skip if already marked as down
+			if status == NodeStatusDown {
+				continue
+			}
+
 			zlog.Warn().
 				Str("node_id", nodeID).
 				Dur("last_seen", now.Sub(lastSeen)).
@@ -799,6 +819,9 @@ func (c *Coordinator) Leave(ctx context.Context, req *clusterpb.LeaveRequest) (*
 	delete(c.lastHeartbeat, req.NodeId)
 	delete(c.failureCount, req.NodeId)
 	c.mu.Unlock()
+
+	// Clean up router connection to the removed node
+	c.router.RemoveClient(req.NodeId)
 
 	return &clusterpb.LeaveResponse{
 		Success: true,

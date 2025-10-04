@@ -32,8 +32,13 @@ func (o *Operations) Put(ctx context.Context, key string, data []byte, ttlSecond
 		return err
 	}
 
+	client := conn.getClient()
+	if client == nil {
+		return fmt.Errorf("no healthy connections available")
+	}
+
 	req := &pb.PutRequest{Key: key, Data: data, TtlSeconds: ttlSeconds}
-	_, err = conn.getClient().PutObject(ctx, req)
+	_, err = client.PutObject(ctx, req)
 	conn.recordError(err)
 	return err
 }
@@ -45,7 +50,12 @@ func (o *Operations) PutStream(ctx context.Context, key string, r io.Reader, ttl
 		return err
 	}
 
-	stream, err := conn.getClient().Put(ctx)
+	client := conn.getClient()
+	if client == nil {
+		return fmt.Errorf("no healthy connections available")
+	}
+
+	stream, err := client.Put(ctx)
 	if err != nil {
 		return err
 	}
@@ -99,7 +109,12 @@ func (o *Operations) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 
-	stream, err := conn.getClient().Get(ctx, &pb.GetRequest{Key: key})
+	client := conn.getClient()
+	if client == nil {
+		return nil, fmt.Errorf("no healthy connections available")
+	}
+
+	stream, err := client.Get(ctx, &pb.GetRequest{Key: key})
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +148,12 @@ func (o *Operations) GetStream(ctx context.Context, key string, w io.Writer) err
 		return err
 	}
 
-	stream, err := conn.getClient().Get(ctx, &pb.GetRequest{Key: key})
+	client := conn.getClient()
+	if client == nil {
+		return fmt.Errorf("no healthy connections available")
+	}
+
+	stream, err := client.Get(ctx, &pb.GetRequest{Key: key})
 	if err != nil {
 		return err
 	}
@@ -166,13 +186,18 @@ func (o *Operations) GetRange(ctx context.Context, key string, start, end int64)
 		return nil, err
 	}
 
+	client := conn.getClient()
+	if client == nil {
+		return nil, fmt.Errorf("no healthy connections available")
+	}
+
 	req := &pb.GetRequest{
 		Key:   key,
 		Start: start,
 		End:   end,
 	}
 
-	stream, err := conn.getClient().Get(ctx, req)
+	stream, err := client.Get(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -204,13 +229,18 @@ func (o *Operations) GetRangeStream(ctx context.Context, key string, start, end 
 		return err
 	}
 
+	client := conn.getClient()
+	if client == nil {
+		return fmt.Errorf("no healthy connections available")
+	}
+
 	req := &pb.GetRequest{
 		Key:   key,
 		Start: start,
 		End:   end,
 	}
 
-	stream, err := conn.getClient().Get(ctx, req)
+	stream, err := client.Get(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -243,7 +273,12 @@ func (o *Operations) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
-	_, err = conn.getClient().Delete(ctx, &pb.DeleteRequest{Key: key})
+	client := conn.getClient()
+	if client == nil {
+		return fmt.Errorf("no healthy connections available")
+	}
+
+	_, err = client.Delete(ctx, &pb.DeleteRequest{Key: key})
 	return err
 }
 
@@ -254,7 +289,12 @@ func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) 
 		return nil, err
 	}
 
-	stream, err := conn.getClient().List(ctx, &pb.ListRequest{Prefix: prefix})
+	client := conn.getClient()
+	if client == nil {
+		return nil, fmt.Errorf("no healthy connections available")
+	}
+
+	stream, err := client.List(ctx, &pb.ListRequest{Prefix: prefix})
 	if err != nil {
 		return nil, err
 	}

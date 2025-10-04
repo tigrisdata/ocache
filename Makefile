@@ -212,10 +212,10 @@ TESTRUN ?=
 TESTFLAGS := $(if $(TEST),-run $(TEST),$(if $(TESTRUN),-run $(TESTRUN),))
 
 .PHONY: test
-test: test-server test-storage test-client
+test: test-server test-storage test-client test-coordinator
 
 .PHONY: test-all
-test-all: test-server test-storage test-client test-integration test-e2e
+test-all: test-server test-storage test-client test-coordinator test-integration test-e2e
 
 .PHONY: test-server
 test-server: proto
@@ -235,11 +235,19 @@ test-client: proto
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd client && go test -v -timeout 30s $(TESTFLAGS) ./...
 
+.PHONY: test-coordinator
+test-coordinator: proto
+	@echo "Running coordinator tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd coordinator && go test -v -timeout 30s $(TESTFLAGS) ./...
+
 .PHONY: test-race
 test-race: proto
 	@echo "Running race tests for server..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 60s $(TESTFLAGS) ./...
+	@echo "Running race tests for coordinator..."
+	@cd coordinator && go test -race -v -timeout 30s $(TESTFLAGS) ./...
 	@echo "Running race tests for client..."
 	@cd client && go test -race -v -timeout 30s $(TESTFLAGS) ./...
 
@@ -250,10 +258,13 @@ test-coverage: proto
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../coverage-server.out -timeout 60s $(TESTFLAGS) ./...
 	@echo "Running coverage tests for client..."
 	@cd client && go test -coverprofile=../coverage-client.out -timeout 30s $(TESTFLAGS) ./...
+	@echo "Running coverage tests for coordinator..."
+	@cd coordinator && go test -coverprofile=../coverage-coordinator.out -timeout 30s $(TESTFLAGS) ./...
 	@echo "Combining coverage reports..."
 	@echo "mode: set" > coverage.out
 	@tail -n +2 coverage-server.out >> coverage.out 2>/dev/null || true
 	@tail -n +2 coverage-client.out >> coverage.out 2>/dev/null || true
+	@tail -n +2 coverage-coordinator.out >> coverage.out 2>/dev/null || true
 	@rm -f coverage-*.out
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
@@ -443,6 +454,7 @@ help:
 	@echo "  test-all                    - Run all tests (unit and integration)"
 	@echo "  test-server                 - Run server tests only"
 	@echo "  test-client                 - Run client tests only"
+	@echo "  test-coordinator            - Run coordinator tests only"
 	@echo "  test-race                   - Run tests with race detector"
 	@echo "  test-coverage               - Run tests with coverage report"
 	@echo "  test-e2e                    - Run end-to-end tests"
