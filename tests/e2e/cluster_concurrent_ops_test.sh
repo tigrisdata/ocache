@@ -55,7 +55,7 @@ cluster_count_keys() {
         if [ -n "$pattern" ]; then
             count=$(echo "$keys" | grep -c "$pattern")
         else
-            count=$(echo "$keys" | wc -l)
+            count=$(echo "$keys" | grep -c ".")
         fi
 
         # Strip whitespace and ensure it's a number
