@@ -19,6 +19,7 @@ NC='\033[0m' # No Color
 # =============================================================================
 TEST_PASSED=true
 SERVER_PID=""
+CLUSTER_PIDS=()
 CLEANUP_DIRS=()
 
 # =============================================================================
@@ -106,9 +107,162 @@ restart_server() {
     local test_name="$1"
     shift
     local server_args="$*"
-    
+
     stop_server
     start_server "$test_name" $server_args
+}
+
+# =============================================================================
+# Cluster Management Functions
+# =============================================================================
+
+# Start a cluster of OCache nodes
+# Usage: start_cluster <test_name> <num_nodes> <base_grpc_port> <base_cluster_port> <cleanup> [additional_server_args...]
+start_cluster() {
+    local test_name="$1"
+    local num_nodes="$2"
+    local base_grpc_port="$3"
+    local base_cluster_port="$4"
+    local cleanup="$5"
+    shift 5
+    local additional_args="$*"
+
+    local test_dir="/tmp/ocache-${test_name}-test"
+    CLEANUP_DIRS+=("$test_dir")
+
+    echo "Starting ${num_nodes}-node OCache cluster for ${test_name} test..."
+
+    # Cleanup any previous test data
+    if [ "$cleanup" = "true" ]; then
+        rm -rf "$test_dir"
+    fi
+
+    # Build seeds list for all nodes
+    local seeds=""
+    for i in $(seq 1 "$num_nodes"); do
+        local cluster_port=$((base_cluster_port + i - 1))
+        if [ -n "$seeds" ]; then
+            seeds="${seeds},localhost:${cluster_port}"
+        else
+            seeds="localhost:${cluster_port}"
+        fi
+    done
+
+    # Start each node
+    CLUSTER_PIDS=()
+    for i in $(seq 1 "$num_nodes"); do
+        local node_id="node${i}"
+        local grpc_port=$((base_grpc_port + i - 1))
+        local http_port=$((grpc_port + 100))
+        local cluster_port=$((base_cluster_port + i - 1))
+        local node_disk="${test_dir}/${node_id}"
+
+        mkdir -p "$node_disk"
+
+        echo "  Starting ${node_id} on gRPC port ${grpc_port}, HTTP port ${http_port}, cluster port ${cluster_port}..."
+
+        ./ocache \
+            -cluster-enabled \
+            -node-id "$node_id" \
+            -listen-addr ":${grpc_port}" \
+            -listen-http ":${http_port}" \
+            -cluster-addr ":${cluster_port}" \
+            -seeds "$seeds" \
+            -disk "$node_disk" \
+            $additional_args &
+
+        local pid=$!
+        CLUSTER_PIDS+=($pid)
+
+        sleep 1
+
+        # Check if node started successfully
+        if ! kill -0 $pid 2>/dev/null; then
+            echo -e "${RED}ERROR: Node ${node_id} failed to start${NC}"
+            stop_cluster
+            exit 1
+        fi
+
+        echo -e "${GREEN}  Node ${node_id} started with PID: $pid${NC}"
+    done
+
+    echo
+    echo "Waiting for cluster to stabilize..."
+    sleep 5
+
+    # Test connectivity to first node with timeout
+    local first_port=$((base_grpc_port))
+    if ! timeout 10 ./ocachecli --addr "localhost:${first_port}" list >/dev/null 2>&1; then
+        echo -e "${RED}ERROR: Cannot connect to cluster${NC}"
+        stop_cluster
+        exit 1
+    fi
+
+    echo -e "${GREEN}Cluster started successfully with ${num_nodes} nodes${NC}"
+    echo
+}
+
+# Stop all cluster nodes gracefully with timeout
+stop_cluster() {
+    if [ ${#CLUSTER_PIDS[@]} -eq 0 ]; then
+        return
+    fi
+
+    echo "Stopping cluster nodes..."
+
+    for pid in "${CLUSTER_PIDS[@]}"; do
+        if [ -n "$pid" ] && kill -0 $pid 2>/dev/null; then
+            kill $pid 2>/dev/null || true
+        fi
+    done
+
+    # Wait for all nodes to stop with timeout
+    local wait_count=0
+    local all_stopped=false
+    while [ $wait_count -lt 10 ]; do
+        local running=0
+        for pid in "${CLUSTER_PIDS[@]}"; do
+            if kill -0 $pid 2>/dev/null; then
+                ((running++))
+            fi
+        done
+
+        if [ $running -eq 0 ]; then
+            all_stopped=true
+            break
+        fi
+
+        sleep 1
+        ((wait_count++))
+    done
+
+    if [ "$all_stopped" = false ]; then
+        echo "Warning: Some nodes didn't stop gracefully, force killing"
+        for pid in "${CLUSTER_PIDS[@]}"; do
+            kill -9 $pid 2>/dev/null || true
+        done
+    fi
+
+    CLUSTER_PIDS=()
+}
+
+# Get cluster addresses as comma-separated string
+# Usage: get_cluster_addrs <base_grpc_port> <num_nodes>
+get_cluster_addrs() {
+    local base_port="$1"
+    local num_nodes="$2"
+
+    local addrs=""
+    for i in $(seq 1 "$num_nodes"); do
+        local port=$((base_port + i - 1))
+        if [ -n "$addrs" ]; then
+            addrs="${addrs},localhost:${port}"
+        else
+            addrs="localhost:${port}"
+        fi
+    done
+
+    echo "$addrs"
 }
 
 # =============================================================================
@@ -370,17 +524,20 @@ delete_key() {
 cleanup_common() {
     echo
     echo "Cleaning up..."
-    
+
     # Stop server if running
     stop_server
-    
+
+    # Stop cluster if running
+    stop_cluster
+
     # Clean up test directories
     for dir in "${CLEANUP_DIRS[@]}"; do
         if [ -d "$dir" ]; then
             rm -rf "$dir"
         fi
     done
-    
+
     # Clean up any temp files
     rm -f /tmp/ocache-*-errors-* /tmp/keys-*.txt /tmp/checksums-*.txt
 }
