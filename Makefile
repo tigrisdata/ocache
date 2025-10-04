@@ -279,6 +279,7 @@ test-e2e: build build-cli
 	@$(MAKE) test-e2e-compaction
 	@$(MAKE) test-e2e-recompaction
 	@$(MAKE) test-e2e-data-validation
+	@$(MAKE) test-e2e-cluster
 
 .PHONY: test-e2e-concurrent
 test-e2e-concurrent: build build-cli
@@ -314,6 +315,11 @@ test-e2e-recompaction: build build-cli
 test-e2e-data-validation: build build-cli
 	@echo "Running comprehensive data validation E2E test..."
 	./tests/e2e/data_validation_test.sh
+
+.PHONY: test-e2e-cluster
+test-e2e-cluster: build build-cli
+	@echo "Running cluster mode concurrent operations E2E test..."
+	./tests/e2e/cluster_concurrent_ops_test.sh
 
 .PHONY: test-integration
 test-integration: proto
@@ -458,6 +464,7 @@ help:
 	@echo "  test-race                   - Run tests with race detector"
 	@echo "  test-coverage               - Run tests with coverage report"
 	@echo "  test-e2e                    - Run end-to-end tests"
+	@echo "  test-e2e-cluster            - Run cluster mode E2E tests"
 	@echo "  test-integration            - Run integration tests (storage layer)"
 	@echo "  test-integration-short      - Run integration tests in short mode"
 	@echo "  test-integration-objects    - Run small, medium, and large objects integration tests"

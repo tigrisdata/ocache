@@ -147,3 +147,6 @@ jobs:
 
       - name: Run recompaction E2E test
         run: STATIC_BUILD=true make test-e2e-recompaction
+
+      - name: Run cluster mode concurrent operations E2E test
+        run: STATIC_BUILD=true make test-e2e-cluster
