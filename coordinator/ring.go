@@ -214,14 +214,17 @@ func (r *Ring) UpdateNodeStatus(id string, status NodeStatus) error {
 
 // GetNode returns the available node that owns the key.
 // Returns error if owner is unavailable.
+// Optimized to minimize lock hold time by doing hash lookup lock-free
 func (r *Ring) GetNode(key string) (*NodeInfo, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+	// Lock-free hash lookup (consistent hash library is thread-safe)
 	member := r.ch.LocateKey([]byte(key))
 	if member == nil {
 		return nil, fmt.Errorf("no node available for key %s", key)
 	}
+
+	// Only take lock for node registry access and availability check
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	node, exists := r.nodes[member.String()]
 	if !exists {
@@ -328,12 +331,15 @@ func (r *Ring) GetEpoch() uint64 {
 }
 
 // IsLocal checks if the local node is the owner of the key
+// This is a hot path function - optimized to be lock-free
 func (r *Ring) IsLocal(key string) bool {
-	node, err := r.GetPrimaryNode(key)
-	if err != nil {
+	// Lock-free ownership check using thread-safe LocateKey
+	// The consistent hash library handles its own synchronization
+	member := r.ch.LocateKey([]byte(key))
+	if member == nil {
 		return false
 	}
-	return node.ID == r.localNodeID
+	return member.String() == r.localNodeID
 }
 
 // IsNodeAvailable checks if a specific node is available

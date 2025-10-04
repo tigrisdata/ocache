@@ -772,6 +772,11 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	c.failureCount[req.NodeId] = 0
 	c.mu.Unlock()
 
+	// Warm up connection to the new node if it's a genuinely new addition
+	if isNewNode {
+		c.router.WarmUpConnections()
+	}
+
 	// Check if we should broadcast this join
 	// We broadcast only if:
 	// 1. This is genuinely a new node (not already in ring)
@@ -819,6 +824,9 @@ func (c *Coordinator) Leave(ctx context.Context, req *clusterpb.LeaveRequest) (*
 	delete(c.lastHeartbeat, req.NodeId)
 	delete(c.failureCount, req.NodeId)
 	c.mu.Unlock()
+
+	// Clean up router connection to the removed node
+	c.router.RemoveClient(req.NodeId)
 
 	return &clusterpb.LeaveResponse{
 		Success: true,

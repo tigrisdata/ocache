@@ -442,6 +442,43 @@ func (r *Router) RefreshConnections() {
 	}
 }
 
+// WarmUpConnections pre-creates connections to all active nodes asynchronously
+// This eliminates first-request latency by establishing connections proactively
+// Runs in background to avoid blocking the caller
+func (r *Router) WarmUpConnections() {
+	activeNodes := r.ring.GetActiveNodes()
+
+	zlog.Debug().
+		Int("node_count", len(activeNodes)).
+		Msg("Starting connection warm-up to active nodes")
+
+	// Warm up connections asynchronously to avoid blocking
+	go func() {
+		for _, node := range activeNodes {
+			// Skip local node
+			if node.ID == r.localID {
+				continue
+			}
+
+			// Try to get/create client connection
+			// This will create the connection if it doesn't exist
+			_, err := r.getClient(node.ID)
+			if err != nil {
+				zlog.Debug().
+					Err(err).
+					Str("node_id", node.ID).
+					Str("address", node.ListenAddress).
+					Msg("Failed to warm up connection to node (will retry on first request)")
+			} else {
+				zlog.Debug().
+					Str("node_id", node.ID).
+					Str("address", node.ListenAddress).
+					Msg("Warmed up connection to node")
+			}
+		}
+	}()
+}
+
 // GetConnectionStats returns statistics about current connections
 func (r *Router) GetConnectionStats() map[string]ConnectionStats {
 	r.mu.RLock()
