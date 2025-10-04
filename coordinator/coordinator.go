@@ -772,11 +772,6 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 	c.failureCount[req.NodeId] = 0
 	c.mu.Unlock()
 
-	// Warm up connection to the new node if it's a genuinely new addition
-	if isNewNode {
-		c.router.WarmUpConnections()
-	}
-
 	// Check if we should broadcast this join
 	// We broadcast only if:
 	// 1. This is genuinely a new node (not already in ring)
