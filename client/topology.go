@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/buraksezer/consistent"
@@ -140,14 +139,15 @@ func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr st
 
 // UpdateTopology updates the internal state based on new topology
 func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (map[string]bool, bool) {
+	// Check if RingConfig changed (under RLock)
+	tm.mu.RLock()
+
 	// Check if topology has changed (use atomic load for consistency)
-	currentEpoch := atomic.LoadUint64(&tm.topologyEpoch)
-	if currentEpoch >= topology.Epoch {
+	if tm.topologyEpoch >= topology.Epoch {
+		tm.mu.RUnlock()
 		return nil, false // No change
 	}
 
-	// Check if RingConfig changed (under RLock)
-	tm.mu.RLock()
 	currentTopology := tm.topology
 	ringConfigChanged := currentTopology == nil ||
 		currentTopology.RingConfig.PartitionCount != topology.RingConfig.PartitionCount ||
@@ -201,6 +201,7 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		tm.ring = newRing
 		tm.partitionOwners = partitionOwners
 		tm.topology = topology
+		tm.topologyEpoch = topology.Epoch
 		tm.mu.Unlock()
 
 	} else {
@@ -229,11 +230,9 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		tm.mu.Lock()
 		tm.partitionOwners = partitionOwners
 		tm.topology = topology
+		tm.topologyEpoch = topology.Epoch
 		tm.mu.Unlock()
 	}
-
-	// Atomically update epoch
-	atomic.StoreUint64(&tm.topologyEpoch, topology.Epoch)
 
 	return activeNodes, true
 }
@@ -256,7 +255,9 @@ func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
 
 // GetTopologyEpoch returns the current topology epoch
 func (tm *TopologyManager) GetTopologyEpoch() uint64 {
-	return atomic.LoadUint64(&tm.topologyEpoch)
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.topologyEpoch
 }
 
 // GetPartitionOwner returns the node ID that owns the given partition
@@ -281,6 +282,12 @@ func (tm *TopologyManager) GetNodeAddresses() map[string]string {
 		result[v.nodeID] = v.address
 	}
 	return result
+}
+
+func (tm *TopologyManager) GetRing() *consistent.Consistent {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.ring
 }
 
 // TopologyRefreshLoop periodically refreshes the cluster topology

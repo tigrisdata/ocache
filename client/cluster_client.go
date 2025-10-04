@@ -391,7 +391,7 @@ func (c *ClusterClient) GetPartitionOwnerID(partitionID int32) string {
 
 // GetRing returns the consistent hash ring
 func (c *ClusterClient) HasRing() bool {
-	return c.topology.ring != nil
+	return c.topology.GetRing() != nil
 }
 
 // FetchTopology fetches the current topology (exposed for testing)
