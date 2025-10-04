@@ -50,7 +50,13 @@ func NewCleaner(storage *Storage, interval time.Duration, maxDiskUsage int64) *C
 }
 
 // Start launches the background cleanup goroutine
+// It performs an initial size calculation synchronously to establish accurate baseline
+// before any concurrent operations can modify the size
 func (c *Cleaner) Start() {
+	// Calculate initial size synchronously to avoid race with concurrent puts
+	c.calculateTotalSize()
+	c.initialized.Store(true)
+
 	c.wg.Add(1)
 	go c.cleanupLoop()
 }
@@ -85,10 +91,6 @@ func (c *Cleaner) cleanupLoop() {
 
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
-
-	// Run initial size calculation
-	c.calculateTotalSize()
-	c.initialized.Store(true)
 
 	// Track when we last cleaned up old buckets
 	lastBucketCleanup := time.Now()
