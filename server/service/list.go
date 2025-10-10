@@ -330,6 +330,9 @@ func (s *CacheService) kWayMerge(ctx context.Context, nodeResponses map[string]*
 				done:   false,
 			})
 			nodeIndices[nodeID] = 0
+		} else {
+			// Initialize index even for empty responses to track HasMore state
+			nodeIndices[nodeID] = -1
 		}
 	}
 
@@ -348,14 +351,16 @@ func (s *CacheService) kWayMerge(ctx context.Context, nodeResponses map[string]*
 		// Pop minimum key
 		minNode := heap.Pop(h).(*heapNode)
 
-		// Deduplicate (shouldn't happen with proper partitioning)
+		// Always update cursor for this node (even if duplicate)
+		nodeCursors[minNode.nodeID] = minNode.key
+
+		// Deduplicate (shouldn't happen with proper partitioning, but handle it)
+		addedToResult := false
 		if !seenKeys[minNode.key] {
 			result = append(result, minNode.key)
 			seenKeys[minNode.key] = true
+			addedToResult = true
 		}
-
-		// Update cursor for this node
-		nodeCursors[minNode.nodeID] = minNode.key
 
 		// Try to get next key from this node's response
 		nodeResp := nodeResponses[minNode.nodeID]
@@ -375,6 +380,13 @@ func (s *CacheService) kWayMerge(ctx context.Context, nodeResponses map[string]*
 			// The continuation token is already in nodeResp.ContinuationToken
 			// We'll use it for the next page request
 		}
+
+		// If we hit limit due to a duplicate key, continue to fill up to limit
+		// This ensures we always return 'limit' unique keys when available
+		if !addedToResult && len(result) >= limit {
+			// We skipped a duplicate but already have enough results
+			break
+		}
 	}
 
 	// Determine if there are more keys available
@@ -388,7 +400,9 @@ func (s *CacheService) kWayMerge(ctx context.Context, nodeResponses map[string]*
 		for nodeID, nodeResp := range nodeResponses {
 			if nodeResp.HasMore {
 				// Check if we've consumed all keys from this node
-				if nodeIndices[nodeID] >= len(nodeResp.Keys)-1 {
+				// nodeIndices[nodeID] could be -1 (empty response) or the last index
+				idx, exists := nodeIndices[nodeID]
+				if !exists || idx >= len(nodeResp.Keys)-1 {
 					hasMore = true
 					// Update cursor to the continuation token from the node
 					if nodeResp.ContinuationToken != "" {

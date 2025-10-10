@@ -438,13 +438,6 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 		// Extract the original user key
 		userKey := keys.ExtractUserKey(k)
 
-		// For prefix filtering, ensure key actually starts with prefix
-		if userPrefix != "" && !bytes.HasPrefix([]byte(userKey), []byte(userPrefix)) {
-			it.Key().Free()
-			it.Value().Free()
-			break
-		}
-
 		keyList = append(keyList, userKey)
 		lastKey = userKey
 
