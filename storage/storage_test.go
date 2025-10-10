@@ -555,3 +555,295 @@ func TestStorage_Get_ByteRange_PartialReads(t *testing.T) {
 
 	assert.Equal(t, "abcdefghijklmnopqrst", string(result), "Partial reads returned wrong data")
 }
+
+func TestStorage_ListKeysWithPagination_Basic(t *testing.T) {
+	// Test basic pagination with default limit
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Create 50 keys
+	keyCount := 50
+	for i := 0; i < keyCount; i++ {
+		key := "key-" + string(rune('a'+i/26)) + string(rune('a'+i%26))
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err, "Put failed for %s", key)
+	}
+
+	// Get first page with limit 10
+	keys, lastKey, hasMore, err := s.ListKeysWithPagination("", "", 10)
+	assert.NoError(t, err, "ListKeysWithPagination failed")
+	assert.Len(t, keys, 10, "should return 10 keys")
+	assert.True(t, hasMore, "should have more keys")
+	assert.NotEmpty(t, lastKey, "lastKey should not be empty when hasMore=true")
+
+	// Verify keys are sorted
+	for i := 1; i < len(keys); i++ {
+		assert.LessOrEqual(t, keys[i-1], keys[i], "keys should be in sorted order")
+	}
+}
+
+func TestStorage_ListKeysWithPagination_WithPrefix(t *testing.T) {
+	// Test pagination with prefix filtering
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Create keys with different prefixes
+	prefixes := []string{"user-", "session-", "cache-"}
+	for _, prefix := range prefixes {
+		for i := 0; i < 15; i++ {
+			key := prefix + string(rune('a'+i))
+			err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+			assert.NoError(t, err, "Put failed for %s", key)
+		}
+	}
+
+	// List only "user-" prefix with pagination
+	keys, lastKey, hasMore, err := s.ListKeysWithPagination("user-", "", 10)
+	assert.NoError(t, err, "ListKeysWithPagination failed")
+	assert.Len(t, keys, 10, "should return 10 keys")
+	assert.True(t, hasMore, "should have more user- keys")
+	assert.NotEmpty(t, lastKey, "lastKey should not be empty")
+
+	// Verify all keys have the prefix
+	for _, key := range keys {
+		assert.True(t, len(key) >= 5 && key[:5] == "user-", "all keys should have user- prefix")
+	}
+
+	// Get next page
+	keys2, lastKey2, hasMore2, err := s.ListKeysWithPagination("user-", lastKey, 10)
+	assert.NoError(t, err, "ListKeysWithPagination failed for page 2")
+	assert.Len(t, keys2, 5, "should return remaining 5 keys")
+	assert.False(t, hasMore2, "should not have more keys")
+	assert.Empty(t, lastKey2, "lastKey should be empty when hasMore=false")
+
+	// Verify no overlap between pages
+	firstPageMap := make(map[string]bool)
+	for _, k := range keys {
+		firstPageMap[k] = true
+	}
+	for _, k := range keys2 {
+		assert.False(t, firstPageMap[k], "pages should not overlap: key %s in both pages", k)
+	}
+}
+
+func TestStorage_ListKeysWithPagination_ContinuationToken(t *testing.T) {
+	// Test that continuation token (startKey) works correctly
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Create 30 keys
+	for i := 0; i < 30; i++ {
+		key := "item-" + string(rune('a'+i))
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err, "Put failed for %s", key)
+	}
+
+	// Get first page
+	page1, lastKey1, hasMore1, err := s.ListKeysWithPagination("", "", 10)
+	assert.NoError(t, err)
+	assert.Len(t, page1, 10)
+	assert.True(t, hasMore1)
+
+	// Get second page using continuation token
+	page2, lastKey2, hasMore2, err := s.ListKeysWithPagination("", lastKey1, 10)
+	assert.NoError(t, err)
+	assert.Len(t, page2, 10)
+	assert.True(t, hasMore2)
+
+	// Get third page
+	page3, lastKey3, hasMore3, err := s.ListKeysWithPagination("", lastKey2, 10)
+	assert.NoError(t, err)
+	assert.Len(t, page3, 10)
+	assert.False(t, hasMore3)
+	assert.Empty(t, lastKey3)
+
+	// Verify ordering continues across pages
+	assert.Less(t, page1[len(page1)-1], page2[0], "page 2 should start after page 1")
+	assert.Less(t, page2[len(page2)-1], page3[0], "page 3 should start after page 2")
+}
+
+func TestStorage_ListKeysWithPagination_LimitValidation(t *testing.T) {
+	// Test limit validation and defaults
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Create some keys
+	for i := 0; i < 5; i++ {
+		key := "test-" + string(rune('a'+i))
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err)
+	}
+
+	// Test with limit 0 (should use default 1000)
+	keys, _, _, err := s.ListKeysWithPagination("", "", 0)
+	assert.NoError(t, err)
+	assert.Len(t, keys, 5, "should return all 5 keys with default limit")
+
+	// Test with limit exceeding max (should cap at 1000)
+	keys, _, _, err = s.ListKeysWithPagination("", "", 2000)
+	assert.NoError(t, err)
+	assert.Len(t, keys, 5, "should return all keys, capped to max limit")
+
+	// Test with negative limit (should use default 1000)
+	keys, _, _, err = s.ListKeysWithPagination("", "", -5)
+	assert.NoError(t, err)
+	assert.Len(t, keys, 5, "should return all keys with default limit")
+}
+
+func TestStorage_ListKeysWithPagination_EmptyResults(t *testing.T) {
+	// Test pagination with no matching keys
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Add keys with different prefix
+	err := s.Put("foo-1", bytes.NewReader([]byte("value")), 0)
+	assert.NoError(t, err)
+
+	// Query with non-existent prefix
+	keys, lastKey, hasMore, err := s.ListKeysWithPagination("bar-", "", 10)
+	assert.NoError(t, err, "ListKeysWithPagination should not error on empty results")
+	assert.Empty(t, keys, "should return empty keys")
+	assert.False(t, hasMore, "should not have more")
+	assert.Empty(t, lastKey, "lastKey should be empty")
+}
+
+func TestStorage_ListKeysWithPagination_SkipsExpiredKeys(t *testing.T) {
+	// Test that pagination skips expired keys without including them in the count
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Add permanent keys
+	for i := 0; i < 5; i++ {
+		key := "perm-" + string(rune('a'+i))
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err)
+	}
+
+	// Add expiring keys
+	for i := 0; i < 5; i++ {
+		key := "temp-" + string(rune('a'+i))
+		err := s.Put(key, bytes.NewReader([]byte("value")), 1) // 1 second TTL
+		assert.NoError(t, err)
+	}
+
+	// Wait for expiration
+	time.Sleep(2 * time.Second)
+
+	// List all keys - should only return permanent keys
+	keys, lastKey, hasMore, err := s.ListKeysWithPagination("", "", 100)
+	assert.NoError(t, err)
+	assert.Len(t, keys, 5, "should return only non-expired keys")
+	assert.False(t, hasMore, "should not have more keys")
+	assert.Empty(t, lastKey, "lastKey should be empty")
+
+	// Verify no expired keys in results
+	for _, key := range keys {
+		assert.True(t, len(key) >= 5 && key[:5] == "perm-", "should only contain permanent keys")
+	}
+}
+
+func TestStorage_ListKeysWithPagination_SkipsInternalKeys(t *testing.T) {
+	// Test that pagination skips internal keys
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Add user keys
+	userKeys := []string{"user-a", "user-b", "user-c"}
+	for _, key := range userKeys {
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err)
+	}
+
+	// Directly add internal keys
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	s.meta.Handle().Put(wo, []byte("!access/user-a"), []byte("12345678"))
+	s.meta.Handle().Put(wo, []byte("!compact/00000000000000000001|user-b"), []byte("/path"))
+
+	// List should only return user keys
+	keys, _, _, err := s.ListKeysWithPagination("", "", 100)
+	assert.NoError(t, err)
+	assert.Len(t, keys, len(userKeys), "should return only user keys")
+
+	for _, expected := range userKeys {
+		assert.Contains(t, keys, expected, "should contain user key %s", expected)
+	}
+}
+
+func TestStorage_ListKeysWithPagination_SortOrder(t *testing.T) {
+	// Test that keys are returned in lexicographic order
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Add keys in random order
+	unorderedKeys := []string{"zebra", "apple", "mango", "banana", "kiwi"}
+	for _, key := range unorderedKeys {
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err)
+	}
+
+	// List all keys
+	keys, _, _, err := s.ListKeysWithPagination("", "", 100)
+	assert.NoError(t, err)
+	assert.Len(t, keys, len(unorderedKeys))
+
+	// Verify sorted order
+	expectedOrder := []string{"apple", "banana", "kiwi", "mango", "zebra"}
+	assert.Equal(t, expectedOrder, keys, "keys should be in lexicographic order")
+}
+
+func TestStorage_ListKeysWithPagination_MultiPage(t *testing.T) {
+	// Test paginating through many keys
+	s, cleanup := createTestStorageWithDefaults(t)
+	defer cleanup()
+
+	// Create 100 keys
+	keyCount := 100
+	expectedKeys := make([]string, keyCount)
+	for i := 0; i < keyCount; i++ {
+		key := "key-" + string(rune('a'+i/26)) + string(rune('a'+i%26))
+		expectedKeys[i] = key
+		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
+		assert.NoError(t, err)
+	}
+
+	// Paginate through all keys
+	var allKeys []string
+	continuationToken := ""
+	pageCount := 0
+	pageSize := 15
+
+	for {
+		keys, lastKey, hasMore, err := s.ListKeysWithPagination("", continuationToken, pageSize)
+		assert.NoError(t, err)
+
+		pageCount++
+		allKeys = append(allKeys, keys...)
+
+		if !hasMore {
+			break
+		}
+
+		assert.NotEmpty(t, lastKey, "lastKey should not be empty when hasMore=true")
+		continuationToken = lastKey
+	}
+
+	// Verify we got all keys
+	assert.Len(t, allKeys, keyCount, "should receive all keys across pages")
+
+	// Verify no duplicates
+	keyMap := make(map[string]int)
+	for _, key := range allKeys {
+		keyMap[key]++
+	}
+	for key, count := range keyMap {
+		assert.Equal(t, 1, count, "key %s should appear only once", key)
+	}
+
+	// Verify global sort order
+	for i := 1; i < len(allKeys); i++ {
+		assert.LessOrEqual(t, allKeys[i-1], allKeys[i], "keys should be in sorted order across pages")
+	}
+
+	t.Logf("Successfully paginated through %d keys in %d pages (page size %d)", keyCount, pageCount, pageSize)
+}

@@ -12,6 +12,7 @@ type CacheClient interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Delete(ctx context.Context, key string) error
 	List(ctx context.Context, prefix string) ([]string, error)
+	ListPage(ctx context.Context, prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error)
 
 	// Streaming operations
 	PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error

@@ -54,8 +54,12 @@ func (m *mockRouterCacheService) Delete(ctx context.Context, req *pb.DeleteReque
 	return &pb.DeleteResponse{Success: true}, nil
 }
 
-func (m *mockRouterCacheService) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
-	return stream.Send(&pb.ListResponse{Keys: []string{"key1", "key2"}})
+func (m *mockRouterCacheService) List(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
+	return &pb.ListResponse{Keys: []string{"key1", "key2"}}, nil
+}
+
+func (m *mockRouterCacheService) ListLocal(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
+	return &pb.ListResponse{Keys: []string{"key1", "key2"}}, nil
 }
 
 func startMockRouterServer(t *testing.T, nodeID string) (string, string, *grpc.Server, *grpc.Server, *mockRouterClusterService, *mockRouterCacheService) {

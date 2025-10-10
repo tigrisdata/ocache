@@ -230,3 +230,159 @@ func (s *ClusterSuite) Test_WorkloadDistribution_MixedOperations() {
 	assert.Equal(s.T(), int64(keyCount), totalReads, "Total reads should match")
 	assert.Equal(s.T(), int64(deleteCount), totalDeletes, "Total deletes should match")
 }
+
+// Test_ClusterList_BasicOperation verifies List operation aggregates keys across all cluster nodes
+func (s *ClusterSuite) Test_ClusterList_BasicOperation() {
+	clusterHarness, ok := s.Harness.(*ClusterTestHarness)
+	if !ok {
+		s.T().Skip("Test requires ClusterTestHarness")
+	}
+
+	// Write keys distributed across nodes
+	keyCount := 300
+	keyPrefix := "list-test-"
+	data := GenerateRandomData(1024) // 1KB objects
+
+	expectedKeys := make(map[string]bool)
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%04d", keyPrefix, i)
+		expectedKeys[key] = true
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(s.T(), err)
+	}
+
+	s.T().Logf("Created %d keys with prefix '%s'", keyCount, keyPrefix)
+
+	// Verify keys are distributed across nodes
+	distribution, err := clusterHarness.VerifyKeyDistribution(keysFromMap(expectedKeys))
+	require.NoError(s.T(), err)
+
+	nodeCount := len(distribution)
+	require.Greater(s.T(), nodeCount, 1, "Keys should be distributed across multiple nodes")
+
+	s.T().Logf("Keys distributed across %d nodes:", nodeCount)
+	for nodeID, keys := range distribution {
+		s.T().Logf("  Node %s: %d keys", nodeID, len(keys))
+	}
+
+	// List all keys with prefix
+	listedKeys, err := s.Harness.List(keyPrefix)
+	require.NoError(s.T(), err)
+
+	// Verify all keys were returned
+	assert.Len(s.T(), listedKeys, keyCount, "Should list all keys from all nodes")
+
+	// Verify each expected key is in the result
+	listedKeyMap := make(map[string]bool)
+	for _, key := range listedKeys {
+		listedKeyMap[key] = true
+	}
+
+	for expectedKey := range expectedKeys {
+		assert.True(s.T(), listedKeyMap[expectedKey], "Expected key %s should be in list results", expectedKey)
+	}
+
+	// Verify no extra keys
+	for listedKey := range listedKeyMap {
+		assert.True(s.T(), expectedKeys[listedKey], "Listed key %s should be in expected keys", listedKey)
+	}
+
+	// Verify keys are in sorted order
+	for i := 1; i < len(listedKeys); i++ {
+		assert.LessOrEqual(s.T(), listedKeys[i-1], listedKeys[i],
+			"Keys should be in sorted order: %s should be <= %s", listedKeys[i-1], listedKeys[i])
+	}
+
+	s.T().Logf("Successfully listed %d keys across %d nodes in sorted order", len(listedKeys), nodeCount)
+}
+
+// Test_ClusterList_Pagination verifies pagination works correctly across cluster nodes
+func (s *ClusterSuite) Test_ClusterList_Pagination() {
+	_, ok := s.Harness.(*ClusterTestHarness)
+	if !ok {
+		s.T().Skip("Test requires ClusterTestHarness")
+	}
+
+	// Write 2000 keys to force pagination (default page size is 1000)
+	keyCount := 2000
+	keyPrefix := "page-test-"
+	data := GenerateRandomData(512)
+
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%05d", keyPrefix, i)
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(s.T(), err)
+	}
+
+	s.T().Logf("Created %d keys for pagination test", keyCount)
+
+	// Use pagination to get all keys
+	var allKeys []string
+	continuationToken := ""
+	pageCount := 0
+
+	for {
+		keys, token, hasMore, err := s.Harness.ListPage(keyPrefix, 1000, continuationToken)
+		require.NoError(s.T(), err)
+
+		pageCount++
+		s.T().Logf("Page %d: received %d keys, hasMore=%v", pageCount, len(keys), hasMore)
+
+		allKeys = append(allKeys, keys...)
+
+		if !hasMore {
+			break
+		}
+
+		require.NotEmpty(s.T(), token, "Continuation token should not be empty when hasMore=true")
+		continuationToken = token
+	}
+
+	// Verify we got all keys
+	assert.Len(s.T(), allKeys, keyCount, "Should receive all keys across pages")
+
+	// Verify keys are globally sorted across pages
+	for i := 1; i < len(allKeys); i++ {
+		assert.LessOrEqual(s.T(), allKeys[i-1], allKeys[i],
+			"Keys should be in sorted order across pages: %s should be <= %s", allKeys[i-1], allKeys[i])
+	}
+
+	s.T().Logf("Successfully paginated through %d keys in %d pages, maintaining global sort order", keyCount, pageCount)
+}
+
+// Test_ClusterList_EmptyPrefix verifies List with empty prefix returns all keys
+func (s *ClusterSuite) Test_ClusterList_EmptyPrefix() {
+	_, ok := s.Harness.(*ClusterTestHarness)
+	if !ok {
+		s.T().Skip("Test requires ClusterTestHarness")
+	}
+
+	// Write some keys
+	keys := []string{"alpha-1", "beta-2", "gamma-3", "delta-4"}
+	data := GenerateRandomData(512)
+
+	for _, key := range keys {
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(s.T(), err)
+	}
+
+	// List all keys (empty prefix)
+	allKeys, err := s.Harness.List("")
+	require.NoError(s.T(), err)
+
+	// Should contain at least our keys (may contain more from other tests)
+	s.T().Logf("Listed %d total keys with empty prefix", len(allKeys))
+
+	for _, expectedKey := range keys {
+		assert.Contains(s.T(), allKeys, expectedKey, "All keys should be listed with empty prefix")
+	}
+}
+
+// Helper function to convert map keys to slice
+func keysFromMap(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}

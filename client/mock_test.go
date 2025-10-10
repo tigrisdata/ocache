@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -247,11 +248,11 @@ func (m *mockCacheServiceServer) Delete(ctx context.Context, req *pb.DeleteReque
 	return &pb.DeleteResponse{Success: true}, nil
 }
 
-func (m *mockCacheServiceServer) List(req *pb.ListRequest, stream pb.CacheService_ListServer) error {
+func (m *mockCacheServiceServer) List(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
 	m.listCallCount.Add(1)
 
 	if m.listError != nil {
-		return m.listError
+		return nil, m.listError
 	}
 
 	m.dataMu.RLock()
@@ -264,19 +265,51 @@ func (m *mockCacheServiceServer) List(req *pb.ListRequest, stream pb.CacheServic
 		}
 	}
 
-	// Send keys in batches
-	batchSize := 10
-	for i := 0; i < len(keys); i += batchSize {
-		end := i + batchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-		if err := stream.Send(&pb.ListResponse{Keys: keys[i:end]}); err != nil {
-			return err
+	// Sort keys to match real behavior
+	sort.Strings(keys)
+
+	// Apply pagination
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = 1000
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	startIdx := 0
+	if req.StartKey != "" {
+		// Find first key after startKey
+		for i, k := range keys {
+			if k > req.StartKey {
+				startIdx = i
+				break
+			}
 		}
 	}
 
-	return nil
+	endIdx := startIdx + limit
+	hasMore := endIdx < len(keys)
+	if endIdx > len(keys) {
+		endIdx = len(keys)
+	}
+
+	resultKeys := keys[startIdx:endIdx]
+	var continuationToken string
+	if hasMore && len(resultKeys) > 0 {
+		continuationToken = resultKeys[len(resultKeys)-1]
+	}
+
+	return &pb.ListResponse{
+		Keys:              resultKeys,
+		ContinuationToken: continuationToken,
+		HasMore:           hasMore,
+	}, nil
+}
+
+// ListLocal is identical to List for the mock
+func (m *mockCacheServiceServer) ListLocal(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
+	return m.List(ctx, req)
 }
 
 // SetClusterTopology safely sets the cluster topology

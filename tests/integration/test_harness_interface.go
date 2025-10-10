@@ -12,6 +12,10 @@ type TestHarnessInterface interface {
 	GetObject(key string) ([]byte, error)
 	DeleteObject(key string) error
 
+	// List operations
+	List(prefix string) ([]string, error)
+	ListPage(prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error)
+
 	// Storage inspection
 	GetStorageStats() StorageStats
 

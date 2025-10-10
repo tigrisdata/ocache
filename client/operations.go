@@ -283,7 +283,15 @@ func (o *Operations) Delete(ctx context.Context, key string) error {
 }
 
 // List lists keys with optional prefix
+// Returns all keys matching the prefix (automatically handles pagination)
 func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) {
+	return o.ListWithLimit(ctx, prefix, 0) // 0 means get all keys
+}
+
+// ListWithLimit lists keys with optional prefix and limit
+// If limit is 0, returns all keys (automatically paginates)
+// If limit > 0, returns at most that many keys
+func (o *Operations) ListWithLimit(ctx context.Context, prefix string, limit int) ([]string, error) {
 	conn, err := o.router.RoundRobinRoute()
 	if err != nil {
 		return nil, err
@@ -294,12 +302,14 @@ func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) 
 		return nil, fmt.Errorf("no healthy connections available")
 	}
 
-	stream, err := client.List(ctx, &pb.ListRequest{Prefix: prefix})
-	if err != nil {
-		return nil, err
+	var allKeys []string
+	continuationToken := ""
+	pageLimit := int32(1000) // Max page size
+	if limit > 0 && limit < 1000 {
+		pageLimit = int32(limit)
 	}
 
-	var keys []string
+	// Paginate through all results
 	for {
 		select {
 		case <-ctx.Done():
@@ -307,14 +317,62 @@ func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) 
 		default:
 		}
 
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
+		req := &pb.ListRequest{
+			Prefix:            prefix,
+			Limit:             pageLimit,
+			ContinuationToken: continuationToken,
 		}
+
+		resp, err := client.List(ctx, req)
 		if err != nil {
 			return nil, err
 		}
-		keys = append(keys, resp.Keys...)
+
+		allKeys = append(allKeys, resp.Keys...)
+
+		// Check if we've reached the desired limit
+		if limit > 0 && len(allKeys) >= limit {
+			return allKeys[:limit], nil
+		}
+
+		// Check if there are more pages
+		if !resp.HasMore || resp.ContinuationToken == "" {
+			break
+		}
+
+		continuationToken = resp.ContinuationToken
 	}
-	return keys, nil
+
+	return allKeys, nil
+}
+
+// ListPage returns a single page of keys with pagination support
+// Returns: (keys, continuationToken, hasMore, error)
+func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, continuationToken string) ([]string, string, bool, error) {
+	conn, err := o.router.RoundRobinRoute()
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	client := conn.getClient()
+	if client == nil {
+		return nil, "", false, fmt.Errorf("no healthy connections available")
+	}
+
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	req := &pb.ListRequest{
+		Prefix:            prefix,
+		Limit:             int32(limit),
+		ContinuationToken: continuationToken,
+	}
+
+	resp, err := client.List(ctx, req)
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	return resp.Keys, resp.ContinuationToken, resp.HasMore, nil
 }
