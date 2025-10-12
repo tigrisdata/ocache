@@ -278,13 +278,19 @@ func (m *mockCacheServiceServer) List(ctx context.Context, req *pb.ListRequest) 
 	}
 
 	startIdx := 0
+	foundStart := req.StartKey == ""
 	if req.StartKey != "" {
 		// Find first key after startKey
 		for i, k := range keys {
 			if k > req.StartKey {
 				startIdx = i
+				foundStart = true
 				break
 			}
+		}
+		// If startKey is greater than all existing keys, return empty
+		if !foundStart {
+			startIdx = len(keys)
 		}
 	}
 

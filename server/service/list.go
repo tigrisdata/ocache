@@ -400,9 +400,13 @@ func (s *CacheService) kWayMerge(ctx context.Context, nodeResponses map[string]*
 		for nodeID, nodeResp := range nodeResponses {
 			if nodeResp.HasMore {
 				// Check if we've consumed all keys from this node
-				// nodeIndices[nodeID] could be -1 (empty response) or the last index
-				idx, exists := nodeIndices[nodeID]
-				if !exists || idx >= len(nodeResp.Keys)-1 {
+				// nodeIndices[nodeID] is either:
+				// - -1 if node returned empty response
+				// - the last consumed index if node had keys
+				idx := nodeIndices[nodeID]
+				if idx >= len(nodeResp.Keys)-1 {
+					// We've consumed all keys from this node's current response
+					// but it has more data available
 					hasMore = true
 					// Update cursor to the continuation token from the node
 					if nodeResp.ContinuationToken != "" {
