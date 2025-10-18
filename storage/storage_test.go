@@ -662,34 +662,6 @@ func TestStorage_ListKeysWithPagination_ContinuationToken(t *testing.T) {
 	assert.Less(t, page2[len(page2)-1], page3[0], "page 3 should start after page 2")
 }
 
-func TestStorage_ListKeysWithPagination_LimitValidation(t *testing.T) {
-	// Test limit validation and defaults
-	s, cleanup := createTestStorageWithDefaults(t)
-	defer cleanup()
-
-	// Create some keys
-	for i := 0; i < 5; i++ {
-		key := "test-" + string(rune('a'+i))
-		err := s.Put(key, bytes.NewReader([]byte("value")), 0)
-		assert.NoError(t, err)
-	}
-
-	// Test with limit 0 (should use default 1000)
-	keys, _, _, err := s.ListKeysWithPagination("", "", 0)
-	assert.NoError(t, err)
-	assert.Len(t, keys, 5, "should return all 5 keys with default limit")
-
-	// Test with limit exceeding max (should cap at 1000)
-	keys, _, _, err = s.ListKeysWithPagination("", "", 2000)
-	assert.NoError(t, err)
-	assert.Len(t, keys, 5, "should return all keys, capped to max limit")
-
-	// Test with negative limit (should use default 1000)
-	keys, _, _, err = s.ListKeysWithPagination("", "", -5)
-	assert.NoError(t, err)
-	assert.Len(t, keys, 5, "should return all keys with default limit")
-}
-
 func TestStorage_ListKeysWithPagination_EmptyResults(t *testing.T) {
 	// Test pagination with no matching keys
 	s, cleanup := createTestStorageWithDefaults(t)

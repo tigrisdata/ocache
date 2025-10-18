@@ -285,13 +285,6 @@ func (o *Operations) Delete(ctx context.Context, key string) error {
 // List lists keys with optional prefix
 // Returns all keys matching the prefix (automatically handles pagination)
 func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) {
-	return o.ListWithLimit(ctx, prefix, 0) // 0 means get all keys
-}
-
-// ListWithLimit lists keys with optional prefix and limit
-// If limit is 0, returns all keys (automatically paginates)
-// If limit > 0, returns at most that many keys
-func (o *Operations) ListWithLimit(ctx context.Context, prefix string, limit int) ([]string, error) {
 	conn, err := o.router.RoundRobinRoute()
 	if err != nil {
 		return nil, err
@@ -304,10 +297,7 @@ func (o *Operations) ListWithLimit(ctx context.Context, prefix string, limit int
 
 	var allKeys []string
 	continuationToken := ""
-	pageLimit := int32(1000) // Max page size
-	if limit > 0 && limit < 1000 {
-		pageLimit = int32(limit)
-	}
+	pageLimit := int32(MaxPageLimit)
 
 	// Paginate through all results
 	for {
@@ -329,11 +319,6 @@ func (o *Operations) ListWithLimit(ctx context.Context, prefix string, limit int
 		}
 
 		allKeys = append(allKeys, resp.Keys...)
-
-		// Check if we've reached the desired limit
-		if limit > 0 && len(allKeys) >= limit {
-			return allKeys[:limit], nil
-		}
 
 		// Check if there are more pages
 		if !resp.HasMore || resp.ContinuationToken == "" {
@@ -359,8 +344,8 @@ func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, con
 		return nil, "", false, fmt.Errorf("no healthy connections available")
 	}
 
-	if limit <= 0 {
-		limit = 1000
+	if limit <= 0 || limit > MaxPageLimit {
+		limit = MaxPageLimit
 	}
 
 	req := &pb.ListRequest{

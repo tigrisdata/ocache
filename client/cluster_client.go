@@ -324,7 +324,7 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 	return err
 }
 
-// PutStream and List are inherited from Operations
+// PutStream, List and ListPage are inherited from Operations
 
 // Close closes all connections and stops background goroutines
 func (c *ClusterClient) Close() error {

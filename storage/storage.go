@@ -301,58 +301,10 @@ func (s *Storage) Close() {
 // ListKeys returns all non-expired keys in the RocksDB instance that match the given prefix
 // Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
 func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
-	storageType := "unknown"
-	start := time.Now()
-	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(float64(time.Since(start).Milliseconds()))
-	}()
-
-	ro := metadata.CreateReadOptions(true, false)
-	it := s.meta.Handle().NewIterator(ro)
-	defer it.Close()
-
-	var keyList []string
-
-	// Construct the prefix for RocksDB iteration
-	var prefix []byte
-	if userPrefix != "" {
-		// Combine metadata prefix with user-provided prefix for efficient iteration
-		prefix = keys.MakeMetadataKey(userPrefix)
-	} else {
-		// Use just the metadata prefix to get all keys
-		prefix = []byte(keys.MetadataPrefix)
+	keyList, _, _, err := s.ListKeysWithPagination(userPrefix, "", 0)
+	if err != nil {
+		return nil, err
 	}
-
-	// Seek to the constructed prefix to start iteration
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		k := it.Key().Data()
-		v := it.Value().Data()
-
-		// Try to decode as proto ValueMessage to check expiry
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(v, valueMsg); err == nil {
-			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
-				// Expired, skip but don't delete - let the cleaner handle it
-				it.Key().Free()
-				it.Value().Free()
-				continue
-			}
-		}
-
-		// Extract the original user key without the prefix
-		userKey := keys.ExtractUserKey(k)
-		keyList = append(keyList, userKey)
-		it.Key().Free()
-		it.Value().Free()
-	}
-	if err := it.Err(); err != nil {
-		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
-		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
-
-		return nil, mapRocksDBError("ListKeys", "", err)
-	}
-
-	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
 	return keyList, nil
 }
 
@@ -367,14 +319,6 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("list_paginated", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
-
-	// Validate and apply default limit
-	if limit <= 0 {
-		limit = 1000
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
 
 	ro := metadata.CreateReadOptions(true, false)
 	it := s.meta.Handle().NewIterator(ro)
@@ -419,7 +363,12 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	}
 
 	// Collect up to limit keys
-	for it.ValidForPrefix(prefixBoundary) && len(keyList) < limit {
+	for it.ValidForPrefix(prefixBoundary) {
+		// Check if we've reached the limit
+		if limit > 0 && len(keyList) >= limit {
+			break
+		}
+
 		k := it.Key().Data()
 		v := it.Value().Data()
 
