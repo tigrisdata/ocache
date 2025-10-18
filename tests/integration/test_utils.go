@@ -225,6 +225,27 @@ func (h *IntegrationTestHarness) DeleteObject(key string) error {
 	return nil
 }
 
+// List returns all keys with the given prefix
+func (h *IntegrationTestHarness) List(prefix string) ([]string, error) {
+	keys, _, _, err := h.Storage.ListKeysWithPagination(prefix, "", 1000)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return nil, err
+	}
+	return keys, nil
+}
+
+// ListPage returns a page of keys with pagination support
+func (h *IntegrationTestHarness) ListPage(prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error) {
+	keys, lastKey, hasMore, err := h.Storage.ListKeysWithPagination(prefix, continuationToken, limit)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return nil, "", false, err
+	}
+
+	return keys, lastKey, hasMore, nil
+}
+
 // WaitForCompaction waits for compaction to complete or timeout
 func (h *IntegrationTestHarness) WaitForCompaction(timeout time.Duration) error {
 	start := time.Now()

@@ -39,31 +39,21 @@ cluster_cli() {
     ./ocachecli --addr "$CLUSTER_ADDRS" "$@"
 }
 
-# Helper function to count keys across all cluster nodes
+# Helper function to count keys
 cluster_count_keys() {
     local pattern="$1"
-    local total=0
+    local count=0
 
-    # Query each node individually and sum the results
-    for i in $(seq 1 "$NUM_NODES"); do
-        local port=$((BASE_GRPC_PORT + i - 1))
-        local count=0
-        local keys
-        keys=$(./ocachecli --mode simple --addr "localhost:${port}" list 2>/dev/null || echo "")
+    keys=$(cluster_cli list 2>/dev/null || echo "")
 
-        # Only count non-empty lines
-        if [ -n "$pattern" ]; then
-            count=$(echo "$keys" | grep -c "$pattern")
-        else
-            count=$(echo "$keys" | grep -c ".")
-        fi
+    # Only count non-empty lines
+    if [ -n "$pattern" ]; then
+        count=$(echo "$keys" | grep -c "$pattern")
+    else
+        count=$(echo "$keys" | grep -c ".")
+    fi
 
-        # Strip whitespace and ensure it's a number
-        count=${count:-0}
-        total=$((total + count))
-    done
-
-    echo "$total"
+    echo "$count"
 }
 
 echo "=== Test 1: Concurrent Writes ==="

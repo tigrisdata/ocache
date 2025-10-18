@@ -25,11 +25,15 @@ service CacheService {
       delete: "/v1/cache/{key}"
     };
   }
-  rpc List (ListRequest) returns (stream ListResponse) {
+  rpc List (ListRequest) returns (ListResponse) {
     option (google.api.http) = {
       get: "/v1/cache"
     };
   }
+  // ListLocal is an internal RPC for cluster mode: queries local node only
+  // Returns sorted, paginated keys from this node's storage
+  rpc ListLocal (ListRequest) returns (ListResponse);
+
   rpc GetTopology (GetTopologyRequest) returns (GetTopologyResponse) {
     option (google.api.http) = {
       get: "/v1/topology"
@@ -69,10 +73,15 @@ message DeleteResponse {
 
 message ListRequest {
   string prefix = 1; // Optional prefix to filter keys
+  string start_key = 2; // Start listing after this key (exclusive), for pagination
+  int32 limit = 3; // Maximum number of keys to return (default 1000, max 1000)
+  string continuation_token = 4; // Opaque token for resuming pagination
 }
 
 message ListResponse {
   repeated string keys = 1;
+  string continuation_token = 2; // Token to resume listing from where this response ended
+  bool has_more = 3; // True if more keys are available beyond this page
 }
 
 message GetTopologyRequest {

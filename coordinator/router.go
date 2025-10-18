@@ -374,6 +374,17 @@ func (r *Router) IsLocal(key string) bool {
 	return r.ring.IsLocal(key)
 }
 
+// GetClientForNode returns a client for a specific node ID
+// This is useful for operations that need to query all nodes (e.g., List)
+func (r *Router) GetClientForNode(nodeID string) (pb.CacheServiceClient, error) {
+	// Check if this is the local node (shouldn't be called for local, but check defensively)
+	if nodeID == r.localID {
+		return nil, NewLocalRoutingError(r.localID, "")
+	}
+
+	return r.getClient(nodeID)
+}
+
 // RemoveClient removes and closes the client connection for a node
 func (r *Router) RemoveClient(nodeID string) {
 	r.mu.Lock()

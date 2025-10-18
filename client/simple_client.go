@@ -104,6 +104,7 @@ func (c *SimpleClient) RoundRobinRoute() (*connection, error) {
 // - GetRangeStream
 // - Delete
 // - List
+// - ListPage
 
 // Close closes all connections
 func (c *SimpleClient) Close() error {

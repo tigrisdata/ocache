@@ -540,6 +540,33 @@ func (h *ClusterTestHarness) DeleteObject(key string) error {
 	return nil
 }
 
+// List returns all keys with the given prefix
+func (h *ClusterTestHarness) List(prefix string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	keys, err := h.Client.List(ctx, prefix)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return nil, err
+	}
+	return keys, nil
+}
+
+// ListPage returns a page of keys with pagination support
+func (h *ClusterTestHarness) ListPage(prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	keys, nextToken, hasMore, err = h.Client.ListPage(ctx, prefix, limit, continuationToken)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return nil, "", false, err
+	}
+
+	return keys, nextToken, hasMore, nil
+}
+
 // GetStorageStats returns aggregate storage statistics across all nodes
 func (h *ClusterTestHarness) GetStorageStats() StorageStats {
 	h.mu.RLock()

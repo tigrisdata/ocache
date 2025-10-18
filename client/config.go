@@ -18,9 +18,7 @@ const (
 	ModeSimple ConnectionMode = "simple"
 	// ModeCluster uses topology service for smart routing
 	ModeCluster ConnectionMode = "cluster"
-)
 
-const (
 	// DefaultRefreshInterval is the default topology refresh interval
 	DefaultRefreshInterval = 30 * time.Second
 	// MaxMessageSize is the maximum message size for gRPC
@@ -39,6 +37,9 @@ const (
 	DefaultKeepaliveTime = 30 * time.Second
 	// DefaultKeepaliveTimeout is the default keepalive timeout for client connections
 	DefaultKeepaliveTimeout = 10 * time.Second
+
+	// MaxPageLimit is the maximum number of keys to return in a single page
+	MaxPageLimit = 1000
 )
 
 // ClientConfig contains configuration for the unified Client

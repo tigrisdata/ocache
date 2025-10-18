@@ -301,10 +301,23 @@ func (s *Storage) Close() {
 // ListKeys returns all non-expired keys in the RocksDB instance that match the given prefix
 // Note: Expired keys are skipped but not deleted - deletion is handled by the background cleaner
 func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
+	keyList, _, _, err := s.ListKeysWithPagination(userPrefix, "", 0)
+	if err != nil {
+		return nil, err
+	}
+	return keyList, nil
+}
+
+// ListKeysWithPagination returns paginated, sorted keys from RocksDB
+// Returns: (keys, lastKey, hasMore, error)
+// - keys: Up to 'limit' keys starting after 'startKey'
+// - lastKey: The last key in this page (for continuation)
+// - hasMore: True if more keys exist beyond this page
+func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, limit int) ([]string, string, bool, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
-		metrics.StorageOperationDuration.WithLabelValues("list", storageType).Observe(float64(time.Since(start).Milliseconds()))
+		metrics.StorageOperationDuration.WithLabelValues("list_paginated", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
 	ro := metadata.CreateReadOptions(true, false)
@@ -312,19 +325,50 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 	defer it.Close()
 
 	var keyList []string
+	var lastKey string
 
-	// Construct the prefix for RocksDB iteration
-	var prefix []byte
-	if userPrefix != "" {
-		// Combine metadata prefix with user-provided prefix for efficient iteration
-		prefix = keys.MakeMetadataKey(userPrefix)
+	// Determine where to start iteration
+	var seekKey []byte
+	if startKey != "" {
+		// Start after the given key
+		seekKey = keys.MakeMetadataKey(startKey)
+	} else if userPrefix != "" {
+		// Start at the prefix
+		seekKey = keys.MakeMetadataKey(userPrefix)
 	} else {
-		// Use just the metadata prefix to get all keys
-		prefix = []byte(keys.MetadataPrefix)
+		// Start at the beginning of all keys
+		seekKey = []byte(keys.MetadataPrefix)
 	}
 
-	// Seek to the constructed prefix to start iteration
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+	// Construct the prefix boundary for iteration
+	var prefixBoundary []byte
+	if userPrefix != "" {
+		prefixBoundary = keys.MakeMetadataKey(userPrefix)
+	} else {
+		prefixBoundary = []byte(keys.MetadataPrefix)
+	}
+
+	// Seek to start position
+	it.Seek(seekKey)
+
+	// If we have a startKey, skip it (pagination is exclusive)
+	if startKey != "" && it.Valid() {
+		k := it.Key().Data()
+		currentUserKey := keys.ExtractUserKey(k)
+		if currentUserKey == startKey {
+			it.Key().Free()
+			it.Value().Free()
+			it.Next()
+		}
+	}
+
+	// Collect up to limit keys
+	for it.ValidForPrefix(prefixBoundary) {
+		// Check if we've reached the limit
+		if limit > 0 && len(keyList) >= limit {
+			break
+		}
+
 		k := it.Key().Data()
 		v := it.Value().Data()
 
@@ -335,25 +379,47 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 				// Expired, skip but don't delete - let the cleaner handle it
 				it.Key().Free()
 				it.Value().Free()
+				it.Next()
 				continue
 			}
 		}
 
-		// Extract the original user key without the prefix
+		// Extract the original user key
 		userKey := keys.ExtractUserKey(k)
+
 		keyList = append(keyList, userKey)
+		lastKey = userKey
+
 		it.Key().Free()
 		it.Value().Free()
+		it.Next()
 	}
+
 	if err := it.Err(); err != nil {
-		metrics.StorageOperations.WithLabelValues("list", storageType, "error").Inc()
-		metrics.Errors.WithLabelValues("rocksdb", "list").Inc()
-
-		return nil, mapRocksDBError("ListKeys", "", err)
+		metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "list_paginated").Inc()
+		return nil, "", false, mapRocksDBError("ListKeysWithPagination", "", err)
 	}
 
-	metrics.StorageOperations.WithLabelValues("list", storageType, "success").Inc()
-	return keyList, nil
+	// Check if there are more keys
+	hasMore := it.ValidForPrefix(prefixBoundary)
+	if hasMore {
+		// Peek at the next key to confirm it matches prefix
+		k := it.Key().Data()
+		nextUserKey := keys.ExtractUserKey(k)
+		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
+			hasMore = false
+		}
+		it.Key().Free()
+	}
+
+	// Clear lastKey if there are no more results
+	if !hasMore {
+		lastKey = ""
+	}
+
+	metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "success").Inc()
+	return keyList, lastKey, hasMore, nil
 }
 
 // DeleteKey removes metadata and spills for a key

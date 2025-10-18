@@ -103,15 +103,19 @@ func TestCacheService_List(t *testing.T) {
 		_, err := svc.PutObject(ctx, &pb.PutRequest{Key: k, Data: []byte(k), TtlSeconds: 0})
 		assert.NoError(t, err)
 	}
-	stream := &mockListServer{responses: []*pb.ListResponse{}}
-	err := svc.List(&pb.ListRequest{}, stream)
+
+	resp, err := svc.List(ctx, &pb.ListRequest{})
 	assert.NoError(t, err)
-	var found []string
-	for _, resp := range stream.responses {
-		found = append(found, resp.Keys...)
-	}
+	assert.NotNil(t, resp)
+
+	found := resp.Keys
 	for _, k := range keys {
 		assert.Contains(t, found, k)
+	}
+
+	// Verify keys are sorted
+	for i := 1; i < len(found); i++ {
+		assert.LessOrEqual(t, found[i-1], found[i], "Keys should be in sorted order")
 	}
 }
 
@@ -177,35 +181,105 @@ func TestCacheService_ListWithPrefix(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			stream := &mockListServer{responses: []*pb.ListResponse{}}
-			err := svc.List(&pb.ListRequest{Prefix: tc.prefix}, stream)
+			resp, err := svc.List(ctx, &pb.ListRequest{Prefix: tc.prefix})
 			assert.NoError(t, err)
+			assert.NotNil(t, resp)
 
-			var found []string
-			for _, resp := range stream.responses {
-				found = append(found, resp.Keys...)
-			}
+			found := resp.Keys
 			assert.ElementsMatch(t, tc.expected, found, "unexpected keys for prefix %q", tc.prefix)
+
+			// Verify keys are sorted
+			for i := 1; i < len(found); i++ {
+				assert.LessOrEqual(t, found[i-1], found[i], "Keys should be in sorted order for prefix %q", tc.prefix)
+			}
 		})
 	}
 }
 
-type mockListServer struct {
-	pb.CacheService_ListServer
-	responses []*pb.ListResponse
-	ctx       context.Context
-}
-
-func (m *mockListServer) Send(resp *pb.ListResponse) error {
-	m.responses = append(m.responses, resp)
-	return nil
-}
-
-func (m *mockListServer) Context() context.Context {
-	if m.ctx == nil {
-		return context.Background()
+func TestCacheService_List_Pagination(t *testing.T) {
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
 	}
-	return m.ctx
+	ctx := context.Background()
+
+	// Create 50 keys to test pagination
+	keyCount := 50
+	for i := 0; i < keyCount; i++ {
+		key := string('a'+rune(i/26)) + string('a'+rune(i%26))
+		_, err := svc.PutObject(ctx, &pb.PutRequest{Key: key, Data: []byte(key), TtlSeconds: 0})
+		assert.NoError(t, err)
+	}
+
+	// Test pagination with limit
+	resp, err := svc.List(ctx, &pb.ListRequest{Limit: 10})
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+	assert.LessOrEqual(t, len(resp.Keys), 10, "Should respect limit")
+
+	// Verify sorted order
+	for i := 1; i < len(resp.Keys); i++ {
+		assert.LessOrEqual(t, resp.Keys[i-1], resp.Keys[i], "Keys should be sorted")
+	}
+
+	// If there are more keys, continuation token should be present
+	if resp.HasMore {
+		assert.NotEmpty(t, resp.ContinuationToken, "Continuation token should be present when hasMore=true")
+
+		// Get next page
+		resp2, err := svc.List(ctx, &pb.ListRequest{
+			Limit:             10,
+			ContinuationToken: resp.ContinuationToken,
+		})
+		assert.NoError(t, err)
+		assert.NotNil(t, resp2)
+
+		// Verify no overlap between pages
+		firstPageKeys := make(map[string]bool)
+		for _, k := range resp.Keys {
+			firstPageKeys[k] = true
+		}
+		for _, k := range resp2.Keys {
+			assert.False(t, firstPageKeys[k], "Pages should not overlap: key %s in both pages", k)
+		}
+
+		// Verify continuation of sort order across pages
+		if len(resp.Keys) > 0 && len(resp2.Keys) > 0 {
+			lastKeyPage1 := resp.Keys[len(resp.Keys)-1]
+			firstKeyPage2 := resp2.Keys[0]
+			assert.Less(t, lastKeyPage1, firstKeyPage2, "Sort order should continue across pages")
+		}
+	}
+}
+
+func TestCacheService_ListLocal(t *testing.T) {
+	s := setupTestStorage(t)
+	svc := &CacheService{
+		storage: s,
+	}
+	ctx := context.Background()
+
+	// Create test keys
+	keys := []string{"local-a", "local-b", "local-c"}
+	for _, k := range keys {
+		_, err := svc.PutObject(ctx, &pb.PutRequest{Key: k, Data: []byte(k), TtlSeconds: 0})
+		assert.NoError(t, err)
+	}
+
+	// Test ListLocal (now single-response, not streaming)
+	resp, err := svc.ListLocal(ctx, &pb.ListRequest{Prefix: "local-"})
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+
+	found := resp.Keys
+
+	// Verify all keys are present
+	assert.ElementsMatch(t, keys, found)
+
+	// Verify keys are sorted
+	for i := 1; i < len(found); i++ {
+		assert.LessOrEqual(t, found[i-1], found[i], "Keys should be in sorted order")
+	}
 }
 
 func TestCacheService_Put_TTL(t *testing.T) {
