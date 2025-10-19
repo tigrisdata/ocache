@@ -9,6 +9,7 @@ import (
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -113,6 +114,7 @@ func (r *Router) Route(key string) (pb.CacheServiceClient, error) {
 func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClient, error) {
 	node, err := r.ring.GetNode(key)
 	if err != nil {
+		metrics.ClusterRouteRequests.WithLabelValues("error").Inc()
 		return nil, err
 	}
 
@@ -124,6 +126,8 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 			Str("node_id", node.ID).
 			Msg("Received request to route to local node")
 
+		metrics.ClusterRouteRequests.WithLabelValues("local").Inc()
+		metrics.ClusterRoutingErrors.WithLabelValues("local_routing").Inc()
 		return nil, NewLocalRoutingError(r.localID, key)
 	}
 
@@ -135,6 +139,8 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 			// Wait before retry with exponential backoff
 			time.Sleep(backoff)
 			backoff = r.calculateBackoff(backoff)
+
+			metrics.ClusterRetryAttempts.WithLabelValues(node.ID).Inc()
 
 			zlog.Debug().
 				Str("node_id", node.ID).
@@ -149,6 +155,7 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 				Str("node_id", node.ID).
 				Msg("Successfully routed to node")
 
+			metrics.ClusterRouteRequests.WithLabelValues("remote").Inc()
 			return client, nil
 		}
 
@@ -160,6 +167,8 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 		}
 	}
 
+	metrics.ClusterRouteRequests.WithLabelValues("error").Inc()
+	metrics.ClusterRoutingErrors.WithLabelValues("max_retries_exceeded").Inc()
 	return nil, NewMaxRetriesExceededError(node.ID, key, maxRetries+1, lastErr)
 }
 
@@ -178,6 +187,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		if err := r.getConnectionHealth(state, nodeID); err == nil {
 			return state.client, nil
 		} else if errors.Is(err, ErrCircuitBreakerOpen) {
+			metrics.ClusterRoutingErrors.WithLabelValues("circuit_breaker_open").Inc()
 			return nil, err
 		}
 	}
@@ -216,6 +226,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 			Str("node_id", nodeID).
 			Msg("Node not found in ring")
 
+		metrics.ClusterRoutingErrors.WithLabelValues("node_not_found").Inc()
 		return nil, NewNodeNotFoundError(nodeID, "")
 	}
 
@@ -240,6 +251,8 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 			Str("address", nodeAddr).
 			Msg("Failed to create connection to node")
 
+		metrics.ClusterConnectionFailures.WithLabelValues(nodeID, "connection_failed").Inc()
+		metrics.ClusterRoutingErrors.WithLabelValues("connection_failed").Inc()
 		return nil, NewConnectionFailedError(nodeID, nodeAddr, err)
 	}
 
@@ -248,6 +261,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	state.conn = conn
 
 	atomic.StoreInt32(&state.failureCount, 0) // Reset failure count on successful connection
+	metrics.ClusterConnectionsActive.WithLabelValues(nodeID).Set(1)
 
 	zlog.Debug().
 		Str("node_id", nodeID).
@@ -333,6 +347,21 @@ func (r *Router) isCircuitOpen(state *clientState) bool {
 		if atomic.CompareAndSwapInt32(&state.circuitOpen, 1, 0) {
 			// Only reset failure count if we successfully closed the circuit
 			atomic.StoreInt32(&state.failureCount, 0)
+
+			// Find node ID and update metrics
+			r.mu.RLock()
+			var nodeID string
+			for id, s := range r.clients {
+				if s == state {
+					nodeID = id
+					break
+				}
+			}
+			r.mu.RUnlock()
+
+			if nodeID != "" {
+				metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(0)
+			}
 		}
 		return false
 	}
@@ -353,6 +382,22 @@ func (r *Router) recordFailureAndOpenCircuit(state *clientState) {
 			state.mu.Lock()
 			state.circuitOpenTime = time.Now()
 			state.mu.Unlock()
+
+			// Find node ID for metrics (reverse lookup through clients map)
+			r.mu.RLock()
+			var nodeID string
+			for id, s := range r.clients {
+				if s == state {
+					nodeID = id
+					break
+				}
+			}
+			r.mu.RUnlock()
+
+			if nodeID != "" {
+				metrics.ClusterCircuitBreakerOpened.WithLabelValues(nodeID).Inc()
+				metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(1)
+			}
 
 			zlog.Warn().
 				Int32("failure_count", failures).
@@ -395,6 +440,7 @@ func (r *Router) RemoveClient(nodeID string) {
 			state.conn.Close()
 		}
 		delete(r.clients, nodeID)
+		metrics.ClusterConnectionsActive.WithLabelValues(nodeID).Set(0)
 
 		zlog.Debug().
 			Str("node_id", nodeID).

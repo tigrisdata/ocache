@@ -10,6 +10,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/hash"
+	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator/discovery"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -334,11 +335,11 @@ func (c *Coordinator) joinCluster() error {
 		Msg("Attempting to sync with nodes")
 
 	var lastErr error
-	for _, node := range otherNodes {
-		if err := c.syncWithNode(node); err != nil {
+	for _, nodeAddr := range otherNodes {
+		if err := c.syncWithNode(nodeAddr); err != nil {
 			zlog.Warn().
 				Err(err).
-				Str("node", node).
+				Str("node", nodeAddr).
 				Msg("Failed to sync with node")
 			lastErr = err
 			continue
@@ -346,7 +347,7 @@ func (c *Coordinator) joinCluster() error {
 		// Successfully synced with at least one node
 		zlog.Info().
 			Str("node_id", c.config.MyNodeID).
-			Str("node", node).
+			Str("node", nodeAddr).
 			Msg("Successfully synced with node")
 		return nil
 	}
@@ -363,6 +364,7 @@ func (c *Coordinator) joinCluster() error {
 
 // syncWithNode gets cluster state from node and announces our join to the cluster
 func (c *Coordinator) syncWithNode(nodeAddr string) error {
+	start := time.Now()
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
 		Str("node", nodeAddr).
@@ -376,6 +378,7 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		grpc.WithBlock(),
 	)
 	if err != nil {
+		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
 		return err
 	}
 	defer conn.Close()
@@ -387,8 +390,11 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		Str("node", nodeAddr).
 		Msg("Requesting cluster state from node")
 
+	// Get the node ID from the node address
+	var nodeId string
 	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
 	if err != nil {
+		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
 		return err
 	}
 
@@ -403,6 +409,11 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		// Skip self
 		if node.Id == c.config.MyNodeID {
 			continue
+		}
+
+		// Get the node ID from the node address
+		if node.Address == nodeAddr {
+			nodeId = node.Id
 		}
 
 		// Add node to our ring
@@ -429,8 +440,12 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 
 	_, err = client.Join(ctx, joinReq)
 	if err != nil {
+		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
 		return err
 	}
+
+	metrics.ClusterSyncOperations.WithLabelValues("success").Inc()
+	metrics.ClusterSyncDuration.WithLabelValues(nodeId).Observe(float64(time.Since(start).Milliseconds()))
 
 	zlog.Info().
 		Str("node_id", c.config.MyNodeID).
@@ -481,8 +496,11 @@ func (c *Coordinator) sendHeartbeats() {
 		}
 
 		go func(n *NodeInfo) {
+			start := time.Now()
 			ctx, cancel := context.WithTimeout(context.Background(), HeartbeatRequestTimeout)
 			defer cancel()
+
+			metrics.ClusterHeartbeatsSent.WithLabelValues(n.ID).Inc()
 
 			conn, err := grpc.DialContext(ctx, n.Address,
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -493,6 +511,7 @@ func (c *Coordinator) sendHeartbeats() {
 					Str("node_id", n.ID).
 					Msg("Failed to send heartbeat to node")
 
+				metrics.ClusterHeartbeatFailures.WithLabelValues(n.ID).Inc()
 				// Update the node failure count on connection failure
 				c.recordFailure(n.ID)
 				return
@@ -512,9 +531,13 @@ func (c *Coordinator) sendHeartbeats() {
 					Str("node_id", n.ID).
 					Msg("Failed to send heartbeat to node")
 
+				metrics.ClusterHeartbeatFailures.WithLabelValues(n.ID).Inc()
 				// Update the node failure count on heartbeat request failure
 				c.recordFailure(n.ID)
 			} else {
+				// Record successful heartbeat duration
+				metrics.ClusterHeartbeatDuration.WithLabelValues(n.ID).Observe(float64(time.Since(start).Milliseconds()))
+
 				// Check if heartbeat epoch is newer
 				if resp.Epoch > c.ring.GetEpoch() {
 					zlog.Info().
@@ -541,6 +564,7 @@ func (c *Coordinator) recordFailure(nodeID string) {
 	defer c.mu.Unlock()
 
 	c.failureCount[nodeID]++
+	metrics.ClusterNodeFailureCount.WithLabelValues(nodeID).Set(float64(c.failureCount[nodeID]))
 
 	// Mark node as down if failure threshold is exceeded
 	if c.failureCount[nodeID] >= c.failureThreshold {
@@ -548,6 +572,8 @@ func (c *Coordinator) recordFailure(nodeID string) {
 			Str("node_id", nodeID).
 			Int("failures", c.failureCount[nodeID]).
 			Msg("Node exceeded failure threshold, marking as down")
+
+		metrics.ClusterNodesMarkedDown.Inc()
 
 		if err := c.ring.UpdateNodeStatus(nodeID, NodeStatusDown); err != nil {
 			zlog.Error().
@@ -565,6 +591,7 @@ func (c *Coordinator) recordSuccess(nodeID string) {
 
 	c.failureCount[nodeID] = 0
 	c.lastHeartbeat[nodeID] = time.Now()
+	metrics.ClusterNodeFailureCount.WithLabelValues(nodeID).Set(0)
 }
 
 // failureDetectionLoop checks for nodes that haven't sent heartbeats
@@ -680,17 +707,22 @@ func (c *Coordinator) nodeDiscoveryLoop() {
 
 // refreshNodes re-resolves nodes and updates the cluster membership
 func (c *Coordinator) refreshNodes() {
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	newNodes, err := c.nodeDiscovery.Resolve(ctx)
 	if err != nil {
+		metrics.ClusterDiscoveryRefreshes.WithLabelValues("error").Inc()
 		zlog.Warn().
 			Err(err).
 			Str("discovery", c.nodeDiscovery.String()).
 			Msg("Failed to refresh node addresses")
 		return
 	}
+
+	metrics.ClusterDiscoveryRefreshes.WithLabelValues("success").Inc()
+	metrics.ClusterDiscoveryDuration.Observe(float64(time.Since(start).Milliseconds()))
 
 	c.nodesMu.RLock()
 	oldNodes := make([]string, len(c.currentNodes))
@@ -701,6 +733,14 @@ func (c *Coordinator) refreshNodes() {
 	added, removed := discovery.DiffNodes(oldNodes, newNodes)
 
 	if len(added) > 0 || len(removed) > 0 {
+		// Record node changes
+		for range added {
+			metrics.ClusterDiscoveryNodesChanged.WithLabelValues("added").Inc()
+		}
+		for range removed {
+			metrics.ClusterDiscoveryNodesChanged.WithLabelValues("removed").Inc()
+		}
+
 		zlog.Info().
 			Strs("added", added).
 			Strs("removed", removed).
@@ -714,8 +754,8 @@ func (c *Coordinator) refreshNodes() {
 		c.nodesMu.Unlock()
 
 		// Try to sync with new nodes
-		for _, node := range added {
-			go c.tryJoinNode(node)
+		for _, addr := range added {
+			go c.tryJoinNode(addr)
 		}
 	} else {
 		zlog.Debug().
@@ -725,24 +765,24 @@ func (c *Coordinator) refreshNodes() {
 }
 
 // tryJoinNode attempts to sync with a newly discovered node
-func (c *Coordinator) tryJoinNode(node string) {
+func (c *Coordinator) tryJoinNode(nodeClusterAddr string) {
 	// Skip if it's our own address
-	if node == c.config.ClusterAddr {
+	if nodeClusterAddr == c.config.ClusterAddr {
 		return
 	}
 
 	zlog.Info().
-		Str("node", node).
+		Str("node", nodeClusterAddr).
 		Msg("Attempting to sync with newly discovered node")
 
-	if err := c.syncWithNode(node); err != nil {
+	if err := c.syncWithNode(nodeClusterAddr); err != nil {
 		zlog.Warn().
-			Str("node", node).
+			Str("node", nodeClusterAddr).
 			Err(err).
 			Msg("Failed to sync with newly discovered node")
 	} else {
 		zlog.Info().
-			Str("node", node).
+			Str("node", nodeClusterAddr).
 			Msg("Successfully synced with newly discovered node")
 	}
 }
@@ -757,12 +797,14 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 
 	// Validate addresses
 	if req.NodeId == "" || req.Address == "" || req.ListenAddress == "" {
+		metrics.ClusterJoinRequests.WithLabelValues("error").Inc()
 		return nil, fmt.Errorf("invalid join request: missing required fields")
 	}
 
 	// Add node to ring with both addresses
 	isNewNode, err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress)
 	if err != nil {
+		metrics.ClusterJoinRequests.WithLabelValues("error").Inc()
 		return nil, fmt.Errorf("failed to add node to ring: %w", err)
 	}
 
@@ -792,10 +834,13 @@ func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*cl
 			Str("node_id", req.NodeId).
 			Msg("Node already in ring, skipping broadcast")
 	} else {
+		metrics.ClusterBroadcastsDuplicate.Inc()
 		zlog.Debug().
 			Str("node_id", req.NodeId).
 			Msg("Recent duplicate broadcast detected, skipping re-broadcast")
 	}
+
+	metrics.ClusterJoinRequests.WithLabelValues("success").Inc()
 
 	return &clusterpb.JoinResponse{
 		Success: true,
@@ -834,6 +879,8 @@ func (c *Coordinator) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatReq
 		Str("node_id", req.NodeId).
 		Uint64("epoch", req.Epoch).
 		Msg("Received heartbeat from node")
+
+	metrics.ClusterHeartbeatsReceived.WithLabelValues(req.NodeId).Inc()
 
 	// Record heartbeat success
 	c.recordSuccess(req.NodeId)
@@ -1239,6 +1286,7 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 				if successCounter != nil {
 					atomic.AddInt32(successCounter, 1)
 				}
+				metrics.ClusterBroadcastsSent.WithLabelValues("join").Inc()
 				zlog.Debug().
 					Str("target_node", targetNode.ID).
 					Str("new_node", newNodeID).
