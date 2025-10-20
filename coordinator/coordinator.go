@@ -390,8 +390,6 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		Str("node", nodeAddr).
 		Msg("Requesting cluster state from node")
 
-	// Get the node ID from the node address
-	var nodeId string
 	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
 	if err != nil {
 		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
@@ -404,16 +402,28 @@ func (c *Coordinator) syncWithNode(nodeAddr string) error {
 		Uint64("epoch", state.Epoch).
 		Msg("Received cluster state from node")
 
+	// Get the node ID from the node address by matching against returned nodes
+	var nodeId string
+	for _, node := range state.Nodes {
+		if node.Address == nodeAddr {
+			nodeId = node.Id
+			break
+		}
+	}
+
+	// If we didn't find a matching node, use a placeholder to avoid empty label
+	if nodeId == "" {
+		nodeId = "unknown"
+		zlog.Warn().
+			Str("node_addr", nodeAddr).
+			Msg("Could not determine node ID from cluster state")
+	}
+
 	// Add all nodes to our ring to make sure we have the correct state
 	for _, node := range state.Nodes {
 		// Skip self
 		if node.Id == c.config.MyNodeID {
 			continue
-		}
-
-		// Get the node ID from the node address
-		if node.Address == nodeAddr {
-			nodeId = node.Id
 		}
 
 		// Add node to our ring
