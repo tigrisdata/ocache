@@ -244,7 +244,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	// Create new connection with keepalive
 	conn, err := r.createConnection(nodeAddr)
 	if err != nil {
-		r.recordFailureAndOpenCircuit(state)
+		r.recordFailureAndOpenCircuit(state, nodeID)
 
 		zlog.Warn().
 			Str("node_id", nodeID).
@@ -370,7 +370,8 @@ func (r *Router) isCircuitOpen(state *clientState) bool {
 }
 
 // recordFailureAndOpenCircuit records a failure and potentially opens the circuit breaker
-func (r *Router) recordFailureAndOpenCircuit(state *clientState) {
+// nodeID parameter is used for metrics reporting
+func (r *Router) recordFailureAndOpenCircuit(state *clientState, nodeID string) {
 	failures := atomic.AddInt32(&state.failureCount, 1)
 
 	state.mu.Lock()
@@ -383,17 +384,7 @@ func (r *Router) recordFailureAndOpenCircuit(state *clientState) {
 			state.circuitOpenTime = time.Now()
 			state.mu.Unlock()
 
-			// Find node ID for metrics (reverse lookup through clients map)
-			r.mu.RLock()
-			var nodeID string
-			for id, s := range r.clients {
-				if s == state {
-					nodeID = id
-					break
-				}
-			}
-			r.mu.RUnlock()
-
+			// Update metrics using the provided nodeID
 			if nodeID != "" {
 				metrics.ClusterCircuitBreakerOpened.WithLabelValues(nodeID).Inc()
 				metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(1)
