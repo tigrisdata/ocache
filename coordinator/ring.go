@@ -9,6 +9,7 @@ import (
 	"github.com/buraksezer/consistent"
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/hash"
+	"github.com/tigrisdata/ocache/common/metrics"
 )
 
 // NodeStatus represents the status of a node in the cluster
@@ -81,12 +82,17 @@ func NewRing(partitionCount int, localNodeID string) (*Ring, error) {
 
 	ch := consistent.New(nil, cfg)
 
-	return &Ring{
+	r := &Ring{
 		ch:             ch,
 		nodes:          make(map[string]*NodeInfo),
 		partitionCount: partitionCount,
 		localNodeID:    localNodeID,
-	}, nil
+	}
+
+	// Initialize partition count metric
+	metrics.ClusterPartitionCount.Set(float64(partitionCount))
+
+	return r, nil
 }
 
 // AddNode adds a new node with both cluster and listen addresses
@@ -136,8 +142,13 @@ func (r *Ring) AddNode(id, address, listenAddress string) (bool, error) {
 	}
 
 	// Increment membership epoch (true membership change)
-	atomic.AddUint64(&r.epoch, 1)
+	newEpoch := atomic.AddUint64(&r.epoch, 1)
 	isNewNode = true
+
+	// Update metrics
+	metrics.ClusterNodesAdded.Inc()
+	metrics.ClusterEpoch.Set(float64(newEpoch))
+	r.updateNodeCountMetrics()
 
 	zlog.Info().
 		Str("node_id", id).
@@ -166,7 +177,12 @@ func (r *Ring) RemoveNode(id string) error {
 	delete(r.nodes, id)
 
 	// Increment membership epoch (true membership change)
-	atomic.AddUint64(&r.epoch, 1)
+	newEpoch := atomic.AddUint64(&r.epoch, 1)
+
+	// Update metrics
+	metrics.ClusterNodesRemoved.Inc()
+	metrics.ClusterEpoch.Set(float64(newEpoch))
+	r.updateNodeCountMetrics()
 
 	zlog.Info().
 		Str("node_id", id).
@@ -201,6 +217,9 @@ func (r *Ring) UpdateNodeStatus(id string, status NodeStatus) error {
 		node.Available = false // Not available until fully joined
 	}
 
+	// Update metrics
+	r.updateNodeCountMetrics()
+
 	zlog.Info().
 		Str("node_id", id).
 		Str("old_status", oldStatus.String()).
@@ -216,6 +235,8 @@ func (r *Ring) UpdateNodeStatus(id string, status NodeStatus) error {
 // Returns error if owner is unavailable.
 // Optimized to minimize lock hold time by doing hash lookup lock-free
 func (r *Ring) GetNode(key string) (*NodeInfo, error) {
+	metrics.ClusterKeyLookups.Inc()
+
 	// Lock-free hash lookup (consistent hash library is thread-safe)
 	member := r.ch.LocateKey([]byte(key))
 	if member == nil {
@@ -339,7 +360,13 @@ func (r *Ring) IsLocal(key string) bool {
 	if member == nil {
 		return false
 	}
-	return member.String() == r.localNodeID
+	isLocal := member.String() == r.localNodeID
+	if isLocal {
+		metrics.ClusterLocalKeyChecks.WithLabelValues("local").Inc()
+	} else {
+		metrics.ClusterLocalKeyChecks.WithLabelValues("remote").Inc()
+	}
+	return isLocal
 }
 
 // IsNodeAvailable checks if a specific node is available
@@ -436,4 +463,19 @@ func (r *Ring) GetRingConfig() (partitionCount int32, replicationFactor int32, l
 
 	// Return the actual configuration used by this ring
 	return int32(r.partitionCount), hash.DefaultReplicationFactor, hash.DefaultLoad
+}
+
+// updateNodeCountMetrics updates node count metrics by status
+// Must be called with r.mu held (either read or write lock)
+func (r *Ring) updateNodeCountMetrics() {
+	statusCounts := make(map[NodeStatus]int)
+	for _, node := range r.nodes {
+		statusCounts[node.Status]++
+	}
+
+	// Update metrics for each status
+	metrics.ClusterNodes.WithLabelValues("active").Set(float64(statusCounts[NodeStatusActive]))
+	metrics.ClusterNodes.WithLabelValues("down").Set(float64(statusCounts[NodeStatusDown]))
+	metrics.ClusterNodes.WithLabelValues("joining").Set(float64(statusCounts[NodeStatusJoining]))
+	metrics.ClusterNodes.WithLabelValues("leaving").Set(float64(statusCounts[NodeStatusLeaving]))
 }

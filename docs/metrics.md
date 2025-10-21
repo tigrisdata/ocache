@@ -140,6 +140,70 @@ OCache exposes Prometheus metrics at the `/metrics` endpoint on the configured H
 | `ocache_bytes_total`        | Gauge | -      | Total bytes currently stored in cache.                      |
 | `ocache_connections_active` | Gauge | `type` | Number of active connections. Type can be `grpc` or `http`. |
 
+### Cluster Metrics
+
+These metrics are only available when OCache is running in cluster mode (`-cluster-enabled`).
+
+#### Cluster Membership Metrics
+
+| Metric Name                          | Type    | Labels   | Description                                                                              |
+| ------------------------------------ | ------- | -------- | ---------------------------------------------------------------------------------------- |
+| `ocache_cluster_nodes`               | Gauge   | `status` | Number of nodes in the cluster. Status can be `active`, `down`, `joining`, or `leaving`. |
+| `ocache_cluster_epoch`               | Gauge   | -        | Current cluster membership epoch. Increments on node add/remove.                         |
+| `ocache_cluster_partition_count`     | Gauge   | -        | Total number of partitions in the consistent hash ring.                                  |
+| `ocache_cluster_nodes_added_total`   | Counter | -        | Total number of nodes added to the cluster.                                              |
+| `ocache_cluster_nodes_removed_total` | Counter | -        | Total number of nodes removed from the cluster.                                          |
+
+#### Heartbeat & Failure Detection Metrics
+
+| Metric Name                                | Type      | Labels        | Description                                                                |
+| ------------------------------------------ | --------- | ------------- | -------------------------------------------------------------------------- |
+| `ocache_cluster_heartbeats_sent_total`     | Counter   | `target_node` | Total number of heartbeats sent to each node.                              |
+| `ocache_cluster_heartbeats_received_total` | Counter   | `source_node` | Total number of heartbeats received from each node.                        |
+| `ocache_cluster_heartbeat_failures_total`  | Counter   | `target_node` | Total number of failed heartbeat attempts per node.                        |
+| `ocache_cluster_heartbeat_duration_ms`     | Histogram | `target_node` | Heartbeat round-trip time in milliseconds.                                 |
+| `ocache_cluster_node_failure_count`        | Gauge     | `node_id`     | Current consecutive failure count for each node.                           |
+| `ocache_cluster_nodes_marked_down_total`   | Counter   | -             | Total number of times nodes were marked as down due to heartbeat failures. |
+
+#### Router & Connection Metrics
+
+| Metric Name                                   | Type    | Labels              | Description                                                                       |
+| --------------------------------------------- | ------- | ------------------- | --------------------------------------------------------------------------------- |
+| `ocache_cluster_route_requests_total`         | Counter | `result`            | Total routing requests. Result can be `local`, `remote`, or `error`.              |
+| `ocache_cluster_connections_active`           | Gauge   | `node_id`           | Number of active gRPC connections to each node (0 or 1).                          |
+| `ocache_cluster_connection_failures_total`    | Counter | `node_id`, `reason` | Total connection failures per node. Reason indicates the failure type.            |
+| `ocache_cluster_circuit_breaker_state`        | Gauge   | `node_id`           | Circuit breaker state per node (0=closed/healthy, 1=open/unhealthy).              |
+| `ocache_cluster_circuit_breaker_opened_total` | Counter | `node_id`           | Total number of times circuit breaker opened for each node.                       |
+| `ocache_cluster_retry_attempts_total`         | Counter | `node_id`           | Total number of retry attempts for failed routing operations.                     |
+| `ocache_cluster_routing_errors_total`         | Counter | `error_type`        | Total routing errors by type (e.g., `circuit_breaker_open`, `connection_failed`). |
+
+#### Join/Sync Operations Metrics
+
+| Metric Name                                 | Type      | Labels        | Description                                                                    |
+| ------------------------------------------- | --------- | ------------- | ------------------------------------------------------------------------------ |
+| `ocache_cluster_join_requests_total`        | Counter   | `status`      | Total join requests handled. Status can be `success` or `error`.               |
+| `ocache_cluster_sync_operations_total`      | Counter   | `status`      | Total cluster state synchronizations. Status can be `success` or `error`.      |
+| `ocache_cluster_sync_duration_ms`           | Histogram | `target_node` | Time to synchronize cluster state with a node in milliseconds.                 |
+| `ocache_cluster_broadcasts_sent_total`      | Counter   | `type`        | Total broadcast operations sent. Type indicates broadcast type (e.g., `join`). |
+| `ocache_cluster_broadcasts_duplicate_total` | Counter   | -             | Total number of duplicate broadcasts prevented by deduplication cache.         |
+
+#### Discovery Metrics
+
+These metrics track node discovery operations, especially relevant for DNS-based discovery.
+
+| Metric Name                                    | Type      | Labels   | Description                                                                |
+| ---------------------------------------------- | --------- | -------- | -------------------------------------------------------------------------- |
+| `ocache_cluster_discovery_refreshes_total`     | Counter   | `status` | Total node discovery refresh attempts. Status can be `success` or `error`. |
+| `ocache_cluster_discovery_nodes_changed_total` | Counter   | `type`   | Total node changes detected. Type can be `added` or `removed`.             |
+| `ocache_cluster_discovery_duration_ms`         | Histogram | -        | Time to resolve nodes via discovery in milliseconds.                       |
+
+#### Ring/Partition Metrics
+
+| Metric Name                             | Type    | Labels   | Description                                                     |
+| --------------------------------------- | ------- | -------- | --------------------------------------------------------------- |
+| `ocache_cluster_key_lookups_total`      | Counter | -        | Total number of key-to-node lookups performed in the hash ring. |
+| `ocache_cluster_local_key_checks_total` | Counter | `result` | Total IsLocal() checks. Result can be `local` or `remote`.      |
+
 ## Histogram Buckets
 
 OCache uses two sets of histogram buckets optimized for different operation types:

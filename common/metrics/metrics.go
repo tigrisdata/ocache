@@ -451,6 +451,231 @@ var (
 			Help: "Total bytes freed by recompaction",
 		},
 	)
+
+	// Cluster Membership Metrics
+	ClusterNodes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_nodes",
+			Help: "Number of nodes in the cluster by status",
+		},
+		[]string{"status"},
+	)
+
+	ClusterEpoch = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_epoch",
+			Help: "Current cluster membership epoch",
+		},
+	)
+
+	ClusterPartitionCount = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_partition_count",
+			Help: "Total number of partitions in the hash ring",
+		},
+	)
+
+	ClusterNodesAdded = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_nodes_added_total",
+			Help: "Total number of nodes added to the cluster",
+		},
+	)
+
+	ClusterNodesRemoved = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_nodes_removed_total",
+			Help: "Total number of nodes removed from the cluster",
+		},
+	)
+
+	// Heartbeat & Failure Detection Metrics
+	ClusterHeartbeatsSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_heartbeats_sent_total",
+			Help: "Total number of heartbeats sent to each node",
+		},
+		[]string{"target_node"},
+	)
+
+	ClusterHeartbeatsReceived = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_heartbeats_received_total",
+			Help: "Total number of heartbeats received from each node",
+		},
+		[]string{"source_node"},
+	)
+
+	ClusterHeartbeatFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_heartbeat_failures_total",
+			Help: "Total number of failed heartbeat attempts per node",
+		},
+		[]string{"target_node"},
+	)
+
+	ClusterHeartbeatDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ocache_cluster_heartbeat_duration_ms",
+			Help:    "Heartbeat round-trip time in milliseconds",
+			Buckets: fastOpsBuckets,
+		},
+		[]string{"target_node"},
+	)
+
+	ClusterNodeFailureCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_node_failure_count",
+			Help: "Current consecutive failure count for each node",
+		},
+		[]string{"node_id"},
+	)
+
+	ClusterNodesMarkedDown = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_nodes_marked_down_total",
+			Help: "Total number of times nodes were marked as down",
+		},
+	)
+
+	// Router & Connection Metrics
+	ClusterRouteRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_route_requests_total",
+			Help: "Total number of routing requests by result type",
+		},
+		[]string{"result"},
+	)
+
+	ClusterConnectionsActive = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_connections_active",
+			Help: "Number of active gRPC connections to each node",
+		},
+		[]string{"node_id"},
+	)
+
+	ClusterConnectionFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_connection_failures_total",
+			Help: "Total number of connection failures per node",
+		},
+		[]string{"node_id", "reason"},
+	)
+
+	ClusterCircuitBreakerState = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_circuit_breaker_state",
+			Help: "Circuit breaker state per node (0=closed, 1=open)",
+		},
+		[]string{"node_id"},
+	)
+
+	ClusterCircuitBreakerOpened = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_circuit_breaker_opened_total",
+			Help: "Total number of times circuit breaker opened per node",
+		},
+		[]string{"node_id"},
+	)
+
+	ClusterRetryAttempts = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_retry_attempts_total",
+			Help: "Total number of retry attempts for failed routes",
+		},
+		[]string{"node_id"},
+	)
+
+	ClusterRoutingErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_routing_errors_total",
+			Help: "Total number of routing errors by type",
+		},
+		[]string{"error_type"},
+	)
+
+	// Join/Sync Operations Metrics
+	ClusterJoinRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_join_requests_total",
+			Help: "Total number of join requests handled",
+		},
+		[]string{"status"},
+	)
+
+	ClusterSyncOperations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_sync_operations_total",
+			Help: "Total number of cluster state synchronizations",
+		},
+		[]string{"status"},
+	)
+
+	ClusterSyncDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "ocache_cluster_sync_duration_ms",
+			Help:    "Time to synchronize cluster state with a node in milliseconds",
+			Buckets: fastOpsBuckets,
+		},
+		[]string{"target_node"},
+	)
+
+	ClusterBroadcastsSent = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_broadcasts_sent_total",
+			Help: "Total number of broadcast operations sent",
+		},
+		[]string{"type"},
+	)
+
+	ClusterBroadcastsDuplicate = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_broadcasts_duplicate_total",
+			Help: "Total number of duplicate broadcasts prevented",
+		},
+	)
+
+	// Discovery Metrics
+	ClusterDiscoveryRefreshes = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_discovery_refreshes_total",
+			Help: "Total number of node discovery refresh attempts",
+		},
+		[]string{"status"},
+	)
+
+	ClusterDiscoveryNodesChanged = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_discovery_nodes_changed_total",
+			Help: "Total number of node changes detected during discovery",
+		},
+		[]string{"type"},
+	)
+
+	ClusterDiscoveryDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "ocache_cluster_discovery_duration_ms",
+			Help:    "Time to resolve nodes via discovery in milliseconds",
+			Buckets: fastOpsBuckets,
+		},
+	)
+
+	// Ring/Partition Metrics
+	ClusterKeyLookups = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_key_lookups_total",
+			Help: "Total number of key-to-node lookups performed",
+		},
+	)
+
+	ClusterLocalKeyChecks = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cluster_local_key_checks_total",
+			Help: "Total number of IsLocal checks performed",
+		},
+		[]string{"result"},
+	)
 )
 
 // Init initializes the metrics package
