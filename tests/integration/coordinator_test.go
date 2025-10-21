@@ -132,3 +132,107 @@ func (s *CoordinatorSuite) Test_Coordinator_NodeLeave() {
 		assert.Equal(s.T(), 2, activeCount, "Node %s should see 2 active nodes", nodeID)
 	}
 }
+
+// Test_Coordinator_GracefulNodeDeparture tests that graceful departure removes node quickly
+func (s *CoordinatorSuite) Test_Coordinator_GracefulNodeDeparture() {
+	// Start all 3 nodes
+	err := s.harness.StartAllNodes()
+	require.NoError(s.T(), err, "Failed to start nodes")
+
+	// Wait for convergence
+	err = s.harness.WaitForConvergence(10 * time.Second)
+	require.NoError(s.T(), err, "Cluster did not converge")
+
+	// Verify all nodes see each other (3 nodes total)
+	for nodeID := range s.harness.Nodes {
+		topology, err := s.harness.GetTopology(nodeID)
+		require.NoError(s.T(), err)
+		assert.Equal(s.T(), 3, len(topology.Nodes),
+			"Node %s should see 3 nodes before departure", nodeID)
+	}
+
+	// Select a node to stop gracefully
+	var nodeToStop string
+	var remainingNodes []string
+	for nodeID := range s.harness.Nodes {
+		if nodeToStop == "" {
+			nodeToStop = nodeID
+		} else {
+			remainingNodes = append(remainingNodes, nodeID)
+		}
+	}
+
+	require.NotEmpty(s.T(), nodeToStop, "Should have a node to stop")
+	require.Len(s.T(), remainingNodes, 2, "Should have 2 remaining nodes")
+
+	node := s.harness.Nodes[nodeToStop]
+	require.NotNil(s.T(), node)
+
+	s.T().Logf("Stopping node %s gracefully", nodeToStop)
+
+	// Record time before stopping
+	startTime := time.Now()
+
+	// Gracefully stop the node (this should trigger announceLeave)
+	err = node.Stop()
+	require.NoError(s.T(), err)
+
+	// Verify remaining nodes quickly detect the departure
+	// With graceful departure, this should happen in < 1 second
+	// (not 10-20 seconds like passive detection)
+	for _, nodeID := range remainingNodes {
+		n := s.harness.Nodes[nodeID]
+		if !n.IsRunning() {
+			continue
+		}
+
+		s.T().Logf("Checking if node %s detected departure of %s", nodeID, nodeToStop)
+
+		var topology *clusterpb.ClusterTopology
+		nodeRemoved := false
+
+		// Check every 100ms for up to 5 seconds
+		// Graceful departure should complete within ~500ms
+		for i := 0; i < 50; i++ {
+			topology, err = s.harness.GetTopology(nodeID)
+			require.NoError(s.T(), err)
+
+			// Check if the stopped node is completely removed from ring
+			nodeFound := false
+			for _, topologyNode := range topology.Nodes {
+				if topologyNode.Id == nodeToStop {
+					nodeFound = true
+					break
+				}
+			}
+
+			if !nodeFound {
+				nodeRemoved = true
+				elapsed := time.Since(startTime)
+				s.T().Logf("Node %s detected departure of %s in %v", nodeID, nodeToStop, elapsed)
+				break
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		require.True(s.T(), nodeRemoved,
+			"Node %s should have removed departed node %s from ring", nodeID, nodeToStop)
+
+		// Verify topology now has only 2 nodes
+		assert.Equal(s.T(), 2, len(topology.Nodes),
+			"Node %s should see only 2 nodes after graceful departure", nodeID)
+
+		// Verify both remaining nodes are active
+		for _, topologyNode := range topology.Nodes {
+			assert.Equal(s.T(), clusterpb.NodeStatus_NODE_STATUS_ACTIVE, topologyNode.Status,
+				"All remaining nodes should be active")
+		}
+	}
+
+	// Verify graceful departure was fast (< 2 seconds)
+	totalElapsed := time.Since(startTime)
+	s.T().Logf("Total time for graceful departure detection: %v", totalElapsed)
+	assert.Less(s.T(), totalElapsed, 2*time.Second,
+		"Graceful departure should be detected quickly (not 10-20s like passive detection)")
+}
