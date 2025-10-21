@@ -350,9 +350,7 @@ func (r *Router) isCircuitOpen(state *clientState, nodeID string) bool {
 			atomic.StoreInt32(&state.failureCount, 0)
 
 			// Update metrics using the provided nodeID
-			if nodeID != "" {
-				metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(0)
-			}
+			metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(0)
 		}
 		return false
 	}
@@ -376,10 +374,8 @@ func (r *Router) recordFailureAndOpenCircuit(state *clientState, nodeID string) 
 			state.mu.Unlock()
 
 			// Update metrics using the provided nodeID
-			if nodeID != "" {
-				metrics.ClusterCircuitBreakerOpened.WithLabelValues(nodeID).Inc()
-				metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(1)
-			}
+			metrics.ClusterCircuitBreakerOpened.WithLabelValues(nodeID).Inc()
+			metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(1)
 
 			zlog.Warn().
 				Int32("failure_count", failures).
