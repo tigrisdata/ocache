@@ -42,6 +42,12 @@ const (
 
 	// DefaultSyncTimeout is the default timeout for syncing with other nodes
 	DefaultSyncTimeout = 10 * time.Second
+
+	// MaxBroadcastNodes is the maximum number of nodes to broadcast to (prevents broadcast storms)
+	MaxBroadcastNodes = 10
+
+	// LeaveAnnouncementTimeout is the timeout for announcing graceful departure
+	LeaveAnnouncementTimeout = 5 * time.Second
 )
 
 // Config contains the configuration for the coordinator
@@ -1217,7 +1223,6 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 	nodes := c.ring.GetActiveNodes()
 
 	// Limit broadcasts to prevent storms
-	maxBroadcasts := 10
 	actualBroadcasts := 0
 
 	// Count eligible nodes (excluding self and new node)
@@ -1232,7 +1237,7 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 		Str("node_id", c.config.MyNodeID).
 		Str("new_node", newNodeID).
 		Int("eligible_nodes", eligibleNodes).
-		Int("max_broadcasts", maxBroadcasts).
+		Int("max_broadcasts", MaxBroadcastNodes).
 		Msg("Broadcasting join event to cluster")
 
 	for _, node := range nodes {
@@ -1242,7 +1247,7 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 		}
 
 		// Limit number of broadcasts
-		if actualBroadcasts >= maxBroadcasts {
+		if actualBroadcasts >= MaxBroadcastNodes {
 			remainingNodes := eligibleNodes - actualBroadcasts
 			zlog.Warn().
 				Int("sent", actualBroadcasts).
@@ -1324,19 +1329,19 @@ func (c *Coordinator) announceLeave() {
 	c.broadcastLeave(c.config.MyNodeID, &successfulBroadcasts, &wg, nodes)
 
 	// Wait for all broadcasts to complete with a timeout
-	done := make(chan struct{})
+	waitCh := make(chan struct{})
 	go func() {
 		wg.Wait()
-		close(done)
+		close(waitCh)
 	}()
 
 	select {
-	case <-done:
+	case <-waitCh:
 		zlog.Info().
 			Str("node_id", c.config.MyNodeID).
 			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
 			Msg("Graceful departure announced to cluster")
-	case <-time.After(5 * time.Second):
+	case <-time.After(LeaveAnnouncementTimeout):
 		zlog.Warn().
 			Str("node_id", c.config.MyNodeID).
 			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
@@ -1347,7 +1352,6 @@ func (c *Coordinator) announceLeave() {
 // broadcastLeave notifies all active nodes about this node leaving
 func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int32, wg *sync.WaitGroup, nodes []*NodeInfo) {
 	// Limit broadcasts to prevent storms
-	maxBroadcasts := 10
 	actualBroadcasts := 0
 
 	// Count eligible nodes (excluding self)
@@ -1362,7 +1366,7 @@ func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int
 		Str("node_id", c.config.MyNodeID).
 		Str("departing_node", departingNodeID).
 		Int("eligible_nodes", eligibleNodes).
-		Int("max_broadcasts", maxBroadcasts).
+		Int("max_broadcasts", MaxBroadcastNodes).
 		Msg("Broadcasting leave event to cluster")
 
 	for _, node := range nodes {
@@ -1372,7 +1376,7 @@ func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int
 		}
 
 		// Limit number of broadcasts
-		if actualBroadcasts >= maxBroadcasts {
+		if actualBroadcasts >= MaxBroadcastNodes {
 			remainingNodes := eligibleNodes - actualBroadcasts
 			zlog.Warn().
 				Int("sent", actualBroadcasts).
