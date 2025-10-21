@@ -310,7 +310,7 @@ func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
 
 func (r *Router) getConnectionHealth(state *clientState, nodeID string) error {
 	// Check if circuit breaker is open
-	if r.isCircuitOpen(state) {
+	if r.isCircuitOpen(state, nodeID) {
 		zlog.Warn().
 			Str("node_id", nodeID).
 			Msg("Circuit breaker open for node")
@@ -332,7 +332,8 @@ func (r *Router) getConnectionHealth(state *clientState, nodeID string) error {
 }
 
 // isCircuitOpen checks if the circuit breaker is open for a client
-func (r *Router) isCircuitOpen(state *clientState) bool {
+// nodeID parameter is used for metrics reporting when circuit closes
+func (r *Router) isCircuitOpen(state *clientState, nodeID string) bool {
 	if atomic.LoadInt32(&state.circuitOpen) == 0 {
 		return false
 	}
@@ -348,17 +349,7 @@ func (r *Router) isCircuitOpen(state *clientState) bool {
 			// Only reset failure count if we successfully closed the circuit
 			atomic.StoreInt32(&state.failureCount, 0)
 
-			// Find node ID and update metrics
-			r.mu.RLock()
-			var nodeID string
-			for id, s := range r.clients {
-				if s == state {
-					nodeID = id
-					break
-				}
-			}
-			r.mu.RUnlock()
-
+			// Update metrics using the provided nodeID
 			if nodeID != "" {
 				metrics.ClusterCircuitBreakerState.WithLabelValues(nodeID).Set(0)
 			}
