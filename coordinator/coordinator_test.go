@@ -1016,14 +1016,14 @@ func TestCoordinator_GracefulDepartureTimeout(t *testing.T) {
 	require.NoError(t, err)
 
 	// Stop should complete even though broadcast to unreachable node will timeout
-	// The LeaveAnnouncementTimeout (2s) should prevent hanging
+	// The LeaveAnnouncementTimeout (5s) should prevent hanging
 	start := time.Now()
 	err = coord.Stop()
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	// Should complete within timeout window (2s + some overhead)
-	assert.Less(t, elapsed, 4*time.Second, "Stop should complete within timeout window")
+	// Should complete within timeout window (5s + some overhead)
+	assert.Less(t, elapsed, 7*time.Second, "Stop should complete within timeout window")
 }
 
 // TestCoordinator_BroadcastLeaveToAllNodes tests that broadcasts go to all nodes

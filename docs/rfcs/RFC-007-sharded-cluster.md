@@ -221,7 +221,7 @@ sequenceDiagram
 
 When a node receives SIGINT/SIGTERM, it announces its departure before shutting down:
 
-- **Leave Broadcast**: Sends Leave RPC to up to 10 active nodes (MaxBroadcastNodes)
+- **Leave Broadcast**: Sends Leave RPC to all active nodes
 - **Broadcast Timeout**: 5 seconds (LeaveAnnouncementTimeout)
 - **Node Removal**: Receiving nodes immediately remove departing node from ring
 - **Cleanup**: Deletes heartbeat tracking and closes connections
