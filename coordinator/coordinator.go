@@ -42,6 +42,12 @@ const (
 
 	// DefaultSyncTimeout is the default timeout for syncing with other nodes
 	DefaultSyncTimeout = 10 * time.Second
+
+	// MaxBroadcastNodes is the maximum number of nodes to broadcast to (prevents broadcast storms)
+	MaxBroadcastNodes = 10
+
+	// LeaveAnnouncementTimeout is the timeout for announcing graceful departure
+	LeaveAnnouncementTimeout = 5 * time.Second
 )
 
 // Config contains the configuration for the coordinator
@@ -283,6 +289,9 @@ func (c *Coordinator) Start(ctx context.Context) error {
 
 // Stop stops the coordinator and cleans up resources
 func (c *Coordinator) Stop() error {
+	// Announce graceful departure to cluster before stopping
+	c.announceLeave()
+
 	close(c.stopCh)
 
 	if c.grpcServer != nil {
@@ -1214,7 +1223,6 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 	nodes := c.ring.GetActiveNodes()
 
 	// Limit broadcasts to prevent storms
-	maxBroadcasts := 10
 	actualBroadcasts := 0
 
 	// Count eligible nodes (excluding self and new node)
@@ -1229,7 +1237,7 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 		Str("node_id", c.config.MyNodeID).
 		Str("new_node", newNodeID).
 		Int("eligible_nodes", eligibleNodes).
-		Int("max_broadcasts", maxBroadcasts).
+		Int("max_broadcasts", MaxBroadcastNodes).
 		Msg("Broadcasting join event to cluster")
 
 	for _, node := range nodes {
@@ -1239,7 +1247,7 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 		}
 
 		// Limit number of broadcasts
-		if actualBroadcasts >= maxBroadcasts {
+		if actualBroadcasts >= MaxBroadcastNodes {
 			remainingNodes := eligibleNodes - actualBroadcasts
 			zlog.Warn().
 				Int("sent", actualBroadcasts).
@@ -1301,6 +1309,115 @@ func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr st
 					Str("target_node", targetNode.ID).
 					Str("new_node", newNodeID).
 					Msg("Successfully broadcast join to node")
+			}
+		}(node)
+	}
+}
+
+// announceLeave notifies all active nodes that this node is leaving gracefully
+func (c *Coordinator) announceLeave() {
+	zlog.Info().
+		Str("node_id", c.config.MyNodeID).
+		Msg("Announcing graceful departure to cluster")
+
+	// Get all active nodes before we start shutting down
+	nodes := c.ring.GetActiveNodes()
+
+	var wg sync.WaitGroup
+	var successfulBroadcasts int32
+
+	c.broadcastLeave(c.config.MyNodeID, &successfulBroadcasts, &wg, nodes)
+
+	// Wait for all broadcasts to complete with a timeout
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+
+	select {
+	case <-waitCh:
+		zlog.Info().
+			Str("node_id", c.config.MyNodeID).
+			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
+			Msg("Graceful departure announced to cluster")
+	case <-time.After(LeaveAnnouncementTimeout):
+		zlog.Warn().
+			Str("node_id", c.config.MyNodeID).
+			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
+			Msg("Timeout waiting for leave broadcasts to complete")
+	}
+}
+
+// broadcastLeave notifies all active nodes about this node leaving
+func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int32, wg *sync.WaitGroup, nodes []*NodeInfo) {
+	// Count eligible nodes (excluding self)
+	eligibleNodes := 0
+	for _, node := range nodes {
+		if node.ID != c.config.MyNodeID {
+			eligibleNodes++
+		}
+	}
+
+	zlog.Info().
+		Str("node_id", c.config.MyNodeID).
+		Str("departing_node", departingNodeID).
+		Int("target_nodes", eligibleNodes).
+		Msg("Broadcasting leave event to all nodes in cluster")
+
+	for _, node := range nodes {
+		// Skip self
+		if node.ID == c.config.MyNodeID {
+			continue
+		}
+
+		// Add to WaitGroup before launching goroutine
+		wg.Add(1)
+
+		// Broadcast asynchronously to avoid blocking
+		go func(targetNode *NodeInfo) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			conn, err := grpc.DialContext(ctx, targetNode.Address,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithBlock(),
+			)
+			if err != nil {
+				zlog.Warn().
+					Err(err).
+					Str("target_node", targetNode.ID).
+					Str("departing_node", departingNodeID).
+					Msg("Failed to connect for leave broadcast")
+				return
+			}
+			defer conn.Close()
+
+			client := clusterpb.NewClusterServiceClient(conn)
+
+			// Send leave request to notify about departure
+			leaveReq := &clusterpb.LeaveRequest{
+				NodeId: departingNodeID,
+			}
+
+			_, err = client.Leave(ctx, leaveReq)
+			if err != nil {
+				zlog.Warn().
+					Err(err).
+					Str("target_node", targetNode.ID).
+					Str("departing_node", departingNodeID).
+					Msg("Failed to broadcast leave to node")
+			} else {
+				if successCounter != nil {
+					atomic.AddInt32(successCounter, 1)
+				}
+				metrics.ClusterBroadcastsSent.WithLabelValues("leave").Inc()
+				zlog.Debug().
+					Str("target_node", targetNode.ID).
+					Str("departing_node", departingNodeID).
+					Msg("Successfully broadcast leave to node")
 			}
 		}(node)
 	}

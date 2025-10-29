@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -924,4 +925,186 @@ func TestCoordinator_SyncWithNodeSuccess(t *testing.T) {
 		}
 	}
 	assert.True(t, foundMockNode, "Mock node from node should be in ring")
+}
+
+// TestCoordinator_GracefulDeparture tests that Stop() announces departure to other nodes
+func TestCoordinator_GracefulDeparture(t *testing.T) {
+	// Start node1 (the one that will receive the leave announcement)
+	config1 := &Config{
+		Enabled:            true,
+		MyNodeID:           "node1",
+		ClusterAddr:        "localhost:9350",
+		ListenAddr:         "localhost:8350",
+		RingPartitionCount: 1024,
+	}
+
+	coord1, err := New(config1)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = coord1.Start(ctx)
+	require.NoError(t, err)
+	defer coord1.Stop()
+
+	// Start node2 (the one that will gracefully leave)
+	config2 := &Config{
+		Enabled:            true,
+		MyNodeID:           "node2",
+		ClusterAddr:        "localhost:9351",
+		ListenAddr:         "localhost:8351",
+		Nodes:              []string{"localhost:9350"},
+		RingPartitionCount: 1024,
+	}
+
+	coord2, err := New(config2)
+	require.NoError(t, err)
+
+	err = coord2.Start(ctx)
+	require.NoError(t, err)
+
+	// Wait for nodes to sync
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify both nodes see each other
+	nodes1 := coord1.GetRing().GetAllNodes()
+	assert.Len(t, nodes1, 2, "Node1 should see 2 nodes")
+
+	nodes2 := coord2.GetRing().GetAllNodes()
+	assert.Len(t, nodes2, 2, "Node2 should see 2 nodes")
+
+	// Node2 gracefully stops (should announce departure)
+	err = coord2.Stop()
+	require.NoError(t, err)
+
+	// Wait for leave announcement to be processed
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify node1 removed node2 from ring
+	nodes1After := coord1.GetRing().GetAllNodes()
+	assert.Len(t, nodes1After, 1, "Node1 should only see itself after node2 leaves")
+	assert.Equal(t, "node1", nodes1After[0].ID)
+}
+
+// TestCoordinator_GracefulDepartureTimeout tests timeout behavior when broadcasts fail
+func TestCoordinator_GracefulDepartureTimeout(t *testing.T) {
+	// Create a coordinator with no other nodes to broadcast to
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "solo-node",
+		ClusterAddr:        "localhost:9352",
+		ListenAddr:         "localhost:8352",
+		RingPartitionCount: 1024,
+	}
+
+	coord, err := New(config)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = coord.Start(ctx)
+	require.NoError(t, err)
+
+	// Add a fake node that won't respond (simulates unreachable node)
+	_, err = coord.Join(context.Background(), &clusterpb.JoinRequest{
+		NodeId:        "unreachable-node",
+		Address:       "localhost:9999", // Nothing listening here
+		ListenAddress: "localhost:8999",
+	})
+	require.NoError(t, err)
+
+	// Stop should complete even though broadcast to unreachable node will timeout
+	// The LeaveAnnouncementTimeout (5s) should prevent hanging
+	start := time.Now()
+	err = coord.Stop()
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	// Should complete within timeout window (5s + some overhead)
+	assert.Less(t, elapsed, 7*time.Second, "Stop should complete within timeout window")
+}
+
+// TestCoordinator_BroadcastLeaveToAllNodes tests that broadcasts go to all nodes
+func TestCoordinator_BroadcastLeaveToAllNodes(t *testing.T) {
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "test-node",
+		ClusterAddr:        "localhost:9353",
+		ListenAddr:         "localhost:8353",
+		RingPartitionCount: 1024,
+	}
+
+	coord, err := New(config)
+	require.NoError(t, err)
+
+	// Add 15 nodes (more than old MaxBroadcastNodes limit of 10)
+	nodeCount := 15
+	for i := 0; i < nodeCount; i++ {
+		_, err = coord.Join(context.Background(), &clusterpb.JoinRequest{
+			NodeId:        fmt.Sprintf("node%d", i),
+			Address:       fmt.Sprintf("localhost:%d", 10000+i),
+			ListenAddress: fmt.Sprintf("localhost:%d", 11000+i),
+		})
+		require.NoError(t, err)
+	}
+
+	// Get all nodes before broadcast
+	nodesBefore := coord.GetRing().GetActiveNodes()
+	assert.Equal(t, nodeCount+1, len(nodesBefore), "Should have test-node + 15 added nodes")
+
+	// Create a mock set of nodes for testing
+	var wg sync.WaitGroup
+	var successfulBroadcasts int32
+
+	// Call broadcastLeave - should broadcast to ALL nodes (not just 10)
+	coord.broadcastLeave(coord.config.MyNodeID, &successfulBroadcasts, &wg, nodesBefore)
+
+	// Wait for all goroutines to complete (they'll all fail since nodes don't exist)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Expected - all broadcasts attempted
+		t.Logf("All %d broadcast attempts completed", nodeCount)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Broadcast goroutines didn't complete in time")
+	}
+
+	// Test ensures that broadcasting to all nodes (15) works without hanging or panicking
+	// All broadcasts will fail (nodes don't exist) but we verify the function completes
+}
+
+// TestCoordinator_AnnounceLeaveWithNoNodes tests announceLeave when no other nodes exist
+func TestCoordinator_AnnounceLeaveWithNoNodes(t *testing.T) {
+	config := &Config{
+		Enabled:            true,
+		MyNodeID:           "solo-node",
+		ClusterAddr:        "localhost:9354",
+		ListenAddr:         "localhost:8354",
+		RingPartitionCount: 1024,
+	}
+
+	coord, err := New(config)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = coord.Start(ctx)
+	require.NoError(t, err)
+
+	// Should complete immediately with no other nodes
+	start := time.Now()
+	err = coord.Stop()
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	// Should complete very quickly since there are no nodes to broadcast to
+	assert.Less(t, elapsed, 1*time.Second, "Stop should complete quickly with no other nodes")
 }
