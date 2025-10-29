@@ -1016,18 +1016,18 @@ func TestCoordinator_GracefulDepartureTimeout(t *testing.T) {
 	require.NoError(t, err)
 
 	// Stop should complete even though broadcast to unreachable node will timeout
-	// The LeaveAnnouncementTimeout (5s) should prevent hanging
+	// The LeaveAnnouncementTimeout (2s) should prevent hanging
 	start := time.Now()
 	err = coord.Stop()
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	// Should complete within timeout window (5s + some overhead)
-	assert.Less(t, elapsed, 7*time.Second, "Stop should complete within timeout window")
+	// Should complete within timeout window (2s + some overhead)
+	assert.Less(t, elapsed, 4*time.Second, "Stop should complete within timeout window")
 }
 
-// TestCoordinator_BroadcastLeaveLimit tests that broadcasts are limited to MaxBroadcastNodes
-func TestCoordinator_BroadcastLeaveLimit(t *testing.T) {
+// TestCoordinator_BroadcastLeaveToAllNodes tests that broadcasts go to all nodes
+func TestCoordinator_BroadcastLeaveToAllNodes(t *testing.T) {
 	config := &Config{
 		Enabled:            true,
 		MyNodeID:           "test-node",
@@ -1039,8 +1039,9 @@ func TestCoordinator_BroadcastLeaveLimit(t *testing.T) {
 	coord, err := New(config)
 	require.NoError(t, err)
 
-	// Add more nodes than MaxBroadcastNodes
-	for i := 0; i < MaxBroadcastNodes+5; i++ {
+	// Add 15 nodes (more than old MaxBroadcastNodes limit of 10)
+	nodeCount := 15
+	for i := 0; i < nodeCount; i++ {
 		_, err = coord.Join(context.Background(), &clusterpb.JoinRequest{
 			NodeId:        fmt.Sprintf("node%d", i),
 			Address:       fmt.Sprintf("localhost:%d", 10000+i),
@@ -1051,13 +1052,13 @@ func TestCoordinator_BroadcastLeaveLimit(t *testing.T) {
 
 	// Get all nodes before broadcast
 	nodesBefore := coord.GetRing().GetActiveNodes()
-	assert.Greater(t, len(nodesBefore), MaxBroadcastNodes, "Should have more nodes than broadcast limit")
+	assert.Equal(t, nodeCount+1, len(nodesBefore), "Should have test-node + 15 added nodes")
 
 	// Create a mock set of nodes for testing
 	var wg sync.WaitGroup
 	var successfulBroadcasts int32
 
-	// Call broadcastLeave - it should only broadcast to MaxBroadcastNodes
+	// Call broadcastLeave - should broadcast to ALL nodes (not just 10)
 	coord.broadcastLeave(coord.config.MyNodeID, &successfulBroadcasts, &wg, nodesBefore)
 
 	// Wait for all goroutines to complete (they'll all fail since nodes don't exist)
@@ -1070,13 +1071,13 @@ func TestCoordinator_BroadcastLeaveLimit(t *testing.T) {
 	select {
 	case <-done:
 		// Expected - all broadcasts attempted
+		t.Logf("All %d broadcast attempts completed", nodeCount)
 	case <-time.After(10 * time.Second):
 		t.Fatal("Broadcast goroutines didn't complete in time")
 	}
 
-	// Verify that we didn't try to broadcast to more than MaxBroadcastNodes
-	// (We can't easily verify the exact count without mocking, but the test ensures
-	// the function doesn't hang or panic with many nodes)
+	// Test ensures that broadcasting to all nodes (15) works without hanging or panicking
+	// All broadcasts will fail (nodes don't exist) but we verify the function completes
 }
 
 // TestCoordinator_AnnounceLeaveWithNoNodes tests announceLeave when no other nodes exist

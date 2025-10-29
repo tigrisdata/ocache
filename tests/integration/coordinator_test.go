@@ -87,49 +87,47 @@ func (s *CoordinatorSuite) Test_Coordinator_NodeLeave() {
 	err = node.Stop()
 	require.NoError(s.T(), err)
 
-	// Verify remaining nodes detect the stopped node as down
-	// Note: Failure detection runs every 10 seconds, and requires 3 missed heartbeats (at 1s intervals)
-	// So we need to wait at least 10-13 seconds for detection
-	// The stopped node will remain in the topology but marked as "Down"
+	// Verify remaining nodes receive leave broadcast and remove the node
+	// With graceful departure, the node is completely removed (not marked DOWN)
+	// This should happen very quickly (< 1s via Leave broadcast)
 	for nodeID, n := range s.harness.Nodes {
 		if nodeID == nodeToStop || !n.IsRunning() {
 			continue
 		}
 
-		// Wait for failure detection (runs every 10s) plus some buffer
+		// Wait for graceful departure to propagate (should be fast)
 		var topology *clusterpb.ClusterTopology
-		detected := false
-		for i := 0; i < 20; i++ {
+		nodeRemoved := false
+		for i := 0; i < 10; i++ {
 			topology, err = s.harness.GetTopology(nodeID)
 			require.NoError(s.T(), err)
 
-			// Check if the stopped node is marked as down
+			// Check if the stopped node is completely removed from topology
+			nodeFound := false
 			for _, node := range topology.Nodes {
-				if node.Id == nodeToStop && node.Status == clusterpb.NodeStatus_NODE_STATUS_DOWN {
-					detected = true
+				if node.Id == nodeToStop {
+					nodeFound = true
 					break
 				}
 			}
 
-			if detected {
+			if !nodeFound {
+				nodeRemoved = true
 				break
 			}
-			time.Sleep(1 * time.Second)
+			time.Sleep(200 * time.Millisecond)
 		}
 
-		require.True(s.T(), detected, "Node %s failed to detect stopped node %s as down within timeout", nodeID, nodeToStop)
+		require.True(s.T(), nodeRemoved, "Node %s failed to remove stopped node %s within timeout", nodeID, nodeToStop)
 
-		// Verify topology still has 3 nodes but one is marked as down
-		assert.Equal(s.T(), 3, len(topology.Nodes), "Node %s should still see 3 nodes in topology", nodeID)
+		// Verify topology now has only 2 nodes (departed node completely removed)
+		assert.Equal(s.T(), 2, len(topology.Nodes), "Node %s should see only 2 nodes after graceful departure", nodeID)
 
-		// Count active nodes
-		activeCount := 0
+		// Verify all remaining nodes are active
 		for _, node := range topology.Nodes {
-			if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
-				activeCount++
-			}
+			assert.Equal(s.T(), clusterpb.NodeStatus_NODE_STATUS_ACTIVE, node.Status,
+				"All remaining nodes should be active, got status %v for node %s", node.Status, node.Id)
 		}
-		assert.Equal(s.T(), 2, activeCount, "Node %s should see 2 active nodes", nodeID)
 	}
 }
 

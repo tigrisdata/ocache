@@ -1351,9 +1351,6 @@ func (c *Coordinator) announceLeave() {
 
 // broadcastLeave notifies all active nodes about this node leaving
 func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int32, wg *sync.WaitGroup, nodes []*NodeInfo) {
-	// Limit broadcasts to prevent storms
-	actualBroadcasts := 0
-
 	// Count eligible nodes (excluding self)
 	eligibleNodes := 0
 	for _, node := range nodes {
@@ -1365,9 +1362,8 @@ func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int
 	zlog.Info().
 		Str("node_id", c.config.MyNodeID).
 		Str("departing_node", departingNodeID).
-		Int("eligible_nodes", eligibleNodes).
-		Int("max_broadcasts", MaxBroadcastNodes).
-		Msg("Broadcasting leave event to cluster")
+		Int("target_nodes", eligibleNodes).
+		Msg("Broadcasting leave event to all nodes in cluster")
 
 	for _, node := range nodes {
 		// Skip self
@@ -1375,27 +1371,13 @@ func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int
 			continue
 		}
 
-		// Limit number of broadcasts
-		if actualBroadcasts >= MaxBroadcastNodes {
-			remainingNodes := eligibleNodes - actualBroadcasts
-			zlog.Warn().
-				Int("sent", actualBroadcasts).
-				Int("skipped", remainingNodes).
-				Msg("Reached broadcast limit, skipping remaining nodes")
-			break
-		}
-		actualBroadcasts++
-
 		// Add to WaitGroup before launching goroutine
-		if wg != nil {
-			wg.Add(1)
-		}
+		wg.Add(1)
 
 		// Broadcast asynchronously to avoid blocking
 		go func(targetNode *NodeInfo) {
-			if wg != nil {
-				defer wg.Done()
-			}
+			defer wg.Done()
+
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 

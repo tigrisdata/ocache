@@ -246,7 +246,7 @@ The cluster maintains eventual consistency through six complementary synchroniza
 | **Join Broadcast**    | Push    | On join event    | Announce new member via gossip cascade     | Up to 10 (with gossip) | Both           |
 | **Heartbeat**         | Push    | Every 1 second   | Liveness detection + epoch verification    | All active nodes       | Both           |
 | **Failure Detection** | Passive | Every 10 seconds | Mark failed nodes as DOWN                  | 0 (local only)         | Both           |
-| **Leave Broadcast**   | Push    | On graceful stop | Announce departure to cluster              | Up to 10               | Both           |
+| **Leave Broadcast**   | Push    | On graceful stop | Announce departure to cluster              | All active nodes       | Both           |
 | **Discovery Loop**    | Pull    | Every 30 seconds | Re-discover dynamic nodes via DNS          | N/A (DNS query)        | DNS only       |
 
 #### 4.4.2 Initial Sync (Bootstrap) - Pull Model
@@ -336,7 +336,7 @@ for each tracked node:
 ```
 Stop() → announceLeave()
   ↓
-broadcastLeave() to up to 10 nodes
+broadcastLeave() to all active nodes
   ↓
 Each node: Leave(departing_node_id)
   ↓
