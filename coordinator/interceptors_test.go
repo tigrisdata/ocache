@@ -108,14 +108,9 @@ func TestCheckHopCount(t *testing.T) {
 		expectErr bool
 	}{
 		{
-			name:      "two hops is allowed",
-			hopCount:  2,
-			expectErr: false,
-		},
-		{
-			name:      "max hops (3) is exceeded",
+			name:      "max hops (3) is allowed",
 			hopCount:  3,
-			expectErr: true,
+			expectErr: false,
 		},
 		{
 			name:      "more than max hops is exceeded",

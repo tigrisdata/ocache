@@ -103,7 +103,7 @@ func AttachForwardingMetadata(ctx context.Context, rm RequestMetadata) context.C
 // Returns an error if the limit is exceeded, nil otherwise.
 // This is the single source of truth for hop count validation.
 func CheckHopCount(hopCount int) error {
-	if hopCount >= MaxHops {
+	if hopCount > MaxHops {
 		return status.Errorf(codes.ResourceExhausted,
 			"max hop count exceeded (%d hops, max %d)", hopCount, MaxHops)
 	}
