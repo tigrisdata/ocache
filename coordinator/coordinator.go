@@ -3,103 +3,65 @@ package coordinator
 import (
 	"context"
 	"fmt"
-	"net"
-	"sync"
-	"sync/atomic"
-	"time"
 
+	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
 	zlog "github.com/rs/zerolog/log"
-	"github.com/tigrisdata/ocache/common/hash"
-	"github.com/tigrisdata/ocache/common/metrics"
-	"github.com/tigrisdata/ocache/coordinator/discovery"
+	"github.com/tigrisdata/ocache/coordinator/gossip"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 const (
 	// MaxMessageSize is the maximum message size for gRPC messages
 	MaxMessageSize = 128 * 1024 * 1024 // 128MB
-
-	// HeartbeatRequestTimeout is the timeout for heartbeat requests
-	HeartbeatRequestTimeout = 2 * time.Second
-
-	// FailureDetectionInterval is the interval at which failure detection is performed
-	FailureDetectionInterval = 10 * time.Second
-
-	// HeartbeatInterval is the interval at which heartbeats are sent to detect node failures
-	DefaultHeartbeatInterval = 5 * time.Second
-
-	// FailureThreshold is the number of consecutive failures before a node is marked as down
-	DefaultFailureThreshold = 3
-
-	// DefaultDNSRefreshInterval is the default interval for DNS refresh
-	DefaultDNSRefreshInterval = 30 * time.Second
-
-	// DefaultBroadcastCacheTime is the default time for broadcasting cache state
-	DefaultBroadcastCacheTime = 10 * time.Second
-
-	// DefaultSyncTimeout is the default timeout for syncing with other nodes
-	DefaultSyncTimeout = 10 * time.Second
-
-	// MaxBroadcastNodes is the maximum number of nodes to broadcast to (prevents broadcast storms)
-	MaxBroadcastNodes = 10
-
-	// LeaveAnnouncementTimeout is the timeout for announcing graceful departure
-	LeaveAnnouncementTimeout = 5 * time.Second
 )
 
 // Config contains the configuration for the coordinator
 type Config struct {
-	Enabled            bool          // Whether the coordinator is enabled
-	MyNodeID           string        // The ID of the node
-	ClusterAddr        string        // The address the coordinator will listen on for cluster communication
-	ListenAddr         string        // The address the node listens on for client requests (Put/Get/Delete)
-	Nodes              []string      // The nodes of the cluster (can be static list or DNS name)
-	RingPartitionCount int           // The number of partitions in the hash ring
-	HeartbeatInterval  int           // The interval at which heartbeats are sent to detect node failures
-	FailureThreshold   int           // The number of consecutive failures before a node is marked as down
-	AllowLocalhost     bool          // Whether to restrict to localhost addresses (for testing)
-	DNSRefreshInterval int           // The interval at which DNS node discovery is performed (seconds)
-	SyncTimeout        int           // The timeout for syncing with other nodes (seconds)
-	RouterConfig       *RouterConfig // Configuration for the Router (optional, uses defaults if nil)
+	Enabled            bool     // Whether the coordinator is enabled
+	MyNodeID           string   // The ID of the node
+	ClusterAddr        string   // The address for memberlist gossip (host:port format, e.g., "0.0.0.0:7946")
+	ListenAddr         string   // The address the node listens on for client requests (Put/Get/Delete and cluster topology)
+	Seeds              []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
+	RingPartitionCount int      // The number of partitions in the hash ring (unused with dskit, kept for API compatibility)
+
+	// LifecyclerConfig allows advanced ring configuration (optional).
+	// Mainly used for testing.
+	LifecyclerConfig ring.LifecyclerConfig
+
+	// Router configuration
+	RouterConfig *RouterConfig
+
+	// Registerer is the prometheus registerer to use. If nil, uses prometheus.DefaultRegisterer.
+	// This is useful for tests to avoid duplicate registration panics.
+	Registerer prometheus.Registerer
 }
 
 // Coordinator manages cluster membership, request routing, and cluster RPC handling.
-// Combines membership tracking, failure detection, and cluster RPC handling.
+// Uses dskit ring + memberlist for gossip-based membership.
+// Note: GetClusterState/GetClusterTopology RPCs are registered on the main server gRPC service.
 type Coordinator struct {
 	clusterpb.UnimplementedClusterServiceServer
 
-	// Configuration for the coordinator
+	// Configuration
 	config *Config
 
-	// Node discovery
-	nodeDiscovery discovery.NodeDiscovery
-	currentNodes  []string     // Currently resolved nodes
-	nodesMu       sync.RWMutex // Protects currentNodes
-
-	// Core components
-	ring   *Ring
-	router *Router
-
-	// Membership tracking
-	heartbeatInterval time.Duration
-	failureThreshold  int
-	failureCount      map[string]int
-	lastHeartbeat     map[string]time.Time // Last heartbeat time for each node
-	syncTimeout       time.Duration
-	mu                sync.RWMutex
-
-	// Broadcast deduplication
-	broadcastCache   map[string]time.Time // Track recent broadcasts to prevent loops
-	broadcastCacheMu sync.RWMutex
+	// dskit ring components
+	memberlistKV *gossip.Memberlist
+	ringManager  *ring.RingManager
+	router       *Router
 
 	// Lifecycle management
-	grpcServer *grpc.Server
-	stopCh     chan struct{}
-	errCh      chan error // Channel for propagating fatal errors
-	wg         sync.WaitGroup
+	stopCh chan struct{}
+	errCh  chan error // Channel for propagating fatal errors
+
+	// Logger adapter for dskit
+	logger log.Logger
+
+	// Prometheus registry
+	reg prometheus.Registerer
 }
 
 // New creates a new coordinator
@@ -112,103 +74,61 @@ func New(config *Config) (*Coordinator, error) {
 	zlog.Debug().
 		Str("node_id", config.MyNodeID).
 		Str("cluster_addr", config.ClusterAddr).
-		Int("node_count", len(config.Nodes)).
-		Int("partition_count", config.RingPartitionCount).
+		Str("listen_addr", config.ListenAddr).
 		Msg("Creating new coordinator")
 
-	if config.MyNodeID == "" {
-		return nil, fmt.Errorf("node ID is required in cluster mode")
+	// Validate node ID format - must be safe for use in memberlist gossip protocol
+	if err := validateNodeID(config.MyNodeID); err != nil {
+		return nil, fmt.Errorf("invalid node ID: %w", err)
 	}
 
-	// Validate cluster address
-	if err := discovery.ValidateClusterAddress(config.ClusterAddr); err != nil {
-		return nil, fmt.Errorf("invalid cluster address: %w", err)
-	}
-
-	// Validate listen address is provided
 	if config.ListenAddr == "" {
 		return nil, fmt.Errorf("listen address is required in cluster mode")
 	}
 
-	// Create node discovery
-	dnsRefreshInterval := time.Duration(config.DNSRefreshInterval) * time.Second
-	if dnsRefreshInterval <= 0 {
-		dnsRefreshInterval = discovery.DefaultDNSRefreshInterval
+	// Create logger adapter for dskit - wraps zerolog to go-kit/log interface
+	logger := &zerologAdapter{}
+
+	// Create prometheus registry (use provided or default)
+	reg := config.Registerer
+	if reg == nil {
+		reg = prometheus.DefaultRegisterer
 	}
 
-	nodeDiscovery, err := discovery.CreateNodeDiscovery(config.Nodes, dnsRefreshInterval)
+	// Create memberlist KV for ring state storage
+	memberlistKV, err := gossip.NewMemberlist(config.MyNodeID, config.ClusterAddr, config.Seeds, logger, reg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create node discovery: %w", err)
+		return nil, fmt.Errorf("failed to create memberlist KV: %w", err)
 	}
 
-	// Initial nodes resolution
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	// Create lifecycler config
+	if err := ring.SetupLifecyclerConfig(config.MyNodeID, config.ListenAddr, &config.LifecyclerConfig); err != nil {
+		return nil, fmt.Errorf("failed to create lifecycler config: %w", err)
+	}
 
-	initialNodes, err := nodeDiscovery.Resolve(ctx)
+	// Create ring manager
+	ringManager, err := ring.NewRingManager(config.LifecyclerConfig, memberlistKV.Client(), logger, reg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve initial nodes: %w", err)
+		return nil, fmt.Errorf("failed to create ring manager: %w", err)
 	}
 
-	zlog.Info().
-		Str("discovery_mode", string(nodeDiscovery.Mode())).
-		Int("resolved_nodes", len(initialNodes)).
-		Strs("nodes", initialNodes).
-		Str("discovery", nodeDiscovery.String()).
-		Msg("Node discovery initialized")
-
-	// Default to 16384 partitions if not set
-	if config.RingPartitionCount < 1 {
-		config.RingPartitionCount = hash.DefaultPartitionCount
-	}
-
-	ring, err := NewRing(config.RingPartitionCount, config.MyNodeID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ring: %w", err)
-	}
-
-	// Create router with config if provided, otherwise use defaults
+	// Create router with ring manager
 	var router *Router
 	if config.RouterConfig != nil {
-		router = NewRouterWithConfig(ring, config.MyNodeID, config.RouterConfig)
+		router = NewRouterWithConfig(ringManager, config.MyNodeID, config.RouterConfig)
 	} else {
-		router = NewRouter(ring, config.MyNodeID)
-	}
-
-	heartbeatInterval := time.Duration(config.HeartbeatInterval) * time.Second
-	if heartbeatInterval == 0 {
-		heartbeatInterval = DefaultHeartbeatInterval
-	}
-
-	failureThreshold := config.FailureThreshold
-	if failureThreshold == 0 {
-		failureThreshold = DefaultFailureThreshold
-	}
-
-	syncTimeout := time.Duration(config.SyncTimeout) * time.Second
-	if syncTimeout == 0 {
-		syncTimeout = DefaultSyncTimeout
+		router = NewRouter(ringManager, config.MyNodeID)
 	}
 
 	coord := &Coordinator{
-		config:            config,
-		nodeDiscovery:     nodeDiscovery,
-		currentNodes:      initialNodes,
-		ring:              ring,
-		router:            router,
-		heartbeatInterval: heartbeatInterval,
-		failureThreshold:  failureThreshold,
-		syncTimeout:       syncTimeout,
-		failureCount:      make(map[string]int),
-		lastHeartbeat:     make(map[string]time.Time),
-		broadcastCache:    make(map[string]time.Time),
-		stopCh:            make(chan struct{}),
-		errCh:             make(chan error, 1), // Buffered to prevent blocking
-	}
-
-	// Add self to ring immediately during initialization
-	if _, err := ring.AddNode(config.MyNodeID, config.ClusterAddr, config.ListenAddr); err != nil {
-		return nil, fmt.Errorf("failed to add self to ring: %w", err)
+		config:       config,
+		memberlistKV: memberlistKV,
+		ringManager:  ringManager,
+		router:       router,
+		stopCh:       make(chan struct{}),
+		errCh:        make(chan error, 1), // Buffered to prevent blocking
+		logger:       logger,
+		reg:          reg,
 	}
 
 	return coord, nil
@@ -216,72 +136,28 @@ func New(config *Config) (*Coordinator, error) {
 
 // Start starts the coordinator and joins the cluster
 func (c *Coordinator) Start(ctx context.Context) error {
-	// Start gRPC server for cluster communication
-	// It will be used to communicate with other nodes in the cluster
-	lis, err := net.Listen("tcp", c.config.ClusterAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on cluster address %s: %w", c.config.ClusterAddr, err)
+	// Start memberlist KV for gossip-based state sharing
+	if err := c.memberlistKV.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start memberlist KV: %w", err)
 	}
 
-	c.grpcServer = grpc.NewServer(
-		grpc.MaxRecvMsgSize(MaxMessageSize),
-		grpc.MaxSendMsgSize(MaxMessageSize),
-	)
-
-	clusterpb.RegisterClusterServiceServer(c.grpcServer, c)
-
-	zlog.Debug().
+	zlog.Info().
 		Str("node_id", c.config.MyNodeID).
-		Str("listen_addr", c.config.ClusterAddr).
-		Msg("Starting cluster gRPC server")
+		Strs("seeds", c.config.Seeds).
+		Msg("Memberlist KV started")
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		if err := c.grpcServer.Serve(lis); err != nil {
-			zlog.Error().Err(err).Msg("Cluster gRPC server failed")
-			// Propagate fatal error unless we're shutting down gracefully
-			select {
-			case <-ctx.Done():
-				// Context cancelled, graceful shutdown
-			case c.errCh <- fmt.Errorf("coordinator gRPC server failed: %w", err):
-				// Error sent
-			default:
-				// Channel full or closed, log and continue
-			}
-		}
-	}()
-
-	// Join cluster
-	zlog.Debug().Msg("Attempting to join cluster")
-	if err := c.joinCluster(); err != nil {
-		// Cleanup: stop the gRPC server we started before returning error
-		if c.grpcServer != nil {
-			c.grpcServer.Stop() // Use Stop() not GracefulStop() since we're in error state
-		}
-		c.wg.Wait() // Wait for serve goroutine to exit
-		return fmt.Errorf("failed to join cluster: %w", err)
-	}
-
-	// Start background tasks
-	zlog.Debug().
-		Bool("node_refresh", c.nodeDiscovery.NeedsRefresh()).
-		Msg("Starting background tasks")
-
-	c.wg.Add(2)
-	go c.sendHeartbeatsLoop()
-	go c.failureDetectionLoop()
-
-	if c.nodeDiscovery.NeedsRefresh() {
-		c.wg.Add(1)
-		go c.nodeDiscoveryLoop()
+	// Start ring manager (ring + lifecycler)
+	if err := c.ringManager.Start(ctx); err != nil {
+		// Cleanup memberlist on failure
+		_ = c.memberlistKV.Stop(ctx)
+		return fmt.Errorf("failed to start ring manager: %w", err)
 	}
 
 	zlog.Info().
 		Str("node_id", c.config.MyNodeID).
 		Str("cluster_addr", c.config.ClusterAddr).
-		Int("partition_count", c.config.RingPartitionCount).
-		Int("node_count", len(c.config.Nodes)).
+		Str("listen_addr", c.config.ListenAddr).
+		Uint64("epoch", c.ringManager.GetEpoch()).
 		Msg("Coordinator started")
 
 	return nil
@@ -289,20 +165,24 @@ func (c *Coordinator) Start(ctx context.Context) error {
 
 // Stop stops the coordinator and cleans up resources
 func (c *Coordinator) Stop() error {
-	// Announce graceful departure to cluster before stopping
-	c.announceLeave()
-
 	close(c.stopCh)
 
-	if c.grpcServer != nil {
-		c.grpcServer.GracefulStop()
-	}
+	ctx := context.Background()
 
+	// Close router connections
 	if err := c.router.Close(); err != nil {
 		zlog.Error().Err(err).Msg("Error closing router connections")
 	}
 
-	c.wg.Wait()
+	// Stop ring manager (will transition to LEAVING state)
+	if err := c.ringManager.Stop(ctx); err != nil {
+		zlog.Error().Err(err).Msg("Error stopping ring manager")
+	}
+
+	// Stop memberlist KV
+	if err := c.memberlistKV.Stop(ctx); err != nil {
+		zlog.Error().Err(err).Msg("Error stopping memberlist KV")
+	}
 
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
@@ -311,659 +191,14 @@ func (c *Coordinator) Stop() error {
 	return nil
 }
 
-// joinCluster bootstraps or joins existing cluster via current discovered nodes
-func (c *Coordinator) joinCluster() error {
-	// Self is already added to ring in New()
-
-	// Get current nodes
-	c.nodesMu.RLock()
-	nodes := c.currentNodes
-	c.nodesMu.RUnlock()
-
-	// Filter out self from the seed list to avoid attempting to sync with ourselves
-	otherNodes := make([]string, 0, len(nodes))
-	for _, node := range nodes {
-		if node != c.config.ClusterAddr {
-			otherNodes = append(otherNodes, node)
-		}
-	}
-
-	// If no other nodes after filtering, we're the bootstrap node
-	if len(otherNodes) == 0 {
-		zlog.Info().
-			Str("node_id", c.config.MyNodeID).
-			Msg("Starting as bootstrap node (no other seeds available)")
-		return nil
-	}
-
-	// Try to sync with all the nodes to get the cluster state
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Strs("nodes", otherNodes).
-		Str("discovery_mode", string(c.nodeDiscovery.Mode())).
-		Msg("Attempting to sync with nodes")
-
-	var lastErr error
-	for _, nodeAddr := range otherNodes {
-		if err := c.syncWithNode(nodeAddr); err != nil {
-			zlog.Warn().
-				Err(err).
-				Str("node", nodeAddr).
-				Msg("Failed to sync with node")
-			lastErr = err
-			continue
-		}
-		// Successfully synced with at least one node
-		zlog.Info().
-			Str("node_id", c.config.MyNodeID).
-			Str("node", nodeAddr).
-			Msg("Successfully synced with node")
-		return nil
-	}
-
-	// All node sync attempts failed - this is acceptable if we're the first node starting up
-	// Fall back to bootstrap mode
-	zlog.Warn().
-		Err(lastErr).
-		Str("node_id", c.config.MyNodeID).
-		Int("attempted_seeds", len(otherNodes)).
-		Msg("Failed to sync with any seed node, starting as bootstrap node")
-	return nil
-}
-
-// syncWithNode gets cluster state from node and announces our join to the cluster
-func (c *Coordinator) syncWithNode(nodeAddr string) error {
-	start := time.Now()
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Str("node", nodeAddr).
-		Msg("Syncing with node")
-
-	ctx, cancel := context.WithTimeout(context.Background(), c.syncTimeout)
-	defer cancel()
-
-	conn, err := grpc.DialContext(ctx, nodeAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
-		return err
-	}
-	defer conn.Close()
-
-	client := clusterpb.NewClusterServiceClient(conn)
-
-	// Get current cluster state from the node
-	zlog.Debug().
-		Str("node", nodeAddr).
-		Msg("Requesting cluster state from node")
-
-	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
-	if err != nil {
-		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
-		return err
-	}
-
-	zlog.Debug().
-		Str("node", nodeAddr).
-		Int("node_count", len(state.Nodes)).
-		Uint64("epoch", state.Epoch).
-		Msg("Received cluster state from node")
-
-	// Get the node ID from the node address by matching against returned nodes
-	var nodeId string
-	for _, node := range state.Nodes {
-		if node.Address == nodeAddr {
-			nodeId = node.Id
-			break
-		}
-	}
-
-	// If we didn't find a matching node, use a placeholder to avoid empty label
-	if nodeId == "" {
-		nodeId = "unknown"
-		zlog.Warn().
-			Str("node_addr", nodeAddr).
-			Msg("Could not determine node ID from cluster state")
-	}
-
-	// Add all nodes to our ring to make sure we have the correct state
-	for _, node := range state.Nodes {
-		// Skip self
-		if node.Id == c.config.MyNodeID {
-			continue
-		}
-
-		// Add node to our ring
-		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
-			zlog.Warn().
-				Err(err).
-				Str("node_id", node.Id).
-				Msg("Failed to add node to ring")
-		}
-	}
-
-	// Announce our join to the cluster
-	joinReq := &clusterpb.JoinRequest{
-		NodeId:        c.config.MyNodeID,
-		Address:       c.config.ClusterAddr,
-		ListenAddress: c.config.ListenAddr,
-	}
-
-	// Send join request to the node
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Str("node", nodeAddr).
-		Msg("Sending join request to node")
-
-	_, err = client.Join(ctx, joinReq)
-	if err != nil {
-		metrics.ClusterSyncOperations.WithLabelValues("error").Inc()
-		return err
-	}
-
-	metrics.ClusterSyncOperations.WithLabelValues("success").Inc()
-	metrics.ClusterSyncDuration.WithLabelValues(nodeId).Observe(float64(time.Since(start).Milliseconds()))
-
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Str("node", nodeAddr).
-		Int("cluster_size", len(state.Nodes)+1).
-		Msg("Successfully joined cluster")
-
-	return nil
-}
-
-// sendHeartbeatsLoop periodically sends heartbeats to detect node failures
-func (c *Coordinator) sendHeartbeatsLoop() {
-	defer c.wg.Done()
-
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Dur("interval", c.heartbeatInterval).
-		Msg("Starting heartbeat loop")
-
-	ticker := time.NewTicker(c.heartbeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			c.sendHeartbeats()
-		case <-c.stopCh:
-			zlog.Debug().
-				Str("node_id", c.config.MyNodeID).
-				Msg("Heartbeat loop stopping")
-			return
-		}
-	}
-}
-
-// sendHeartbeats sends heartbeats to detect node failures
-func (c *Coordinator) sendHeartbeats() {
-	// Send heartbeats to all active nodes
-	nodes := c.ring.GetActiveNodes()
-
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Int("active_nodes", len(nodes)).
-		Msg("Sending heartbeats to nodes")
-	for _, node := range nodes {
-		if node.ID == c.config.MyNodeID {
-			continue
-		}
-
-		go func(n *NodeInfo) {
-			start := time.Now()
-			ctx, cancel := context.WithTimeout(context.Background(), HeartbeatRequestTimeout)
-			defer cancel()
-
-			metrics.ClusterHeartbeatsSent.WithLabelValues(n.ID).Inc()
-
-			conn, err := grpc.DialContext(ctx, n.Address,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-			)
-			if err != nil {
-				zlog.Warn().
-					Err(err).
-					Str("node_id", n.ID).
-					Msg("Failed to send heartbeat to node")
-
-				metrics.ClusterHeartbeatFailures.WithLabelValues(n.ID).Inc()
-				// Update the node failure count on connection failure
-				c.recordFailure(n.ID)
-				return
-			}
-			defer conn.Close()
-
-			client := clusterpb.NewClusterServiceClient(conn)
-			req := &clusterpb.HeartbeatRequest{
-				NodeId: c.config.MyNodeID,
-				Epoch:  c.ring.GetEpoch(),
-			}
-
-			resp, err := client.Heartbeat(ctx, req)
-			if err != nil {
-				zlog.Warn().
-					Err(err).
-					Str("node_id", n.ID).
-					Msg("Failed to send heartbeat to node")
-
-				metrics.ClusterHeartbeatFailures.WithLabelValues(n.ID).Inc()
-				// Update the node failure count on heartbeat request failure
-				c.recordFailure(n.ID)
-			} else {
-				// Record successful heartbeat duration
-				metrics.ClusterHeartbeatDuration.WithLabelValues(n.ID).Observe(float64(time.Since(start).Milliseconds()))
-
-				// Check if heartbeat epoch is newer
-				if resp.Epoch > c.ring.GetEpoch() {
-					zlog.Info().
-						Str("node_id", n.ID).
-						Uint64("local_epoch", c.ring.GetEpoch()).
-						Uint64("remote_epoch", resp.Epoch).
-						Msg("Received heartbeat with newer membership epoch, may need to sync")
-				}
-
-				zlog.Debug().
-					Str("node_id", n.ID).
-					Msg("Successfully sent heartbeat to node")
-
-				// Reset the node failure count on heartbeat success
-				c.recordSuccess(n.ID)
-			}
-		}(node)
-	}
-}
-
-// recordFailure tracks heartbeat failures, marks node down after threshold
-func (c *Coordinator) recordFailure(nodeID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.failureCount[nodeID]++
-	metrics.ClusterNodeFailureCount.WithLabelValues(nodeID).Set(float64(c.failureCount[nodeID]))
-
-	// Mark node as down if failure threshold is exceeded
-	if c.failureCount[nodeID] >= c.failureThreshold {
-		zlog.Warn().
-			Str("node_id", nodeID).
-			Int("failures", c.failureCount[nodeID]).
-			Msg("Node exceeded failure threshold, marking as down")
-
-		metrics.ClusterNodesMarkedDown.Inc()
-
-		if err := c.ring.UpdateNodeStatus(nodeID, NodeStatusDown); err != nil {
-			zlog.Error().
-				Err(err).
-				Str("node_id", nodeID).
-				Msg("Failed to update node status")
-		}
-	}
-}
-
-// recordSuccess resets failure count on successful heartbeat
-func (c *Coordinator) recordSuccess(nodeID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.failureCount[nodeID] = 0
-	c.lastHeartbeat[nodeID] = time.Now()
-	metrics.ClusterNodeFailureCount.WithLabelValues(nodeID).Set(0)
-}
-
-// failureDetectionLoop checks for nodes that haven't sent heartbeats
-func (c *Coordinator) failureDetectionLoop() {
-	defer c.wg.Done()
-
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Msg("Starting failure detection loop")
-
-	ticker := time.NewTicker(FailureDetectionInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			c.verifyLastHeartbeat()
-		case <-c.stopCh:
-			zlog.Debug().
-				Str("node_id", c.config.MyNodeID).
-				Msg("Failure detection loop stopping")
-			return
-		}
-	}
-}
-
-// verifyLastHeartbeat marks nodes as down if heartbeat timeout exceeded
-func (c *Coordinator) verifyLastHeartbeat() {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if len(c.lastHeartbeat) > 0 {
-		zlog.Debug().
-			Str("node_id", c.config.MyNodeID).
-			Int("tracked_nodes", len(c.lastHeartbeat)).
-			Msg("Checking for failed nodes")
-	}
-
-	// Calculate timeout as a multiple of the heartbeat interval
-	timeout := time.Duration(c.failureThreshold) * c.heartbeatInterval
-	now := time.Now()
-
-	for nodeID, lastSeen := range c.lastHeartbeat {
-		// Skip checking our own heartbeat
-		if nodeID == c.config.MyNodeID {
-			continue
-		}
-
-		// Check if heartbeat timeout exceeded
-		if now.Sub(lastSeen) > timeout {
-			// Check current node status to avoid redundant updates
-			status, err := c.ring.GetNodeStatus(nodeID)
-			if err != nil {
-				zlog.Debug().
-					Err(err).
-					Str("node_id", nodeID).
-					Msg("Failed to get node status, skipping heartbeat timeout check")
-				continue
-			}
-
-			// Skip if already marked as down
-			if status == NodeStatusDown {
-				continue
-			}
-
-			zlog.Warn().
-				Str("node_id", nodeID).
-				Dur("last_seen", now.Sub(lastSeen)).
-				Msg("Node heartbeat timeout, marking as down")
-
-			// Mark node as down because heartbeat timeout exceeded
-			if err := c.ring.UpdateNodeStatus(nodeID, NodeStatusDown); err != nil {
-				zlog.Error().
-					Err(err).
-					Str("node_id", nodeID).
-					Msg("Failed to update node status")
-			}
-		}
-	}
-}
-
-// nodeDiscoveryLoop periodically refreshes node addresses if needed
-func (c *Coordinator) nodeDiscoveryLoop() {
-	defer c.wg.Done()
-
-	// Only run if discovery needs refresh (should be checked but double-check)
-	if !c.nodeDiscovery.NeedsRefresh() {
-		return
-	}
-
-	interval := c.nodeDiscovery.RefreshInterval()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Str("discovery_mode", string(c.nodeDiscovery.Mode())).
-		Dur("refresh_interval", interval).
-		Msg("Starting node discovery refresh loop")
-
-	for {
-		select {
-		case <-ticker.C:
-			c.refreshNodes()
-		case <-c.stopCh:
-			zlog.Debug().
-				Str("node_id", c.config.MyNodeID).
-				Msg("Node discovery loop stopping")
-			return
-		}
-	}
-}
-
-// refreshNodes re-resolves nodes and updates the cluster membership
-func (c *Coordinator) refreshNodes() {
-	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	newNodes, err := c.nodeDiscovery.Resolve(ctx)
-	if err != nil {
-		metrics.ClusterDiscoveryRefreshes.WithLabelValues("error").Inc()
-		zlog.Warn().
-			Err(err).
-			Str("discovery", c.nodeDiscovery.String()).
-			Msg("Failed to refresh node addresses")
-		return
-	}
-
-	metrics.ClusterDiscoveryRefreshes.WithLabelValues("success").Inc()
-	metrics.ClusterDiscoveryDuration.Observe(float64(time.Since(start).Milliseconds()))
-
-	c.nodesMu.RLock()
-	oldNodes := make([]string, len(c.currentNodes))
-	copy(oldNodes, c.currentNodes)
-	c.nodesMu.RUnlock()
-
-	// Compare old and new nodes
-	added, removed := discovery.DiffNodes(oldNodes, newNodes)
-
-	if len(added) > 0 || len(removed) > 0 {
-		// Record node changes
-		for range added {
-			metrics.ClusterDiscoveryNodesChanged.WithLabelValues("added").Inc()
-		}
-		for range removed {
-			metrics.ClusterDiscoveryNodesChanged.WithLabelValues("removed").Inc()
-		}
-
-		zlog.Info().
-			Strs("added", added).
-			Strs("removed", removed).
-			Int("old_count", len(oldNodes)).
-			Int("new_count", len(newNodes)).
-			Msg("Node addresses changed")
-
-		// Update current nodes
-		c.nodesMu.Lock()
-		c.currentNodes = newNodes
-		c.nodesMu.Unlock()
-
-		// Try to sync with new nodes
-		for _, addr := range added {
-			go c.tryJoinNode(addr)
-		}
-	} else {
-		zlog.Debug().
-			Int("node_count", len(newNodes)).
-			Msg("Node addresses unchanged")
-	}
-}
-
-// tryJoinNode attempts to sync with a newly discovered node
-func (c *Coordinator) tryJoinNode(nodeClusterAddr string) {
-	// Skip if it's our own address
-	if nodeClusterAddr == c.config.ClusterAddr {
-		return
-	}
-
-	zlog.Info().
-		Str("node", nodeClusterAddr).
-		Msg("Attempting to sync with newly discovered node")
-
-	if err := c.syncWithNode(nodeClusterAddr); err != nil {
-		zlog.Warn().
-			Str("node", nodeClusterAddr).
-			Err(err).
-			Msg("Failed to sync with newly discovered node")
-	} else {
-		zlog.Info().
-			Str("node", nodeClusterAddr).
-			Msg("Successfully synced with newly discovered node")
-	}
-}
-
-// Join handles cluster join requests from new nodes
-func (c *Coordinator) Join(ctx context.Context, req *clusterpb.JoinRequest) (*clusterpb.JoinResponse, error) {
-	zlog.Info().
-		Str("node_id", req.NodeId).
-		Str("cluster_address", req.Address).
-		Str("listen_address", req.ListenAddress).
-		Msg("Received join request")
-
-	// Validate addresses
-	if req.NodeId == "" || req.Address == "" || req.ListenAddress == "" {
-		metrics.ClusterJoinRequests.WithLabelValues("error").Inc()
-		return nil, fmt.Errorf("invalid join request: missing required fields")
-	}
-
-	// Add node to ring with both addresses
-	isNewNode, err := c.ring.AddNode(req.NodeId, req.Address, req.ListenAddress)
-	if err != nil {
-		metrics.ClusterJoinRequests.WithLabelValues("error").Inc()
-		return nil, fmt.Errorf("failed to add node to ring: %w", err)
-	}
-
-	// Reset last heartbeat and failure count
-	c.mu.Lock()
-	c.lastHeartbeat[req.NodeId] = time.Now()
-	c.failureCount[req.NodeId] = 0
-	c.mu.Unlock()
-
-	// Check if we should broadcast this join
-	// We broadcast only if:
-	// 1. This is genuinely a new node (not already in ring)
-	// 2. We haven't recently broadcast this same join (deduplication)
-	shouldBroadcast := isNewNode && !c.shouldSkipBroadcast(req.NodeId, req.Address, req.ListenAddress)
-
-	if shouldBroadcast {
-		// Broadcast the join to all other nodes in the cluster
-		// This ensures all nodes learn about the new member
-		// Note: We record the broadcast AFTER starting it to allow retries on failure
-		go c.broadcastJoinWithCacheUpdate(req.NodeId, req.Address, req.ListenAddress)
-
-		zlog.Debug().
-			Str("node_id", req.NodeId).
-			Msg("Broadcasting join to cluster")
-	} else if !isNewNode {
-		zlog.Debug().
-			Str("node_id", req.NodeId).
-			Msg("Node already in ring, skipping broadcast")
-	} else {
-		metrics.ClusterBroadcastsDuplicate.Inc()
-		zlog.Debug().
-			Str("node_id", req.NodeId).
-			Msg("Recent duplicate broadcast detected, skipping re-broadcast")
-	}
-
-	metrics.ClusterJoinRequests.WithLabelValues("success").Inc()
-
-	return &clusterpb.JoinResponse{
-		Success: true,
-		Epoch:   c.ring.GetEpoch(),
-	}, nil
-}
-
-// Leave handles graceful node departure from cluster
-func (c *Coordinator) Leave(ctx context.Context, req *clusterpb.LeaveRequest) (*clusterpb.LeaveResponse, error) {
-	zlog.Info().
-		Str("node_id", req.NodeId).
-		Msg("Received leave request")
-
-	// Remove node from ring
-	if err := c.ring.RemoveNode(req.NodeId); err != nil {
-		return nil, err
-	}
-
-	// Delete last heartbeat and failure count tracking
-	c.mu.Lock()
-	delete(c.lastHeartbeat, req.NodeId)
-	delete(c.failureCount, req.NodeId)
-	c.mu.Unlock()
-
-	// Clean up router connection to the removed node
-	c.router.RemoveClient(req.NodeId)
-
-	return &clusterpb.LeaveResponse{
-		Success: true,
-	}, nil
-}
-
-// Heartbeat receives heartbeat from remote node, updates tracking
-func (c *Coordinator) Heartbeat(ctx context.Context, req *clusterpb.HeartbeatRequest) (*clusterpb.HeartbeatResponse, error) {
-	zlog.Debug().
-		Str("node_id", req.NodeId).
-		Uint64("epoch", req.Epoch).
-		Msg("Received heartbeat from node")
-
-	metrics.ClusterHeartbeatsReceived.WithLabelValues(req.NodeId).Inc()
-
-	// Record heartbeat success
-	c.recordSuccess(req.NodeId)
-
-	// Check if heartbeat epoch is newer and trigger sync
-	localEpoch := c.ring.GetEpoch()
-	if req.Epoch > localEpoch {
-		zlog.Info().
-			Str("from_node", req.NodeId).
-			Uint64("local_epoch", localEpoch).
-			Uint64("remote_epoch", req.Epoch).
-			Msg("Received heartbeat with newer membership epoch, triggering sync")
-
-		// Get the node's address from our ring to sync with it
-		// Do this atomically to avoid race conditions
-		nodeAddr := c.getNodeAddress(req.NodeId)
-
-		if nodeAddr != "" {
-			// Trigger async sync to avoid blocking heartbeat response
-			// Use a copy of the address to avoid any potential race
-			syncAddr := nodeAddr
-			go func() {
-				// Add timeout to prevent hanging
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-
-				if err := c.syncClusterStateWithContext(ctx, syncAddr); err != nil {
-					zlog.Warn().
-						Err(err).
-						Str("from_node", req.NodeId).
-						Str("sync_addr", syncAddr).
-						Msg("Failed to sync cluster state after detecting newer epoch")
-
-					// Note: We do NOT increment failure count here because:
-					// 1. The heartbeat itself was successful (node is alive)
-					// 2. Sync failure could be due to transient network issues
-					// 3. We don't want to mark healthy nodes as down due to sync issues
-				} else {
-					zlog.Debug().
-						Str("from_node", req.NodeId).
-						Str("sync_addr", syncAddr).
-						Msg("Successfully synced cluster state after epoch mismatch")
-				}
-			}()
-		} else {
-			zlog.Warn().
-				Str("node_id", req.NodeId).
-				Msg("Received heartbeat from unknown node with newer epoch")
-		}
-	}
-
-	return &clusterpb.HeartbeatResponse{
-		Epoch: c.ring.GetEpoch(),
-	}, nil
-}
-
-// GetClusterState returns current cluster membership for new nodes
+// GetClusterState returns current cluster membership for clients
 func (c *Coordinator) GetClusterState(ctx context.Context, req *clusterpb.Empty) (*clusterpb.ClusterState, error) {
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
 		Msg("Received request for cluster state")
 
 	// Get all nodes from ring
-	nodes := c.ring.GetAllNodes()
+	nodes := c.ringManager.GetAllNodes()
 	pbNodes := make([]*clusterpb.NodeInfo, 0, len(nodes))
 
 	// Convert nodes to protobuf format
@@ -984,19 +219,19 @@ func (c *Coordinator) GetClusterState(ctx context.Context, req *clusterpb.Empty)
 		Msg("Returning cluster state")
 
 	return &clusterpb.ClusterState{
-		Epoch: c.ring.GetEpoch(),
+		Epoch: c.ringManager.GetEpoch(),
 		Nodes: pbNodes,
 	}, nil
 }
 
-// GetClusterTopology returns full cluster topology including partition ownership
+// GetClusterTopology returns full cluster topology including token assignments for routing
 func (c *Coordinator) GetClusterTopology(ctx context.Context, req *clusterpb.Empty) (*clusterpb.ClusterTopology, error) {
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
 		Msg("Received request for cluster topology")
 
 	// Get all nodes from ring
-	nodes := c.ring.GetAllNodes()
+	nodes := c.ringManager.GetAllNodes()
 	pbNodes := make([]*clusterpb.NodeInfo, 0, len(nodes))
 
 	// Convert nodes to protobuf format
@@ -1011,41 +246,39 @@ func (c *Coordinator) GetClusterTopology(ctx context.Context, req *clusterpb.Emp
 		pbNodes = append(pbNodes, pbNode)
 	}
 
-	// Get ring configuration
-	partitionCount, replicationFactor, load := c.ring.GetRingConfig()
-	ringConfig := &clusterpb.RingConfig{
-		PartitionCount:    partitionCount,
-		ReplicationFactor: replicationFactor,
-		Load:              load,
+	// Get token assignments from ring for each node
+	nodeTokens := c.ringManager.GetNodeTokens()
+	pbNodeTokens := make([]*clusterpb.NodeTokens, 0, len(nodeTokens))
+	for nodeID, tokens := range nodeTokens {
+		pbNodeTokens = append(pbNodeTokens, &clusterpb.NodeTokens{
+			NodeId: nodeID,
+			Tokens: tokens,
+		})
 	}
 
-	// Get partition ownership mapping
-	partitionOwners := c.ring.GetAllPartitionOwners()
-	pbPartitionOwners := make([]*clusterpb.PartitionOwner, 0, len(partitionOwners))
-	for partitionID, nodeID := range partitionOwners {
-		pbPartitionOwners = append(pbPartitionOwners, &clusterpb.PartitionOwner{
-			PartitionId: partitionID,
-			NodeId:      nodeID,
-		})
+	// Ring config with token assignments for clients
+	// ReplicationFactor here is data replication (1 = no replication)
+	ringConfig := &clusterpb.RingConfig{
+		ReplicationFactor: int32(c.config.LifecyclerConfig.RingConfig.ReplicationFactor),
+		NodeTokens:        pbNodeTokens,
 	}
 
 	zlog.Debug().
 		Str("node_id", c.config.MyNodeID).
 		Int("node_count", len(pbNodes)).
-		Int("partition_count", len(pbPartitionOwners)).
+		Int("token_node_count", len(pbNodeTokens)).
 		Msg("Returning cluster topology")
 
 	return &clusterpb.ClusterTopology{
-		Epoch:           c.ring.GetEpoch(),
-		Nodes:           pbNodes,
-		RingConfig:      ringConfig,
-		PartitionOwners: pbPartitionOwners,
+		Epoch:      c.ringManager.GetEpoch(),
+		Nodes:      pbNodes,
+		RingConfig: ringConfig,
 	}, nil
 }
 
-// GetRing returns the consistent hash ring
-func (c *Coordinator) GetRing() *Ring {
-	return c.ring
+// GetRing returns the ring manager
+func (c *Coordinator) GetRing() *ring.RingManager {
+	return c.ringManager
 }
 
 // GetRouter returns the router
@@ -1060,7 +293,7 @@ func (c *Coordinator) ErrorChan() <-chan error {
 
 // IsLocal checks if the key belongs to the local node
 func (c *Coordinator) IsLocal(key string) bool {
-	return c.router.IsLocal(key)
+	return c.ringManager.IsLocal(key)
 }
 
 // Route returns a client for routing requests for the given key
@@ -1069,8 +302,8 @@ func (c *Coordinator) Route(key string) (pb.CacheServiceClient, error) {
 }
 
 // GetNodeForKey returns the node for the given key
-func (c *Coordinator) GetNodeForKey(key string) (*NodeInfo, error) {
-	return c.ring.GetNode(key)
+func (c *Coordinator) GetNodeForKey(key string) (*ring.NodeInfo, error) {
+	return c.ringManager.GetNode(key)
 }
 
 // GetLocalNodeID returns the ID of the local node
@@ -1078,347 +311,103 @@ func (c *Coordinator) GetLocalNodeID() string {
 	return c.config.MyNodeID
 }
 
-// getNodeAddress safely retrieves a node's address from the ring
-func (c *Coordinator) getNodeAddress(nodeID string) string {
-	nodes := c.ring.GetAllNodes()
-	for _, node := range nodes {
-		if node.ID == nodeID {
-			return node.Address
-		}
-	}
-	return ""
+// GetEpoch returns the current ring epoch
+func (c *Coordinator) GetEpoch() uint64 {
+	return c.ringManager.GetEpoch()
 }
 
-// syncClusterStateWithContext synchronizes the local cluster state with a remote node using provided context
-func (c *Coordinator) syncClusterStateWithContext(ctx context.Context, nodeAddr string) error {
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Str("sync_with", nodeAddr).
-		Msg("Syncing cluster state with remote node")
+// IsReady returns true if the coordinator is ready to serve requests
+func (c *Coordinator) IsReady() bool {
+	return c.ringManager.IsReady()
+}
 
-	conn, err := grpc.DialContext(ctx, nodeAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to connect to node %s: %w", nodeAddr, err)
-	}
-	defer conn.Close()
+// WaitReady blocks until the coordinator reaches ACTIVE state or the context is cancelled.
+// This is useful for callers that need to wait for the cluster to be ready before proceeding.
+func (c *Coordinator) WaitReady(ctx context.Context) error {
+	return c.ringManager.WaitReady(ctx)
+}
 
-	client := clusterpb.NewClusterServiceClient(conn)
+// validateNodeID validates the node ID format.
+// Node IDs must be non-empty and safe for use in memberlist gossip protocol.
+func validateNodeID(nodeID string) error {
+	const maxNodeIDLength = 256
 
-	// Get current cluster state from the remote node
-	state, err := client.GetClusterState(ctx, &clusterpb.Empty{})
-	if err != nil {
-		return fmt.Errorf("failed to get cluster state from node %s: %w", nodeAddr, err)
+	if nodeID == "" {
+		return fmt.Errorf("node ID is required in cluster mode")
 	}
 
-	zlog.Debug().
-		Str("node_id", c.config.MyNodeID).
-		Str("sync_with", nodeAddr).
-		Int("node_count", len(state.Nodes)).
-		Uint64("remote_epoch", state.Epoch).
-		Uint64("local_epoch", c.ring.GetEpoch()).
-		Msg("Received cluster state from remote node")
-
-	// Only sync if remote epoch is newer
-	if state.Epoch <= c.ring.GetEpoch() {
-		zlog.Debug().
-			Str("node_id", c.config.MyNodeID).
-			Uint64("remote_epoch", state.Epoch).
-			Uint64("local_epoch", c.ring.GetEpoch()).
-			Msg("Remote epoch not newer, skipping sync")
-		return nil
+	if len(nodeID) > maxNodeIDLength {
+		return fmt.Errorf("node ID exceeds maximum length of %d characters", maxNodeIDLength)
 	}
 
-	// Apply the state to our local ring
-	successCount := 0
-	for _, node := range state.Nodes {
-		// Add node to our ring (idempotent operation)
-		if _, err := c.ring.AddNode(node.Id, node.Address, node.ListenAddress); err != nil {
-			zlog.Warn().
-				Err(err).
-				Str("node_id", node.Id).
-				Msg("Failed to add node during sync")
-		} else {
-			successCount++
+	// Check for disallowed characters that could cause issues in gossip protocol
+	for i, r := range nodeID {
+		// Disallow control characters, whitespace (except space), and problematic punctuation
+		if r < 32 || r == 127 { // Control characters
+			return fmt.Errorf("node ID contains control character at position %d", i)
+		}
+		if r == '\t' || r == '\n' || r == '\r' {
+			return fmt.Errorf("node ID contains whitespace character at position %d", i)
 		}
 	}
-
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Str("sync_with", nodeAddr).
-		Int("nodes_synced", successCount).
-		Int("total_nodes", len(state.Nodes)).
-		Uint64("new_epoch", c.ring.GetEpoch()).
-		Msg("Completed cluster state sync")
 
 	return nil
 }
 
-// shouldSkipBroadcast checks if a broadcast should be skipped due to recent duplicate
-func (c *Coordinator) shouldSkipBroadcast(nodeID, address, listenAddress string) bool {
-	broadcastKey := fmt.Sprintf("%s:%s:%s", nodeID, address, listenAddress)
+// zerologAdapter adapts zerolog to the go-kit/log interface used by dskit.
+// This allows dskit's memberlist and ring components to log through zerolog.
+type zerologAdapter struct{}
 
-	c.broadcastCacheMu.RLock()
-	lastTime, exists := c.broadcastCache[broadcastKey]
-	c.broadcastCacheMu.RUnlock()
+// Log implements the go-kit/log.Logger interface
+func (z *zerologAdapter) Log(keyvals ...interface{}) error {
+	// Convert key-value pairs to a zerolog event
+	event := zlog.Debug()
 
-	if !exists {
-		return false
-	}
-
-	// Skip if we've seen this broadcast in the last DefaultBroadcastCacheTime
-	return time.Since(lastTime) < DefaultBroadcastCacheTime
-}
-
-// recordBroadcast records that a broadcast was sent
-func (c *Coordinator) recordBroadcast(nodeID, address, listenAddress string) {
-	c.broadcastCacheMu.Lock()
-	defer c.broadcastCacheMu.Unlock()
-
-	broadcastKey := fmt.Sprintf("%s:%s:%s", nodeID, address, listenAddress)
-	c.broadcastCache[broadcastKey] = time.Now()
-
-	// Clean old entries to prevent memory leak
-	if len(c.broadcastCache) > 1000 {
-		c.cleanBroadcastCache()
-	}
-}
-
-// cleanBroadcastCache removes old entries from the broadcast cache
-func (c *Coordinator) cleanBroadcastCache() {
-	// Already holding the lock
-	cutoff := time.Now().Add(-DefaultBroadcastCacheTime)
-	for key, timestamp := range c.broadcastCache {
-		if timestamp.Before(cutoff) {
-			delete(c.broadcastCache, key)
-		}
-	}
-}
-
-// broadcastJoinWithCacheUpdate broadcasts join and updates cache only after successful broadcasts
-func (c *Coordinator) broadcastJoinWithCacheUpdate(newNodeID, newNodeAddr, newNodeListenAddr string) {
-	// Mark as sent only after we've successfully sent at least one broadcast
-	var successfulBroadcasts int32
-	var wg sync.WaitGroup
-
-	c.broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr, &successfulBroadcasts, &wg)
-
-	// Wait for all broadcasts to complete
-	wg.Wait()
-
-	// Now check if any were successful
-	if atomic.LoadInt32(&successfulBroadcasts) > 0 {
-		c.recordBroadcast(newNodeID, newNodeAddr, newNodeListenAddr)
-		zlog.Debug().
-			Str("node_id", newNodeID).
-			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
-			Msg("Recorded successful broadcast in cache")
-	}
-}
-
-// broadcastJoin notifies all active nodes about a new member joining
-func (c *Coordinator) broadcastJoin(newNodeID, newNodeAddr, newNodeListenAddr string, successCounter *int32, wg *sync.WaitGroup) {
-	nodes := c.ring.GetActiveNodes()
-
-	// Limit broadcasts to prevent storms
-	actualBroadcasts := 0
-
-	// Count eligible nodes (excluding self and new node)
-	eligibleNodes := 0
-	for _, node := range nodes {
-		if node.ID != c.config.MyNodeID && node.ID != newNodeID {
-			eligibleNodes++
-		}
-	}
-
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Str("new_node", newNodeID).
-		Int("eligible_nodes", eligibleNodes).
-		Int("max_broadcasts", MaxBroadcastNodes).
-		Msg("Broadcasting join event to cluster")
-
-	for _, node := range nodes {
-		// Skip self and the new node
-		if node.ID == c.config.MyNodeID || node.ID == newNodeID {
+	// Process key-value pairs
+	for i := 0; i < len(keyvals)-1; i += 2 {
+		key, ok := keyvals[i].(string)
+		if !ok {
 			continue
 		}
 
-		// Limit number of broadcasts
-		if actualBroadcasts >= MaxBroadcastNodes {
-			remainingNodes := eligibleNodes - actualBroadcasts
-			zlog.Warn().
-				Int("sent", actualBroadcasts).
-				Int("skipped", remainingNodes).
-				Msg("Reached broadcast limit, skipping remaining nodes")
-			break
-		}
-		actualBroadcasts++
-
-		// Add to WaitGroup before launching goroutine
-		if wg != nil {
-			wg.Add(1)
-		}
-
-		// Broadcast asynchronously to avoid blocking
-		go func(targetNode *NodeInfo) {
-			if wg != nil {
-				defer wg.Done()
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			conn, err := grpc.DialContext(ctx, targetNode.Address,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithBlock(),
-			)
-			if err != nil {
-				zlog.Warn().
-					Err(err).
-					Str("target_node", targetNode.ID).
-					Str("new_node", newNodeID).
-					Msg("Failed to connect for join broadcast")
-				return
-			}
-			defer conn.Close()
-
-			client := clusterpb.NewClusterServiceClient(conn)
-
-			// Send join request to propagate the new member
-			joinReq := &clusterpb.JoinRequest{
-				NodeId:        newNodeID,
-				Address:       newNodeAddr,
-				ListenAddress: newNodeListenAddr,
-			}
-
-			_, err = client.Join(ctx, joinReq)
-			if err != nil {
-				zlog.Warn().
-					Err(err).
-					Str("target_node", targetNode.ID).
-					Str("new_node", newNodeID).
-					Msg("Failed to broadcast join to node")
-			} else {
-				if successCounter != nil {
-					atomic.AddInt32(successCounter, 1)
+		// Check for "level" key to set appropriate log level
+		if key == "level" {
+			levelStr, ok := keyvals[i+1].(fmt.Stringer)
+			if ok {
+				switch levelStr.String() {
+				case "error":
+					event = zlog.Error()
+				case "warn":
+					event = zlog.Warn()
+				case "info":
+					event = zlog.Info()
+				default:
+					event = zlog.Debug()
 				}
-				metrics.ClusterBroadcastsSent.WithLabelValues("join").Inc()
-				zlog.Debug().
-					Str("target_node", targetNode.ID).
-					Str("new_node", newNodeID).
-					Msg("Successfully broadcast join to node")
 			}
-		}(node)
-	}
-}
-
-// announceLeave notifies all active nodes that this node is leaving gracefully
-func (c *Coordinator) announceLeave() {
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Msg("Announcing graceful departure to cluster")
-
-	// Get all active nodes before we start shutting down
-	nodes := c.ring.GetActiveNodes()
-
-	var wg sync.WaitGroup
-	var successfulBroadcasts int32
-
-	c.broadcastLeave(c.config.MyNodeID, &successfulBroadcasts, &wg, nodes)
-
-	// Wait for all broadcasts to complete with a timeout
-	waitCh := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(waitCh)
-	}()
-
-	select {
-	case <-waitCh:
-		zlog.Info().
-			Str("node_id", c.config.MyNodeID).
-			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
-			Msg("Graceful departure announced to cluster")
-	case <-time.After(LeaveAnnouncementTimeout):
-		zlog.Warn().
-			Str("node_id", c.config.MyNodeID).
-			Int32("successful_broadcasts", atomic.LoadInt32(&successfulBroadcasts)).
-			Msg("Timeout waiting for leave broadcasts to complete")
-	}
-}
-
-// broadcastLeave notifies all active nodes about this node leaving
-func (c *Coordinator) broadcastLeave(departingNodeID string, successCounter *int32, wg *sync.WaitGroup, nodes []*NodeInfo) {
-	// Count eligible nodes (excluding self)
-	eligibleNodes := 0
-	for _, node := range nodes {
-		if node.ID != c.config.MyNodeID {
-			eligibleNodes++
-		}
-	}
-
-	zlog.Info().
-		Str("node_id", c.config.MyNodeID).
-		Str("departing_node", departingNodeID).
-		Int("target_nodes", eligibleNodes).
-		Msg("Broadcasting leave event to all nodes in cluster")
-
-	for _, node := range nodes {
-		// Skip self
-		if node.ID == c.config.MyNodeID {
 			continue
 		}
 
-		// Add to WaitGroup before launching goroutine
-		wg.Add(1)
-
-		// Broadcast asynchronously to avoid blocking
-		go func(targetNode *NodeInfo) {
-			defer wg.Done()
-
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-
-			conn, err := grpc.DialContext(ctx, targetNode.Address,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithBlock(),
-			)
-			if err != nil {
-				zlog.Warn().
-					Err(err).
-					Str("target_node", targetNode.ID).
-					Str("departing_node", departingNodeID).
-					Msg("Failed to connect for leave broadcast")
-				return
-			}
-			defer conn.Close()
-
-			client := clusterpb.NewClusterServiceClient(conn)
-
-			// Send leave request to notify about departure
-			leaveReq := &clusterpb.LeaveRequest{
-				NodeId: departingNodeID,
-			}
-
-			_, err = client.Leave(ctx, leaveReq)
-			if err != nil {
-				zlog.Warn().
-					Err(err).
-					Str("target_node", targetNode.ID).
-					Str("departing_node", departingNodeID).
-					Msg("Failed to broadcast leave to node")
-			} else {
-				if successCounter != nil {
-					atomic.AddInt32(successCounter, 1)
-				}
-				metrics.ClusterBroadcastsSent.WithLabelValues("leave").Inc()
-				zlog.Debug().
-					Str("target_node", targetNode.ID).
-					Str("departing_node", departingNodeID).
-					Msg("Successfully broadcast leave to node")
-			}
-		}(node)
+		// Add the key-value pair to the event
+		val := keyvals[i+1]
+		switch v := val.(type) {
+		case string:
+			event = event.Str(key, v)
+		case int:
+			event = event.Int(key, v)
+		case int64:
+			event = event.Int64(key, v)
+		case float64:
+			event = event.Float64(key, v)
+		case bool:
+			event = event.Bool(key, v)
+		case error:
+			event = event.Err(v)
+		default:
+			event = event.Interface(key, v)
+		}
 	}
+
+	event.Msg("[dskit]")
+	return nil
 }

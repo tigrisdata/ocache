@@ -7,6 +7,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 )
 
@@ -128,6 +129,16 @@ func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 	}
 
 	ctx := localStream.Context()
+
+	// Increment hop count for forwarding loop detection
+	ctx, err = coordinator.IncrementHopCount(ctx, s.coordinator.GetLocalNodeID())
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Put", "hop_limit_exceeded").Inc()
+		return localStream.SendAndClose(&pb.PutResponse{
+			Success: false,
+			Error:   err.Error(),
+		})
+	}
 
 	// Create a streaming Put call to the remote node
 	remoteStream, err := client.Put(ctx)

@@ -3,39 +3,23 @@ package cacheclient
 import (
 	"context"
 	"fmt"
-	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/buraksezer/consistent"
 	"google.golang.org/grpc"
 
-	"github.com/tigrisdata/ocache/common/hash"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 )
 
-// nodeMember implements consistent.Member interface
-type nodeMember string
-
-func (n nodeMember) String() string {
-	return string(n)
-}
-
-// partitionOwner represents the owner of a partition
-type partitionOwner struct {
-	nodeID  string
-	address string
-}
-
-// TopologyManager manages cluster topology for ClusterClient
+// TopologyManager manages cluster topology for ClusterClient.
+// It uses a token-based ring that matches the server's dskit ring implementation,
+// ensuring consistent key routing between client and server.
 type TopologyManager struct {
-	ring            *consistent.Consistent
-	partitionOwners map[int32]partitionOwner
+	ring *TokenRing // Token-based ring for key lookup
 
-	seedAddrs       []string                   // seed addresses
-	topology        *clusterpb.ClusterTopology // Current topology
-	topologyEpoch   uint64                     // Topology version
-	mu              sync.RWMutex
+	seedAddrs       []string      // seed addresses
+	topologyEpoch   atomic.Uint64 // Content-addressable epoch (hash of ring state)
 	refreshInterval time.Duration
 	dialOpts        []grpc.DialOption
 }
@@ -43,6 +27,7 @@ type TopologyManager struct {
 // NewTopologyManager creates a new topology manager
 func NewTopologyManager(seedAddrs []string, refreshInterval time.Duration, dialOpts []grpc.DialOption) (*TopologyManager, error) {
 	tm := &TopologyManager{
+		ring:            NewTokenRing(),
 		seedAddrs:       seedAddrs,
 		refreshInterval: refreshInterval,
 		dialOpts:        dialOpts,
@@ -137,25 +122,18 @@ func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr st
 	return resp.Topology, nil
 }
 
-// UpdateTopology updates the internal state based on new topology
+// UpdateTopology updates the internal state based on new topology.
+// With content-addressable epochs, same epoch = same ring state, so we
+// use equality check (not >=) to detect changes.
 func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (map[string]bool, bool) {
-	// Check if RingConfig changed (under RLock)
-	tm.mu.RLock()
-
-	// Check if topology has changed (use atomic load for consistency)
-	if tm.topologyEpoch >= topology.Epoch {
-		tm.mu.RUnlock()
-		return nil, false // No change
+	// Content-addressable epochs: same epoch means identical ring state.
+	// Use atomic load for lock-free check.
+	currentEpoch := tm.topologyEpoch.Load()
+	if currentEpoch == topology.Epoch {
+		return nil, false // Same ring state, no update needed
 	}
 
-	currentTopology := tm.topology
-	ringConfigChanged := currentTopology == nil ||
-		currentTopology.RingConfig.PartitionCount != topology.RingConfig.PartitionCount ||
-		currentTopology.RingConfig.ReplicationFactor != topology.RingConfig.ReplicationFactor ||
-		currentTopology.RingConfig.Load != topology.RingConfig.Load
-	tm.mu.RUnlock()
-
-	// Build active nodes and addresses (no lock needed)
+	// Build active nodes and addresses
 	activeNodes := make(map[string]bool)
 	nodeAddresses := make(map[string]string)
 	for _, node := range topology.Nodes {
@@ -163,8 +141,7 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 			// Use listen address for client connections
 			listenAddr := node.ListenAddress
 			if listenAddr == "" {
-				// ListenAddress is required - this should not happen in properly configured clusters
-				// Skip this node as it's not properly configured
+				// ListenAddress is required - skip improperly configured nodes
 				continue
 			}
 			activeNodes[node.Id] = true
@@ -172,121 +149,48 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		}
 	}
 
-	// Build partition owners cache
-	partitionOwners := make(map[int32]partitionOwner)
-	for _, owner := range topology.PartitionOwners {
-		partitionOwners[owner.PartitionId] = partitionOwner{
-			nodeID:  owner.NodeId,
-			address: nodeAddresses[owner.NodeId],
+	// Build token map from RingConfig.NodeTokens
+	nodeTokens := make(map[string][]uint32)
+	if topology.RingConfig != nil {
+		for _, nt := range topology.RingConfig.NodeTokens {
+			nodeTokens[nt.NodeId] = nt.Tokens
 		}
 	}
 
-	if ringConfigChanged {
-		// Create new ring from scratch (rare case - RingConfig changed)
-		cfg := consistent.Config{
-			PartitionCount:    int(topology.RingConfig.PartitionCount),
-			ReplicationFactor: int(topology.RingConfig.ReplicationFactor),
-			Load:              topology.RingConfig.Load,
-			Hasher:            hash.Hasher{},
-		}
-		newRing := consistent.New(nil, cfg)
+	// Update the token ring (thread-safe internally)
+	tm.ring.Update(nodeTokens, nodeAddresses)
 
-		// Add all active nodes to new ring
-		for nodeID := range activeNodes {
-			newRing.Add(nodeMember(nodeID))
-		}
-
-		// Update everything under write lock
-		tm.mu.Lock()
-		tm.ring = newRing
-		tm.partitionOwners = partitionOwners
-		tm.topology = topology
-		tm.topologyEpoch = topology.Epoch
-		tm.mu.Unlock()
-
-	} else {
-		// Modify existing ring (common case - only nodes changed)
-		// ring.Add/Remove are thread-safe - operate on tm.ring directly!
-
-		// Get current members
-		nodesToRemove := make(map[string]bool)
-		for _, member := range tm.ring.GetMembers() {
-			if !activeNodes[member.String()] {
-				nodesToRemove[member.String()] = true
-			}
-		}
-
-		// Remove departed nodes (thread-safe)
-		for nodeID := range nodesToRemove {
-			tm.ring.Remove(nodeID)
-		}
-
-		// Add new nodes (thread-safe)
-		for nodeID := range activeNodes {
-			tm.ring.Add(nodeMember(nodeID))
-		}
-
-		// Only update maps and topology - ring already modified!
-		tm.mu.Lock()
-		tm.partitionOwners = partitionOwners
-		tm.topology = topology
-		tm.topologyEpoch = topology.Epoch
-		tm.mu.Unlock()
-	}
+	// Atomic store for epoch - no lock needed
+	tm.topologyEpoch.Store(topology.Epoch)
 
 	return activeNodes, true
 }
 
-// GetNodeForKey returns the node address for a given key
+// GetNodeForKey returns the node address for a given key.
+// Uses FNV-1a 32-bit hash + binary search (same as server).
 func (tm *TopologyManager) GetNodeForKey(key string) (string, error) {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-
-	// Compute partitionID from key using consistent hash
-	partitionID := int32(tm.ring.FindPartitionID([]byte(key)))
-
-	node, exists := tm.partitionOwners[partitionID]
-	if !exists {
-		return "", fmt.Errorf("no owner for partition %d", partitionID)
-	}
-
-	return node.address, nil
+	return tm.ring.GetNodeForKey(key)
 }
 
-// GetTopologyEpoch returns the current topology epoch
+// GetNodeIDForKey returns the node ID for a given key.
+// Useful for debugging and testing.
+func (tm *TopologyManager) GetNodeIDForKey(key string) (string, error) {
+	return tm.ring.GetNodeIDForKey(key)
+}
+
+// GetTopologyEpoch returns the current topology epoch.
+// Uses atomic load for lock-free access.
 func (tm *TopologyManager) GetTopologyEpoch() uint64 {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-	return tm.topologyEpoch
-}
-
-// GetPartitionOwner returns the node ID that owns the given partition
-func (tm *TopologyManager) GetPartitionOwner(partitionID int32) *partitionOwner {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-
-	owner, exists := tm.partitionOwners[partitionID]
-	if !exists {
-		return nil
-	}
-	return &owner
+	return tm.topologyEpoch.Load()
 }
 
 // GetNodeAddresses returns all node addresses
 func (tm *TopologyManager) GetNodeAddresses() map[string]string {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
-
-	result := make(map[string]string)
-	for _, v := range tm.partitionOwners {
-		result[v.nodeID] = v.address
-	}
-	return result
+	return tm.ring.GetNodeAddresses()
 }
 
-func (tm *TopologyManager) GetRing() *consistent.Consistent {
-	tm.mu.RLock()
-	defer tm.mu.RUnlock()
+// GetRing returns the underlying token ring
+func (tm *TopologyManager) GetRing() *TokenRing {
 	return tm.ring
 }
 

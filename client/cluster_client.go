@@ -7,9 +7,16 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
+)
+
+const (
+	// minRefreshInterval is the minimum time between epoch mismatch refresh triggers.
+	// This prevents a burst of requests from triggering many concurrent refreshes.
+	minRefreshInterval = 100 * time.Millisecond
 )
 
 // ClusterClient implements a cluster-aware cache client with topology support
@@ -23,6 +30,10 @@ type ClusterClient struct {
 	mu            sync.RWMutex
 	stopCh        chan struct{}
 	refreshCancel context.CancelFunc
+
+	// lastRefresh tracks when the last topology refresh was triggered.
+	// Used to rate-limit epoch mismatch refresh triggers.
+	lastRefresh atomic.Int64
 }
 
 // NewClusterClient creates a new ClusterClient with the given configuration
@@ -85,10 +96,16 @@ func (c *ClusterClient) updateConnections() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Create new connections for new nodes
+	// Create new connections for new nodes with epoch tracking
 	for addr := range activeNodes {
 		if _, exists := c.conns[addr]; !exists {
-			conn, err := newConnection(addr, c.config.DialOpts, c.config.ConnectionPoolSize)
+			conn, err := newConnectionWithEpoch(
+				addr,
+				c.config.DialOpts,
+				c.config.ConnectionPoolSize,
+				c.topology.GetTopologyEpoch, // Epoch getter
+				c.onEpochMismatch,           // Mismatch handler
+			)
 			if err != nil {
 				// Log error but continue
 				continue
@@ -106,6 +123,34 @@ func (c *ClusterClient) updateConnections() error {
 	}
 
 	return nil
+}
+
+// onEpochMismatch is called when server returns a different epoch than client.
+// With content-addressable epochs, ANY mismatch means the ring state differs,
+// so we trigger a background topology refresh.
+//
+// Rate limiting: To prevent a burst of mismatches from triggering many concurrent
+// refreshes, we enforce a minimum interval between refresh attempts.
+func (c *ClusterClient) onEpochMismatch(clientEpoch, serverEpoch uint64) {
+	if serverEpoch == clientEpoch {
+		return
+	}
+
+	// Rate limit: check if enough time has passed since last refresh
+	now := time.Now().UnixNano()
+	lastRefresh := c.lastRefresh.Load()
+	if now-lastRefresh < int64(minRefreshInterval) {
+		// Too soon since last refresh, skip
+		return
+	}
+
+	// Try to claim the refresh slot using CAS to prevent concurrent refreshes
+	if !c.lastRefresh.CompareAndSwap(lastRefresh, now) {
+		// Another goroutine already claimed it, skip
+		return
+	}
+
+	go c.forceRefreshTopology(context.Background())
 }
 
 // Route determines which connection to use for a given key
@@ -378,20 +423,17 @@ func (c *ClusterClient) GetTopologyEpoch() uint64 {
 	return c.topology.GetTopologyEpoch()
 }
 
-// GetPartitionOwnerID returns the node ID that owns the given partition
-func (c *ClusterClient) GetPartitionOwnerID(partitionID int32) string {
-	owner := c.topology.GetPartitionOwner(partitionID)
-	if owner == nil {
-		return ""
-	}
-	return owner.nodeID
+// GetNodeIDForKey returns the node ID that owns the given key.
+func (c *ClusterClient) GetNodeIDForKey(key string) (string, error) {
+	return c.topology.GetNodeIDForKey(key)
 }
 
 // Test helper methods - exposed for testing only
 
-// GetRing returns the consistent hash ring
+// HasRing returns true if the token ring is initialized and has tokens
 func (c *ClusterClient) HasRing() bool {
-	return c.topology.GetRing() != nil
+	ring := c.topology.GetRing()
+	return ring != nil && !ring.IsEmpty()
 }
 
 // FetchTopology fetches the current topology (exposed for testing)

@@ -12,16 +12,39 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	cacheclient "github.com/tigrisdata/ocache/client"
-	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/service"
 	"github.com/tigrisdata/ocache/storage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// clusterPortCounter is a global atomic counter for allocating unique port ranges
+// to each cluster test harness to avoid port collisions between tests.
+// Each harness uses a range of 2000 ports (1000 for gRPC, 1000 for memberlist).
+var clusterPortCounter atomic.Int32
+
+func init() {
+	// Start at 0, so first harness gets base port 32000
+	clusterPortCounter.Store(0)
+}
+
+// getNextClusterBasePort returns the next available base port for cluster tests.
+// Each call increments the counter to ensure different tests get different ports.
+func getNextClusterBasePort() int {
+	// Base starts at 32000 to avoid conflicts with coordinator tests (27000-28999)
+	// and legacy cluster tests (30000-31999)
+	basePortStart := 32000
+	// Each harness needs up to 2000 ports (1000 for gRPC + 1000 for memberlist)
+	portRange := 2000
+	counter := clusterPortCounter.Add(1) - 1 // Get current and increment
+	return basePortStart + (int(counter) * portRange)
+}
 
 // NodeMetrics tracks metrics for a single cluster node
 type NodeMetrics struct {
@@ -63,26 +86,34 @@ func (n *ClusterServerNode) Stop() error {
 		return nil
 	}
 
-	if n.cancel != nil {
-		n.cancel()
+	// Close the cluster client connection first
+	if n.ClusterConn != nil {
+		n.ClusterConn.Close()
 	}
 
-	if n.GRPCServer != nil {
-		n.GRPCServer.GracefulStop()
-	}
-
+	// Stop the coordinator gracefully - this will:
+	// 1. Stop ring manager (unregister from ring, broadcast leave)
+	// 2. Stop memberlist KV
+	// The coordinator handles its own shutdown order correctly.
 	if n.Coordinator != nil {
 		if err := n.Coordinator.Stop(); err != nil {
 			return err
 		}
 	}
 
-	if n.ClusterConn != nil {
-		n.ClusterConn.Close()
+	// Stop gRPC server after coordinator (it might still be handling requests during unregister)
+	if n.GRPCServer != nil {
+		n.GRPCServer.GracefulStop()
 	}
 
+	// Close storage after gRPC server to ensure all pending operations complete
 	if n.Storage != nil {
 		n.Storage.Close()
+	}
+
+	// Cancel context last - this is just for cleanup, not for triggering shutdown
+	if n.cancel != nil {
+		n.cancel()
 	}
 
 	if n.TempDir != "" {
@@ -117,10 +148,14 @@ type ClusterTestHarness struct {
 
 // NewClusterTestHarness creates a new cluster test harness with full cache servers
 func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestConfig) *ClusterTestHarness {
+	// Get a unique base port for this harness to avoid port collisions between tests
+	basePort := getNextClusterBasePort()
+	t.Logf("ClusterTestHarness using base port %d", basePort)
+
 	return &ClusterTestHarness{
 		T:           t,
 		Nodes:       make(map[string]*ClusterServerNode),
-		BasePort:    30000, // Use separate port range to avoid conflicts (coordinator uses 27000-28002)
+		BasePort:    basePort,
 		NodeCount:   nodeCount,
 		Config:      config,
 		Metrics:     &TestMetrics{StartTime: time.Now()},
@@ -132,10 +167,10 @@ func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestCo
 // StartNode starts a full cache server node
 func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error) {
 	nodeID := fmt.Sprintf("cluster-node-%d", nodeIndex+1)
-	listenPort := h.BasePort + nodeIndex
-	clusterPort := h.BasePort + 1000 + nodeIndex
+	listenPort := h.BasePort + nodeIndex            // gRPC service port (cache + cluster RPCs)
+	memberlistPort := h.BasePort + 1000 + nodeIndex // Memberlist gossip port
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
-	clusterAddr := fmt.Sprintf("localhost:%d", clusterPort)
+	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
 
 	// Create temporary directory for this node
 	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("ocache-cluster-test-node-%d-*", nodeIndex))
@@ -143,11 +178,12 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	// Build seed list
+	// Build seed list (memberlist addresses of other nodes)
 	var seeds []string
 	for i := 0; i < h.NodeCount; i++ {
-		seedClusterPort := h.BasePort + 1000 + i
-		seedAddr := fmt.Sprintf("localhost:%d", seedClusterPort)
+		seedPort := h.BasePort + 1000 + i
+		// Seeds use 127.0.0.1 so nodes can reach each other
+		seedAddr := fmt.Sprintf("127.0.0.1:%d", seedPort)
 		seeds = append(seeds, seedAddr)
 	}
 
@@ -173,17 +209,24 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		return nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
 
-	// Create coordinator config
+	// Create coordinator config with dskit ring
 	coordConfig := &coordinator.Config{
-		Enabled:            true,
-		MyNodeID:           nodeID,
-		ClusterAddr:        clusterAddr,
-		ListenAddr:         listenAddr,
-		Nodes:              seeds,
-		RingPartitionCount: hash.DefaultPartitionCount,
-		HeartbeatInterval:  1, // 1 second for faster testing
-		FailureThreshold:   3,
-		SyncTimeout:        1, // 1 second for faster testing
+		Enabled:     true,
+		MyNodeID:    nodeID,
+		ClusterAddr: clusterAddr,
+		ListenAddr:  listenAddr,
+		Seeds:       seeds,
+		LifecyclerConfig: ring.LifecyclerConfig{
+			NumTokens:            128,                    // Fewer tokens for faster testing
+			ObservePeriod:        100 * time.Millisecond, // Very fast observe for testing
+			MinReadyDuration:     0,                      // No minimum ready duration for testing
+			UnregisterOnShutdown: true,                   // Remove from ring on shutdown for clean departure
+			RingConfig: ring.Config{
+				HeartbeatPeriod:  100 * time.Millisecond, // Fast heartbeat for testing
+				HeartbeatTimeout: 10 * time.Second,       // Longer timeout to account for gossip delay
+			},
+		},
+		Registerer: prometheus.NewRegistry(), // Use fresh registry to avoid duplicate registration
 	}
 
 	// Create coordinator
@@ -222,9 +265,11 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	)
 
 	// Register cache service with node-specific storage instance
-	// We use a lightweight test wrapper to enable per-node storage isolation
 	cacheService := service.NewCacheService(coord, stor)
 	pb.RegisterCacheServiceServer(grpcServer, cacheService)
+
+	// Register ClusterService on the same gRPC server
+	clusterpb.RegisterClusterServiceServer(grpcServer, coord)
 
 	// Start gRPC server
 	listener, err := net.Listen("tcp", listenAddr)
@@ -239,6 +284,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	// Channel to signal when server is ready
 	serverStartedCh := make(chan struct{})
 
+	// Start gRPC server in background
 	go func() {
 		close(serverStartedCh)
 		if err := grpcServer.Serve(listener); err != nil {
@@ -248,13 +294,16 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 
 	// Wait for server to start
 	<-serverStartedCh
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
-	// Create cluster client connection for topology queries
-	clusterConn, err := grpc.Dial(clusterAddr,
+	// Create cluster client connection for topology queries (connect to ListenAddr, not ClusterAddr)
+	// Use a context with timeout instead of deprecated grpc.WithTimeout
+	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dialCancel()
+
+	clusterConn, err := grpc.DialContext(dialCtx, listenAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
-		grpc.WithTimeout(5*time.Second),
 	)
 	if err != nil {
 		grpcServer.Stop()
@@ -371,7 +420,9 @@ func (h *ClusterTestHarness) WaitForConvergence(timeout time.Duration) error {
 	}
 }
 
-// IsConverged checks if all nodes have the same view
+// IsConverged checks if all nodes have the same view of the cluster.
+// With content-addressable epochs, we can simply compare epoch values across nodes -
+// nodes with identical ring views will have identical epochs.
 func (h *ClusterTestHarness) IsConverged() bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -380,10 +431,22 @@ func (h *ClusterTestHarness) IsConverged() bool {
 		return false
 	}
 
-	var referenceTopology *clusterpb.ClusterTopology
-	var referenceNodeID string
+	// Count running nodes
+	runningNodes := 0
+	for _, node := range h.Nodes {
+		if node.IsRunning() {
+			runningNodes++
+		}
+	}
 
-	// Get reference topology from first running node
+	if runningNodes == 0 {
+		return false
+	}
+
+	var referenceEpoch uint64
+	var referenceNodeCount int
+	first := true
+
 	for nodeID, node := range h.Nodes {
 		if !node.IsRunning() {
 			continue
@@ -397,43 +460,31 @@ func (h *ClusterTestHarness) IsConverged() bool {
 			return false
 		}
 
-		referenceTopology = topology
-		referenceNodeID = nodeID
-		break
-	}
-
-	if referenceTopology == nil {
-		return false
-	}
-
-	// Check expected node count
-	expectedNodes := 0
-	for _, node := range h.Nodes {
-		if node.IsRunning() {
-			expectedNodes++
-		}
-	}
-
-	if len(referenceTopology.Nodes) != expectedNodes {
-		return false
-	}
-
-	// Compare with other nodes
-	for nodeID, node := range h.Nodes {
-		if !node.IsRunning() || nodeID == referenceNodeID {
+		if first {
+			referenceEpoch = topology.Epoch
+			referenceNodeCount = len(topology.Nodes)
+			first = false
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		topology, err := node.ClusterSvc.GetClusterTopology(ctx, &clusterpb.Empty{})
-		cancel()
-
-		if err != nil {
+		// With content-addressable epochs, same epoch = same ring view
+		if topology.Epoch != referenceEpoch {
+			h.T.Logf("Epoch mismatch: node %s has epoch %d, expected %d", nodeID, topology.Epoch, referenceEpoch)
 			return false
 		}
 
-		if topology.Epoch != referenceTopology.Epoch || len(topology.Nodes) != len(referenceTopology.Nodes) {
+		// Also verify node count matches (sanity check)
+		if len(topology.Nodes) != referenceNodeCount {
+			h.T.Logf("Node count mismatch: node %s sees %d nodes, expected %d", nodeID, len(topology.Nodes), referenceNodeCount)
 			return false
+		}
+
+		// Verify all nodes are ACTIVE (not just epoch match)
+		for _, topologyNode := range topology.Nodes {
+			if topologyNode.Status != clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
+				h.T.Logf("Node %s sees node %s as %v (not ACTIVE)", nodeID, topologyNode.Id, topologyNode.Status)
+				return false
+			}
 		}
 	}
 
@@ -618,11 +669,11 @@ func (h *ClusterTestHarness) GetNodeForKey(key string) (*ClusterServerNode, erro
 		if node.Coordinator == nil {
 			continue
 		}
-		ring := node.Coordinator.GetRing()
-		if ring == nil {
+		ringManager := node.Coordinator.GetRing()
+		if ringManager == nil {
 			continue
 		}
-		primaryNode, err := ring.GetPrimaryNode(key)
+		primaryNode, err := ringManager.GetPrimaryNode(key)
 		if err != nil {
 			return nil, err
 		}
@@ -695,20 +746,20 @@ func (h *ClusterTestHarness) GetPartitionDistribution() map[string][]int {
 		if node.Coordinator == nil {
 			continue
 		}
-		ring := node.Coordinator.GetRing()
-		if ring == nil {
+		ringManager := node.Coordinator.GetRing()
+		if ringManager == nil {
 			continue
 		}
 
 		// Get all nodes from ring
-		allNodes := ring.GetAllNodes()
+		allNodes := ringManager.GetAllNodes()
 
 		// For each node, determine which partitions it owns
 		// We'll sample partitions to avoid checking all 16384
 		sampleSize := 1000
 		for i := 0; i < sampleSize; i++ {
 			partitionKey := fmt.Sprintf("__partition_sample_%d__", i)
-			owner, err := ring.GetPrimaryNode(partitionKey)
+			owner, err := ringManager.GetPrimaryNode(partitionKey)
 			if err == nil && owner != nil {
 				distribution[owner.ID] = append(distribution[owner.ID], i)
 			}

@@ -29,13 +29,11 @@ type Config struct {
 	MetadataCacheSize int64 // RocksDB block cache size in bytes
 
 	// Cluster configuration
-	ClusterEnabled    bool          // Enable cluster mode
-	NodeID            string        // Unique node identifier in cluster
-	ClusterAddr       string        // Address for cluster communication
-	Seeds             []string      // Seed nodes for joining cluster
-	PartitionCount    int           // Number of partitions in hash ring
-	HeartbeatInterval time.Duration // Interval between heartbeats
-	FailureThreshold  int           // Number of failed heartbeats before marking node down
+	ClusterEnabled bool     // Enable cluster mode
+	NodeID         string   // Unique node identifier in cluster
+	ClusterAddr    string   // Address for cluster communication
+	Seeds          []string // Seed nodes for joining cluster
+	PartitionCount int      // Number of partitions in hash ring
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -69,7 +67,5 @@ func LoadConfig() {
 		ClusterAddr:            *clusterAddr,
 		Seeds:                  seeds,
 		PartitionCount:         *partitionCount,
-		HeartbeatInterval:      *heartbeatInterval,
-		FailureThreshold:       *failureThreshold,
 	}
 }

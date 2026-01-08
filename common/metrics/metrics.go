@@ -489,6 +489,13 @@ var (
 		},
 	)
 
+	ClusterTokensOwned = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_cluster_tokens_owned",
+			Help: "Number of tokens owned by this instance",
+		},
+	)
+
 	// Heartbeat & Failure Detection Metrics
 	ClusterHeartbeatsSent = promauto.NewCounterVec(
 		prometheus.CounterOpts{

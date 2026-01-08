@@ -42,13 +42,11 @@ var (
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
 
 	// Cluster configuration flags
-	clusterEnabled    = flag.Bool("cluster-enabled", false, "Enable cluster mode")
-	nodeID            = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
-	clusterAddr       = flag.String("cluster-addr", ":7000", "Address for cluster communication")
-	seedsStr          = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000 or ocache.svc.cluster.local:7000)")
-	partitionCount    = flag.Int("partition-count", hash.DefaultPartitionCount, "Number of partitions in hash ring")
-	heartbeatInterval = flag.Duration("heartbeat-interval", coordinator.DefaultHeartbeatInterval, "Interval between heartbeats")
-	failureThreshold  = flag.Int("failure-threshold", coordinator.DefaultFailureThreshold, "Number of failed heartbeats before marking node down")
+	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")
+	nodeID         = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
+	clusterAddr    = flag.String("cluster-addr", ":7000", "Address for cluster communication")
+	seedsStr       = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000 or ocache.svc.cluster.local:7000)")
+	partitionCount = flag.Int("partition-count", hash.DefaultPartitionCount, "Number of partitions in hash ring")
 
 	seeds []string
 )
@@ -77,10 +75,8 @@ func initializeCluster(ctx context.Context) *coordinator.Coordinator {
 		MyNodeID:           AppConfig.NodeID,
 		ClusterAddr:        AppConfig.ClusterAddr,
 		ListenAddr:         AppConfig.ListenAddr,
-		Nodes:              AppConfig.Seeds,
+		Seeds:              AppConfig.Seeds,
 		RingPartitionCount: AppConfig.PartitionCount,
-		HeartbeatInterval:  int(AppConfig.HeartbeatInterval.Seconds()),
-		FailureThreshold:   AppConfig.FailureThreshold,
 	}
 
 	var err error

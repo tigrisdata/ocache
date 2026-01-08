@@ -152,6 +152,12 @@ func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, list
 	service := NewCacheService(coord, storage)
 	pb.RegisterCacheServiceServer(grpcServer, service)
 
+	// Register ClusterService on the same gRPC server if clustering is enabled
+	// This allows clients to query cluster topology on the same port as cache operations
+	if coord != nil {
+		clusterpb.RegisterClusterServiceServer(grpcServer, coord)
+	}
+
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("failed to listen for gRPC")
