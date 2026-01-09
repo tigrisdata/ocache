@@ -651,20 +651,6 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 // 1. JOINING/PENDING nodes are not yet ready to serve requests
 // 2. LEAVING nodes are transitioning out and should not receive new requests
 // 3. Temporarily unhealthy nodes (missed heartbeats) are filtered by GetAllHealthy
-//
-// Question from code review (Comment #4): What happens if an instance is temporarily
-// unhealthy when we fetch this information?
-//
-// Answer: The temporarily unhealthy node's tokens will NOT be included in the response.
-// This is intentional and correct behavior because:
-// - Routing to an unhealthy node would cause request failures
-// - The client will receive an error and trigger a topology refresh
-// - Once the node recovers (heartbeats resume), it will be included in the next fetch
-// - Client's retry logic handles transient routing failures gracefully
-//
-// The alternative (including unhealthy nodes) would cause clients to route requests
-// to nodes that can't serve them, leading to systematic failures until the client
-// refreshes topology anyway. The current approach fails fast and recovers quickly.
 func (rm *RingManager) GetNodeTokens() map[string][]uint32 {
 	result := make(map[string][]uint32)
 

@@ -121,14 +121,12 @@ func TestNewMemberlistConfigFromCoordinator(t *testing.T) {
 	}
 }
 
-func TestMemberlistConfig_ToMemberlistConfig(t *testing.T) {
+func TestMemberlistConfig_ToKVConfig(t *testing.T) {
 	cfg := memberlistConfig{
 		JoinMembers:       []string{"node1:7946", "node2:7946"},
 		AbortIfJoinFails:  true,
 		BindAddr:          "0.0.0.0",
 		BindPort:          7946,
-		AdvertiseAddr:     "192.168.1.1",
-		AdvertisePort:     7946,
 		GossipInterval:    200 * time.Millisecond,
 		GossipNodes:       3,
 		PushPullInterval:  30 * time.Second,
@@ -142,8 +140,6 @@ func TestMemberlistConfig_ToMemberlistConfig(t *testing.T) {
 	assert.Equal(t, []string(cfg.JoinMembers), []string(mlCfg.JoinMembers))
 	assert.Equal(t, cfg.AbortIfJoinFails, mlCfg.AbortIfJoinFails)
 	assert.Equal(t, cfg.BindPort, mlCfg.TCPTransport.BindPort)
-	assert.Equal(t, cfg.AdvertiseAddr, mlCfg.AdvertiseAddr)
-	assert.Equal(t, cfg.AdvertisePort, mlCfg.AdvertisePort)
 	assert.Equal(t, cfg.GossipInterval, mlCfg.GossipInterval)
 	assert.Equal(t, cfg.GossipNodes, mlCfg.GossipNodes)
 	assert.Equal(t, cfg.PushPullInterval, mlCfg.PushPullInterval)

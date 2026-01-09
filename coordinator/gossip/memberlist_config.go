@@ -41,14 +41,6 @@ type memberlistConfig struct {
 	// BindPort is the port to bind the gossip listener
 	BindPort int `yaml:"bind_port"`
 
-	// AdvertiseAddr is the address advertised to other members
-	// If empty, bind address is used
-	AdvertiseAddr string `yaml:"advertise_addr"`
-
-	// AdvertisePort is the port advertised to other members
-	// If 0, bind port is used
-	AdvertisePort int `yaml:"advertise_port"`
-
 	// GossipInterval is the interval between gossip messages
 	GossipInterval time.Duration `yaml:"gossip_interval"`
 
@@ -138,14 +130,6 @@ func (c *memberlistConfig) ToKVConfig() memberlist.KVConfig {
 	cfg.TCPTransport = memberlist.TCPTransportConfig{
 		BindAddrs: flagext.StringSlice{c.BindAddr},
 		BindPort:  c.BindPort,
-	}
-
-	// Set advertise address if specified
-	if c.AdvertiseAddr != "" {
-		cfg.AdvertiseAddr = c.AdvertiseAddr
-	}
-	if c.AdvertisePort > 0 {
-		cfg.AdvertisePort = c.AdvertisePort
 	}
 
 	return cfg

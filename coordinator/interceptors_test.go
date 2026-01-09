@@ -168,7 +168,7 @@ func TestIncrementHopCount(t *testing.T) {
 		},
 		{
 			name:          "max hops exceeded",
-			initialHop:    3,
+			initialHop:    4,
 			initialOrigin: "node1",
 			localNodeID:   "node4",
 			expectErr:     true,
@@ -213,8 +213,8 @@ func TestUnaryServerEpochInterceptor(t *testing.T) {
 	interceptor := UnaryServerEpochInterceptor(epochGetter)
 	require.NotNil(t, interceptor)
 
-	// Test with hop count at limit (should reject)
-	md := metadata.Pairs(MetadataKeyHop, "3")
+	// Test with hop count above the limit (should reject)
+	md := metadata.Pairs(MetadataKeyHop, "4")
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
 	_, err := interceptor(ctx, nil, nil, func(ctx context.Context, req interface{}) (interface{}, error) {
