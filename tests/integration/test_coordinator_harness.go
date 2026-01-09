@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -101,6 +102,12 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
 
+	// Create temporary directory for this node
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("ocache-cluster-test-node-%d-*", nodeIndex))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+
 	// Build seed list (memberlist addresses of other nodes)
 	var seeds []string
 	for i := 0; i < h.NodeCount; i++ {
@@ -117,6 +124,7 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 		ClusterAddr: clusterAddr, // For memberlist gossip
 		ListenAddr:  listenAddr,  // For gRPC (cache ops + cluster topology)
 		Seeds:       seeds,
+		DiskPath:    tmpDir,
 		LifecyclerConfig: ring.LifecyclerConfig{
 			NumTokens:            128,                    // Fewer tokens for faster testing
 			ObservePeriod:        100 * time.Millisecond, // Very fast observe for testing

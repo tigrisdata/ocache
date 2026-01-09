@@ -216,6 +216,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		ClusterAddr: clusterAddr,
 		ListenAddr:  listenAddr,
 		Seeds:       seeds,
+		DiskPath:    tmpDir,
 		LifecyclerConfig: ring.LifecyclerConfig{
 			NumTokens:            128,                    // Fewer tokens for faster testing
 			ObservePeriod:        100 * time.Millisecond, // Very fast observe for testing

@@ -77,6 +77,7 @@ func initializeCluster(ctx context.Context) *coordinator.Coordinator {
 		ListenAddr:         AppConfig.ListenAddr,
 		Seeds:              AppConfig.Seeds,
 		RingPartitionCount: AppConfig.PartitionCount,
+		DiskPath:           AppConfig.DiskPath,
 	}
 
 	var err error

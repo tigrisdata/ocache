@@ -178,6 +178,11 @@ func (tm *TopologyManager) GetNodeIDForKey(key string) (string, error) {
 	return tm.ring.GetNodeIDForKey(key)
 }
 
+// GetNodeInfoForKey returns both the node ID and address for a given key.
+func (tm *TopologyManager) GetNodeInfoForKey(key string) (nodeID, address string, err error) {
+	return tm.ring.GetNodeInfoForKey(key)
+}
+
 // GetTopologyEpoch returns the current topology epoch.
 // Uses atomic load for lock-free access.
 func (tm *TopologyManager) GetTopologyEpoch() uint64 {

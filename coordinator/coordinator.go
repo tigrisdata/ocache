@@ -26,6 +26,7 @@ type Config struct {
 	ListenAddr         string   // The address the node listens on for client requests (Put/Get/Delete and cluster topology)
 	Seeds              []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
 	RingPartitionCount int      // The number of partitions in the hash ring (unused with dskit, kept for API compatibility)
+	DiskPath           string   // The path to the disk for persisting ring tokens
 
 	// LifecyclerConfig allows advanced ring configuration (optional).
 	// Mainly used for testing.
@@ -86,6 +87,10 @@ func New(config *Config) (*Coordinator, error) {
 		return nil, fmt.Errorf("listen address is required in cluster mode")
 	}
 
+	if config.DiskPath == "" {
+		return nil, fmt.Errorf("disk path is required in cluster mode")
+	}
+
 	// Create logger adapter for dskit - wraps zerolog to go-kit/log interface
 	logger := &zerologAdapter{}
 
@@ -102,7 +107,7 @@ func New(config *Config) (*Coordinator, error) {
 	}
 
 	// Create lifecycler config
-	if err := ring.SetupLifecyclerConfig(config.MyNodeID, config.ListenAddr, &config.LifecyclerConfig); err != nil {
+	if err := ring.SetupLifecyclerConfig(config.MyNodeID, config.ListenAddr, config.DiskPath, &config.LifecyclerConfig); err != nil {
 		return nil, fmt.Errorf("failed to create lifecycler config: %w", err)
 	}
 
@@ -351,63 +356,5 @@ func validateNodeID(nodeID string) error {
 		}
 	}
 
-	return nil
-}
-
-// zerologAdapter adapts zerolog to the go-kit/log interface used by dskit.
-// This allows dskit's memberlist and ring components to log through zerolog.
-type zerologAdapter struct{}
-
-// Log implements the go-kit/log.Logger interface
-func (z *zerologAdapter) Log(keyvals ...interface{}) error {
-	// Convert key-value pairs to a zerolog event
-	event := zlog.Debug()
-
-	// Process key-value pairs
-	for i := 0; i < len(keyvals)-1; i += 2 {
-		key, ok := keyvals[i].(string)
-		if !ok {
-			continue
-		}
-
-		// Check for "level" key to set appropriate log level
-		if key == "level" {
-			levelStr, ok := keyvals[i+1].(fmt.Stringer)
-			if ok {
-				switch levelStr.String() {
-				case "error":
-					event = zlog.Error()
-				case "warn":
-					event = zlog.Warn()
-				case "info":
-					event = zlog.Info()
-				default:
-					event = zlog.Debug()
-				}
-			}
-			continue
-		}
-
-		// Add the key-value pair to the event
-		val := keyvals[i+1]
-		switch v := val.(type) {
-		case string:
-			event = event.Str(key, v)
-		case int:
-			event = event.Int(key, v)
-		case int64:
-			event = event.Int64(key, v)
-		case float64:
-			event = event.Float64(key, v)
-		case bool:
-			event = event.Bool(key, v)
-		case error:
-			event = event.Err(v)
-		default:
-			event = event.Interface(key, v)
-		}
-	}
-
-	event.Msg("[dskit]")
 	return nil
 }

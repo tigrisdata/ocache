@@ -103,23 +103,26 @@ func TestSetupLifecyclerConfig(t *testing.T) {
 		name       string
 		nodeID     string
 		listenAddr string
+		diskPath   string
 	}{
 		{
 			name:       "basic config",
 			nodeID:     "node-1",
 			listenAddr: "localhost:9001",
+			diskPath:   "/data/ocache1",
 		},
 		{
 			name:       "with IP address",
 			nodeID:     "node-2",
 			listenAddr: "192.168.1.1:8080",
+			diskPath:   "/data/ocache2",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := LifecyclerConfig{}
-			err := SetupLifecyclerConfig(tt.nodeID, tt.listenAddr, &cfg)
+			err := SetupLifecyclerConfig(tt.nodeID, tt.listenAddr, tt.diskPath, &cfg)
 			assert.NoError(t, err)
 
 			assert.Equal(t, tt.nodeID, cfg.InstanceID)
@@ -127,6 +130,7 @@ func TestSetupLifecyclerConfig(t *testing.T) {
 			assert.True(t, cfg.UnregisterOnShutdown, "should default to graceful departure")
 			assert.Equal(t, DefaultNumTokens, cfg.NumTokens)
 			assert.Equal(t, DefaultHeartbeatPeriod, cfg.RingConfig.HeartbeatPeriod)
+			assert.Contains(t, cfg.TokensFilePath, tt.diskPath)
 		})
 	}
 }

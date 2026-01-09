@@ -77,6 +77,8 @@ func newMemberlistConfig(nodeID, clusterAddr string, seeds []string) memberlistC
 	if host, portStr, err := net.SplitHostPort(clusterAddr); err == nil {
 		if host != "" {
 			cfg.BindAddr = host
+		} else {
+			cfg.BindAddr = "0.0.0.0"
 		}
 		if port, err := parsePort(portStr); err == nil {
 			cfg.BindPort = port

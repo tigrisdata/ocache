@@ -179,3 +179,36 @@ func (r *TokenRing) GetNodeAddresses() map[string]string {
 	}
 	return result
 }
+
+// GetNodeInfoForKey returns both the node ID and address that owns the given key.
+// This method is lock-free.
+func (r *TokenRing) GetNodeInfoForKey(key string) (nodeID, address string, err error) {
+	state := r.state.Load()
+
+	if len(state.tokens) == 0 {
+		return "", "", fmt.Errorf("ring is empty")
+	}
+
+	// Hash key with FNV-1a 32-bit (same as server)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	token := h.Sum32()
+
+	// Binary search for the first token >= our hash
+	idx := sort.Search(len(state.tokens), func(i int) bool {
+		return state.tokens[i].token >= token
+	})
+
+	// Wrap around if we're past the last token
+	if idx == len(state.tokens) {
+		idx = 0
+	}
+
+	nodeID = state.tokens[idx].nodeID
+	address, exists := state.nodes[nodeID]
+	if !exists {
+		return "", "", fmt.Errorf("node %s not found in address map", nodeID)
+	}
+
+	return nodeID, address, nil
+}

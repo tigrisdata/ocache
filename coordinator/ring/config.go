@@ -128,8 +128,9 @@ type LifecyclerConfig struct {
 // Parameters:
 //   - nodeID: unique identifier for this instance
 //   - listenAddr: the address this instance listens on for client requests (e.g., ":9001" or "0.0.0.0:9001")
+//   - diskPath: the path where the ring tokens will be persisted
 //   - baseConfig: the base configuration to use
-func SetupLifecyclerConfig(nodeID, listenAddr string, baseConfig *LifecyclerConfig) error {
+func SetupLifecyclerConfig(nodeID, listenAddr, diskPath string, baseConfig *LifecyclerConfig) error {
 	if baseConfig == nil {
 		return fmt.Errorf("base config is required")
 	}
@@ -137,33 +138,10 @@ func SetupLifecyclerConfig(nodeID, listenAddr string, baseConfig *LifecyclerConf
 	baseConfig.InstanceID = nodeID
 	baseConfig.InstanceAddr = listenAddr
 	baseConfig.UnregisterOnShutdown = true // Default to graceful departure
+	baseConfig.DiskPath = diskPath
 	baseConfig.ApplyDefaults()
 
 	return nil
-}
-
-// RegisterFlags registers the lifecycler configuration flags
-func (c *LifecyclerConfig) RegisterFlags(f *flag.FlagSet) {
-	c.RingConfig.RegisterFlags(f)
-
-	f.StringVar(&c.InstanceID, "ring.instance-id", "",
-		"Unique identifier for this instance. Defaults to hostname if not set.")
-	f.StringVar(&c.InstanceAddr, "ring.instance-addr", "",
-		"Address advertised to other instances for client requests")
-	f.IntVar(&c.InstancePort, "ring.instance-port", 0,
-		"Port advertised to other instances for client requests")
-	f.IntVar(&c.NumTokens, "ring.num-tokens", DefaultNumTokens,
-		"Number of tokens this instance claims on the ring")
-	f.StringVar(&c.DiskPath, "ring.disk-path", "",
-		"Base directory for persistent storage (typically same as -disk flag)")
-	f.StringVar(&c.TokensFilePath, "ring.tokens-file-path", "",
-		"Path to persist tokens. Defaults to <disk-path>/coordinator/ring-tokens")
-	f.DurationVar(&c.ObservePeriod, "ring.observe-period", 0,
-		"Time to observe the ring before marking as ACTIVE")
-	f.DurationVar(&c.MinReadyDuration, "ring.min-ready-duration", 15*time.Second,
-		"Minimum time in ACTIVE state before /ready returns ready")
-	f.BoolVar(&c.UnregisterOnShutdown, "ring.unregister-on-shutdown", true,
-		"Whether to unregister from the ring on shutdown")
 }
 
 // ApplyDefaults applies default values for any unset or invalid configuration fields.

@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc"
+
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 )
@@ -426,6 +428,52 @@ func (c *ClusterClient) GetTopologyEpoch() uint64 {
 // GetNodeIDForKey returns the node ID that owns the given key.
 func (c *ClusterClient) GetNodeIDForKey(key string) (string, error) {
 	return c.topology.GetNodeIDForKey(key)
+}
+
+// GetNodeInfoForKey returns both the node ID and address that owns the given key.
+func (c *ClusterClient) GetNodeInfoForKey(key string) (nodeID, address string, err error) {
+	return c.topology.GetNodeInfoForKey(key)
+}
+
+// FetchClusterState fetches the current cluster state from any available node.
+func (c *ClusterClient) FetchClusterState() (*clusterpb.ClusterState, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), TopologyDetectTimeout)
+	defer cancel()
+	return c.fetchClusterStateFromAddresses(ctx)
+}
+
+// fetchClusterStateFromAddresses tries to fetch cluster state from available nodes.
+func (c *ClusterClient) fetchClusterStateFromAddresses(ctx context.Context) (*clusterpb.ClusterState, error) {
+	// Try topology nodes first
+	nodeAddresses := c.topology.GetNodeAddresses()
+	for _, addr := range nodeAddresses {
+		state, err := c.fetchClusterStateFromAddress(ctx, addr)
+		if err == nil {
+			return state, nil
+		}
+	}
+
+	// Fall back to seed addresses
+	for _, addr := range c.seedAddrs {
+		state, err := c.fetchClusterStateFromAddress(ctx, addr)
+		if err == nil {
+			return state, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to fetch cluster state from any node")
+}
+
+// fetchClusterStateFromAddress fetches cluster state from a specific address.
+func (c *ClusterClient) fetchClusterStateFromAddress(ctx context.Context, addr string) (*clusterpb.ClusterState, error) {
+	conn, err := grpc.NewClient(addr, c.config.DialOpts...)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	client := clusterpb.NewClusterServiceClient(conn)
+	return client.GetClusterState(ctx, &clusterpb.Empty{})
 }
 
 // Test helper methods - exposed for testing only
