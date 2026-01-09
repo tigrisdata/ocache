@@ -72,11 +72,6 @@ func newClient() *cacheclient.Client {
 		os.Exit(1)
 	}
 
-	// Log the detected mode if auto was used
-	if connMode == "auto" {
-		fmt.Fprintf(os.Stderr, "Using %s mode\n", c.GetMode())
-	}
-
 	return c
 }
 
@@ -246,34 +241,8 @@ var benchCmd = &cobra.Command{
 var clusterCmd = &cobra.Command{
 	Use:   "cluster",
 	Short: "Cluster management commands",
-	Long: `Commands for inspecting cluster state, topology, and key ownership.
+	Long: `Commands for inspecting cluster topology and key ownership.
 These commands only work when connected to a cluster-enabled ocache server.`,
-}
-
-var clusterStateCmd = &cobra.Command{
-	Use:   "state",
-	Short: "Display cluster state (epoch and nodes)",
-	Run: func(cmd *cobra.Command, args []string) {
-		c := newClient()
-		defer c.Close()
-
-		if !c.IsClusterMode() {
-			fmt.Fprintln(os.Stderr, "Error: cluster commands require cluster mode. Connected in simple mode.")
-			os.Exit(1)
-		}
-
-		state, err := c.FetchClusterState()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to fetch cluster state: %v\n", err)
-			os.Exit(1)
-		}
-
-		if jsonOutput {
-			printJSON(state)
-		} else {
-			printClusterState(state)
-		}
-	},
 }
 
 var clusterTopologyCmd = &cobra.Command{
@@ -359,27 +328,6 @@ func printJSON(v interface{}) {
 	_ = enc.Encode(v)
 }
 
-func printClusterState(state *clusterpb.ClusterState) {
-	fmt.Printf("Cluster State (Epoch: %d)\n", state.Epoch)
-	fmt.Println()
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NODE ID\tSTATUS\tLISTEN ADDRESS\tCLUSTER ADDRESS\tJOINED AT")
-	fmt.Fprintln(w, "-------\t------\t--------------\t---------------\t---------")
-
-	for _, node := range state.Nodes {
-		joinedAt := time.Unix(int64(node.JoinedAt), 0).Format(time.RFC3339)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			node.Id,
-			nodeStatusString(node.Status),
-			node.ListenAddress,
-			node.Address,
-			joinedAt,
-		)
-	}
-	_ = w.Flush()
-}
-
 func printClusterTopology(topology *clusterpb.ClusterTopology) {
 	fmt.Printf("Cluster Topology (Epoch: %d)\n", topology.Epoch)
 	fmt.Println()
@@ -450,5 +398,5 @@ func init() {
 
 	// cluster command flags and subcommands
 	clusterCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	clusterCmd.AddCommand(clusterStateCmd, clusterTopologyCmd, clusterNodeCmd, clusterEpochCmd)
+	clusterCmd.AddCommand(clusterTopologyCmd, clusterNodeCmd, clusterEpochCmd)
 }

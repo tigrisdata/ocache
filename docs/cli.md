@@ -121,6 +121,80 @@ ocachecli list --prefix "user:"
 ocachecli --addr "node1:9001,node2:9002" list --prefix "session:"
 ```
 
+### Cluster
+
+Inspect cluster topology and key ownership. These commands only work when connected to a cluster-enabled server.
+
+#### Topology
+
+Display full cluster topology including nodes and ring configuration:
+
+```bash
+# Display cluster topology
+ocachecli cluster topology
+
+# Output in JSON format
+ocachecli cluster topology --json
+```
+
+Example output:
+```
+Cluster Topology (Epoch: 12345678901234567890)
+
+Ring Configuration:
+  Replication Factor: 1
+  Total Tokens: 384
+
+Nodes:
+NODE ID   STATUS   LISTEN ADDRESS    CLUSTER ADDRESS   JOINED AT
+-------   ------   --------------    ---------------   ---------
+node1     ACTIVE   localhost:9001    localhost:7001    2025-01-09T10:30:00Z
+node2     ACTIVE   localhost:9002    localhost:7002    2025-01-09T10:30:05Z
+node3     ACTIVE   localhost:9003    localhost:7003    2025-01-09T10:30:10Z
+```
+
+#### Node
+
+Get the node that owns a specific key:
+
+```bash
+# Find which node owns a key
+ocachecli cluster node mykey
+
+# Output in JSON format
+ocachecli cluster node mykey --json
+```
+
+Example output:
+```
+Key: mykey
+Node: node2
+Address: localhost:9002
+```
+
+#### Epoch
+
+Display the current topology epoch:
+
+```bash
+# Display epoch
+ocachecli cluster epoch
+
+# Output in JSON format
+ocachecli cluster epoch --json
+```
+
+Example output:
+```
+Epoch: 12345678901234567890
+```
+
+#### Cluster Command Flags
+
+| Flag     | Description              | Default |
+| -------- | ------------------------ | ------- |
+| `--json` | Output in JSON format    | `false` |
+
 ## Mode Detection and Behavior
 
 ### Auto Mode Behavior
@@ -131,7 +205,6 @@ When using the default `auto` mode:
 2. It checks if a cluster topology service is available
 3. If topology service is found → operates in cluster mode
 4. If no topology service → operates in simple mode
-5. Displays the detected mode when starting (e.g., "Using cluster mode" or "Using simple mode")
 
 ### Simple Mode Features
 
@@ -209,12 +282,9 @@ The CLI provides clear error messages for common issues:
 # Connection errors
 Failed to create client: failed to create pool for localhost:9000
 
-# Mode detection
-Using simple mode  # When no topology service is found
-Using cluster mode # When topology service is available
-
 # Cluster mode specific
 Failed to fetch initial topology: no topology service available
+Error: cluster commands require cluster mode. Connected in simple mode.
 
 # General errors
 Get failed: rpc error: code = NotFound desc = key not found
@@ -239,9 +309,9 @@ Get failed: rpc error: code = NotFound desc = key not found
 # Test basic connectivity
 ocachecli --addr localhost:9000 put test "value"
 
-# Check mode detection
-ocachecli --addr "node1:9001,node2:9002" put test "value"
-# Look for "Using simple mode" or "Using cluster mode" in output
+# Check if cluster mode is available
+ocachecli --addr "node1:9001,node2:9002" cluster topology
+# Will show error if cluster mode is not available
 
 # Force specific mode to isolate issues
 ocachecli --mode simple --addr "node1:9001" put test "value"
