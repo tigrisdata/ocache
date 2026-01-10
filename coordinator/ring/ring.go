@@ -67,8 +67,10 @@ const (
 )
 
 const (
-	// DefaultAnnounceTimeout is the maximum time to wait for the LEAVING state transition
-	DefaultAnnounceTimeout = 2 * time.Second
+	// DefaultAnnounceTimeout is the maximum time to wait for the LEAVING state transition.
+	// This needs to be long enough to allow CAS retries to succeed when there's contention
+	// with background heartbeat operations, especially under race detection.
+	DefaultAnnounceTimeout = 5 * time.Second
 
 	// DefaultGossipPropagationDelay is the time to wait for gossip to propagate to other nodes.
 	// Memberlist gossip typically propagates within 200-500ms.
