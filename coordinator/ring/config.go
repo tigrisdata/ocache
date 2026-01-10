@@ -1,7 +1,6 @@
 package ring
 
 import (
-	"flag"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -46,18 +45,6 @@ type Config struct {
 
 	// ReplicationFactor is the number of replicas for each key (1 = no replication)
 	ReplicationFactor int `yaml:"replication_factor"`
-}
-
-// RegisterFlags registers the ring configuration flags
-func (c *Config) RegisterFlags(f *flag.FlagSet) {
-	c.KVStore.RegisterFlagsWithPrefix("ring.", "Ring key-value store configuration.", f)
-
-	f.DurationVar(&c.HeartbeatPeriod, "ring.heartbeat-period", DefaultHeartbeatPeriod,
-		"Interval at which this instance sends heartbeats to the ring")
-	f.DurationVar(&c.HeartbeatTimeout, "ring.heartbeat-timeout", DefaultHeartbeatTimeout,
-		"Time after which an instance is considered unhealthy. Should be >= 2x heartbeat period")
-	f.IntVar(&c.ReplicationFactor, "ring.replication-factor", DefaultReplicationFactor,
-		"Number of replicas for each key (1 = no replication)")
 }
 
 // ApplyDefaults applies default values for any unset or invalid configuration fields.

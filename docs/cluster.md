@@ -8,26 +8,27 @@ Cluster mode provides:
 
 - **Horizontal Scaling**: Distribute cache across multiple nodes
 - **Smart Routing**: Automatic request routing to the correct node
-- **High Availability**: Temporary ownership transfer during failures
-- **Consistent Hashing**: Even data distribution with minimal reshuffling
-- **Connection Pooling**: Efficient resource utilization
+- **Gossip-Based Membership**: Nodes discover each other via gossip protocol using [memberlist](https://github.com/hashicorp/memberlist)
+- **Consistent Hashing**: Even data distribution with minimal reshuffling using [dskit](https://github.com/grafana/dskit) ring
+- **Token Persistence**: Stable key ownership across node restarts
+- **Connection Pooling**: Efficient resource utilization with circuit breakers
 
 ## Architecture
 
 ### Components
 
-1. **Coordinator**: Manages cluster membership and topology
-2. **Consistent Hash Ring**: Determines data ownership using 16384 partitions
-3. **Router**: Handles request forwarding between nodes
-4. **Failure Detector**: Monitors node health via heartbeats
-5. **Cluster Client**: Client-side routing with topology caching
+1. **Coordinator**: Manages cluster membership, ring state, and request routing
+2. **Ring Manager**: dskit-based consistent hash ring with lifecycle management
+3. **Memberlist KV**: Gossip-based key-value store for ring state propagation
+4. **Router**: Request forwarding with connection pooling and circuit breakers
+5. **Cluster Client**: Client-side routing with topology caching and epoch tracking
 
 ### Data Distribution
 
-- Uses consistent hashing with virtual nodes for even distribution
-- Default partition count: 16384 (configurable)
-- Hash function: xxhash64 for performance
-- Replication factor: 20 virtual nodes per physical node
+- Uses Grafana dskit ring for consistent hashing with token-based ownership
+- Hash function: FNV-1a (32-bit) for token computation
+- Default tokens per node: 512 (provides good distribution across the ring)
+- Replication factor: 1 (no replication by default, configurable)
 
 ## Setting Up a Cluster
 
@@ -82,35 +83,90 @@ Start three nodes with cluster mode enabled:
 
 ### Configuration Parameters
 
-| Parameter             | Description                               | Default  |
-| --------------------- | ----------------------------------------- | -------- |
-| `-cluster-enabled`    | Enable cluster mode                       | false    |
-| `-node-id`            | Unique identifier for this node           | Required |
-| `-cluster-addr`       | Address for cluster communication         | :7000    |
-| `-seeds`              | Comma-separated list of seed nodes        | ""       |
-| `-partition-count`    | Number of hash ring partitions            | 16384    |
-| `-heartbeat-interval` | Heartbeat frequency                       | 5s       |
-| `-failure-threshold`  | Missed heartbeats before node marked down | 3        |
+**Core Cluster Flags:**
+
+| Parameter          | Description                                | Default  |
+| ------------------ | ------------------------------------------ | -------- |
+| `-cluster-enabled` | Enable cluster mode                        | false    |
+| `-node-id`         | Unique identifier for this node            | Required |
+| `-cluster-addr`    | Address for cluster communication (gossip) | :7000    |
+| `-listen-addr`     | Address for gRPC client requests           | :9000    |
+| `-seeds`           | Comma-separated list of seed nodes         | ""       |
+
+**Token Ownership Persistence:**
+
+Token ownership is automatically persisted to `<disk-path>/coordinator/ring-tokens` to maintain stable key ownership across node restarts. This prevents unnecessary data movement when a node rejoins the cluster.
 
 ## Client Usage
 
 See [Client Usage](client.md) for more details.
 
-# Node Failure Detection
+### Cluster Inspection Commands
 
-- Heartbeat-based failure detection
-- Configurable detection threshold
-- Automatic removal from routing table
+The CLI provides commands for inspecting cluster state:
 
-### Current Behavior (Phase 1)
+```bash
+# Display full cluster topology (nodes + ring config)
+./ocachecli --addr "localhost:9001,localhost:9002" cluster topology
 
-When a node fails:
+# Display info about a specific node
+./ocachecli cluster node node1
 
+# Display the current topology epoch
+./ocachecli cluster epoch
+```
+
+Use `--json` flag for JSON output:
+
+```bash
+./ocachecli cluster topology --json
+```
+
+## Node Lifecycle
+
+Each node goes through a defined lifecycle managed by the dskit ring:
+
+### Lifecycle States
+
+| State   | Description                                                         |
+| ------- | ------------------------------------------------------------------- |
+| JOINING | Node is registering with the ring and claiming tokens               |
+| ACTIVE  | Node is fully participating in the ring and serving requests        |
+| LEAVING | Node has announced departure and is waiting for gossip to propagate |
+| LEFT    | Node has left the ring completely                                   |
+
+### Node Join Process
+
+1. Node starts and creates a memberlist gossip service
+2. Ring manager registers instance with JOINING state
+3. Tokens are generated (or loaded from persistence file)
+4. Node transitions to ACTIVE state after tokens stabilize
+5. Gossip propagates the new membership to other nodes
+
+### Node Leave Process (Graceful Shutdown)
+
+1. Node receives shutdown signal
+2. Calls `AnnounceLeaving()` which transitions to LEAVING state
+3. Gossip propagates the state change (~500ms)
+4. Node unregisters from the ring and transitions to LEFT
+5. Other nodes update their routing tables
+
+## Node Failure Detection
+
+- Gossip-based failure detection via memberlist
+- Heartbeat timeout: 60s by default
+- Automatic removal from routing table after timeout
+
+### Current Behavior
+
+When a node fails ungracefully:
+
+- Other nodes detect missing heartbeats via gossip
+- After heartbeat timeout, node is marked as unhealthy
 - Keys owned by failed node become temporarily unavailable
-- Other nodes continue operating normally
 - Failed node automatically removed from topology
 
-### Future Enhancements (Phase 2)
+### Future Enhancements
 
 Planned improvements:
 
@@ -122,11 +178,12 @@ Planned improvements:
 
 ### Health Checks
 
-Each node monitors others via:
+Each node monitors others via the gossip protocol:
 
-- Regular heartbeat messages
-- Configurable failure threshold
-- Automatic topology updates
+- Regular heartbeat messages (default: every 5 seconds)
+- Configurable heartbeat timeout (default: 60 seconds)
+- Automatic topology updates propagated via memberlist
+- Epoch tracking for efficient client topology cache invalidation
 
 ### Adding Nodes
 
@@ -141,7 +198,8 @@ To add a new node:
   -cluster-addr :7000 \
   -seeds "node1:7000,node2:7000,node3:7000" \
   -listen-addr :9000 \
-  -listen-http :9001
+  -listen-http :9001 \
+  -disk /var/cache/ocache/node4
 ```
 
 2. Node automatically joins the cluster
@@ -150,39 +208,32 @@ To add a new node:
 
 ### Removing Nodes
 
-To remove a node gracefully:
+**Graceful Removal:**
 
-1. Stop the node process
-2. Other nodes detect failure via heartbeats
-3. Node removed from topology after failure threshold
-4. Clients update routing tables automatically
+1. Send SIGTERM or SIGINT to the node process
+2. Node transitions to LEAVING state and announces departure
+3. Gossip propagates state change to other nodes (~500ms)
+4. Node unregisters from ring and shuts down
+5. Clients update routing tables automatically
 
-## Performance Considerations
+**Ungraceful Removal (node crash):**
 
-### Partition Count
-
-Impact of partition count:
-
-- Lower (1024-4096): Less memory, coarser distribution
-- Default (16384): Good balance for 3-20 nodes
-- Higher (32768+): Better for large clusters (20+ nodes)
-
-### Network Topology
-
-Best practices:
-
-- Keep cluster nodes in same network/datacenter
-- Use private network for cluster communication
-- Separate cluster traffic from client traffic
+1. Other nodes detect missing heartbeats
+2. Node removed from topology after heartbeat timeout (default: 60s)
+3. Clients update routing tables automatically
 
 ## Limitations
 
-Current limitations (Phase 1):
+Current limitations:
 
-- Keys unavailable during owner node failure
+- Keys unavailable during owner node failure (no automatic failover)
+- No data replication (replication factor is 1 by default)
+- No automatic data migration when nodes are added
 
 ## Future Roadmap
 
 Planned enhancements:
 
-- Phase 2: Temporary ownership transfer during failures
+- Configurable replication factor for high availability
+- Temporary ownership transfer during failures
+- Automatic data migration on topology changes
