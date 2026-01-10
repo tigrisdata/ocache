@@ -239,13 +239,63 @@ func UnaryClientEpochInterceptor(epochGetter EpochGetter, onEpochMismatch func(c
 	}
 }
 
-// StreamClientEpochInterceptor creates a gRPC stream client interceptor
-func StreamClientEpochInterceptor(epochGetter EpochGetter) grpc.StreamClientInterceptor {
+// StreamClientEpochInterceptor creates a gRPC stream client interceptor that:
+// 1. Attaches client epoch to outgoing requests
+// 2. Extracts server epoch from response headers on first message (for cache invalidation)
+func StreamClientEpochInterceptor(epochGetter EpochGetter, onEpochMismatch func(clientEpoch, serverEpoch uint64)) grpc.StreamClientInterceptor {
 	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 		// Attach client epoch
 		clientEpoch := epochGetter()
 		ctx = metadata.AppendToOutgoingContext(ctx, MetadataKeyRingEpoch, strconv.FormatUint(clientEpoch, 10))
 
-		return streamer(ctx, desc, cc, method, opts...)
+		stream, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Wrap the stream to detect epoch mismatches on first receive
+		return &epochClientStream{
+			ClientStream:    stream,
+			clientEpoch:     clientEpoch,
+			onEpochMismatch: onEpochMismatch,
+			headerChecked:   false,
+		}, nil
+	}
+}
+
+// epochClientStream wraps a ClientStream to detect epoch mismatches
+type epochClientStream struct {
+	grpc.ClientStream
+	clientEpoch     uint64
+	onEpochMismatch func(clientEpoch, serverEpoch uint64)
+	headerChecked   bool
+}
+
+func (s *epochClientStream) RecvMsg(m interface{}) error {
+	err := s.ClientStream.RecvMsg(m)
+
+	// Check for epoch mismatch on first receive (after headers are available)
+	if !s.headerChecked {
+		s.headerChecked = true
+		s.checkEpochMismatch()
+	}
+
+	return err
+}
+
+func (s *epochClientStream) checkEpochMismatch() {
+	// Get response headers
+	header, err := s.ClientStream.Header()
+	if err != nil {
+		return
+	}
+
+	// Check for epoch mismatch
+	if serverEpochs := header.Get(MetadataKeyRingEpoch); len(serverEpochs) > 0 {
+		if serverEpoch, parseErr := strconv.ParseUint(serverEpochs[0], 10, 64); parseErr == nil {
+			if serverEpoch != s.clientEpoch && s.onEpochMismatch != nil {
+				s.onEpochMismatch(s.clientEpoch, serverEpoch)
+			}
+		}
 	}
 }

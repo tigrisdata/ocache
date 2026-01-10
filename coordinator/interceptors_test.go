@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -230,4 +231,402 @@ func TestUnaryServerEpochInterceptor(t *testing.T) {
 
 func intToString(i int) string {
 	return string(rune('0' + i))
+}
+
+// mockServerStream implements grpc.ServerStream for testing
+type mockServerStream struct {
+	ctx         context.Context
+	sentMsgs    []interface{}
+	headersSent metadata.MD
+}
+
+func (m *mockServerStream) SetHeader(md metadata.MD) error {
+	m.headersSent = metadata.Join(m.headersSent, md)
+	return nil
+}
+
+func (m *mockServerStream) SendHeader(md metadata.MD) error {
+	m.headersSent = metadata.Join(m.headersSent, md)
+	return nil
+}
+
+func (m *mockServerStream) SetTrailer(md metadata.MD) {}
+
+func (m *mockServerStream) Context() context.Context {
+	return m.ctx
+}
+
+func (m *mockServerStream) SendMsg(msg interface{}) error {
+	m.sentMsgs = append(m.sentMsgs, msg)
+	return nil
+}
+
+func (m *mockServerStream) RecvMsg(msg interface{}) error {
+	return nil
+}
+
+// mockClientStream implements grpc.ClientStream for testing
+type mockClientStream struct {
+	ctx         context.Context
+	header      metadata.MD
+	recvMsgs    []interface{}
+	recvIndex   int
+	recvErr     error
+	headerCalls int
+}
+
+func (m *mockClientStream) Header() (metadata.MD, error) {
+	m.headerCalls++
+	return m.header, nil
+}
+
+func (m *mockClientStream) Trailer() metadata.MD {
+	return nil
+}
+
+func (m *mockClientStream) CloseSend() error {
+	return nil
+}
+
+func (m *mockClientStream) Context() context.Context {
+	return m.ctx
+}
+
+func (m *mockClientStream) SendMsg(msg interface{}) error {
+	return nil
+}
+
+func (m *mockClientStream) RecvMsg(msg interface{}) error {
+	if m.recvErr != nil {
+		return m.recvErr
+	}
+	if m.recvIndex < len(m.recvMsgs) {
+		m.recvIndex++
+	}
+	return nil
+}
+
+func TestStreamServerEpochInterceptor(t *testing.T) {
+	tests := []struct {
+		name       string
+		hopCount   int
+		expectErr  bool
+		expectCode codes.Code
+	}{
+		{
+			name:      "valid hop count allows stream",
+			hopCount:  0,
+			expectErr: false,
+		},
+		{
+			name:      "max hop count (3) is allowed",
+			hopCount:  3,
+			expectErr: false,
+		},
+		{
+			name:       "hop count exceeded rejects stream",
+			hopCount:   4,
+			expectErr:  true,
+			expectCode: codes.ResourceExhausted,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var currentEpoch uint64 = 42
+			epochGetter := func() uint64 { return currentEpoch }
+
+			interceptor := StreamServerEpochInterceptor(epochGetter)
+			require.NotNil(t, interceptor)
+
+			// Set up context with hop count
+			md := metadata.Pairs(MetadataKeyHop, intToString(tt.hopCount))
+			ctx := metadata.NewIncomingContext(context.Background(), md)
+
+			mockStream := &mockServerStream{ctx: ctx}
+			handlerCalled := false
+			wrappedStreamReceived := false
+
+			err := interceptor(nil, mockStream, nil, func(srv interface{}, ss grpc.ServerStream) error {
+				handlerCalled = true
+				// Verify the stream is wrapped with epochServerStream
+				_, isWrapped := ss.(*epochServerStream)
+				wrappedStreamReceived = isWrapped
+				// Simulate sending a message (header setting may fail in mock context, that's OK)
+				_ = ss.SendMsg("test message")
+				return nil
+			})
+
+			if tt.expectErr {
+				require.Error(t, err)
+				st, ok := status.FromError(err)
+				require.True(t, ok)
+				assert.Equal(t, tt.expectCode, st.Code())
+				assert.False(t, handlerCalled, "handler should not be called when hop limit exceeded")
+			} else {
+				require.NoError(t, err)
+				assert.True(t, handlerCalled, "handler should be called")
+				assert.True(t, wrappedStreamReceived, "stream should be wrapped with epochServerStream")
+				// Verify the message was forwarded to the underlying stream
+				assert.Equal(t, 1, len(mockStream.sentMsgs))
+			}
+		})
+	}
+}
+
+func TestEpochServerStream_SendMsg(t *testing.T) {
+	tests := []struct {
+		name      string
+		sendCount int
+	}{
+		{
+			name:      "first send sets headerSent flag",
+			sendCount: 1,
+		},
+		{
+			name:      "subsequent sends maintain headerSent flag",
+			sendCount: 3,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var currentEpoch uint64 = 99
+			epochGetter := func() uint64 { return currentEpoch }
+
+			ctx := metadata.NewIncomingContext(context.Background(), nil)
+			mockStream := &mockServerStream{ctx: ctx}
+
+			wrapped := &epochServerStream{
+				ServerStream: mockStream,
+				epochGetter:  epochGetter,
+				headerSent:   false,
+			}
+
+			// Verify headerSent starts false
+			assert.False(t, wrapped.headerSent)
+
+			// Send multiple messages
+			for i := 0; i < tt.sendCount; i++ {
+				err := wrapped.SendMsg("message")
+				require.NoError(t, err)
+			}
+
+			// Verify messages were forwarded to underlying stream
+			assert.Equal(t, tt.sendCount, len(mockStream.sentMsgs))
+
+			// Verify headerSent flag is set to true after first send
+			// Note: grpc.SetHeader requires a real gRPC context, so we can't verify
+			// the actual header in unit tests. The headerSent flag confirms the logic was executed.
+			assert.True(t, wrapped.headerSent, "headerSent should be true after sending")
+		})
+	}
+}
+
+func TestStreamClientEpochInterceptor(t *testing.T) {
+	tests := []struct {
+		name          string
+		clientEpoch   uint64
+		serverEpoch   string
+		expectWrapped bool
+	}{
+		{
+			name:          "creates wrapped stream",
+			clientEpoch:   42,
+			serverEpoch:   "42",
+			expectWrapped: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			epochGetter := func() uint64 { return tt.clientEpoch }
+			mismatchCalled := false
+			onMismatch := func(client, server uint64) {
+				mismatchCalled = true
+			}
+
+			interceptor := StreamClientEpochInterceptor(epochGetter, onMismatch)
+			require.NotNil(t, interceptor)
+
+			// Create a mock streamer that returns our mock stream
+			mockStream := &mockClientStream{
+				ctx: context.Background(),
+				header: metadata.Pairs(
+					MetadataKeyRingEpoch, tt.serverEpoch,
+				),
+			}
+			streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+				// Verify epoch was attached to context
+				md, ok := metadata.FromOutgoingContext(ctx)
+				require.True(t, ok)
+				epochs := md.Get(MetadataKeyRingEpoch)
+				require.Len(t, epochs, 1)
+				assert.Equal(t, "42", epochs[0])
+				return mockStream, nil
+			}
+
+			// Create outgoing context
+			ctx := context.Background()
+
+			stream, err := interceptor(ctx, nil, nil, "test.Method", streamer)
+			require.NoError(t, err)
+			require.NotNil(t, stream)
+
+			// Verify the stream is wrapped
+			_, ok := stream.(*epochClientStream)
+			assert.True(t, ok, "stream should be wrapped with epochClientStream")
+
+			// Mismatch callback should not be called until RecvMsg
+			assert.False(t, mismatchCalled)
+		})
+	}
+}
+
+func TestEpochClientStream_RecvMsg(t *testing.T) {
+	tests := []struct {
+		name           string
+		clientEpoch    uint64
+		serverEpoch    string
+		recvCount      int
+		expectMismatch bool
+		expectCallback int // number of times callback should be called
+	}{
+		{
+			name:           "detects mismatch on first recv",
+			clientEpoch:    42,
+			serverEpoch:    "100",
+			recvCount:      1,
+			expectMismatch: true,
+			expectCallback: 1,
+		},
+		{
+			name:           "no callback when epochs match",
+			clientEpoch:    42,
+			serverEpoch:    "42",
+			recvCount:      1,
+			expectMismatch: false,
+			expectCallback: 0,
+		},
+		{
+			name:           "callback only on first recv",
+			clientEpoch:    42,
+			serverEpoch:    "100",
+			recvCount:      3,
+			expectMismatch: true,
+			expectCallback: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callbackCount := 0
+			var capturedClient, capturedServer uint64
+			onMismatch := func(client, server uint64) {
+				callbackCount++
+				capturedClient = client
+				capturedServer = server
+			}
+
+			mockStream := &mockClientStream{
+				ctx: context.Background(),
+				header: metadata.Pairs(
+					MetadataKeyRingEpoch, tt.serverEpoch,
+				),
+				recvMsgs: make([]interface{}, tt.recvCount),
+			}
+
+			wrapped := &epochClientStream{
+				ClientStream:    mockStream,
+				clientEpoch:     tt.clientEpoch,
+				onEpochMismatch: onMismatch,
+				headerChecked:   false,
+			}
+
+			// Receive multiple messages
+			for i := 0; i < tt.recvCount; i++ {
+				err := wrapped.RecvMsg(nil)
+				require.NoError(t, err)
+			}
+
+			// Verify callback count
+			assert.Equal(t, tt.expectCallback, callbackCount, "callback should be called correct number of times")
+
+			if tt.expectMismatch {
+				assert.Equal(t, tt.clientEpoch, capturedClient)
+				assert.Equal(t, uint64(100), capturedServer)
+			}
+
+			// Verify headerChecked is set
+			assert.True(t, wrapped.headerChecked)
+		})
+	}
+}
+
+func TestEpochClientStream_CheckEpochMismatch(t *testing.T) {
+	tests := []struct {
+		name           string
+		clientEpoch    uint64
+		serverEpoch    string
+		noHeader       bool
+		invalidEpoch   bool
+		expectCallback bool
+	}{
+		{
+			name:           "calls callback on mismatch",
+			clientEpoch:    42,
+			serverEpoch:    "100",
+			expectCallback: true,
+		},
+		{
+			name:           "no callback when epochs match",
+			clientEpoch:    42,
+			serverEpoch:    "42",
+			expectCallback: false,
+		},
+		{
+			name:           "handles missing header gracefully",
+			clientEpoch:    42,
+			noHeader:       true,
+			expectCallback: false,
+		},
+		{
+			name:           "handles invalid epoch gracefully",
+			clientEpoch:    42,
+			serverEpoch:    "not-a-number",
+			invalidEpoch:   true,
+			expectCallback: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callbackCalled := false
+			onMismatch := func(client, server uint64) {
+				callbackCalled = true
+			}
+
+			var header metadata.MD
+			if !tt.noHeader {
+				header = metadata.Pairs(MetadataKeyRingEpoch, tt.serverEpoch)
+			}
+
+			mockStream := &mockClientStream{
+				ctx:    context.Background(),
+				header: header,
+			}
+
+			wrapped := &epochClientStream{
+				ClientStream:    mockStream,
+				clientEpoch:     tt.clientEpoch,
+				onEpochMismatch: onMismatch,
+				headerChecked:   false,
+			}
+
+			// Call checkEpochMismatch directly
+			wrapped.checkEpochMismatch()
+
+			assert.Equal(t, tt.expectCallback, callbackCalled, "callback should be called correctly")
+		})
+	}
 }

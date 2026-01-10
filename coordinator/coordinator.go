@@ -107,12 +107,14 @@ func New(config *Config) (*Coordinator, error) {
 
 	// Create lifecycler config
 	if err := ring.SetupLifecyclerConfig(config.MyNodeID, config.ListenAddr, config.DiskPath, &config.LifecyclerConfig); err != nil {
+		_ = memberlistKV.Stop(context.Background()) // Cleanup on failure
 		return nil, fmt.Errorf("failed to create lifecycler config: %w", err)
 	}
 
 	// Create ring manager
 	ringManager, err := ring.NewRingManager(config.LifecyclerConfig, memberlistKV.Client(), logger, reg)
 	if err != nil {
+		_ = memberlistKV.Stop(context.Background()) // Cleanup on failure
 		return nil, fmt.Errorf("failed to create ring manager: %w", err)
 	}
 

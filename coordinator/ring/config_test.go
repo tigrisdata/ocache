@@ -18,19 +18,31 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 			input: Config{},
 			expected: Config{
 				HeartbeatPeriod:   DefaultHeartbeatPeriod,
-				HeartbeatTimeout:  2 * DefaultHeartbeatPeriod, // 2x heartbeat period
+				HeartbeatTimeout:  MinHeartbeatTimeout, // Uses 60s minimum, not 2x heartbeat period
 				ReplicationFactor: 1,
 			},
 		},
 		{
-			name: "custom heartbeat period updates timeout minimum",
+			name: "short timeout is upgraded to minimum",
 			input: Config{
 				HeartbeatPeriod:  10 * time.Second,
-				HeartbeatTimeout: 5 * time.Second, // less than 2x period
+				HeartbeatTimeout: 5 * time.Second, // less than MinHeartbeatTimeout
 			},
 			expected: Config{
 				HeartbeatPeriod:   10 * time.Second,
-				HeartbeatTimeout:  20 * time.Second, // adjusted to 2x period
+				HeartbeatTimeout:  MinHeartbeatTimeout, // upgraded to 60s minimum
+				ReplicationFactor: 1,
+			},
+		},
+		{
+			name: "timeout above minimum is kept",
+			input: Config{
+				HeartbeatPeriod:  1 * time.Second,
+				HeartbeatTimeout: 2 * time.Minute, // above minimum
+			},
+			expected: Config{
+				HeartbeatPeriod:   1 * time.Second,
+				HeartbeatTimeout:  2 * time.Minute,
 				ReplicationFactor: 1,
 			},
 		},
@@ -60,7 +72,7 @@ func TestLifecyclerConfig_ApplyDefaults(t *testing.T) {
 			expected: LifecyclerConfig{
 				RingConfig: Config{
 					HeartbeatPeriod:   DefaultHeartbeatPeriod,
-					HeartbeatTimeout:  2 * DefaultHeartbeatPeriod,
+					HeartbeatTimeout:  MinHeartbeatTimeout,
 					ReplicationFactor: 1,
 				},
 				NumTokens: DefaultNumTokens,
@@ -74,7 +86,7 @@ func TestLifecyclerConfig_ApplyDefaults(t *testing.T) {
 			expected: LifecyclerConfig{
 				RingConfig: Config{
 					HeartbeatPeriod:   DefaultHeartbeatPeriod,
-					HeartbeatTimeout:  2 * DefaultHeartbeatPeriod,
+					HeartbeatTimeout:  MinHeartbeatTimeout,
 					ReplicationFactor: 1,
 				},
 				DiskPath:       "/data/ocache",

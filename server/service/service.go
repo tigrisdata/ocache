@@ -133,13 +133,30 @@ func grpcStreamLoggingInterceptor(
 }
 
 func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, listenAddr string, requestLogging bool) {
-	// If request logging is enabled, add the interceptors to the gRPC server
 	var opts []grpc.ServerOption
+
+	// Build interceptor chains
+	var unaryInterceptors []grpc.UnaryServerInterceptor
+	var streamInterceptors []grpc.StreamServerInterceptor
+
+	// Add logging interceptors if enabled
 	if requestLogging {
-		opts = append(opts,
-			grpc.UnaryInterceptor(grpcLoggingInterceptor),
-			grpc.StreamInterceptor(grpcStreamLoggingInterceptor),
-		)
+		unaryInterceptors = append(unaryInterceptors, grpcLoggingInterceptor)
+		streamInterceptors = append(streamInterceptors, grpcStreamLoggingInterceptor)
+	}
+
+	// Add epoch interceptors if cluster mode is enabled
+	if coord != nil {
+		unaryInterceptors = append(unaryInterceptors, coordinator.UnaryServerEpochInterceptor(coord.GetEpoch))
+		streamInterceptors = append(streamInterceptors, coordinator.StreamServerEpochInterceptor(coord.GetEpoch))
+	}
+
+	// Chain interceptors if we have any
+	if len(unaryInterceptors) > 0 {
+		opts = append(opts, grpc.ChainUnaryInterceptor(unaryInterceptors...))
+	}
+	if len(streamInterceptors) > 0 {
+		opts = append(opts, grpc.ChainStreamInterceptor(streamInterceptors...))
 	}
 
 	opts = append(opts,

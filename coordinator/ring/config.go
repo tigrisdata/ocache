@@ -11,11 +11,11 @@ import (
 
 const (
 	// DefaultHeartbeatPeriod is the default interval for heartbeat updates
-	DefaultHeartbeatPeriod = 5 * time.Second
+	DefaultHeartbeatPeriod = 500 * time.Millisecond
 
-	// DefaultHeartbeatTimeout is the default timeout before marking a node unhealthy.
+	// MinHeartbeatTimeout is the default timeout before marking a node unhealthy.
 	// Set long enough to handle rolling updates (60s allows for typical pod restarts).
-	DefaultHeartbeatTimeout = 60 * time.Second
+	MinHeartbeatTimeout = 60 * time.Second
 
 	// DefaultNumTokens is the default number of tokens per instance.
 	// 512 provides good distribution across the ring.
@@ -53,7 +53,13 @@ func (c *Config) ApplyDefaults() {
 	if c.HeartbeatPeriod <= 0 {
 		c.HeartbeatPeriod = DefaultHeartbeatPeriod
 	}
+	if c.HeartbeatTimeout < MinHeartbeatTimeout {
+		// Use the full default timeout when configured timeout is too short.
+		// This prevents flaky health checks due to gossip propagation delays.
+		c.HeartbeatTimeout = MinHeartbeatTimeout
+	}
 	if c.HeartbeatTimeout < 2*c.HeartbeatPeriod {
+		// Ensure at least 2x heartbeat period if configured timeout is too low.
 		c.HeartbeatTimeout = 2 * c.HeartbeatPeriod
 	}
 	if c.ReplicationFactor < 1 {

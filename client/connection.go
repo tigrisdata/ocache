@@ -63,7 +63,7 @@ func newConnectionWithEpoch(addr string, dialOpts []grpc.DialOption, poolSize in
 		if epochGetter != nil {
 			opts = append(opts,
 				grpc.WithUnaryInterceptor(clientEpochUnaryInterceptor(epochGetter, onMismatch)),
-				grpc.WithStreamInterceptor(clientEpochStreamInterceptor(epochGetter)),
+				grpc.WithStreamInterceptor(clientEpochStreamInterceptor(epochGetter, onMismatch)),
 			)
 		}
 
@@ -295,8 +295,10 @@ func clientEpochUnaryInterceptor(epochGetter EpochGetter, onMismatch EpochMismat
 	}
 }
 
-// clientEpochStreamInterceptor creates a stream client interceptor that attaches epoch
-func clientEpochStreamInterceptor(epochGetter EpochGetter) grpc.StreamClientInterceptor {
+// clientEpochStreamInterceptor creates a stream client interceptor that:
+// 1. Attaches client epoch to outgoing requests
+// 2. Detects server epoch from responses on first receive (for cache invalidation)
+func clientEpochStreamInterceptor(epochGetter EpochGetter, onMismatch EpochMismatchHandler) grpc.StreamClientInterceptor {
 	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 		// Attach client epoch to outgoing metadata
 		clientEpoch := epochGetter()
@@ -304,6 +306,54 @@ func clientEpochStreamInterceptor(epochGetter EpochGetter) grpc.StreamClientInte
 			coordinator.MetadataKeyRingEpoch, strconv.FormatUint(clientEpoch, 10),
 		)
 
-		return streamer(ctx, desc, cc, method, opts...)
+		stream, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Wrap the stream to detect epoch mismatches on first receive
+		return &epochClientStream{
+			ClientStream:  stream,
+			clientEpoch:   clientEpoch,
+			onMismatch:    onMismatch,
+			headerChecked: false,
+		}, nil
+	}
+}
+
+// epochClientStream wraps a ClientStream to detect epoch mismatches
+type epochClientStream struct {
+	grpc.ClientStream
+	clientEpoch   uint64
+	onMismatch    EpochMismatchHandler
+	headerChecked bool
+}
+
+func (s *epochClientStream) RecvMsg(m interface{}) error {
+	err := s.ClientStream.RecvMsg(m)
+
+	// Check for epoch mismatch on first receive (after headers are available)
+	if !s.headerChecked {
+		s.headerChecked = true
+		s.checkEpochMismatch()
+	}
+
+	return err
+}
+
+func (s *epochClientStream) checkEpochMismatch() {
+	// Get response headers
+	header, err := s.ClientStream.Header()
+	if err != nil {
+		return
+	}
+
+	// Check for epoch mismatch
+	if serverEpochs := header.Get(coordinator.MetadataKeyRingEpoch); len(serverEpochs) > 0 {
+		if serverEpoch, parseErr := strconv.ParseUint(serverEpochs[0], 10, 64); parseErr == nil {
+			if serverEpoch != s.clientEpoch && s.onMismatch != nil {
+				s.onMismatch(s.clientEpoch, serverEpoch)
+			}
+		}
 	}
 }
