@@ -66,6 +66,15 @@ const (
 	NodeStatusDown
 )
 
+const (
+	// DefaultAnnounceTimeout is the maximum time to wait for the LEAVING state transition
+	DefaultAnnounceTimeout = 2 * time.Second
+
+	// DefaultGossipPropagationDelay is the time to wait for gossip to propagate to other nodes.
+	// Memberlist gossip typically propagates within 200-500ms.
+	DefaultGossipPropagationDelay = 500 * time.Millisecond
+)
+
 func (s NodeStatus) String() string {
 	switch s {
 	case NodeStatusActive:
@@ -116,9 +125,10 @@ type RingManager struct {
 	// Used by clients to detect stale topology information.
 	epoch *Epoch
 
-	// stateMu protects lastEpoch used for logging epoch changes.
-	stateMu   sync.Mutex
-	lastEpoch uint64
+	// stateMu protects lastEpoch and lastKnownNodes for tracking membership changes.
+	stateMu        sync.Mutex
+	lastEpoch      uint64
+	lastKnownNodes map[string]ring.InstanceState // Track previous node states for delta logging
 
 	// Pre-allocated operation for GetPrimaryNode (includes all states except LEFT)
 	allStatesOp ring.Operation
@@ -237,6 +247,14 @@ func (rm *RingManager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start ring services: %w", err)
 	}
 
+	// Initialize lastKnownNodes map for tracking membership changes
+	rm.lastKnownNodes = make(map[string]ring.InstanceState)
+
+	// Start the ring watcher to detect membership changes via KV store updates.
+	// This ensures we log node join/leave events immediately when they happen
+	// via gossip, rather than waiting for the next heartbeat callback.
+	rm.startRingWatcher(rm.ctx)
+
 	zlog.Info().
 		Str("instance_id", rm.localNodeID).
 		Str("instance_addr", rm.localAddr).
@@ -270,28 +288,113 @@ func (rm *RingManager) Stop(ctx context.Context) error {
 	return nil
 }
 
-// checkRingChangesFromDesc computes epoch from ring state using content-addressable hashing.
-// Nodes with identical ring views will compute identical epochs.
-// Called from heartbeat callback.
-func (rm *RingManager) checkRingChangesFromDesc(ringDesc *ring.Desc) {
-	if ringDesc == nil {
-		return
+// AnnounceLeaving transitions this node to LEAVING state and waits briefly for gossip propagation.
+// This should be called BEFORE Stop() to ensure other nodes are notified of the departure.
+func (rm *RingManager) AnnounceLeaving(ctx context.Context) error {
+	// Use a timeout to avoid hanging indefinitely
+	announceCtx, cancel := context.WithTimeout(ctx, DefaultAnnounceTimeout)
+	defer cancel()
+
+	// Transition to LEAVING state - this broadcasts via memberlist KV
+	if err := rm.lifecycler.ChangeState(announceCtx, ring.LEAVING); err != nil {
+		return fmt.Errorf("failed to transition to LEAVING: %w", err)
 	}
 
-	// Compute new epoch from ring state (content-addressable hash)
-	newEpoch := rm.epoch.Set(ringDesc)
+	level.Info(rm.logger).Log("msg", "announced leaving, waiting for propagation")
 
-	// Log if epoch changed (for debugging/monitoring)
-	rm.stateMu.Lock()
-	if newEpoch != rm.lastEpoch {
-		level.Info(rm.logger).Log(
-			"msg", "ring epoch updated",
-			"epoch", newEpoch,
-			"node_count", len(ringDesc.Ingesters),
-		)
-		rm.lastEpoch = newEpoch
+	// Brief delay to allow gossip to propagate to other nodes
+	select {
+	case <-time.After(DefaultGossipPropagationDelay):
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	rm.stateMu.Unlock()
+
+	return nil
+}
+
+// startRingWatcher starts a goroutine that watches for ring changes via the KV store.
+// This ensures we detect membership changes immediately when they happen via gossip,
+// rather than waiting for the next heartbeat callback.
+func (rm *RingManager) startRingWatcher(ctx context.Context) {
+	go func() {
+		rm.kvClient.WatchKey(ctx, RingKey, func(value interface{}) bool {
+			// Check if context is cancelled
+			if ctx.Err() != nil {
+				return false // stop watching
+			}
+
+			ringDesc, ok := value.(*ring.Desc)
+			if !ok || ringDesc == nil {
+				return true // continue watching
+			}
+
+			// Compute new epoch from ring state
+			newEpoch := rm.epoch.Set(ringDesc)
+
+			// Log if epoch changed
+			rm.stateMu.Lock()
+			if newEpoch != rm.lastEpoch {
+				rm.logMembershipChange(ringDesc, newEpoch)
+				rm.lastEpoch = newEpoch
+			}
+			rm.stateMu.Unlock()
+
+			return true // continue watching
+		})
+	}()
+}
+
+// logMembershipChange logs detailed membership changes including which nodes joined/left.
+// MUST be called with stateMu held.
+func (rm *RingManager) logMembershipChange(ringDesc *ring.Desc, newEpoch uint64) {
+	// Build current node state map
+	currentNodes := make(map[string]ring.InstanceState)
+	for id, inst := range ringDesc.Ingesters {
+		currentNodes[id] = inst.State
+	}
+
+	// Detect new nodes (joined)
+	for id, state := range currentNodes {
+		if _, existed := rm.lastKnownNodes[id]; !existed {
+			level.Info(rm.logger).Log(
+				"msg", "node joined",
+				"node_id", id,
+				"state", state.String(),
+			)
+		}
+	}
+
+	// Detect removed nodes (left)
+	for id := range rm.lastKnownNodes {
+		if _, exists := currentNodes[id]; !exists {
+			level.Info(rm.logger).Log(
+				"msg", "node left",
+				"node_id", id,
+			)
+		}
+	}
+
+	// Detect state changes for existing nodes
+	for id, newState := range currentNodes {
+		if oldState, existed := rm.lastKnownNodes[id]; existed && oldState != newState {
+			level.Info(rm.logger).Log(
+				"msg", "node state changed",
+				"node_id", id,
+				"old_state", oldState.String(),
+				"new_state", newState.String(),
+			)
+		}
+	}
+
+	// Update tracked state
+	rm.lastKnownNodes = currentNodes
+
+	// Log the epoch update summary
+	level.Info(rm.logger).Log(
+		"msg", "ring epoch updated",
+		"epoch", newEpoch,
+		"node_count", len(currentNodes),
+	)
 }
 
 // tokenForKey computes a 32-bit token for the given key using FNV-1a.
@@ -623,14 +726,13 @@ func (d *ringDelegate) OnRingInstanceStopping(lifecycler *ring.BasicLifecycler) 
 	level.Info(d.rm.logger).Log("msg", "instance stopping")
 }
 
-// OnRingInstanceHeartbeat is called on each heartbeat
+// OnRingInstanceHeartbeat is called on each heartbeat.
+// Ring membership changes are detected via the KV watcher (startRingWatcher),
+// so this callback only updates metrics.
 func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler, ringDesc *ring.Desc, instanceDesc *ring.InstanceDesc) {
 	if ringDesc == nil {
 		return
 	}
-
-	// Check for ring membership changes and update epoch if needed
-	d.rm.checkRingChangesFromDesc(ringDesc)
 
 	// Update metrics
 	activeCount := 0
@@ -656,7 +758,6 @@ func (rm *RingManager) GetNodeTokens() map[string][]uint32 {
 
 	// Get all healthy instances from the ring.
 	// Note: GetAllHealthy filters out instances that have missed heartbeats.
-	// This is correct - unhealthy instances should not receive client traffic.
 	replicationSet, err := rm.ring.GetAllHealthy(ring.Reporting)
 	if err != nil {
 		// Ring may be empty during bootstrap

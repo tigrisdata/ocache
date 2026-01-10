@@ -20,13 +20,12 @@ const (
 
 // Config contains the configuration for the coordinator
 type Config struct {
-	Enabled            bool     // Whether the coordinator is enabled
-	MyNodeID           string   // The ID of the node
-	ClusterAddr        string   // The address for memberlist gossip (host:port format, e.g., "0.0.0.0:7946")
-	ListenAddr         string   // The address the node listens on for client requests (Put/Get/Delete and cluster topology)
-	Seeds              []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
-	RingPartitionCount int      // The number of partitions in the hash ring (unused with dskit, kept for API compatibility)
-	DiskPath           string   // The path to the disk for persisting ring tokens
+	Enabled     bool     // Whether the coordinator is enabled
+	MyNodeID    string   // The ID of the node
+	ClusterAddr string   // The address for memberlist gossip (host:port format, e.g., "0.0.0.0:7946")
+	ListenAddr  string   // The address the node listens on for client requests (Put/Get/Delete and cluster topology)
+	Seeds       []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
+	DiskPath    string   // The path to the disk for persisting ring tokens
 
 	// LifecyclerConfig allows advanced ring configuration (optional).
 	// Mainly used for testing.
@@ -174,12 +173,19 @@ func (c *Coordinator) Stop() error {
 
 	ctx := context.Background()
 
-	// Close router connections
+	// Close router connections first
 	if err := c.router.Close(); err != nil {
 		zlog.Error().Err(err).Msg("Error closing router connections")
 	}
 
-	// Stop ring manager (will transition to LEAVING state)
+	// Announce leaving BEFORE stopping ring manager.
+	// This broadcasts LEAVING state while memberlist is still running,
+	// ensuring other nodes are notified of our departure.
+	if err := c.ringManager.AnnounceLeaving(ctx); err != nil {
+		zlog.Warn().Err(err).Msg("Failed to announce leaving (continuing with shutdown)")
+	}
+
+	// Stop ring manager (will complete the unregister)
 	if err := c.ringManager.Stop(ctx); err != nil {
 		zlog.Error().Err(err).Msg("Error stopping ring manager")
 	}

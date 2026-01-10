@@ -3,6 +3,7 @@ package ring
 import (
 	"context"
 	"hash/fnv"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,49 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/coordinator/gossip"
 )
+
+// testLogCapture is a simple log.Logger that captures log messages for testing.
+// It implements the go-kit/log.Logger interface.
+type testLogCapture struct {
+	messages []map[string]interface{}
+	mu       sync.Mutex
+}
+
+func (t *testLogCapture) Log(keyvals ...interface{}) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	msg := make(map[string]interface{})
+	for i := 0; i < len(keyvals)-1; i += 2 {
+		if key, ok := keyvals[i].(string); ok {
+			msg[key] = keyvals[i+1]
+		}
+	}
+	t.messages = append(t.messages, msg)
+	return nil
+}
+
+func (t *testLogCapture) hasMessage(msgType string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, m := range t.messages {
+		if m["msg"] == msgType {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *testLogCapture) getMessagesOfType(msgType string) []map[string]interface{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var result []map[string]interface{}
+	for _, m := range t.messages {
+		if m["msg"] == msgType {
+			result = append(result, m)
+		}
+	}
+	return result
+}
 
 func TestTokenForKey_Deterministic(t *testing.T) {
 	// Create a minimal RingManager just to access tokenForKey
@@ -213,4 +257,197 @@ func TestRingManager_StartStop(t *testing.T) {
 	// Stop the ring manager
 	err = rm.Stop(ctx)
 	assert.NoError(t, err, "failed to stop ring manager")
+}
+
+func TestLogMembershipChange_DetectsJoin(t *testing.T) {
+	logger := &testLogCapture{}
+	rm := &RingManager{
+		logger:         logger,
+		epoch:          NewEpoch(),
+		lastKnownNodes: map[string]ring.InstanceState{"node1": ring.ACTIVE},
+	}
+
+	// Ring descriptor with new node2
+	ringDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+			"node2": {Id: "node2", State: ring.JOINING},
+		},
+	}
+
+	rm.logMembershipChange(ringDesc, 12345)
+
+	assert.True(t, logger.hasMessage("node joined"), "should log 'node joined'")
+	joinMsgs := logger.getMessagesOfType("node joined")
+	require.Len(t, joinMsgs, 1)
+	assert.Equal(t, "node2", joinMsgs[0]["node_id"])
+	assert.Equal(t, "JOINING", joinMsgs[0]["state"])
+}
+
+func TestLogMembershipChange_DetectsLeave(t *testing.T) {
+	logger := &testLogCapture{}
+	rm := &RingManager{
+		logger: logger,
+		epoch:  NewEpoch(),
+		lastKnownNodes: map[string]ring.InstanceState{
+			"node1": ring.ACTIVE,
+			"node2": ring.ACTIVE,
+		},
+	}
+
+	// Ring descriptor with node2 removed
+	ringDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+		},
+	}
+
+	rm.logMembershipChange(ringDesc, 12345)
+
+	assert.True(t, logger.hasMessage("node left"), "should log 'node left'")
+	leaveMsgs := logger.getMessagesOfType("node left")
+	require.Len(t, leaveMsgs, 1)
+	assert.Equal(t, "node2", leaveMsgs[0]["node_id"])
+}
+
+func TestLogMembershipChange_DetectsStateChange(t *testing.T) {
+	logger := &testLogCapture{}
+	rm := &RingManager{
+		logger: logger,
+		epoch:  NewEpoch(),
+		lastKnownNodes: map[string]ring.InstanceState{
+			"node1": ring.ACTIVE,
+			"node2": ring.JOINING,
+		},
+	}
+
+	// Ring descriptor with node2 now ACTIVE
+	ringDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+			"node2": {Id: "node2", State: ring.ACTIVE},
+		},
+	}
+
+	rm.logMembershipChange(ringDesc, 12345)
+
+	assert.True(t, logger.hasMessage("node state changed"), "should log 'node state changed'")
+	changeMsgs := logger.getMessagesOfType("node state changed")
+	require.Len(t, changeMsgs, 1)
+	assert.Equal(t, "node2", changeMsgs[0]["node_id"])
+	assert.Equal(t, "JOINING", changeMsgs[0]["old_state"])
+	assert.Equal(t, "ACTIVE", changeMsgs[0]["new_state"])
+}
+
+func TestLogMembershipChange_UpdatesLastKnownNodes(t *testing.T) {
+	logger := &testLogCapture{}
+	rm := &RingManager{
+		logger:         logger,
+		epoch:          NewEpoch(),
+		lastKnownNodes: map[string]ring.InstanceState{},
+	}
+
+	ringDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+			"node2": {Id: "node2", State: ring.JOINING},
+		},
+	}
+
+	rm.logMembershipChange(ringDesc, 12345)
+
+	assert.Len(t, rm.lastKnownNodes, 2)
+	assert.Equal(t, ring.ACTIVE, rm.lastKnownNodes["node1"])
+	assert.Equal(t, ring.JOINING, rm.lastKnownNodes["node2"])
+}
+
+func TestLogMembershipChange_LogsEpochUpdate(t *testing.T) {
+	logger := &testLogCapture{}
+	rm := &RingManager{
+		logger:         logger,
+		epoch:          NewEpoch(),
+		lastKnownNodes: map[string]ring.InstanceState{},
+	}
+
+	ringDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+		},
+	}
+
+	rm.logMembershipChange(ringDesc, 12345)
+
+	assert.True(t, logger.hasMessage("ring epoch updated"), "should log 'ring epoch updated'")
+	epochMsgs := logger.getMessagesOfType("ring epoch updated")
+	require.Len(t, epochMsgs, 1)
+	assert.Equal(t, uint64(12345), epochMsgs[0]["epoch"])
+	assert.Equal(t, 1, epochMsgs[0]["node_count"])
+}
+
+func TestAnnounceLeaving_TransitionsToLeavingState(t *testing.T) {
+	// Use fresh registry to avoid duplicate registration
+	reg := prometheus.NewRegistry()
+	logger := log.NewNopLogger()
+
+	// Create memberlist KV
+	nodeID := "test-node-announce-leaving"
+	clusterAddr := "0.0.0.0:17950"
+	seeds := []string{}
+
+	memberlistKV, err := gossip.NewMemberlist(nodeID, clusterAddr, seeds, logger, reg)
+	require.NoError(t, err, "failed to create memberlist")
+
+	cfg := LifecyclerConfig{
+		InstanceID:           nodeID,
+		InstanceAddr:         "localhost:19050",
+		NumTokens:            128,
+		ObservePeriod:        0,
+		MinReadyDuration:     0,
+		UnregisterOnShutdown: true,
+		RingConfig: Config{
+			HeartbeatPeriod:   100 * time.Millisecond,
+			HeartbeatTimeout:  10 * time.Second,
+			ReplicationFactor: 1,
+		},
+	}
+	cfg.ApplyDefaults()
+
+	ctx := context.Background()
+
+	// Start memberlist
+	err = memberlistKV.Start(ctx)
+	require.NoError(t, err)
+	defer memberlistKV.Stop(ctx)
+
+	// Create and start ring manager
+	rm, err := NewRingManager(cfg, memberlistKV.Client(), logger, reg)
+	require.NoError(t, err)
+
+	err = rm.Start(ctx)
+	require.NoError(t, err)
+
+	// Wait for ACTIVE state with extended timeout for test stability
+	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer waitCancel()
+	err = rm.WaitReady(waitCtx)
+	require.NoError(t, err)
+	assert.Equal(t, ring.ACTIVE, rm.GetState())
+
+	// Give the ring some time to stabilize before calling AnnounceLeaving
+	// This is needed because ChangeState requires CAS operations which can
+	// race with background ring updates in test environments
+	time.Sleep(200 * time.Millisecond)
+
+	// Call AnnounceLeaving with extended timeout for test
+	announceCtx, announceCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer announceCancel()
+	err = rm.AnnounceLeaving(announceCtx)
+	require.NoError(t, err)
+
+	// Verify state is now LEAVING
+	assert.Equal(t, ring.LEAVING, rm.GetState())
+
+	// Cleanup
+	err = rm.Stop(ctx)
+	assert.NoError(t, err)
 }

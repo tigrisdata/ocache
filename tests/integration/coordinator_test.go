@@ -131,6 +131,187 @@ func (s *CoordinatorSuite) Test_Coordinator_NodeLeave() {
 	}
 }
 
+// Test_Coordinator_GracefulDeparture_DetectsLeavingState tests that remaining nodes detect
+// the LEAVING state transition when a node departs gracefully.
+// This verifies the KV watcher detects state changes, not just node removal.
+func (s *CoordinatorSuite) Test_Coordinator_GracefulDeparture_DetectsLeavingState() {
+	// Start 2 nodes (simpler than 3 for this focused test)
+	_, err := s.harness.StartNode(0)
+	require.NoError(s.T(), err)
+	time.Sleep(200 * time.Millisecond)
+
+	_, err = s.harness.StartNode(1)
+	require.NoError(s.T(), err)
+
+	// Wait for convergence with 2 nodes
+	err = s.harness.WaitForConvergence(10 * time.Second)
+	require.NoError(s.T(), err)
+
+	// Verify both nodes see each other as ACTIVE
+	var nodeToStop, remainingNode string
+	for nodeID := range s.harness.Nodes {
+		if nodeToStop == "" {
+			nodeToStop = nodeID
+		} else {
+			remainingNode = nodeID
+		}
+	}
+
+	topology, err := s.harness.GetTopology(remainingNode)
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 2, len(topology.Nodes))
+
+	for _, node := range topology.Nodes {
+		assert.Equal(s.T(), clusterpb.NodeStatus_NODE_STATUS_ACTIVE, node.Status,
+			"Node %s should be ACTIVE before departure", node.Id)
+	}
+
+	s.T().Logf("Stopping node %s gracefully, watching from %s", nodeToStop, remainingNode)
+
+	// Record epoch before stopping
+	initialEpoch := topology.Epoch
+
+	// Stop the node gracefully - this triggers AnnounceLeaving which broadcasts LEAVING state
+	node := s.harness.Nodes[nodeToStop]
+	err = node.Stop()
+	require.NoError(s.T(), err)
+
+	// Poll for either:
+	// 1. LEAVING state detection (intermediate state)
+	// 2. Node removal (final state)
+	// The KV watcher should detect these changes immediately via gossip
+	startTime := time.Now()
+	sawLeavingOrRemoval := false
+	var finalTopology *clusterpb.ClusterTopology
+
+	for i := 0; i < 30; i++ { // Check for up to 3 seconds
+		finalTopology, err = s.harness.GetTopology(remainingNode)
+		require.NoError(s.T(), err)
+
+		// Check if epoch changed (indicates ring state was updated)
+		if finalTopology.Epoch != initialEpoch {
+			// Check if we see LEAVING state or node removal
+			nodeFound := false
+			for _, topologyNode := range finalTopology.Nodes {
+				if topologyNode.Id == nodeToStop {
+					nodeFound = true
+					if topologyNode.Status == clusterpb.NodeStatus_NODE_STATUS_LEAVING {
+						s.T().Logf("Detected LEAVING state for %s in %v", nodeToStop, time.Since(startTime))
+						sawLeavingOrRemoval = true
+					}
+					break
+				}
+			}
+
+			if !nodeFound {
+				// Node was completely removed
+				s.T().Logf("Node %s removed from ring in %v", nodeToStop, time.Since(startTime))
+				sawLeavingOrRemoval = true
+				break
+			}
+		}
+
+		if sawLeavingOrRemoval {
+			break
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	require.True(s.T(), sawLeavingOrRemoval,
+		"Should have detected LEAVING state or node removal within 3 seconds")
+
+	// Verify detection was fast (< 2 seconds) - proving KV watcher works
+	elapsed := time.Since(startTime)
+	assert.Less(s.T(), elapsed, 2*time.Second,
+		"KV watcher should detect departure quickly, got %v", elapsed)
+
+	// Verify epoch was updated
+	assert.NotEqual(s.T(), initialEpoch, finalTopology.Epoch,
+		"Epoch should change after departure")
+}
+
+// Test_Coordinator_KVWatcher_DetectsJoin tests that existing nodes detect a new node
+// joining the cluster immediately via the KV watcher.
+func (s *CoordinatorSuite) Test_Coordinator_KVWatcher_DetectsJoin() {
+	// Start first node alone
+	_, err := s.harness.StartNode(0)
+	require.NoError(s.T(), err)
+
+	// Wait for first node to be ready
+	time.Sleep(500 * time.Millisecond)
+
+	// Get initial state from node1
+	var node1ID string
+	for nodeID := range s.harness.Nodes {
+		node1ID = nodeID
+		break
+	}
+
+	initialTopology, err := s.harness.GetTopology(node1ID)
+	require.NoError(s.T(), err)
+	initialEpoch := initialTopology.Epoch
+	initialNodeCount := len(initialTopology.Nodes)
+	s.T().Logf("Node1 initial state: epoch=%d, nodes=%d", initialEpoch, initialNodeCount)
+
+	// Start second node
+	s.T().Log("Starting node2...")
+	startTime := time.Now()
+	_, err = s.harness.StartNode(1)
+	require.NoError(s.T(), err)
+
+	// Poll node1 to detect node2 joining
+	// The KV watcher should detect the join immediately via gossip
+	sawJoin := false
+	var finalTopology *clusterpb.ClusterTopology
+
+	for i := 0; i < 50; i++ { // Check for up to 5 seconds
+		finalTopology, err = s.harness.GetTopology(node1ID)
+		require.NoError(s.T(), err)
+
+		// Check if node count increased or epoch changed
+		if len(finalTopology.Nodes) > initialNodeCount {
+			elapsed := time.Since(startTime)
+			s.T().Logf("Node1 detected node2 join in %v (nodes=%d, epoch=%d)",
+				elapsed, len(finalTopology.Nodes), finalTopology.Epoch)
+			sawJoin = true
+			break
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	require.True(s.T(), sawJoin,
+		"Node1 should detect node2 joining within 5 seconds")
+
+	// Verify detection was reasonably fast (< 5 seconds)
+	// Note: This includes node startup time. The key is it's much faster than heartbeat timeout (60s).
+	elapsed := time.Since(startTime)
+	assert.Less(s.T(), elapsed, 5*time.Second,
+		"KV watcher should detect join quickly, got %v", elapsed)
+
+	// Verify epoch changed
+	assert.NotEqual(s.T(), initialEpoch, finalTopology.Epoch,
+		"Epoch should change after new node joins")
+
+	// Verify both nodes are visible
+	assert.Equal(s.T(), 2, len(finalTopology.Nodes),
+		"Should see 2 nodes after join")
+
+	// Wait for convergence (both nodes ACTIVE)
+	err = s.harness.WaitForConvergence(10 * time.Second)
+	require.NoError(s.T(), err)
+
+	// Verify final state
+	finalTopology, err = s.harness.GetTopology(node1ID)
+	require.NoError(s.T(), err)
+
+	for _, node := range finalTopology.Nodes {
+		assert.Equal(s.T(), clusterpb.NodeStatus_NODE_STATUS_ACTIVE, node.Status,
+			"Node %s should be ACTIVE after convergence", node.Id)
+	}
+}
+
 // Test_Coordinator_GracefulNodeDeparture tests that graceful departure removes node quickly
 func (s *CoordinatorSuite) Test_Coordinator_GracefulNodeDeparture() {
 	// Start all 3 nodes
@@ -228,9 +409,11 @@ func (s *CoordinatorSuite) Test_Coordinator_GracefulNodeDeparture() {
 		}
 	}
 
-	// Verify graceful departure was fast (< 2 seconds)
+	// Verify graceful departure was fast (< 5 seconds)
+	// Note: This includes the blocking AnnounceLeaving() call (~500ms propagation delay)
+	// plus polling time. The key is that it's much faster than passive detection (10-20s).
 	totalElapsed := time.Since(startTime)
 	s.T().Logf("Total time for graceful departure detection: %v", totalElapsed)
-	assert.Less(s.T(), totalElapsed, 2*time.Second,
+	assert.Less(s.T(), totalElapsed, 5*time.Second,
 		"Graceful departure should be detected quickly (not 10-20s like passive detection)")
 }

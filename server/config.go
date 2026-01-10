@@ -33,7 +33,6 @@ type Config struct {
 	NodeID         string   // Unique node identifier in cluster
 	ClusterAddr    string   // Address for cluster communication
 	Seeds          []string // Seed nodes for joining cluster
-	PartitionCount int      // Number of partitions in hash ring
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -66,6 +65,5 @@ func LoadConfig() {
 		NodeID:                 *nodeID,
 		ClusterAddr:            *clusterAddr,
 		Seeds:                  seeds,
-		PartitionCount:         *partitionCount,
 	}
 }
