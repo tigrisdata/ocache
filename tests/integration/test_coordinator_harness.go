@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,20 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// coordinatorPortCounter ensures each CoordinatorTestHarness gets unique ports
+var coordinatorPortCounter atomic.Int32
+
+// getNextCoordinatorBasePort returns the next available base port for coordinator tests.
+// Each call increments the counter to ensure different tests get different ports.
+func getNextCoordinatorBasePort() int {
+	// Base starts at 27000 (original port range for coordinator tests)
+	// Each harness needs up to 1000 ports (gRPC + memberlist)
+	basePortStart := 27000
+	portRange := 1000
+	counter := coordinatorPortCounter.Add(1) - 1 // Get current and increment
+	return basePortStart + (int(counter) * portRange)
+}
 
 // CoordinatorTestNode represents a coordinator node for testing
 type CoordinatorTestNode struct {
@@ -86,10 +101,13 @@ type CoordinatorTestHarness struct {
 
 // NewCoordinatorTestHarness creates a new coordinator test harness
 func NewCoordinatorTestHarness(t *testing.T, nodeCount int) *CoordinatorTestHarness {
+	basePort := getNextCoordinatorBasePort()
+	t.Logf("CoordinatorTestHarness using base port %d", basePort)
+
 	return &CoordinatorTestHarness{
 		T:         t,
 		Nodes:     make(map[string]*CoordinatorTestNode),
-		BasePort:  27000, // Use high port range
+		BasePort:  basePort,
 		NodeCount: nodeCount,
 	}
 }
