@@ -128,7 +128,11 @@ func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr st
 		return nil, fmt.Errorf("topology error: %s", resp.Error)
 	}
 
-	// Return the topology directly since it's now the same type
+	// Validate topology is not nil (valid protobuf state but invalid for our use)
+	if resp.Topology == nil {
+		return nil, fmt.Errorf("server returned empty topology")
+	}
+
 	return resp.Topology, nil
 }
 

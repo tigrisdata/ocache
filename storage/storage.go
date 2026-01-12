@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -130,6 +131,7 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
+	closed           atomic.Bool           // True when storage has been closed
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -273,6 +275,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 // Close closes this storage instance and releases all resources.
 // This is safe to call on isolated instances created with NewStorageWithConfig.
 func (s *Storage) Close() {
+	// Mark storage as closed first to prevent new operations
+	s.closed.Store(true)
+
 	// Stop background services
 	if s.accessUpdater != nil {
 		s.accessUpdater.Stop()
@@ -296,6 +301,12 @@ func (s *Storage) Close() {
 	if s.meta != nil {
 		s.meta.Close()
 	}
+}
+
+// IsClosed returns true if this storage instance has been closed.
+// This can be used to check if it's safe to call other Storage methods.
+func (s *Storage) IsClosed() bool {
+	return s.closed.Load()
 }
 
 // ListKeys returns all non-expired keys in the RocksDB instance that match the given prefix

@@ -628,7 +628,7 @@ func (h *ClusterTestHarness) GetStorageStats() StorageStats {
 	stats := StorageStats{}
 
 	for _, node := range h.Nodes {
-		if !node.IsRunning() || node.Storage == nil {
+		if !node.IsRunning() || node.Storage == nil || node.Storage.IsClosed() {
 			continue
 		}
 
@@ -715,7 +715,8 @@ func (h *ClusterTestHarness) GetDistributionStats() *DistributionStats {
 	for nodeID, metrics := range h.NodeMetrics {
 		// Count actual keys stored on this node
 		var keyCount int64
-		if node, exists := h.Nodes[nodeID]; exists && node.Storage != nil {
+		// Check both IsRunning() and Storage.IsClosed() to ensure the node's storage is safe to access
+		if node, exists := h.Nodes[nodeID]; exists && node.IsRunning() && node.Storage != nil && !node.Storage.IsClosed() {
 			keys, err := node.Storage.ListKeys("")
 			if err == nil {
 				keyCount = int64(len(keys))
@@ -737,15 +738,15 @@ func (h *ClusterTestHarness) GetDistributionStats() *DistributionStats {
 	return stats
 }
 
-// GetPartitionDistribution shows how partitions are mapped to nodes
-// Returns map[nodeID][]partitionIDs
-func (h *ClusterTestHarness) GetPartitionDistribution() map[string][]int {
+// GetTokenDistribution shows how tokens are distributed across nodes.
+// Returns map[nodeID]tokenCount showing the number of tokens each node owns.
+func (h *ClusterTestHarness) GetTokenDistribution() map[string]int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
-	distribution := make(map[string][]int)
+	distribution := make(map[string]int)
 
-	// Use first node's coordinator to get full ring
+	// Use first node's coordinator to get token distribution
 	for _, node := range h.Nodes {
 		if node.Coordinator == nil {
 			continue
@@ -755,31 +756,17 @@ func (h *ClusterTestHarness) GetPartitionDistribution() map[string][]int {
 			continue
 		}
 
-		// Get all nodes from ring
+		// Get actual token assignments from the ring
+		nodeTokens := ringManager.GetNodeTokens()
+		for nodeID, tokens := range nodeTokens {
+			distribution[nodeID] = len(tokens)
+		}
+
+		// Include nodes with 0 tokens (not yet active)
 		allNodes := ringManager.GetAllNodes()
-
-		// For each node, determine which partitions it owns
-		// We'll sample partitions to avoid checking all 16384
-		sampleSize := 1000
-		for i := 0; i < sampleSize; i++ {
-			partitionKey := fmt.Sprintf("__partition_sample_%d__", i)
-			owner, err := ringManager.GetPrimaryNode(partitionKey)
-			if err == nil && owner != nil {
-				distribution[owner.ID] = append(distribution[owner.ID], i)
-			}
-		}
-
-		// Normalize counts based on sampling
-		for nodeID := range distribution {
-			count := len(distribution[nodeID])
-			estimated := int(float64(count) * 16384.0 / float64(sampleSize))
-			distribution[nodeID] = []int{estimated} // Store estimated partition count
-		}
-
-		// Populate distribution for all nodes (even if they have 0)
 		for _, nodeInfo := range allNodes {
 			if _, exists := distribution[nodeInfo.ID]; !exists {
-				distribution[nodeInfo.ID] = []int{0}
+				distribution[nodeInfo.ID] = 0
 			}
 		}
 
