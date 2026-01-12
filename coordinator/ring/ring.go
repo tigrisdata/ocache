@@ -67,10 +67,10 @@ const (
 )
 
 const (
-	// DefaultAnnounceTimeout is the maximum time to wait for the LEAVING state transition.
-	// This needs to be long enough to allow CAS retries to succeed when there's contention
-	// with background heartbeat operations, especially under race detection.
-	DefaultAnnounceTimeout = 5 * time.Second
+	// RecommendedAnnounceTimeout is the recommended minimum timeout for AnnounceLeaving.
+	// CAS retries can take significant time when there's contention with background
+	// heartbeat operations, especially under race detection or slow CI environments.
+	RecommendedAnnounceTimeout = 10 * time.Second
 
 	// DefaultGossipPropagationDelay is the time to wait for gossip to propagate to other nodes.
 	// Memberlist gossip typically propagates within 200-500ms.
@@ -292,13 +292,12 @@ func (rm *RingManager) Stop(ctx context.Context) error {
 
 // AnnounceLeaving transitions this node to LEAVING state and waits briefly for gossip propagation.
 // This should be called BEFORE Stop() to ensure other nodes are notified of the departure.
+// The caller should provide a context with an appropriate timeout (recommend at least 10 seconds
+// to allow CAS retries to succeed under contention).
 func (rm *RingManager) AnnounceLeaving(ctx context.Context) error {
-	// Use a timeout to avoid hanging indefinitely
-	announceCtx, cancel := context.WithTimeout(ctx, DefaultAnnounceTimeout)
-	defer cancel()
-
 	// Transition to LEAVING state - this broadcasts via memberlist KV
-	if err := rm.lifecycler.ChangeState(announceCtx, ring.LEAVING); err != nil {
+	// Use the caller's context directly to respect their timeout settings
+	if err := rm.lifecycler.ChangeState(ctx, ring.LEAVING); err != nil {
 		return fmt.Errorf("failed to transition to LEAVING: %w", err)
 	}
 
