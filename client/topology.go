@@ -3,6 +3,7 @@ package cacheclient
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,7 @@ type TopologyManager struct {
 	topologyEpoch   atomic.Uint64 // Content-addressable epoch (hash of ring state)
 	refreshInterval time.Duration
 	dialOpts        []grpc.DialOption
+	mu              sync.RWMutex // Protects topology updates
 }
 
 // NewTopologyManager creates a new topology manager
@@ -42,6 +44,10 @@ func NewTopologyManager(seedAddrs []string, refreshInterval time.Duration, dialO
 
 // initialize initializes the topology manager with the given seed addresses
 func (tm *TopologyManager) initialize() error {
+	if len(tm.seedAddrs) == 0 {
+		return fmt.Errorf("no seed addresses provided")
+	}
+
 	var topology *clusterpb.ClusterTopology
 	var err error
 
@@ -58,6 +64,10 @@ func (tm *TopologyManager) initialize() error {
 
 	if err != nil {
 		return fmt.Errorf("failed to fetch topology from any node: %w", err)
+	}
+
+	if topology == nil {
+		return fmt.Errorf("received nil topology from all nodes")
 	}
 
 	tm.UpdateTopology(topology)
@@ -126,11 +136,26 @@ func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr st
 // With content-addressable epochs, same epoch = same ring state, so we
 // use equality check (not >=) to detect changes.
 func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (map[string]bool, bool) {
-	// Content-addressable epochs: same epoch means identical ring state.
-	// Use atomic load for lock-free check.
+	// Guard against nil topology
+	if topology == nil {
+		return nil, false
+	}
+
+	// Fast path: check epoch without lock first
 	currentEpoch := tm.topologyEpoch.Load()
 	if currentEpoch == topology.Epoch {
 		return nil, false // Same ring state, no update needed
+	}
+
+	// Slow path: acquire lock and re-check to prevent race conditions
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	// Re-check epoch under lock to prevent concurrent updates from
+	// overwriting newer topology with older data
+	currentEpoch = tm.topologyEpoch.Load()
+	if currentEpoch == topology.Epoch {
+		return nil, false // Another goroutine already updated
 	}
 
 	// Build active nodes and addresses
@@ -149,18 +174,22 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 		}
 	}
 
-	// Build token map from RingConfig.NodeTokens
+	// Build token map from RingConfig.NodeTokens, but only for active nodes.
+	// This prevents routing to nodes that are DOWN or LEAVING.
 	nodeTokens := make(map[string][]uint32)
 	if topology.RingConfig != nil {
 		for _, nt := range topology.RingConfig.NodeTokens {
-			nodeTokens[nt.NodeId] = nt.Tokens
+			// Only include tokens for nodes that are active
+			if activeNodes[nt.NodeId] {
+				nodeTokens[nt.NodeId] = nt.Tokens
+			}
 		}
 	}
 
 	// Update the token ring (thread-safe internally)
 	tm.ring.Update(nodeTokens, nodeAddresses)
 
-	// Atomic store for epoch - no lock needed
+	// Store new epoch
 	tm.topologyEpoch.Store(topology.Epoch)
 
 	return activeNodes, true

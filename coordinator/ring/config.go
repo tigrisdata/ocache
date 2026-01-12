@@ -53,14 +53,16 @@ func (c *Config) ApplyDefaults() {
 	if c.HeartbeatPeriod <= 0 {
 		c.HeartbeatPeriod = DefaultHeartbeatPeriod
 	}
-	if c.HeartbeatTimeout < MinHeartbeatTimeout {
-		// Use the full default timeout when configured timeout is too short.
-		// This prevents flaky health checks due to gossip propagation delays.
-		c.HeartbeatTimeout = MinHeartbeatTimeout
+	// HeartbeatTimeout must be at least the maximum of:
+	// - The configured value
+	// - MinHeartbeatTimeout (60s) to prevent flaky health checks
+	// - 2x HeartbeatPeriod to allow missed heartbeats
+	minRequired := 2 * c.HeartbeatPeriod
+	if MinHeartbeatTimeout > minRequired {
+		minRequired = MinHeartbeatTimeout
 	}
-	if c.HeartbeatTimeout < 2*c.HeartbeatPeriod {
-		// Ensure at least 2x heartbeat period if configured timeout is too low.
-		c.HeartbeatTimeout = 2 * c.HeartbeatPeriod
+	if c.HeartbeatTimeout < minRequired {
+		c.HeartbeatTimeout = minRequired
 	}
 	if c.ReplicationFactor < 1 {
 		c.ReplicationFactor = 1

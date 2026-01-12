@@ -143,6 +143,7 @@ type ClusterTestHarness struct {
 	NodeMetrics map[string]*NodeMetrics // Per-node metrics
 	mu          sync.RWMutex
 	stopMetrics chan struct{}
+	cleanupOnce sync.Once // Ensures Cleanup only runs once
 	clientAddrs []string
 }
 
@@ -655,9 +656,11 @@ func (h *ClusterTestHarness) GetStorageStats() StorageStats {
 
 // Cleanup cleans up the test harness
 func (h *ClusterTestHarness) Cleanup() {
-	h.Metrics.EndTime = time.Now()
-	close(h.stopMetrics)
-	h.StopAllNodes()
+	h.cleanupOnce.Do(func() {
+		h.Metrics.EndTime = time.Now()
+		close(h.stopMetrics)
+		h.StopAllNodes()
+	})
 }
 
 // GetNodeForKey returns which node should own a given key based on consistent hashing
