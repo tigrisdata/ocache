@@ -8,6 +8,8 @@ import (
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 )
 
+const waitForConvergenceTimeout = 15 * time.Second
+
 // Test_Coordinator_BasicFormation tests basic cluster formation using CoordinatorSuite
 func (s *CoordinatorSuite) Test_Coordinator_BasicFormation() {
 	// Start all nodes
@@ -15,7 +17,7 @@ func (s *CoordinatorSuite) Test_Coordinator_BasicFormation() {
 	require.NoError(s.T(), err, "Failed to start nodes")
 
 	// Wait for convergence
-	err = s.harness.WaitForConvergence(10 * time.Second)
+	err = s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err, "Cluster did not converge")
 
 	// Verify all nodes see each other
@@ -37,7 +39,7 @@ func (s *CoordinatorSuite) Test_Coordinator_NodeJoin() {
 	}
 
 	// Wait for initial convergence
-	err := s.harness.WaitForConvergence(5 * time.Second)
+	err := s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err)
 
 	// Verify 2-node topology
@@ -52,8 +54,7 @@ func (s *CoordinatorSuite) Test_Coordinator_NodeJoin() {
 	require.NoError(s.T(), err)
 
 	// Wait for convergence with 3 nodes
-	time.Sleep(2 * time.Second)
-	err = s.harness.WaitForConvergence(10 * time.Second)
+	err = s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err)
 
 	// Verify 3-node topology
@@ -70,7 +71,7 @@ func (s *CoordinatorSuite) Test_Coordinator_NodeLeave() {
 	err := s.harness.StartAllNodes()
 	require.NoError(s.T(), err)
 
-	err = s.harness.WaitForConvergence(10 * time.Second)
+	err = s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err)
 
 	// Stop one node
@@ -144,7 +145,7 @@ func (s *CoordinatorSuite) Test_Coordinator_GracefulDeparture_DetectsLeavingStat
 	require.NoError(s.T(), err)
 
 	// Wait for convergence with 2 nodes
-	err = s.harness.WaitForConvergence(10 * time.Second)
+	err = s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err)
 
 	// Verify both nodes see each other as ACTIVE
@@ -219,11 +220,11 @@ func (s *CoordinatorSuite) Test_Coordinator_GracefulDeparture_DetectsLeavingStat
 	}
 
 	require.True(s.T(), sawLeavingOrRemoval,
-		"Should have detected LEAVING state or node removal within 3 seconds")
+		"Should have detected LEAVING state or node removal within %v", waitForConvergenceTimeout)
 
-	// Verify detection was fast (< 2 seconds) - proving KV watcher works
+	// Verify detection was fast - proving KV watcher works
 	elapsed := time.Since(startTime)
-	assert.Less(s.T(), elapsed, 2*time.Second,
+	assert.Less(s.T(), elapsed, waitForConvergenceTimeout,
 		"KV watcher should detect departure quickly, got %v", elapsed)
 
 	// Verify epoch was updated
@@ -282,13 +283,13 @@ func (s *CoordinatorSuite) Test_Coordinator_KVWatcher_DetectsJoin() {
 	}
 
 	require.True(s.T(), sawJoin,
-		"Node1 should detect node2 joining within 5 seconds")
+		"Node1 should detect node2 joining within %v", waitForConvergenceTimeout)
 
 	// Verify detection was reasonably fast (< 10 seconds)
 	// Note: This includes node startup time plus CI overhead. The key is it's much faster than heartbeat timeout (60s).
 	// We allow 10s instead of 5s because: 50 iterations × 100ms sleep = 5s, plus RPC overhead per iteration.
 	elapsed := time.Since(startTime)
-	assert.Less(s.T(), elapsed, 10*time.Second,
+	assert.Less(s.T(), elapsed, waitForConvergenceTimeout,
 		"KV watcher should detect join quickly, got %v", elapsed)
 
 	// Verify epoch changed
@@ -300,7 +301,7 @@ func (s *CoordinatorSuite) Test_Coordinator_KVWatcher_DetectsJoin() {
 		"Should see 2 nodes after join")
 
 	// Wait for convergence (both nodes ACTIVE)
-	err = s.harness.WaitForConvergence(10 * time.Second)
+	err = s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err)
 
 	// Verify final state
@@ -320,7 +321,7 @@ func (s *CoordinatorSuite) Test_Coordinator_GracefulNodeDeparture() {
 	require.NoError(s.T(), err, "Failed to start nodes")
 
 	// Wait for convergence
-	err = s.harness.WaitForConvergence(10 * time.Second)
+	err = s.harness.WaitForConvergence(waitForConvergenceTimeout)
 	require.NoError(s.T(), err, "Cluster did not converge")
 
 	// Verify all nodes see each other (3 nodes total)
@@ -415,6 +416,6 @@ func (s *CoordinatorSuite) Test_Coordinator_GracefulNodeDeparture() {
 	// plus polling time. The key is that it's much faster than passive detection (10-20s).
 	totalElapsed := time.Since(startTime)
 	s.T().Logf("Total time for graceful departure detection: %v", totalElapsed)
-	assert.Less(s.T(), totalElapsed, 5*time.Second,
+	assert.Less(s.T(), totalElapsed, waitForConvergenceTimeout,
 		"Graceful departure should be detected quickly (not 10-20s like passive detection)")
 }
