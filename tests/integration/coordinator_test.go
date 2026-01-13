@@ -284,10 +284,11 @@ func (s *CoordinatorSuite) Test_Coordinator_KVWatcher_DetectsJoin() {
 	require.True(s.T(), sawJoin,
 		"Node1 should detect node2 joining within 5 seconds")
 
-	// Verify detection was reasonably fast (< 5 seconds)
-	// Note: This includes node startup time. The key is it's much faster than heartbeat timeout (60s).
+	// Verify detection was reasonably fast (< 10 seconds)
+	// Note: This includes node startup time plus CI overhead. The key is it's much faster than heartbeat timeout (60s).
+	// We allow 10s instead of 5s because: 50 iterations × 100ms sleep = 5s, plus RPC overhead per iteration.
 	elapsed := time.Since(startTime)
-	assert.Less(s.T(), elapsed, 5*time.Second,
+	assert.Less(s.T(), elapsed, 10*time.Second,
 		"KV watcher should detect join quickly, got %v", elapsed)
 
 	// Verify epoch changed
