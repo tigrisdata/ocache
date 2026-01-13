@@ -21,6 +21,7 @@ type Memberlist struct {
 	dnsProvider *simpleDNSProvider
 	logger      log.Logger
 	reg         prometheus.Registerer
+	started     bool // Track if Start() succeeded
 }
 
 // NewMemberlist creates a new memberlist gossip service.
@@ -63,6 +64,8 @@ func (m *Memberlist) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start memberlist: %w", err)
 	}
 
+	m.started = true
+
 	zlog.Info().
 		Strs("join_members", m.cfg.JoinMembers).
 		Str("bind_addr", m.cfg.BindAddr).
@@ -72,8 +75,15 @@ func (m *Memberlist) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the memberlist KV service
+// Stop stops the memberlist KV service.
+// Only attempts to stop if the service was successfully started.
+// This prevents confusing errors when Stop() is called after a failed Start().
 func (m *Memberlist) Stop(ctx context.Context) error {
+	if !m.started {
+		zlog.Debug().Msg("Memberlist KV was never started, skipping stop")
+		return nil
+	}
+
 	if err := services.StopAndAwaitTerminated(ctx, m.kv); err != nil {
 		return fmt.Errorf("failed to stop memberlist: %w", err)
 	}
