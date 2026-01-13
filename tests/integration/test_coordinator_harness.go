@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,20 +16,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
-
-// coordinatorPortCounter ensures each CoordinatorTestHarness gets unique ports
-var coordinatorPortCounter atomic.Int32
-
-// getNextCoordinatorBasePort returns the next available base port for coordinator tests.
-// Each call increments the counter to ensure different tests get different ports.
-func getNextCoordinatorBasePort() int {
-	// Base starts at 27000 (original port range for coordinator tests)
-	// Each harness needs up to 1000 ports (gRPC + memberlist)
-	basePortStart := 27000
-	portRange := 1000
-	counter := coordinatorPortCounter.Add(1) - 1 // Get current and increment
-	return basePortStart + (int(counter) * portRange)
-}
 
 // CoordinatorTestNode represents a coordinator node for testing
 type CoordinatorTestNode struct {
@@ -92,31 +77,42 @@ func (n *CoordinatorTestNode) IsRunning() bool {
 
 // CoordinatorTestHarness provides a simplified harness for testing coordinator clustering
 type CoordinatorTestHarness struct {
-	T         *testing.T
-	Nodes     map[string]*CoordinatorTestNode
-	BasePort  int
-	NodeCount int
-	mu        sync.RWMutex
+	T               *testing.T
+	Nodes           map[string]*CoordinatorTestNode
+	NodeCount       int
+	memberlistPorts []int // Dynamically allocated memberlist ports
+	grpcPorts       []int // Dynamically allocated gRPC ports
+	mu              sync.RWMutex
 }
 
 // NewCoordinatorTestHarness creates a new coordinator test harness
 func NewCoordinatorTestHarness(t *testing.T, nodeCount int) *CoordinatorTestHarness {
-	basePort := getNextCoordinatorBasePort()
-	t.Logf("CoordinatorTestHarness using base port %d", basePort)
+	// Get free ports dynamically: nodeCount for memberlist + nodeCount for gRPC
+	ports, err := getFreePorts(nodeCount * 2)
+	if err != nil {
+		t.Fatalf("Failed to get free ports: %v", err)
+	}
+
+	// First half for memberlist, second half for gRPC
+	memberlistPorts := ports[:nodeCount]
+	grpcPorts := ports[nodeCount:]
+
+	t.Logf("CoordinatorTestHarness using memberlist ports %v, gRPC ports %v", memberlistPorts, grpcPorts)
 
 	return &CoordinatorTestHarness{
-		T:         t,
-		Nodes:     make(map[string]*CoordinatorTestNode),
-		BasePort:  basePort,
-		NodeCount: nodeCount,
+		T:               t,
+		Nodes:           make(map[string]*CoordinatorTestNode),
+		NodeCount:       nodeCount,
+		memberlistPorts: memberlistPorts,
+		grpcPorts:       grpcPorts,
 	}
 }
 
 // StartNode starts a coordinator node
 func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode, error) {
 	nodeID := fmt.Sprintf("test-node-%d", nodeIndex+1)
-	memberlistPort := h.BasePort + nodeIndex                 // Memberlist gossip port
-	listenPort := h.BasePort + 1000 + nodeIndex              // gRPC service port (cache + cluster RPCs)
+	memberlistPort := h.memberlistPorts[nodeIndex]           // Memberlist gossip port
+	listenPort := h.grpcPorts[nodeIndex]                     // gRPC service port (cache + cluster RPCs)
 	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
 
@@ -126,12 +122,11 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	// Build seed list (memberlist addresses of other nodes)
+	// Build seed list (memberlist addresses of all nodes)
 	var seeds []string
 	for i := 0; i < h.NodeCount; i++ {
-		seedPort := h.BasePort + i
 		// Seeds use 127.0.0.1 so nodes can reach each other
-		seedAddr := fmt.Sprintf("127.0.0.1:%d", seedPort)
+		seedAddr := fmt.Sprintf("127.0.0.1:%d", h.memberlistPorts[i])
 		seeds = append(seeds, seedAddr)
 	}
 

@@ -24,29 +24,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// clusterPortCounter is a global atomic counter for allocating unique port ranges
-// to each cluster test harness to avoid port collisions between tests.
-// Each harness uses a range of 200 ports (100 for gRPC, 100 for memberlist).
-var clusterPortCounter atomic.Int32
-
-func init() {
-	// Start at 0, so first harness gets base port 40000
-	clusterPortCounter.Store(0)
-}
-
-// getNextClusterBasePort returns the next available base port for cluster tests.
-// Each call increments the counter to ensure different tests get different ports.
-func getNextClusterBasePort() int {
-	// Base starts at 40000 to avoid conflicts with coordinator tests (27000-39999)
-	// Coordinator tests use 27000 + n*1000, so with 12+ tests they can reach 39000
-	basePortStart := 40000
-	// Each harness needs: 3 gRPC ports + 3 memberlist ports (with 50 offset)
-	// Use 200 port range per test to be safe (supports up to 50 nodes if needed)
-	portRange := 200
-	counter := clusterPortCounter.Add(1) - 1 // Get current and increment
-	return basePortStart + (int(counter) * portRange)
-}
-
 // NodeMetrics tracks metrics for a single cluster node
 type NodeMetrics struct {
 	NodeID         string
@@ -134,43 +111,53 @@ func (n *ClusterServerNode) IsRunning() bool {
 
 // ClusterTestHarness provides a test harness for multi-node cluster testing with full servers
 type ClusterTestHarness struct {
-	T           *testing.T
-	Nodes       map[string]*ClusterServerNode
-	Client      cacheclient.CacheClient
-	BasePort    int
-	NodeCount   int
-	Config      IntegrationTestConfig
-	Metrics     *TestMetrics
-	NodeMetrics map[string]*NodeMetrics // Per-node metrics
-	mu          sync.RWMutex
-	stopMetrics chan struct{}
-	cleanupOnce sync.Once // Ensures Cleanup only runs once
-	clientAddrs []string
+	T               *testing.T
+	Nodes           map[string]*ClusterServerNode
+	Client          cacheclient.CacheClient
+	NodeCount       int
+	Config          IntegrationTestConfig
+	Metrics         *TestMetrics
+	NodeMetrics     map[string]*NodeMetrics // Per-node metrics
+	grpcPorts       []int                   // Dynamically allocated gRPC ports
+	memberlistPorts []int                   // Dynamically allocated memberlist ports
+	mu              sync.RWMutex
+	stopMetrics     chan struct{}
+	cleanupOnce     sync.Once // Ensures Cleanup only runs once
+	clientAddrs     []string
 }
 
 // NewClusterTestHarness creates a new cluster test harness with full cache servers
 func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestConfig) *ClusterTestHarness {
-	// Get a unique base port for this harness to avoid port collisions between tests
-	basePort := getNextClusterBasePort()
-	t.Logf("ClusterTestHarness using base port %d", basePort)
+	// Get free ports dynamically: nodeCount for gRPC + nodeCount for memberlist
+	ports, err := getFreePorts(nodeCount * 2)
+	if err != nil {
+		t.Fatalf("Failed to get free ports: %v", err)
+	}
+
+	// First half for gRPC, second half for memberlist
+	grpcPorts := ports[:nodeCount]
+	memberlistPorts := ports[nodeCount:]
+
+	t.Logf("ClusterTestHarness using gRPC ports %v, memberlist ports %v", grpcPorts, memberlistPorts)
 
 	return &ClusterTestHarness{
-		T:           t,
-		Nodes:       make(map[string]*ClusterServerNode),
-		BasePort:    basePort,
-		NodeCount:   nodeCount,
-		Config:      config,
-		Metrics:     &TestMetrics{StartTime: time.Now()},
-		NodeMetrics: make(map[string]*NodeMetrics),
-		stopMetrics: make(chan struct{}),
+		T:               t,
+		Nodes:           make(map[string]*ClusterServerNode),
+		NodeCount:       nodeCount,
+		Config:          config,
+		Metrics:         &TestMetrics{StartTime: time.Now()},
+		NodeMetrics:     make(map[string]*NodeMetrics),
+		grpcPorts:       grpcPorts,
+		memberlistPorts: memberlistPorts,
+		stopMetrics:     make(chan struct{}),
 	}
 }
 
 // StartNode starts a full cache server node
 func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error) {
 	nodeID := fmt.Sprintf("cluster-node-%d", nodeIndex+1)
-	listenPort := h.BasePort + nodeIndex           // gRPC service port (cache + cluster RPCs)
-	memberlistPort := h.BasePort + 100 + nodeIndex // Memberlist gossip port (offset by 100)
+	listenPort := h.grpcPorts[nodeIndex]           // gRPC service port (cache + cluster RPCs)
+	memberlistPort := h.memberlistPorts[nodeIndex] // Memberlist gossip port
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
 	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
 
@@ -180,12 +167,11 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
 
-	// Build seed list (memberlist addresses of other nodes)
+	// Build seed list (memberlist addresses of all nodes)
 	var seeds []string
 	for i := 0; i < h.NodeCount; i++ {
-		seedPort := h.BasePort + 100 + i
 		// Seeds use 127.0.0.1 so nodes can reach each other
-		seedAddr := fmt.Sprintf("127.0.0.1:%d", seedPort)
+		seedAddr := fmt.Sprintf("127.0.0.1:%d", h.memberlistPorts[i])
 		seeds = append(seeds, seedAddr)
 	}
 
