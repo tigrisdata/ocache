@@ -26,22 +26,23 @@ import (
 
 // clusterPortCounter is a global atomic counter for allocating unique port ranges
 // to each cluster test harness to avoid port collisions between tests.
-// Each harness uses a range of 2000 ports (1000 for gRPC, 1000 for memberlist).
+// Each harness uses a range of 200 ports (100 for gRPC, 100 for memberlist).
 var clusterPortCounter atomic.Int32
 
 func init() {
-	// Start at 0, so first harness gets base port 32000
+	// Start at 0, so first harness gets base port 40000
 	clusterPortCounter.Store(0)
 }
 
 // getNextClusterBasePort returns the next available base port for cluster tests.
 // Each call increments the counter to ensure different tests get different ports.
 func getNextClusterBasePort() int {
-	// Base starts at 32000 to avoid conflicts with coordinator tests (27000-28999)
-	// and legacy cluster tests (30000-31999)
-	basePortStart := 32000
-	// Each harness needs up to 2000 ports (1000 for gRPC + 1000 for memberlist)
-	portRange := 2000
+	// Base starts at 40000 to avoid conflicts with coordinator tests (27000-39999)
+	// Coordinator tests use 27000 + n*1000, so with 12+ tests they can reach 39000
+	basePortStart := 40000
+	// Each harness needs: 3 gRPC ports + 3 memberlist ports (with 50 offset)
+	// Use 200 port range per test to be safe (supports up to 50 nodes if needed)
+	portRange := 200
 	counter := clusterPortCounter.Add(1) - 1 // Get current and increment
 	return basePortStart + (int(counter) * portRange)
 }
@@ -168,8 +169,8 @@ func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestCo
 // StartNode starts a full cache server node
 func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error) {
 	nodeID := fmt.Sprintf("cluster-node-%d", nodeIndex+1)
-	listenPort := h.BasePort + nodeIndex            // gRPC service port (cache + cluster RPCs)
-	memberlistPort := h.BasePort + 1000 + nodeIndex // Memberlist gossip port
+	listenPort := h.BasePort + nodeIndex           // gRPC service port (cache + cluster RPCs)
+	memberlistPort := h.BasePort + 100 + nodeIndex // Memberlist gossip port (offset by 100)
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
 	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
 
@@ -182,7 +183,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	// Build seed list (memberlist addresses of other nodes)
 	var seeds []string
 	for i := 0; i < h.NodeCount; i++ {
-		seedPort := h.BasePort + 1000 + i
+		seedPort := h.BasePort + 100 + i
 		// Seeds use 127.0.0.1 so nodes can reach each other
 		seedAddr := fmt.Sprintf("127.0.0.1:%d", seedPort)
 		seeds = append(seeds, seedAddr)
