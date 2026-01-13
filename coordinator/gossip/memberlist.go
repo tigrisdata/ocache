@@ -21,7 +21,6 @@ type Memberlist struct {
 	dnsProvider *simpleDNSProvider
 	logger      log.Logger
 	reg         prometheus.Registerer
-	started     bool // Track if Start() succeeded
 }
 
 // NewMemberlist creates a new memberlist gossip service.
@@ -64,8 +63,6 @@ func (m *Memberlist) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start memberlist: %w", err)
 	}
 
-	m.started = true
-
 	zlog.Info().
 		Strs("join_members", m.cfg.JoinMembers).
 		Str("bind_addr", m.cfg.BindAddr).
@@ -76,14 +73,20 @@ func (m *Memberlist) Start(ctx context.Context) error {
 }
 
 // Stop stops the memberlist KV service.
-// Only attempts to stop if the service was successfully started.
-// This prevents confusing errors when Stop() is called after a failed Start().
+// Uses dskit's built-in service state to handle cleanup correctly:
+// - New state: call Stop() - dskit handles never-started services correctly
+// - Failed state: skip Stop() - dskit would try to create new transport for leave messages
+// - Running state: call Stop() normally for graceful shutdown
 func (m *Memberlist) Stop(ctx context.Context) error {
-	if !m.started {
-		zlog.Debug().Msg("Memberlist KV was never started, skipping stop")
+	// If the service failed to start, don't call dskit Stop because it will
+	// try to create a new transport for leave messages, which fails since
+	// the port is already bound from the failed start attempt.
+	if m.kv.State() == services.Failed {
+		zlog.Debug().Msg("Memberlist in Failed state, skipping Stop to avoid transport recreation")
 		return nil
 	}
 
+	// For New, Running, and other states, call dskit's Stop - it handles them correctly
 	if err := services.StopAndAwaitTerminated(ctx, m.kv); err != nil {
 		return fmt.Errorf("failed to stop memberlist: %w", err)
 	}
