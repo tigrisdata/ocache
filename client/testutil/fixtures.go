@@ -34,39 +34,44 @@ func StandardTestKeys() []string {
 	}
 }
 
-// CreateSimpleTopology creates a basic topology for testing
+// CreateSimpleTopology creates a basic topology for testing with token assignments
 func CreateSimpleTopology(addresses []string, epoch uint64) *clusterpb.ClusterTopology {
 	nodes := make([]*clusterpb.NodeInfo, len(addresses))
-	partitionOwners := make([]*clusterpb.PartitionOwner, 0)
+	nodeTokens := make([]*clusterpb.NodeTokens, len(addresses))
+
+	// Use 128 tokens per node for testing
+	tokensPerNode := 128
+	tokenRange := uint32(0xFFFFFFFF) / uint32(len(addresses)*tokensPerNode)
 
 	for i, addr := range addresses {
+		nodeID := fmt.Sprintf("node-%d", i)
 		nodes[i] = &clusterpb.NodeInfo{
-			Id:            fmt.Sprintf("node-%d", i),
+			Id:            nodeID,
 			Address:       addr,
 			ListenAddress: addr, // For tests, use the same address for both cluster and listen
 			Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 		}
-	}
 
-	// Distribute partitions among nodes
-	partitionCount := int32(10)
-	for i := int32(0); i < partitionCount; i++ {
-		nodeIdx := i % int32(len(nodes))
-		partitionOwners = append(partitionOwners, &clusterpb.PartitionOwner{
-			PartitionId: i,
-			NodeId:      nodes[nodeIdx].Id,
-		})
+		// Generate tokens for this node
+		tokens := make([]uint32, tokensPerNode)
+		baseToken := uint32(i) * tokenRange * uint32(tokensPerNode)
+		for t := 0; t < tokensPerNode; t++ {
+			tokens[t] = baseToken + uint32(t)*tokenRange
+		}
+
+		nodeTokens[i] = &clusterpb.NodeTokens{
+			NodeId: nodeID,
+			Tokens: tokens,
+		}
 	}
 
 	return &clusterpb.ClusterTopology{
 		Epoch: epoch,
 		Nodes: nodes,
 		RingConfig: &clusterpb.RingConfig{
-			PartitionCount:    partitionCount,
-			ReplicationFactor: 20,
-			Load:              1.25,
+			ReplicationFactor: 1, // Data replication factor
+			NodeTokens:        nodeTokens,
 		},
-		PartitionOwners: partitionOwners,
 	}
 }
 

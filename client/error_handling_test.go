@@ -212,29 +212,27 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("PartitionNotOwned", func(t *testing.T) {
+	t.Run("EmptyTokenRing", func(t *testing.T) {
 		// Create server
 		server, err := newTestServerWithAddr()
 		require.NoError(t, err)
 		defer server.Stop()
 
-		// Set topology with empty partition owners
+		// Set topology with empty token assignments
 		topology := &clusterpb.ClusterTopology{
 			Epoch: 1,
 			Nodes: []*clusterpb.NodeInfo{
 				{
 					Id:            "node-0",
 					Address:       server.address,
-					ListenAddress: server.address, // For tests, use the same address for both cluster and listen
+					ListenAddress: server.address,
 					Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 				},
 			},
 			RingConfig: &clusterpb.RingConfig{
-				PartitionCount:    10,
-				ReplicationFactor: 20,
-				Load:              1.25,
+				ReplicationFactor: 1,
+				NodeTokens:        []*clusterpb.NodeTokens{}, // No tokens!
 			},
-			PartitionOwners: []*clusterpb.PartitionOwner{}, // No owners!
 		}
 		server.cacheService.SetClusterTopology(topology)
 
@@ -248,7 +246,7 @@ func TestError_ClusterModeErrors(t *testing.T) {
 		require.NoError(t, err)
 		defer client.Close()
 
-		// Operations should fail due to no partition owners
+		// Operations should fail due to empty token ring
 		ctx := context.Background()
 		err = client.Put(ctx, "test-key", []byte("value"), 0)
 		assert.Error(t, err)

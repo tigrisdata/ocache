@@ -10,12 +10,26 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
+
+// Ring defines the interface for the hash ring used by the router.
+// This interface allows for testing with mock implementations.
+type Ring interface {
+	// GetNode returns the node that owns the given key
+	GetNode(key string) (*ring.NodeInfo, error)
+	// GetAllNodes returns all nodes in the ring
+	GetAllNodes() []*ring.NodeInfo
+	// GetActiveNodes returns all active nodes in the ring
+	GetActiveNodes() []*ring.NodeInfo
+	// IsLocal returns true if the local node owns the given key
+	IsLocal(key string) bool
+}
 
 // RouterConfig contains configuration for the Router
 type RouterConfig struct {
@@ -77,7 +91,7 @@ type ConnectionStats struct {
 
 // Router is a router for routing requests to the appropriate node
 type Router struct {
-	ring    *Ring
+	ring    Ring
 	clients map[string]*clientState
 	localID string
 	config  *RouterConfig
@@ -85,12 +99,12 @@ type Router struct {
 }
 
 // NewRouter creates a new router with the default configuration
-func NewRouter(ring *Ring, localID string) *Router {
+func NewRouter(ring Ring, localID string) *Router {
 	return NewRouterWithConfig(ring, localID, DefaultRouterConfig())
 }
 
 // NewRouterWithConfig creates a new router with a custom configuration
-func NewRouterWithConfig(ring *Ring, localID string, config *RouterConfig) *Router {
+func NewRouterWithConfig(ring Ring, localID string, config *RouterConfig) *Router {
 	if config == nil {
 		config = DefaultRouterConfig()
 	}

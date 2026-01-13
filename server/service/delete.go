@@ -7,6 +7,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
@@ -55,6 +56,16 @@ func (s *CacheService) handleClusteredDelete(ctx context.Context, req *pb.Delete
 		return &pb.DeleteResponse{
 			Success: false,
 			Error:   fmt.Sprintf("routing error: %v", err),
+		}, nil
+	}
+
+	// Increment hop count for forwarding loop detection
+	ctx, err = coordinator.IncrementHopCount(ctx, s.coordinator.GetLocalNodeID())
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Delete", "hop_limit_exceeded").Inc()
+		return &pb.DeleteResponse{
+			Success: false,
+			Error:   err.Error(),
 		}, nil
 	}
 

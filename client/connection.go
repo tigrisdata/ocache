@@ -1,14 +1,18 @@
 package cacheclient
 
 import (
+	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/metadata"
 )
 
 // connection wraps multiple gRPC connections with health monitoring and load distribution
@@ -22,19 +26,30 @@ type connection struct {
 	lastErrorTime time.Time
 	reconnecting  atomic.Bool
 	mu            sync.RWMutex
+
+	// Epoch tracking for cluster mode
+	epochGetter     EpochGetter
+	onEpochMismatch EpochMismatchHandler
 }
 
 // newConnection creates a new connection pool to the specified address
 func newConnection(addr string, dialOpts []grpc.DialOption, poolSize int) (*connection, error) {
+	return newConnectionWithEpoch(addr, dialOpts, poolSize, nil, nil)
+}
+
+// newConnectionWithEpoch creates a new connection pool with epoch tracking support
+func newConnectionWithEpoch(addr string, dialOpts []grpc.DialOption, poolSize int, epochGetter EpochGetter, onMismatch EpochMismatchHandler) (*connection, error) {
 	if poolSize <= 0 {
 		poolSize = 3 // Default pool size
 	}
 
 	c := &connection{
-		address:     addr,
-		poolSize:    poolSize,
-		connections: make([]*grpc.ClientConn, 0, poolSize),
-		clients:     make([]pb.CacheServiceClient, 0, poolSize),
+		address:         addr,
+		poolSize:        poolSize,
+		connections:     make([]*grpc.ClientConn, 0, poolSize),
+		clients:         make([]pb.CacheServiceClient, 0, poolSize),
+		epochGetter:     epochGetter,
+		onEpochMismatch: onMismatch,
 	}
 
 	// Create multiple connections
@@ -43,6 +58,15 @@ func newConnection(addr string, dialOpts []grpc.DialOption, poolSize int) (*conn
 		opts = append(opts, grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(MaxMessageSize),
 		))
+
+		// Add epoch interceptors if epoch getter is provided (cluster mode)
+		// Use Chain*Interceptor to preserve any user-provided interceptors in dialOpts
+		if epochGetter != nil {
+			opts = append(opts,
+				grpc.WithChainUnaryInterceptor(clientEpochUnaryInterceptor(epochGetter, onMismatch)),
+				grpc.WithChainStreamInterceptor(clientEpochStreamInterceptor(epochGetter, onMismatch)),
+			)
+		}
 
 		conn, err := grpc.Dial(addr, opts...)
 		if err != nil {
@@ -233,4 +257,104 @@ func (c *connection) getHealthStats() (healthy, total int) {
 		}
 	}
 	return healthy, total
+}
+
+// EpochGetter is a function that returns the current client epoch
+type EpochGetter func() uint64
+
+// EpochMismatchHandler is called when server epoch differs from client epoch
+type EpochMismatchHandler func(clientEpoch, serverEpoch uint64)
+
+// clientEpochUnaryInterceptor creates a unary client interceptor that:
+// 1. Attaches client epoch to outgoing requests
+// 2. Detects server epoch from responses (for cache invalidation)
+func clientEpochUnaryInterceptor(epochGetter EpochGetter, onMismatch EpochMismatchHandler) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		// Attach client epoch to outgoing metadata
+		clientEpoch := epochGetter()
+		ctx = metadata.AppendToOutgoingContext(ctx,
+			coordinator.MetadataKeyRingEpoch, strconv.FormatUint(clientEpoch, 10),
+		)
+
+		// Capture response headers
+		var header metadata.MD
+		opts = append(opts, grpc.Header(&header))
+
+		// Make the call
+		err := invoker(ctx, method, req, reply, cc, opts...)
+
+		// Check for epoch mismatch in response
+		if serverEpochs := header.Get(coordinator.MetadataKeyRingEpoch); len(serverEpochs) > 0 {
+			if serverEpoch, parseErr := strconv.ParseUint(serverEpochs[0], 10, 64); parseErr == nil {
+				if serverEpoch != clientEpoch && onMismatch != nil {
+					onMismatch(clientEpoch, serverEpoch)
+				}
+			}
+		}
+
+		return err
+	}
+}
+
+// clientEpochStreamInterceptor creates a stream client interceptor that:
+// 1. Attaches client epoch to outgoing requests
+// 2. Detects server epoch from responses on first receive (for cache invalidation)
+func clientEpochStreamInterceptor(epochGetter EpochGetter, onMismatch EpochMismatchHandler) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		// Attach client epoch to outgoing metadata
+		clientEpoch := epochGetter()
+		ctx = metadata.AppendToOutgoingContext(ctx,
+			coordinator.MetadataKeyRingEpoch, strconv.FormatUint(clientEpoch, 10),
+		)
+
+		stream, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			return nil, err
+		}
+
+		// Wrap the stream to detect epoch mismatches on first receive
+		return &epochClientStream{
+			ClientStream:  stream,
+			clientEpoch:   clientEpoch,
+			onMismatch:    onMismatch,
+			headerChecked: false,
+		}, nil
+	}
+}
+
+// epochClientStream wraps a ClientStream to detect epoch mismatches
+type epochClientStream struct {
+	grpc.ClientStream
+	clientEpoch   uint64
+	onMismatch    EpochMismatchHandler
+	headerChecked bool
+}
+
+func (s *epochClientStream) RecvMsg(m interface{}) error {
+	err := s.ClientStream.RecvMsg(m)
+
+	// Check for epoch mismatch on first receive (after headers are available)
+	if !s.headerChecked {
+		s.headerChecked = true
+		s.checkEpochMismatch()
+	}
+
+	return err
+}
+
+func (s *epochClientStream) checkEpochMismatch() {
+	// Get response headers
+	header, err := s.ClientStream.Header()
+	if err != nil {
+		return
+	}
+
+	// Check for epoch mismatch
+	if serverEpochs := header.Get(coordinator.MetadataKeyRingEpoch); len(serverEpochs) > 0 {
+		if serverEpoch, parseErr := strconv.ParseUint(serverEpochs[0], 10, 64); parseErr == nil {
+			if serverEpoch != s.clientEpoch && s.onMismatch != nil {
+				s.onMismatch(s.clientEpoch, serverEpoch)
+			}
+		}
+	}
 }

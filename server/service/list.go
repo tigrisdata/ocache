@@ -11,7 +11,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
-	"github.com/tigrisdata/ocache/coordinator"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
@@ -243,7 +243,7 @@ func (s *CacheService) handleClusteredList(ctx context.Context, req *pb.ListRequ
 }
 
 // fetchFromAllNodes fetches keys from all nodes in parallel
-func (s *CacheService) fetchFromAllNodes(ctx context.Context, nodes []*coordinator.NodeInfo, req *pb.ListRequest, nodeCursors map[string]string) (map[string]*NodeResponse, error) {
+func (s *CacheService) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, req *pb.ListRequest, nodeCursors map[string]string) (map[string]*NodeResponse, error) {
 	localNodeID := s.coordinator.GetLocalNodeID()
 	router := s.coordinator.GetRouter()
 
@@ -253,7 +253,7 @@ func (s *CacheService) fetchFromAllNodes(ctx context.Context, nodes []*coordinat
 
 	for _, node := range nodes {
 		wg.Add(1)
-		go func(n *coordinator.NodeInfo) {
+		go func(n *ring.NodeInfo) {
 			defer wg.Done()
 
 			// Determine start key for this node

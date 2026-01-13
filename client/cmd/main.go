@@ -2,16 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	ycsb "github.com/tigrisdata/ocache/client/cmd/ycsb"
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 )
 
 var rootCmd = &cobra.Command{
@@ -20,7 +23,7 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
-	rootCmd.AddCommand(putCmd, getCmd, delCmd, listCmd, benchCmd)
+	rootCmd.AddCommand(putCmd, getCmd, delCmd, listCmd, benchCmd, clusterCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -44,6 +47,9 @@ var (
 	noProgress         bool
 	forceStreaming     bool
 	listPrefix         string
+
+	// cluster command flags
+	jsonOutput bool
 )
 
 func newClient() *cacheclient.Client {
@@ -64,11 +70,6 @@ func newClient() *cacheclient.Client {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create client: %v\n", err)
 		os.Exit(1)
-	}
-
-	// Log the detected mode if auto was used
-	if connMode == "auto" {
-		fmt.Fprintf(os.Stderr, "Using %s mode\n", c.GetMode())
 	}
 
 	return c
@@ -236,6 +237,149 @@ var benchCmd = &cobra.Command{
 	},
 }
 
+// cluster command and subcommands
+var clusterCmd = &cobra.Command{
+	Use:   "cluster",
+	Short: "Cluster management commands",
+	Long: `Commands for inspecting cluster topology and key ownership.
+These commands only work when connected to a cluster-enabled ocache server.`,
+}
+
+var clusterTopologyCmd = &cobra.Command{
+	Use:   "topology",
+	Short: "Display full cluster topology (nodes + ring config)",
+	Run: func(cmd *cobra.Command, args []string) {
+		c := newClient()
+		defer c.Close()
+
+		if !c.IsClusterMode() {
+			fmt.Fprintln(os.Stderr, "Error: cluster commands require cluster mode. Connected in simple mode.")
+			os.Exit(1)
+		}
+
+		topology, err := c.FetchTopology()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to fetch topology: %v\n", err)
+			os.Exit(1)
+		}
+
+		if jsonOutput {
+			printJSON(topology)
+		} else {
+			printClusterTopology(topology)
+		}
+	},
+}
+
+var clusterNodeCmd = &cobra.Command{
+	Use:   "node <key>",
+	Short: "Get the node that owns a specific key",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		c := newClient()
+		defer c.Close()
+
+		if !c.IsClusterMode() {
+			fmt.Fprintln(os.Stderr, "Error: cluster commands require cluster mode. Connected in simple mode.")
+			os.Exit(1)
+		}
+
+		key := args[0]
+		nodeID, address, err := c.GetNodeInfoForKey(key)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to get node for key: %v\n", err)
+			os.Exit(1)
+		}
+
+		if jsonOutput {
+			printJSON(map[string]string{"key": key, "node_id": nodeID, "address": address})
+		} else {
+			fmt.Printf("Key: %s\nNode: %s\nAddress: %s\n", key, nodeID, address)
+		}
+	},
+}
+
+var clusterEpochCmd = &cobra.Command{
+	Use:   "epoch",
+	Short: "Display the current topology epoch",
+	Run: func(cmd *cobra.Command, args []string) {
+		c := newClient()
+		defer c.Close()
+
+		if !c.IsClusterMode() {
+			fmt.Fprintln(os.Stderr, "Error: cluster commands require cluster mode. Connected in simple mode.")
+			os.Exit(1)
+		}
+
+		epoch := c.GetTopologyEpoch()
+		if jsonOutput {
+			printJSON(map[string]uint64{"epoch": epoch})
+		} else {
+			fmt.Printf("Epoch: %d\n", epoch)
+		}
+	},
+}
+
+// Helper functions for cluster command output
+
+func printJSON(v interface{}) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
+}
+
+func printClusterTopology(topology *clusterpb.ClusterTopology) {
+	fmt.Printf("Cluster Topology (Epoch: %d)\n", topology.Epoch)
+	fmt.Println()
+
+	// Ring config
+	if topology.RingConfig != nil {
+		fmt.Println("Ring Configuration:")
+		fmt.Printf("  Replication Factor: %d\n", topology.RingConfig.ReplicationFactor)
+		if len(topology.RingConfig.NodeTokens) > 0 {
+			totalTokens := 0
+			for _, nt := range topology.RingConfig.NodeTokens {
+				totalTokens += len(nt.Tokens)
+			}
+			fmt.Printf("  Total Tokens: %d\n", totalTokens)
+		}
+		fmt.Println()
+	}
+
+	// Nodes
+	fmt.Println("Nodes:")
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NODE ID\tSTATUS\tLISTEN ADDRESS\tCLUSTER ADDRESS\tJOINED AT")
+	fmt.Fprintln(w, "-------\t------\t--------------\t---------------\t---------")
+
+	for _, node := range topology.Nodes {
+		joinedAt := time.Unix(int64(node.JoinedAt), 0).Format(time.RFC3339)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			node.Id,
+			nodeStatusString(node.Status),
+			node.ListenAddress,
+			node.Address,
+			joinedAt,
+		)
+	}
+	_ = w.Flush()
+}
+
+func nodeStatusString(status clusterpb.NodeStatus) string {
+	switch status {
+	case clusterpb.NodeStatus_NODE_STATUS_ACTIVE:
+		return "ACTIVE"
+	case clusterpb.NodeStatus_NODE_STATUS_JOINING:
+		return "JOINING"
+	case clusterpb.NodeStatus_NODE_STATUS_LEAVING:
+		return "LEAVING"
+	case clusterpb.NodeStatus_NODE_STATUS_DOWN:
+		return "DOWN"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&addr, "addr", "localhost:9000", "Cache server address (comma-separated for multiple servers)")
 	rootCmd.PersistentFlags().StringVar(&connMode, "mode", "auto", "Connection mode: auto, simple, or cluster")
@@ -251,4 +395,8 @@ func init() {
 	benchCmd.Flags().Int64Var(&seed, "seed", time.Now().UnixNano(), "Random seed")
 	benchCmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress output during benchmark")
 	benchCmd.Flags().BoolVar(&forceStreaming, "force-streaming", false, "Force streaming for all operations regardless of size")
+
+	// cluster command flags and subcommands
+	clusterCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+	clusterCmd.AddCommand(clusterTopologyCmd, clusterNodeCmd, clusterEpochCmd)
 }

@@ -3,13 +3,16 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/tigrisdata/ocache/common/hash"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -18,6 +21,7 @@ import (
 type CoordinatorTestNode struct {
 	NodeID      string
 	Coordinator *coordinator.Coordinator
+	grpcServer  *grpc.Server
 	ClusterConn *grpc.ClientConn
 	ClusterSvc  clusterpb.ClusterServiceClient
 	ctx         context.Context
@@ -35,18 +39,29 @@ func (n *CoordinatorTestNode) Stop() error {
 		return nil
 	}
 
-	if n.cancel != nil {
-		n.cancel()
+	// Close the cluster client connection first (before stopping coordinator)
+	if n.ClusterConn != nil {
+		n.ClusterConn.Close()
 	}
 
+	// Stop the coordinator gracefully - this will:
+	// 1. Stop ring manager (unregister from ring, broadcast leave)
+	// 2. Stop memberlist KV
+	// The coordinator handles its own shutdown order correctly.
 	if n.Coordinator != nil {
 		if err := n.Coordinator.Stop(); err != nil {
 			return err
 		}
 	}
 
-	if n.ClusterConn != nil {
-		n.ClusterConn.Close()
+	// Stop gRPC server after coordinator (it might still be handling requests during unregister)
+	if n.grpcServer != nil {
+		n.grpcServer.GracefulStop()
+	}
+
+	// Cancel context last - this is just for cleanup, not for triggering shutdown
+	if n.cancel != nil {
+		n.cancel()
 	}
 
 	n.stopped = true
@@ -62,52 +77,78 @@ func (n *CoordinatorTestNode) IsRunning() bool {
 
 // CoordinatorTestHarness provides a simplified harness for testing coordinator clustering
 type CoordinatorTestHarness struct {
-	T         *testing.T
-	Nodes     map[string]*CoordinatorTestNode
-	BasePort  int
-	NodeCount int
-	mu        sync.RWMutex
+	T               *testing.T
+	Nodes           map[string]*CoordinatorTestNode
+	NodeCount       int
+	memberlistPorts []int // Dynamically allocated memberlist ports
+	grpcPorts       []int // Dynamically allocated gRPC ports
+	mu              sync.RWMutex
 }
 
 // NewCoordinatorTestHarness creates a new coordinator test harness
 func NewCoordinatorTestHarness(t *testing.T, nodeCount int) *CoordinatorTestHarness {
+	// Get free ports dynamically: nodeCount for memberlist + nodeCount for gRPC
+	ports, err := getFreePorts(nodeCount * 2)
+	if err != nil {
+		t.Fatalf("Failed to get free ports: %v", err)
+	}
+
+	// First half for memberlist, second half for gRPC
+	memberlistPorts := ports[:nodeCount]
+	grpcPorts := ports[nodeCount:]
+
+	t.Logf("CoordinatorTestHarness using memberlist ports %v, gRPC ports %v", memberlistPorts, grpcPorts)
+
 	return &CoordinatorTestHarness{
-		T:         t,
-		Nodes:     make(map[string]*CoordinatorTestNode),
-		BasePort:  27000, // Use high port range
-		NodeCount: nodeCount,
+		T:               t,
+		Nodes:           make(map[string]*CoordinatorTestNode),
+		NodeCount:       nodeCount,
+		memberlistPorts: memberlistPorts,
+		grpcPorts:       grpcPorts,
 	}
 }
 
 // StartNode starts a coordinator node
 func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode, error) {
 	nodeID := fmt.Sprintf("test-node-%d", nodeIndex+1)
-	clusterPort := h.BasePort + nodeIndex
-	listenPort := h.BasePort + 1000 + nodeIndex // Service port
-	clusterAddr := fmt.Sprintf("localhost:%d", clusterPort)
+	memberlistPort := h.memberlistPorts[nodeIndex]           // Memberlist gossip port
+	listenPort := h.grpcPorts[nodeIndex]                     // gRPC service port (cache + cluster RPCs)
+	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
 
-	// Build seed list
-	var seeds []string
+	// Create temporary directory for this node
+	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("ocache-cluster-test-node-%d-*", nodeIndex))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
 
-	// Add addresses of other nodes (they may or may not be running)
+	// Build seed list (memberlist addresses of all nodes)
+	var seeds []string
 	for i := 0; i < h.NodeCount; i++ {
-		seedPort := h.BasePort + i
-		seedAddr := fmt.Sprintf("localhost:%d", seedPort)
+		// Seeds use 127.0.0.1 so nodes can reach each other
+		seedAddr := fmt.Sprintf("127.0.0.1:%d", h.memberlistPorts[i])
 		seeds = append(seeds, seedAddr)
 	}
 
-	// Create coordinator config
+	// Create coordinator config with dskit ring
 	config := &coordinator.Config{
-		Enabled:            true,
-		MyNodeID:           nodeID,
-		ClusterAddr:        clusterAddr,
-		ListenAddr:         listenAddr,
-		Nodes:              seeds,
-		RingPartitionCount: hash.DefaultPartitionCount,
-		HeartbeatInterval:  1, // 1 second for faster testing
-		FailureThreshold:   3,
-		SyncTimeout:        1, // 1 second for faster testing
+		Enabled:     true,
+		MyNodeID:    nodeID,
+		ClusterAddr: clusterAddr, // For memberlist gossip
+		ListenAddr:  listenAddr,  // For gRPC (cache ops + cluster topology)
+		Seeds:       seeds,
+		DiskPath:    tmpDir,
+		LifecyclerConfig: ring.LifecyclerConfig{
+			NumTokens:            128,                    // Fewer tokens for faster testing
+			ObservePeriod:        100 * time.Millisecond, // Very fast observe for testing
+			MinReadyDuration:     0,                      // No minimum ready duration for testing
+			UnregisterOnShutdown: true,                   // Remove from ring on shutdown for clean departure
+			RingConfig: ring.Config{
+				HeartbeatPeriod:  100 * time.Millisecond, // Fast heartbeat for testing
+				HeartbeatTimeout: 10 * time.Second,       // Longer timeout to account for gossip delay
+			},
+		},
+		Registerer: prometheus.NewRegistry(), // Use fresh registry to avoid duplicate registration
 	}
 
 	// Create coordinator
@@ -121,23 +162,43 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 
 	// Start coordinator
 	if err := coord.Start(ctx); err != nil {
-		// Even though Start failed, we need to call Stop() to cleanup
-		// any resources that were successfully initialized (like the gRPC server)
-		coord.Stop() // This is safe even if Start() partially failed
+		coord.Stop()
 		cancel()
 		return nil, fmt.Errorf("failed to start coordinator: %w", err)
 	}
 
-	// Wait for startup
-	time.Sleep(500 * time.Millisecond)
+	// Start gRPC server with ClusterService on ListenAddr
+	grpcServer := grpc.NewServer()
+	clusterpb.RegisterClusterServiceServer(grpcServer, coord)
 
-	// Create cluster client connection
-	conn, err := grpc.Dial(clusterAddr,
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		coord.Stop()
+		cancel()
+		return nil, fmt.Errorf("failed to listen on %s: %w", listenAddr, err)
+	}
+
+	// Start gRPC server in background
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			// Server stopped - this is expected during shutdown
+		}
+	}()
+
+	// Give the server a moment to start accepting connections
+	time.Sleep(100 * time.Millisecond)
+
+	// Create cluster client connection to ListenAddr (where ClusterService is registered)
+	// Use a context with timeout instead of deprecated grpc.WithTimeout
+	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer dialCancel()
+
+	conn, err := grpc.DialContext(dialCtx, listenAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
-		grpc.WithTimeout(5*time.Second),
 	)
 	if err != nil {
+		grpcServer.GracefulStop()
 		coord.Stop()
 		cancel()
 		return nil, fmt.Errorf("failed to connect to cluster service: %w", err)
@@ -146,6 +207,7 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 	node := &CoordinatorTestNode{
 		NodeID:      nodeID,
 		Coordinator: coord,
+		grpcServer:  grpcServer,
 		ClusterConn: conn,
 		ClusterSvc:  clusterpb.NewClusterServiceClient(conn),
 		ctx:         ctx,
@@ -267,10 +329,21 @@ func (h *CoordinatorTestHarness) IsConverged() bool {
 		return false
 	}
 
-	var referenceTopology *clusterpb.ClusterTopology
-	var referenceNodeID string
+	// Check expected node count
+	expectedNodes := 0
+	expectedNodeIDs := make(map[string]struct{})
+	for nodeID, node := range h.Nodes {
+		if node.IsRunning() {
+			expectedNodes++
+			expectedNodeIDs[nodeID] = struct{}{}
+		}
+	}
 
-	// Get reference topology
+	if expectedNodes == 0 {
+		return false
+	}
+
+	// Check each node's view
 	for nodeID, node := range h.Nodes {
 		if !node.IsRunning() {
 			continue
@@ -281,45 +354,28 @@ func (h *CoordinatorTestHarness) IsConverged() bool {
 			return false
 		}
 
-		referenceTopology = topology
-		referenceNodeID = nodeID
-		break
-	}
-
-	if referenceTopology == nil {
-		return false
-	}
-
-	// Check expected node count
-	expectedNodes := 0
-	for _, node := range h.Nodes {
-		if node.IsRunning() {
-			expectedNodes++
-		}
-	}
-
-	if len(referenceTopology.Nodes) != expectedNodes {
-		return false
-	}
-
-	// Compare with other nodes
-	for nodeID, node := range h.Nodes {
-		if !node.IsRunning() || nodeID == referenceNodeID {
-			continue
-		}
-
-		topology, err := h.GetTopology(nodeID)
-		if err != nil {
+		// Check node count
+		if len(topology.Nodes) != expectedNodes {
 			return false
 		}
 
-		// Check epoch and node count
-		if topology.Epoch != referenceTopology.Epoch {
-			return false
+		// Check that all expected nodes are present
+		foundNodeIDs := make(map[string]struct{})
+		for _, topologyNode := range topology.Nodes {
+			foundNodeIDs[topologyNode.Id] = struct{}{}
 		}
 
-		if len(topology.Nodes) != len(referenceTopology.Nodes) {
-			return false
+		for expectedID := range expectedNodeIDs {
+			if _, found := foundNodeIDs[expectedID]; !found {
+				return false
+			}
+		}
+
+		// Check that all nodes are ACTIVE
+		for _, topologyNode := range topology.Nodes {
+			if topologyNode.Status != clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
+				return false
+			}
 		}
 	}
 

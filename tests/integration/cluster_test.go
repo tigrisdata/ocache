@@ -2,6 +2,7 @@ package integration
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,9 +70,10 @@ func (s *ClusterSuite) Test_WorkloadDistribution_Basic() {
 		require.NoError(s.T(), err)
 	}
 
-	// Verify distribution is reasonably even (within 20% deviation)
+	// Verify distribution is reasonably even
+	// With 128 tokens per node (test harness), allow 40% deviation (min score 60)
 	stats := clusterHarness.GetDistributionStats()
-	AssertEvenDistribution(s.T(), stats, 0.2)
+	AssertEvenDistribution(s.T(), stats, 0.40)
 
 	// Verify keys are on correct nodes according to consistent hashing
 	distribution, err := clusterHarness.VerifyKeyDistribution(keys)
@@ -96,31 +98,31 @@ func (s *ClusterSuite) Test_WorkloadDistribution_Basic() {
 	assert.Equal(s.T(), keyCount, totalKeysInDistribution, "All keys should be accounted for")
 }
 
-// Test_WorkloadDistribution_PartitionMapping verifies partition distribution across nodes
-func (s *ClusterSuite) Test_WorkloadDistribution_PartitionMapping() {
+// Test_WorkloadDistribution_TokenMapping verifies token distribution across nodes
+func (s *ClusterSuite) Test_WorkloadDistribution_TokenMapping() {
 	clusterHarness, ok := s.Harness.(*ClusterTestHarness)
 	if !ok {
 		s.T().Skip("Test requires ClusterTestHarness")
 	}
 
-	partitions := clusterHarness.GetPartitionDistribution()
-	require.NotEmpty(s.T(), partitions, "Should have partition distribution")
+	tokens := clusterHarness.GetTokenDistribution()
+	require.NotEmpty(s.T(), tokens, "Should have token distribution")
 
-	// With 3 nodes, each should own approximately 5461 partitions (16384/3)
-	expectedPerNode := 16384 / clusterHarness.NodeCount
-	variance := expectedPerNode / 5 // Allow 20% variance
+	// Each node should own 128 tokens (test harness uses fewer tokens for faster testing)
+	// Production uses 512 tokens per node (DefaultNumTokens)
+	expectedPerNode := 128
+	variance := expectedPerNode / 5
 
-	s.T().Logf("Partition distribution (total 16384 partitions):")
-	for nodeID, parts := range partitions {
-		count := parts[0] // We store estimated count
-		s.T().Logf("  Node %s: %d partitions (expected ~%d)", nodeID, count, expectedPerNode)
+	s.T().Logf("Token distribution (expected ~%d tokens per node):", expectedPerNode)
+	for nodeID, count := range tokens {
+		s.T().Logf("  Node %s: %d tokens", nodeID, count)
 		assert.InDelta(s.T(), expectedPerNode, count, float64(variance),
-			"Node %s partition count should be balanced", nodeID)
+			"Node %s token count should be balanced", nodeID)
 	}
 
 	// All nodes should be present
-	assert.Equal(s.T(), clusterHarness.NodeCount, len(partitions),
-		"All nodes should be in partition distribution")
+	assert.Equal(s.T(), clusterHarness.NodeCount, len(tokens),
+		"All nodes should be in token distribution")
 }
 
 // Test_WorkloadDistribution_ReadBalance verifies read operations are balanced
@@ -168,7 +170,8 @@ func (s *ClusterSuite) Test_WorkloadDistribution_ReadBalance() {
 
 	// Each node should handle roughly equal reads (based on key distribution)
 	// With consistent hashing, reads should follow write distribution
-	AssertEvenDistribution(s.T(), stats, 0.25) // Allow 25% variance for reads
+	// With 128 tokens per node (test harness), allow 40% deviation (min score 60)
+	AssertEvenDistribution(s.T(), stats, 0.40)
 }
 
 // Test_WorkloadDistribution_MixedOperations verifies balanced mixed workload
@@ -214,7 +217,8 @@ func (s *ClusterSuite) Test_WorkloadDistribution_MixedOperations() {
 	}
 
 	// Verify overall balance
-	AssertEvenDistribution(s.T(), stats, 0.25)
+	// With 128 tokens per node (test harness), allow 40% deviation (min score 60)
+	AssertEvenDistribution(s.T(), stats, 0.40)
 
 	// Verify total operations
 	totalWrites := int64(0)
@@ -376,6 +380,193 @@ func (s *ClusterSuite) Test_ClusterList_EmptyPrefix() {
 	for _, expectedKey := range keys {
 		assert.Contains(s.T(), allKeys, expectedKey, "All keys should be listed with empty prefix")
 	}
+}
+
+// Test_NodeFailure_RoutingContinuity verifies that when a node goes down,
+// the cluster client continues to route traffic to the remaining nodes.
+// NOTE: With ReplicationFactor=1, keys on the stopped node are LOST (not replicated).
+// This test verifies routing works, NOT data availability after node failure.
+func (s *ClusterSuite) Test_NodeFailure_RoutingContinuity() {
+	clusterHarness, ok := s.Harness.(*ClusterTestHarness)
+	if !ok {
+		s.T().Skip("Test requires ClusterTestHarness")
+	}
+
+	// Write keys distributed across all nodes
+	keyCount := 300
+	data := GenerateRandomData(1024)
+	keys := make([]string, keyCount)
+
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("failover-key-%04d", i)
+		keys[i] = key
+		err := s.Harness.PutObject(key, data, 0)
+		require.NoError(s.T(), err)
+	}
+
+	// Verify initial distribution and track which keys are on which node
+	initialDist, err := clusterHarness.VerifyKeyDistribution(keys)
+	require.NoError(s.T(), err)
+
+	// Pick a node to stop
+	var nodeToStop string
+	for nodeID := range clusterHarness.Nodes {
+		nodeToStop = nodeID
+		break
+	}
+
+	// Track which keys are on the stopped node vs surviving nodes
+	keysOnStoppedNode := make(map[string]bool)
+	keysOnSurvivingNodes := make(map[string]bool)
+	for nodeID, nodeKeys := range initialDist {
+		for _, key := range nodeKeys {
+			if nodeID == nodeToStop {
+				keysOnStoppedNode[key] = true
+			} else {
+				keysOnSurvivingNodes[key] = true
+			}
+		}
+	}
+
+	s.T().Logf("Initial key distribution:")
+	for nodeID, nodeKeys := range initialDist {
+		s.T().Logf("  Node %s: %d keys", nodeID, len(nodeKeys))
+	}
+	s.T().Logf("Keys on node to stop (%s): %d", nodeToStop, len(keysOnStoppedNode))
+	s.T().Logf("Keys on surviving nodes: %d", len(keysOnSurvivingNodes))
+
+	// Stop the node
+	s.T().Logf("Stopping node %s", nodeToStop)
+	node := clusterHarness.Nodes[nodeToStop]
+	err = node.Stop()
+	require.NoError(s.T(), err)
+
+	// Wait for cluster to detect the node departure
+	time.Sleep(2 * time.Second)
+
+	// Verify keys on surviving nodes are still accessible
+	survivingKeySuccessCount := 0
+	for key := range keysOnSurvivingNodes {
+		_, err := s.Harness.GetObject(key)
+		if err == nil {
+			survivingKeySuccessCount++
+		}
+	}
+
+	// All keys on surviving nodes should be accessible
+	assert.Equal(s.T(), len(keysOnSurvivingNodes), survivingKeySuccessCount,
+		"All keys on surviving nodes should be accessible")
+	s.T().Logf("Keys on surviving nodes accessible: %d/%d",
+		survivingKeySuccessCount, len(keysOnSurvivingNodes))
+
+	// Verify new writes succeed to surviving nodes
+	newWriteCount := 100
+	newWriteSuccessCount := 0
+	for i := 0; i < newWriteCount; i++ {
+		key := fmt.Sprintf("post-failure-key-%04d", i)
+		err := s.Harness.PutObject(key, data, 0)
+		if err == nil {
+			newWriteSuccessCount++
+		}
+	}
+
+	// All new writes should succeed (routed to surviving nodes)
+	assert.Equal(s.T(), newWriteCount, newWriteSuccessCount,
+		"All new writes should succeed on surviving nodes")
+	s.T().Logf("New writes succeeded: %d/%d", newWriteSuccessCount, newWriteCount)
+
+	// Verify we can read back the new keys
+	newReadSuccessCount := 0
+	for i := 0; i < newWriteCount; i++ {
+		key := fmt.Sprintf("post-failure-key-%04d", i)
+		_, err := s.Harness.GetObject(key)
+		if err == nil {
+			newReadSuccessCount++
+		}
+	}
+	assert.Equal(s.T(), newWriteSuccessCount, newReadSuccessCount,
+		"All newly written keys should be readable")
+	s.T().Logf("New keys readable: %d/%d", newReadSuccessCount, newWriteCount)
+}
+
+// Test_NodeFailure_TrafficContinuity verifies that online read/write traffic
+// continues to work when a node is brought down in the cluster.
+// This test focuses on NEW traffic after node failure to avoid the issue
+// of keys lost on the failed node (RF=1 means no replication).
+func (s *ClusterSuite) Test_NodeFailure_TrafficContinuity() {
+	clusterHarness, ok := s.Harness.(*ClusterTestHarness)
+	if !ok {
+		s.T().Skip("Test requires ClusterTestHarness")
+	}
+
+	data := GenerateRandomData(1024)
+
+	// Phase 1: Stop one node
+	var nodeToStop string
+	for nodeID := range clusterHarness.Nodes {
+		nodeToStop = nodeID
+		break
+	}
+
+	s.T().Logf("Phase 1: Stopping node %s", nodeToStop)
+	node := clusterHarness.Nodes[nodeToStop]
+	err := node.Stop()
+	require.NoError(s.T(), err)
+
+	// Wait for cluster to detect the node departure
+	time.Sleep(2 * time.Second)
+
+	// Phase 2: Write new keys after node failure (should all succeed)
+	keyCount := 200
+	writeSuccessCount := 0
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("post-failure-traffic-%04d", i)
+		err := s.Harness.PutObject(key, data, 0)
+		if err == nil {
+			writeSuccessCount++
+		}
+	}
+
+	// All writes should succeed (routed to surviving nodes)
+	assert.Equal(s.T(), keyCount, writeSuccessCount,
+		"All writes should succeed after node failure")
+	s.T().Logf("Phase 2: %d/%d writes succeeded after node failure",
+		writeSuccessCount, keyCount)
+
+	// Phase 3: Read back all written keys
+	readSuccessCount := 0
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("post-failure-traffic-%04d", i)
+		_, err := s.Harness.GetObject(key)
+		if err == nil {
+			readSuccessCount++
+		}
+	}
+
+	// All reads should succeed (keys written to surviving nodes)
+	assert.Equal(s.T(), writeSuccessCount, readSuccessCount,
+		"All written keys should be readable")
+	s.T().Logf("Phase 3: %d/%d keys readable after node failure",
+		readSuccessCount, keyCount)
+
+	// Phase 4: Mixed read/write workload to verify ongoing traffic
+	mixedSuccessCount := 0
+	for i := 0; i < 100; i++ {
+		// Write
+		writeKey := fmt.Sprintf("mixed-traffic-%04d", i)
+		if err := s.Harness.PutObject(writeKey, data, 0); err == nil {
+			mixedSuccessCount++
+			// Read back immediately
+			if _, err := s.Harness.GetObject(writeKey); err == nil {
+				mixedSuccessCount++
+			}
+		}
+	}
+
+	// Mixed operations should mostly succeed
+	assert.GreaterOrEqual(s.T(), mixedSuccessCount, 180, // At least 90% success
+		"Mixed read/write traffic should continue working")
+	s.T().Logf("Phase 4: %d/200 mixed operations succeeded", mixedSuccessCount)
 }
 
 // Helper function to convert map keys to slice

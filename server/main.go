@@ -10,7 +10,6 @@ import (
 
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
-	"github.com/tigrisdata/ocache/common/hash"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/ocache/server/service"
@@ -42,13 +41,10 @@ var (
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
 
 	// Cluster configuration flags
-	clusterEnabled    = flag.Bool("cluster-enabled", false, "Enable cluster mode")
-	nodeID            = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
-	clusterAddr       = flag.String("cluster-addr", ":7000", "Address for cluster communication")
-	seedsStr          = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000 or ocache.svc.cluster.local:7000)")
-	partitionCount    = flag.Int("partition-count", hash.DefaultPartitionCount, "Number of partitions in hash ring")
-	heartbeatInterval = flag.Duration("heartbeat-interval", coordinator.DefaultHeartbeatInterval, "Interval between heartbeats")
-	failureThreshold  = flag.Int("failure-threshold", coordinator.DefaultFailureThreshold, "Number of failed heartbeats before marking node down")
+	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")
+	nodeID         = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
+	clusterAddr    = flag.String("cluster-addr", ":7000", "Address for cluster communication")
+	seedsStr       = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000 or ocache.svc.cluster.local:7000)")
 
 	seeds []string
 )
@@ -73,14 +69,12 @@ func initializeCluster(ctx context.Context) *coordinator.Coordinator {
 	}
 
 	coordConfig := &coordinator.Config{
-		Enabled:            true,
-		MyNodeID:           AppConfig.NodeID,
-		ClusterAddr:        AppConfig.ClusterAddr,
-		ListenAddr:         AppConfig.ListenAddr,
-		Nodes:              AppConfig.Seeds,
-		RingPartitionCount: AppConfig.PartitionCount,
-		HeartbeatInterval:  int(AppConfig.HeartbeatInterval.Seconds()),
-		FailureThreshold:   AppConfig.FailureThreshold,
+		Enabled:     true,
+		MyNodeID:    AppConfig.NodeID,
+		ClusterAddr: AppConfig.ClusterAddr,
+		ListenAddr:  AppConfig.ListenAddr,
+		Seeds:       AppConfig.Seeds,
+		DiskPath:    AppConfig.DiskPath,
 	}
 
 	var err error
@@ -136,7 +130,7 @@ func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error
-func waitForShutdown(cancel context.CancelFunc, coord *coordinator.Coordinator) {
+func waitForShutdown(coord *coordinator.Coordinator) {
 	// Handle graceful shutdown on SIGINT/SIGTERM.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -156,19 +150,21 @@ func waitForShutdown(cancel context.CancelFunc, coord *coordinator.Coordinator) 
 			zlog.Error().Err(err).Msg("Coordinator reported fatal error, shutting down...")
 		}
 	}
-
-	// Cancel context to signal graceful shutdown
-	cancel()
 }
 
 // performShutdown handles graceful shutdown of all components
-func performShutdown(coord *coordinator.Coordinator, storage *stor.Storage) {
-	// Close coordinator if enabled
+func performShutdown(cancel context.CancelFunc, coord *coordinator.Coordinator, storage *stor.Storage) {
+	// Close coordinator if enabled - this handles AnnounceLeaving() BEFORE dskit shuts down
 	if coord != nil {
 		if err := coord.Stop(); err != nil {
 			zlog.Error().Err(err).Msg("Error stopping coordinator")
 		}
 	}
+
+	// NOW cancel the context - this is for cleanup of any remaining goroutines
+	// that might be watching the context. The coordinator's graceful shutdown
+	// is already complete at this point.
+	cancel()
 
 	// Close storage (flush segments, close RocksDB, etc.)
 	storage.Close()
@@ -178,8 +174,8 @@ func performShutdown(coord *coordinator.Coordinator, storage *stor.Storage) {
 
 func RunServer() {
 	// Create a context for the server
+	// Note: We don't defer cancel() here - it's called explicitly in performShutdown().
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Initialize Prometheus metrics
 	metrics.Init()
@@ -195,10 +191,10 @@ func RunServer() {
 	startUserServices(coord, storage)
 
 	// Wait for shutdown signal
-	waitForShutdown(cancel, coord)
+	waitForShutdown(coord)
 
-	// Perform graceful shutdown
-	performShutdown(coord, storage)
+	// Perform graceful shutdown (includes cancel() after coord.Stop())
+	performShutdown(cancel, coord, storage)
 }
 
 func main() {

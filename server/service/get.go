@@ -7,6 +7,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
@@ -88,6 +89,13 @@ func (s *CacheService) forwardStreamingGet(req *pb.GetRequest, localStream pb.Ca
 	}
 
 	ctx := localStream.Context()
+
+	// Increment hop count for forwarding loop detection
+	ctx, err = coordinator.IncrementHopCount(ctx, s.coordinator.GetLocalNodeID())
+	if err != nil {
+		metrics.RPCRequests.WithLabelValues("Get", "hop_limit_exceeded").Inc()
+		return err // IncrementHopCount already returns a status error
+	}
 
 	// Create a streaming Get call to the remote node
 	remoteStream, err := client.Get(ctx, req)

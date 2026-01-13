@@ -4,12 +4,12 @@ package cache;
 
 option go_package = "github.com/tigrisdata/ocache/coordinator/proto;proto";
 
-// ClusterService handles internal cluster communication
+// ClusterService handles cluster communication.
+// Membership is handled via memberlist gossip - only topology queries are exposed.
 service ClusterService {
-  rpc Join(JoinRequest) returns (JoinResponse);
-  rpc Leave(LeaveRequest) returns (LeaveResponse);
-  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // GetClusterState returns the current cluster membership
   rpc GetClusterState(Empty) returns (ClusterState);
+  // GetClusterTopology returns full cluster topology including ring configuration
   rpc GetClusterTopology(Empty) returns (ClusterTopology);
 }
 
@@ -27,7 +27,7 @@ message Empty {}
 // Node information
 message NodeInfo {
   string id = 1;
-  string address = 2;           // Cluster communication address (for heartbeats, etc.)
+  string address = 2;           // Cluster communication address (for gossip)
   NodeStatus status = 3;
   uint64 joined_at = 4;
   double weight = 5;
@@ -40,59 +40,21 @@ message ClusterState {
   repeated NodeInfo nodes = 2;
 }
 
-// Join cluster request
-message JoinRequest {
+// Token assignments per node for consistent hashing
+message NodeTokens {
   string node_id = 1;
-  string address = 2;           // Cluster communication address
-  string listen_address = 3;    // Service listen address for client requests
-}
-
-// Join cluster response
-message JoinResponse {
-  bool success = 1;
-  uint64 epoch = 2;
-  string error = 3;
-}
-
-// Leave cluster request
-message LeaveRequest {
-  string node_id = 1;
-}
-
-// Leave cluster response
-message LeaveResponse {
-  bool success = 1;
-  string error = 2;
-}
-
-// Heartbeat request
-message HeartbeatRequest {
-  string node_id = 1;
-  uint64 epoch = 2;
-}
-
-// Heartbeat response
-message HeartbeatResponse {
-  uint64 epoch = 1;
-}
-
-// Partition ownership information
-message PartitionOwner {
-  int32 partition_id = 1;
-  string node_id = 2;
+  repeated uint32 tokens = 2;  // Sorted list of tokens owned by this node
 }
 
 // Ring configuration for clients to replicate hashing
 message RingConfig {
-  int32 partition_count = 1;
-  int32 replication_factor = 2;
-  double load = 3;
+  int32 replication_factor = 1;        // Data replication factor (1 = no replication)
+  repeated NodeTokens node_tokens = 2; // Token assignments per node
 }
 
-// Enhanced cluster state with partition mapping
+// Cluster topology with token-based ring configuration
 message ClusterTopology {
   uint64 epoch = 1;
   repeated NodeInfo nodes = 2;
   RingConfig ring_config = 3;
-  repeated PartitionOwner partition_owners = 4;
 }

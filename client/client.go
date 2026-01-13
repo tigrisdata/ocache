@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
 )
@@ -115,10 +116,39 @@ func (c *Client) HasRing() bool {
 	return false
 }
 
-// GetPartitionOwnerID returns the node ID that owns the given partition (cluster mode only)
-func (c *Client) GetPartitionOwnerID(partitionID int32) string {
+// GetNodeIDForKey returns the node ID that owns the given key (cluster mode only)
+func (c *Client) GetNodeIDForKey(key string) (string, error) {
 	if cc, ok := c.CacheClient.(*ClusterClient); ok {
-		return cc.GetPartitionOwnerID(partitionID)
+		return cc.GetNodeIDForKey(key)
 	}
-	return ""
+	return "", fmt.Errorf("cluster commands not available in simple mode")
+}
+
+// IsClusterMode returns true if the client is in cluster mode
+func (c *Client) IsClusterMode() bool {
+	return c.mode == ModeCluster
+}
+
+// GetNodeInfoForKey returns both the node ID and address that owns the given key (cluster mode only)
+func (c *Client) GetNodeInfoForKey(key string) (nodeID, address string, err error) {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.GetNodeInfoForKey(key)
+	}
+	return "", "", fmt.Errorf("cluster commands not available in simple mode")
+}
+
+// FetchClusterState fetches the current cluster state (cluster mode only)
+func (c *Client) FetchClusterState() (*clusterpb.ClusterState, error) {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.FetchClusterState()
+	}
+	return nil, fmt.Errorf("cluster commands not available in simple mode")
+}
+
+// FetchTopology fetches the current cluster topology (cluster mode only)
+func (c *Client) FetchTopology() (*clusterpb.ClusterTopology, error) {
+	if cc, ok := c.CacheClient.(*ClusterClient); ok {
+		return cc.FetchTopology()
+	}
+	return nil, fmt.Errorf("cluster commands not available in simple mode")
 }

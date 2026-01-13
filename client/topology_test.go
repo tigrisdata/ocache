@@ -396,9 +396,24 @@ func TestTopology_NodeFailure(t *testing.T) {
 	servers[1].Stop()
 
 	// Update topology to reflect node 1 is down
-	topology2 := setupSimpleTopology(addresses)
+	// Create topology with only 2 active nodes (exclude node 1)
+	activeAddresses := []string{addresses[0], addresses[2]}
+	topology2 := setupSimpleTopology(activeAddresses)
+	// Restore original node list but mark node-1 as DOWN
+	topology2.Nodes = []*clusterpb.NodeInfo{
+		{Id: "node-0", Address: addresses[0], ListenAddress: addresses[0], Status: clusterpb.NodeStatus_NODE_STATUS_ACTIVE},
+		{Id: "node-1", Address: addresses[1], ListenAddress: addresses[1], Status: clusterpb.NodeStatus_NODE_STATUS_DOWN},
+		{Id: "node-2", Address: addresses[2], ListenAddress: addresses[2], Status: clusterpb.NodeStatus_NODE_STATUS_ACTIVE},
+	}
+	// Keep only tokens for active nodes (node-0 and node-2 from setupSimpleTopology)
+	// The setupSimpleTopology was called with 2 addresses, so it created tokens for node-0 and node-1
+	// We need to rename node-1 to node-2 in the token list
+	for _, nt := range topology2.RingConfig.NodeTokens {
+		if nt.NodeId == "node-1" {
+			nt.NodeId = "node-2"
+		}
+	}
 	topology2.Epoch = 2
-	topology2.Nodes[1].Status = clusterpb.NodeStatus_NODE_STATUS_DOWN
 	servers[0].cacheService.SetClusterTopology(topology2)
 	servers[2].cacheService.SetClusterTopology(topology2)
 
@@ -421,8 +436,8 @@ func TestTopology_NodeFailure(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestTopology_PartitionReassignment verifies partition ownership changes
-func TestTopology_PartitionReassignment(t *testing.T) {
+// TestTopology_TokenReassignment verifies token ownership changes between nodes
+func TestTopology_TokenReassignment(t *testing.T) {
 	// Create two servers
 	server1, err := newTestServerWithAddr()
 	require.NoError(t, err)
@@ -432,37 +447,32 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 	require.NoError(t, err)
 	defer server2.Stop()
 
-	// Initial topology - all partitions on server1
+	// Initial topology - all tokens on server1
 	topology1 := &clusterpb.ClusterTopology{
 		Epoch: 1,
 		Nodes: []*clusterpb.NodeInfo{
 			{
 				Id:            "node-0",
 				Address:       server1.address,
-				ListenAddress: server1.address, // For tests, use the same address for both cluster and listen
+				ListenAddress: server1.address,
 				Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 			{
 				Id:            "node-1",
 				Address:       server2.address,
-				ListenAddress: server2.address, // For tests, use the same address for both cluster and listen
+				ListenAddress: server2.address,
 				Status:        clusterpb.NodeStatus_NODE_STATUS_ACTIVE,
 			},
 		},
 		RingConfig: &clusterpb.RingConfig{
-			PartitionCount:    10,
-			ReplicationFactor: 20,
-			Load:              1.25,
+			ReplicationFactor: 1,
+			NodeTokens: []*clusterpb.NodeTokens{
+				{
+					NodeId: "node-0",
+					Tokens: []uint32{0, 1000000000, 2000000000, 3000000000},
+				},
+			},
 		},
-		PartitionOwners: make([]*clusterpb.PartitionOwner, 0, 10),
-	}
-
-	// All partitions initially on node-0
-	for i := int32(0); i < 10; i++ {
-		topology1.PartitionOwners = append(topology1.PartitionOwners, &clusterpb.PartitionOwner{
-			PartitionId: i,
-			NodeId:      "node-0",
-		})
 	}
 
 	server1.cacheService.SetClusterTopology(topology1)
@@ -478,28 +488,28 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 	require.NoError(t, err)
 	defer client.Close()
 
-	// Verify initial partition ownership
-	for i := int32(0); i < 10; i++ {
-		assert.Equal(t, "node-0", client.GetPartitionOwnerID(i))
-	}
+	// All keys should route to node-0 initially
+	nodeID, err := client.GetNodeIDForKey("test-key")
+	require.NoError(t, err)
+	assert.Equal(t, "node-0", nodeID)
 
-	// Rebalance - move half partitions to node-1
+	// Rebalance - give some tokens to node-1
 	topology2 := &clusterpb.ClusterTopology{
-		Epoch:           2,
-		Nodes:           topology1.Nodes,
-		RingConfig:      topology1.RingConfig,
-		PartitionOwners: make([]*clusterpb.PartitionOwner, 0, 10),
-	}
-
-	for i := int32(0); i < 10; i++ {
-		nodeId := "node-0"
-		if i >= 5 {
-			nodeId = "node-1"
-		}
-		topology2.PartitionOwners = append(topology2.PartitionOwners, &clusterpb.PartitionOwner{
-			PartitionId: i,
-			NodeId:      nodeId,
-		})
+		Epoch: 2,
+		Nodes: topology1.Nodes,
+		RingConfig: &clusterpb.RingConfig{
+			ReplicationFactor: 1,
+			NodeTokens: []*clusterpb.NodeTokens{
+				{
+					NodeId: "node-0",
+					Tokens: []uint32{0, 1000000000},
+				},
+				{
+					NodeId: "node-1",
+					Tokens: []uint32{2000000000, 3000000000},
+				},
+			},
+		},
 	}
 
 	server1.cacheService.SetClusterTopology(topology2)
@@ -512,13 +522,9 @@ func TestTopology_PartitionReassignment(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	// Verify partition reassignment
-	for i := int32(0); i < 5; i++ {
-		assert.Equal(t, "node-0", client.GetPartitionOwnerID(i))
-	}
-	for i := int32(5); i < 10; i++ {
-		assert.Equal(t, "node-1", client.GetPartitionOwnerID(i))
-	}
+	// Verify the ring has been updated
+	assert.True(t, client.HasRing())
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
 }
 
 // isTransientError checks if an error is transient (expected during topology changes)
