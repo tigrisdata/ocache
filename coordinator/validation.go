@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+
+	zlog "github.com/rs/zerolog/log"
 )
 
 // validateBindAddress validates a bind address in the format IP:port, hostname:port, or :port.
 // Used for ListenAddr and ClusterAddr which support binding to all interfaces.
 func validateBindAddress(addr, fieldName string) error {
+	zlog.Debug().Str("port_type", fieldName).Str("addr", addr).Msg("Validating bind address")
+
 	if addr == "" {
 		return fmt.Errorf("%s is required in cluster mode", fieldName)
 	}
@@ -36,8 +40,12 @@ func validateBindAddress(addr, fieldName string) error {
 // validateSeedAddresses validates seed addresses in the format IP:port or hostname:port.
 // At least one seed address is required.
 func validateSeedAddresses(seeds []string) error {
+	zlog.Debug().Strs("seeds", seeds).Msg("Validating seed addresses")
+
+	// Empty seeds are allowed
 	if len(seeds) == 0 {
-		return fmt.Errorf("at least one seed address is required in cluster mode")
+		zlog.Info().Msg("No seed addresses provided, allowing empty seeds")
+		return nil
 	}
 
 	for i, seed := range seeds {
