@@ -60,10 +60,11 @@ func newConnectionWithEpoch(addr string, dialOpts []grpc.DialOption, poolSize in
 		))
 
 		// Add epoch interceptors if epoch getter is provided (cluster mode)
+		// Use Chain*Interceptor to preserve any user-provided interceptors in dialOpts
 		if epochGetter != nil {
 			opts = append(opts,
-				grpc.WithUnaryInterceptor(clientEpochUnaryInterceptor(epochGetter, onMismatch)),
-				grpc.WithStreamInterceptor(clientEpochStreamInterceptor(epochGetter, onMismatch)),
+				grpc.WithChainUnaryInterceptor(clientEpochUnaryInterceptor(epochGetter, onMismatch)),
+				grpc.WithChainStreamInterceptor(clientEpochStreamInterceptor(epochGetter, onMismatch)),
 			)
 		}
 

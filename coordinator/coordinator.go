@@ -82,12 +82,20 @@ func New(config *Config) (*Coordinator, error) {
 		return nil, fmt.Errorf("invalid node ID: %w", err)
 	}
 
-	if config.ListenAddr == "" {
-		return nil, fmt.Errorf("listen address is required in cluster mode")
+	if err := validateBindAddress(config.ListenAddr, "listen address"); err != nil {
+		return nil, err
 	}
 
 	if config.DiskPath == "" {
 		return nil, fmt.Errorf("disk path is required in cluster mode")
+	}
+
+	if err := validateBindAddress(config.ClusterAddr, "cluster address"); err != nil {
+		return nil, err
+	}
+
+	if err := validateSeedAddresses(config.Seeds); err != nil {
+		return nil, err
 	}
 
 	// Create logger adapter for dskit - wraps zerolog to go-kit/log interface
