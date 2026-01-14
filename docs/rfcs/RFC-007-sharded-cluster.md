@@ -1,10 +1,10 @@
 # RFC-007: Distributed Sharding and High Availability
 
 **RFC Number**: 007
-**Status**: Implemented (Phase 1)  
+**Status**: Implemented (Phase 1)
 **Author(s)**: Ovais Tariq
 **Created**: 2025-08-20
-**Last Updated**: 2025-09-16
+**Last Updated**: 2026-01-13
 
 ## 1. Abstract
 
@@ -99,31 +99,42 @@ graph TB
 
 ### 3.3 Key Components
 
-1. **Consistent Hash Ring**: Determines data ownership using buraksezer/consistent library
-2. **Coordinator**: Manages membership and routing, implements ClusterService gRPC interface
+1. **Consistent Hash Ring**: Determines data ownership using Grafana dskit ring with memberlist gossip
+2. **Coordinator**: Manages membership via dskit BasicLifecycler, exposes ClusterService gRPC interface
 3. **Router**: Handles request forwarding with retries, circuit breaking, and connection pooling
-4. **Failure Detector**: Monitors node health via heartbeats with configurable thresholds
-5. **Node Discovery**: Static or DNS-based discovery with address validation
-6. **Cluster Client**: Client-side routing with local ring replica and topology caching
+4. **Memberlist Gossip**: SWIM-based gossip protocol for cluster membership and state propagation
+5. **Node Discovery**: DNS-based discovery for seed node resolution (supports Kubernetes headless services)
+6. **Cluster Client**: Client-side routing with TokenRing that receives token assignments from server
 7. **Error Handling**: Structured error types with retryable/non-retryable classification
 
 ## 4. Detailed Design
 
 ### 4.1 Consistent Hashing
 
-- Uses xxhash64 for consistent hashing (via custom Hasher implementation)
-- Virtual nodes (vnodes) for better distribution (DefaultReplicationFactor: 20)
-- Partition count: 16384 (DefaultPartitionCount, configurable)
-- Load factor: 1.25 (DefaultLoad) for bounded loads
-- Library: buraksezer/consistent for ring management
+#### Server-Side (dskit Ring)
+
+- Uses Grafana dskit ring for production-grade consistent hashing
+- Token-based ownership with 512 tokens per instance (DefaultNumTokens)
+- FNV-1a (32-bit) hash algorithm for dskit compatibility
+- Replication factor: 1 (no data replication in Phase 1)
+- Token persistence for stable ownership across restarts (stored in `<disk>/coordinator/ring-tokens`)
+- Ring state distributed via memberlist gossip protocol
+
+#### Client-Side (TokenRing)
+
+- Custom `TokenRing` implementation (`client/tokenring.go`)
+- Receives token assignments from server via `GetClusterTopology` RPC
+- Uses same FNV-1a 32-bit hash for routing consistency
+- Binary search for O(log n) lookups
+- Lock-free reads via atomic pointer swapping
 
 ### 4.2 Request Routing
 
 ```mermaid
 flowchart TD
-    Start([Client sends request<br/>to any node]) --> Hash[Calculate hash of key]
-    Hash --> Partition[Map to partition number]
-    Partition --> Owner[Ring.GetNode finds owner]
+    Start([Client sends request<br/>to any node]) --> Hash[Calculate FNV-1a hash of key]
+    Hash --> Token[Find token owner via binary search]
+    Token --> Owner[Ring.GetNode finds owner]
 
     Owner --> Decision{Owner node?}
 
@@ -172,296 +183,217 @@ flowchart TD
 
 ### 4.3 Cluster Membership
 
+The cluster uses Grafana dskit ring with memberlist gossip for membership management. This provides production-grade features:
+
+- Gossip-based membership (SWIM protocol via HashiCorp memberlist)
+- Automatic failure detection and recovery
+- Token persistence for stable ownership across restarts
+- Well-tested, production-hardened implementation
+
 #### 4.3.1 Join Protocol
 
 ```mermaid
 sequenceDiagram
     participant NewNode as New Node
-    participant SeedNode as Seed Node
+    participant Memberlist as Memberlist Gossip
+    participant Ring as dskit Ring (KV)
     participant Cluster as Other Nodes
 
     Note over NewNode: Node starts up
 
-    NewNode->>+SeedNode: GetClusterState()
-    SeedNode-->>-NewNode: ClusterState (nodes, epoch)
+    NewNode->>Memberlist: Join via seed nodes
+    Memberlist->>Cluster: SWIM gossip protocol
+    Cluster-->>Memberlist: Membership sync
 
-    Note over NewNode: Builds local ring
+    Note over NewNode: Memberlist joined
 
-    NewNode->>+SeedNode: Join(NodeInfo)
-    SeedNode->>Cluster: Broadcast new member
-    SeedNode-->>-NewNode: JoinResponse (success, epoch)
+    NewNode->>Ring: Register with BasicLifecycler
+    Ring->>Ring: Generate or load tokens
+    Ring-->>NewNode: State: JOINING
 
-    Note over NewNode: Starts serving
+    Note over NewNode: Tokens assigned
 
-    loop Every 5 seconds
-        NewNode->>SeedNode: Heartbeat(node_id, epoch)
-        SeedNode-->>NewNode: HeartbeatResponse(epoch)
-    end
+    NewNode->>Ring: Transition to ACTIVE
+    Ring->>Memberlist: Broadcast state via KV
+    Memberlist->>Cluster: Gossip ring update
 
-    Note over NewNode,Cluster: Node is now part of cluster
+    Note over NewNode,Cluster: Node is now ACTIVE in cluster
 ```
 
-#### 4.3.2 Failure Detection
+#### 4.3.2 Instance Lifecycle States
 
-- **Heartbeat Interval**: 5 seconds (DefaultHeartbeatInterval, configurable)
-- **Heartbeat Request Timeout**: 2 seconds
-- **Failure Detection Interval**: 10 seconds (periodic health check)
-- **Failure Threshold**: 3 missed heartbeats (DefaultFailureThreshold)
-- **Detection Time**: ~15 seconds
-- **State Transitions**: Active → Down (no intermediate states in Phase 1)
+dskit BasicLifecycler manages instance state transitions:
 
-#### 4.3.3 Seed Discovery
+- **JOINING**: Instance is starting up, tokens assigned but not yet serving
+- **ACTIVE**: Instance is healthy and serving requests
+- **LEAVING**: Instance is gracefully shutting down (via AnnounceLeaving)
+- **LEFT**: Instance has departed the cluster
 
-- **Static Discovery**: Direct list of node addresses
-- **DNS Discovery**: DNS resolution for dynamic node discovery (e.g., Kubernetes headless service)
-- **DNS Refresh Interval**: 30 seconds (DefaultDNSRefreshInterval, configurable)
-- **Address Validation**: Validates addresses based on allowLocalhost flag (for testing)
+#### 4.3.3 Ring Heartbeats
 
-#### 4.3.4 Graceful Node Departure
+- **Heartbeat Period**: 500ms (DefaultHeartbeatPeriod)
+- **Heartbeat Timeout**: 60s minimum (MinHeartbeatTimeout)
+- Ring heartbeats update instance state in the KV store
+- Other nodes receive updates via memberlist gossip (not direct peer-to-peer)
 
-When a node receives SIGINT/SIGTERM, it announces its departure before shutting down:
+#### 4.3.4 Seed Discovery
 
-- **Leave Broadcast**: Sends Leave RPC to all active nodes
-- **Broadcast Timeout**: 5 seconds (LeaveAnnouncementTimeout)
-- **Node Removal**: Receiving nodes immediately remove departing node from ring
-- **Cleanup**: Deletes heartbeat tracking and closes connections
-- **Fallback**: Nodes that miss broadcast detect departure via passive failure detection (~3s)
+- **DNS Provider**: Resolves seed addresses at startup (supports Kubernetes headless services)
+- Seed nodes are used for initial memberlist join
+- After joining, membership is maintained via gossip (no periodic DNS refresh needed)
 
-**Benefits:**
+#### 4.3.5 Graceful Node Departure
 
-- Reduces detection time from ~15s (passive) to < 1s (active announcement)
-- Distinguishes graceful shutdown from crashes
-- Prevents unnecessary request routing to departed nodes
-- Clean cluster state without stale entries
+When a node receives SIGINT/SIGTERM:
+
+1. **AnnounceLeaving**: Transitions to LEAVING state via BasicLifecycler (10s timeout)
+2. **Gossip Propagation**: State change propagates via memberlist (~500ms)
+3. **Stop**: Ring services shut down gracefully
+4. **Unregister**: Instance is removed from ring (if UnregisterOnShutdown=true)
 
 ### 4.4 Cluster State Synchronization
 
-The cluster maintains eventual consistency through six complementary synchronization mechanisms:
+The cluster uses memberlist gossip for state synchronization. This is a proven approach used by Consul, Nomad, and other production systems.
 
-#### 4.4.1 Synchronization Mechanisms
+#### 4.4.1 Gossip Protocol (Memberlist)
 
-| Mechanism             | Type    | Frequency        | Purpose                                    | Nodes Notified         | Discovery Mode |
-| --------------------- | ------- | ---------------- | ------------------------------------------ | ---------------------- | -------------- |
-| **Initial Sync**      | Pull    | Once (startup)   | Bootstrap new node with full cluster state | 1 (seed node)          | Both           |
-| **Join Broadcast**    | Push    | On join event    | Announce new member via gossip cascade     | Up to 10 (with gossip) | Both           |
-| **Heartbeat**         | Push    | Every 1 second   | Liveness detection + epoch verification    | All active nodes       | Both           |
-| **Failure Detection** | Passive | Every 10 seconds | Mark failed nodes as DOWN                  | 0 (local only)         | Both           |
-| **Leave Broadcast**   | Push    | On graceful stop | Announce departure to cluster              | All active nodes       | Both           |
-| **Discovery Loop**    | Pull    | Every 30 seconds | Re-discover dynamic nodes via DNS          | N/A (DNS query)        | DNS only       |
+Ring state is stored in a distributed KV backed by memberlist:
 
-#### 4.4.2 Initial Sync (Bootstrap) - Pull Model
+| Component           | Purpose                                | Configuration                     |
+| ------------------- | -------------------------------------- | --------------------------------- |
+| **Gossip Messages** | Propagate state changes between nodes  | 200ms interval, 3 nodes per cycle |
+| **Push/Pull Sync**  | Full state reconciliation              | Every 30 seconds                  |
+| **Ring Heartbeats** | Update instance liveness in KV         | Every 500ms                       |
+| **KV Watcher**      | Immediate notification of ring changes | Event-driven                      |
 
-When a new node joins:
+#### 4.4.2 Gossip Configuration
 
-1. **Pull Cluster State**: `GetClusterState()` from seed node
+- **Gossip Interval**: 200ms (Time between gossip messages)
+- **Gossip Nodes**: 3 (Nodes to gossip to per interval)
+- **Push/Pull Interval**: 30 seconds (Full state sync interval)
+- **Leave Timeout**: 5 seconds (Graceful departure timeout)
+- **Retransmit Mult**: 4 (Retransmission multiplier for reliability)
+- **Stream Timeout**: 10 seconds (Connection/read/write timeout)
 
-   - Returns: Full member list, addresses, epoch
-   - New node builds local hash ring
+#### 4.4.3 Ring State Propagation
 
-2. **Announce Join**: `Join()` RPC to seed node
+```mermaid
+sequenceDiagram
+    participant Node1 as Node 1
+    participant KV as Memberlist KV
+    participant Node2 as Node 2
+    participant Node3 as Node 3
 
-   - Seed adds new node to its ring
-   - Seed broadcasts join to up to 10 other nodes
+    Note over Node1: State changes (join/leave/heartbeat)
 
-3. **Gossip Cascade**: Each notified node re-broadcasts (with deduplication)
-   - Ensures all nodes learn about new member
-   - Broadcast deduplication via 10-second cache
+    Node1->>KV: Update ring state
+    KV->>KV: Compute content hash (epoch)
 
-#### 4.4.3 Join Broadcast - Push Model with Gossip
+    par Gossip to subset of nodes
+        KV->>Node2: Gossip delta
+        KV->>Node3: Gossip delta
+    end
 
-**Process:**
+    Node2->>Node2: KV watcher triggers
+    Node3->>Node3: KV watcher triggers
 
-```
-New Node → Join(seed)
-Seed → Broadcast Join to [Node2...Node11] (up to 10)
-Node2 → Re-broadcast Join to [Node3...Node12] (if not duplicate)
-...
-Result: All nodes know about new member within ~1 second
-```
-
-**Deduplication:**
-
-- Broadcasts cached for 10 seconds (DefaultBroadcastCacheTime)
-- Prevents broadcast storms in large clusters
-- Records successful broadcasts to avoid re-sending
-
-#### 4.4.4 Heartbeat Loop - Continuous Sync
-
-**Every node sends heartbeats every 1 second:**
-
-```
-Heartbeat {
-    node_id: "sender-id"
-    epoch: 42  // Current ring version
-}
+    Note over Node2,Node3: Ring state updated
 ```
 
-**Purpose:**
+#### 4.4.4 KV Watcher
 
-- ✅ Liveness detection (is node alive?)
-- ✅ Epoch comparison (detect state divergence)
-- ⚠️ Does NOT sync full state (passive check only)
+Each node runs a KV watcher that monitors ring state changes:
 
-**Receiver actions:**
+Benefits:
 
-- Updates `lastHeartbeat[node_id]` timestamp
-- Compares epochs to detect version mismatch
-- Logs warning if epochs differ (manual reconciliation required)
+- Immediate notification of membership changes
+- No polling overhead
+- Efficient delta-based updates
 
-#### 4.4.5 Failure Detection - Reactive Sync
+#### 4.4.5 Epoch Tracking
 
-**Runs every 10 seconds on each node:**
+The epoch is a content-addressable hash of the ring state:
 
-```
-timeout = failureThreshold × heartbeatInterval  // 3 × 1s = 3s
+- Nodes with identical ring views have identical epochs
+- Clients use epoch to detect stale topology
+- Epoch changes on any membership modification
 
-for each tracked node:
-    if now - lastHeartbeat[node] > timeout:
-        ring.UpdateNodeStatus(node, DOWN)
-```
+#### 4.4.6 Failure Detection
 
-**Characteristics:**
+Memberlist handles failure detection automatically:
 
-- Each node detects failures independently
-- No broadcast of failure state (eventual consistency)
-- Node marked DOWN (not removed from topology)
-- Detection time: ~15 seconds total
-  - 3 failed heartbeat attempts (3s)
-  - Periodic check runs every 10s (up to +10s)
+- **Probe Interval**: Configurable via memberlist
+- **Suspicion Multiplier**: Handles network delays
+- **Heartbeat Timeout**: 60s (MinHeartbeatTimeout) before marking unhealthy
+- **Automatic Recovery**: Failed nodes are automatically detected and removed
 
-#### 4.4.6 Graceful Departure - Push Model
-
-**When node receives SIGINT/SIGTERM:**
-
-```
-Stop() → announceLeave()
-  ↓
-broadcastLeave() to all active nodes
-  ↓
-Each node: Leave(departing_node_id)
-  ↓
-ring.RemoveNode(departing_node_id)
-delete(heartbeat_tracking)
-router.RemoveClient(departing_node_id)
-```
-
-**Fast vs Slow Path:**
-
-- **Fast:** Nodes receiving Leave broadcast (< 1s)
-- **Slow:** Nodes missing broadcast use failure detection (~3s)
-
-#### 4.4.7 Discovery Loop - Dynamic Topology Updates
-
-**DNS Discovery Mode Only** - runs every 30 seconds:
-
-```
-refreshNodes():
-    newNodes = DNS.Resolve("ocache.namespace.svc.cluster.local")
-    added, removed = DiffNodes(oldNodes, newNodes)
-
-    for each added node:
-        tryJoinNode(node)  // Async sync
-```
-
-**Purpose:**
-
-- Handles Kubernetes pod scaling events
-- Re-discovers nodes after IP changes
-- Provides eventual consistency guarantee
-- Resilient to DNS failures (24h cache)
-
-**Example (Kubernetes):**
-
-```
-T=0s:   3 pods → DNS returns [10.1.2.3, 10.1.2.4, 10.1.2.5]
-T=5s:   Scale to 4 pods
-T=10s:  Pod4 bootstraps and joins cluster
-T=30s:  Discovery loop runs on all nodes
-        DNS returns [10.1.2.3, 10.1.2.4, 10.1.2.5, 10.1.2.6]
-        Nodes confirm Pod4 is in cluster (redundant but safe)
-```
-
-#### 4.4.8 Complete Synchronization Flow
-
-```
-Node Startup:
-    |
-    v
-[Pull] GetClusterState() from seed node
-    |  - Returns full member list + epoch
-    |  - Builds local hash ring
-    v
-[Push] Send Join() to seed
-    |  - Seed adds node to ring
-    |  - Seed broadcasts to cluster
-    v
-[Gossip] Join cascades through cluster
-    |  - Up to 10 nodes per hop
-    |  - Deduplication prevents storms
-    v
-Running State (All Modes):
-    |
-    +---> [Push] Heartbeats every 1s
-    |       └─> Liveness + epoch check
-    |
-    +---> [Passive] Failure detection every 10s
-    |       └─> Mark nodes DOWN if no heartbeat (3s timeout)
-    |
-    +---> [Event] New joins trigger broadcasts
-    |       └─> Gossip cascade with deduplication
-    |
-    +---> [Event] Graceful leaves trigger broadcasts
-    |       └─> Fast removal (< 1s) vs passive detection (~3s)
-    |
-    +---> [Pull] Discovery loop every 30s (DNS mode only)
-            └─> Re-discover nodes, sync with new ones
-```
-
-#### 4.4.9 Synchronization Properties
+#### 4.4.7 Synchronization Properties
 
 **✅ Eventually Consistent:**
 
-- No strong consistency (no Raft/Paxos consensus)
-- Nodes may have brief inconsistencies (< 1 second)
-- Converges through broadcasts + heartbeats + discovery
+- SWIM gossip protocol guarantees convergence
+- Typical convergence time: < 1 second for small clusters
+- Logarithmic scaling with cluster size
 
-**✅ Broadcast Storm Prevention:**
+**✅ Partition Tolerant:**
 
-- Limited to 10 nodes per broadcast (MaxBroadcastNodes)
-- Deduplication via 10-second cache
-- Gossip amplification ensures full coverage
+- Gossip continues to function during partial network failures
+- Automatic re-sync when connectivity restored
 
-**✅ Failure Recovery:**
+**✅ Production Tested:**
 
-- Fast path: Active broadcasts (< 1s)
-- Medium path: Passive failure detection (~3s)
-- Slow path: DNS discovery loop (30s, DNS mode only)
+- Same protocol used by Consul, Nomad, Serf
+- Battle-tested at scale
 
-**⚠️ No Full State Reconciliation:**
+### 4.5 gRPC Service API
 
-- No periodic "sync everything" operation
-- Relies on event-driven updates + epoch checking
-- Manual intervention required for split-brain scenarios
+The cluster exposes a minimal gRPC API. Membership is handled internally via memberlist gossip.
+
+```protobuf
+service ClusterService {
+  // GetClusterState returns current cluster membership
+  rpc GetClusterState(Empty) returns (ClusterState);
+
+  // GetClusterTopology returns full topology with token assignments
+  rpc GetClusterTopology(Empty) returns (ClusterTopology);
+}
+
+message ClusterTopology {
+  uint64 epoch = 1;                    // Ring version for cache invalidation
+  repeated NodeInfo nodes = 2;          // All cluster members
+  RingConfig ring_config = 3;           // Token assignments for client routing
+}
+
+message RingConfig {
+  int32 replication_factor = 1;         // Data replication (1 = no replication)
+  repeated NodeTokens node_tokens = 2;  // Token assignments per node
+}
+
+message NodeTokens {
+  string node_id = 1;
+  repeated uint32 tokens = 2;           // Sorted list of tokens owned by this node
+}
+```
 
 ### 4.6 Client Integration
 
 #### ClusterClient Features
 
-- Maintains local copy of ring topology (consistent.Consistent)
-- Caches partition ownership mapping for fast lookups
-- Routes requests directly to owner nodes
+- Custom `TokenRing` for client-side routing
+- Receives token assignments from server via `GetClusterTopology` RPC
+- Routes requests directly to owner nodes using FNV-1a hash
 - Handles retries and failover with exponential backoff
-- Refreshes topology periodically (30s default)
-- Supports topology epoch tracking for consistency
+- Refreshes topology periodically (configurable interval)
+- Supports topology epoch tracking for cache invalidation
 - Round-robin fallback when routing information unavailable
 
 #### Client Protocol
 
-1. Connect to seed nodes to fetch initial topology
-2. Build local hash ring from topology information
-3. Cache partition ownership mapping
-4. Route requests based on key hash
-5. Refresh topology periodically or on routing errors
+1. Connect to seed nodes to fetch initial topology via `GetClusterTopology`
+2. Build local TokenRing from token assignments (sorted array of tokens)
+3. For each request: hash key with FNV-1a, binary search for owning token
+4. Route requests directly to the owner node
+5. Refresh topology on epoch mismatch or routing errors
 
 ### 4.7 Data Consistency Model
 
@@ -499,12 +431,12 @@ Running State (All Modes):
 
 | Scenario               | Impact                            | Recovery                                 |
 | ---------------------- | --------------------------------- | ---------------------------------------- |
-| Graceful shutdown      | Node announces departure          | Detected in < 1s (Leave broadcast)       |
-| Crash/force kill       | Keys on failed node unavailable   | Detected in ~3s (failure detection)      |
-| Single node failure    | Keys on failed node unavailable   | Automatic detection in ~15s (worst case) |
-| Network partition      | Split brain possible              | Manual intervention required             |
+| Graceful shutdown      | Node transitions to LEAVING       | Detected in < 1s (gossip propagation)    |
+| Crash/force kill       | Keys on failed node unavailable   | Detected via heartbeat timeout (60s)     |
+| Single node failure    | Keys on failed node unavailable   | Automatic detection via memberlist       |
+| Network partition      | Split brain possible              | Memberlist handles with suspicion states |
 | Cascading failures     | Circuit breakers prevent overload | Automatic recovery when nodes return     |
-| DNS resolution failure | New nodes cannot join             | Cached nodes continue to be used (24h)   |
+| DNS resolution failure | New nodes cannot join             | Existing gossip cluster continues        |
 | Connection failure     | Retries with exponential backoff  | Circuit breaker opens after threshold    |
 
 ### 6.2 Error Types
@@ -529,55 +461,10 @@ Running State (All Modes):
 - No encryption for inter-node communication
 - Trust-based cluster membership
 
-## 8. Alternatives Considered
-
-### 8.1 Full Replication
-
-- **Pros**: High availability, read scaling
-- **Cons**: 2-3x storage overhead, complex consistency
-- **Decision**: Rejected in favor of hinted handoff
-
-### 8.2 Master-Slave Replication
-
-- **Pros**: Simple consistency model
-- **Cons**: Write bottleneck, failover complexity
-- **Decision**: Rejected for poor write scaling
-
-### 8.3 External Coordination (Zookeeper/etcd)
-
-- **Pros**: Battle-tested coordination
-- **Cons**: Additional dependency, operational complexity
-- **Decision**: Rejected for simplicity
-
-## 9. Implementation Status
-
-### Phase 1 (Completed)
-
-- ✅ Consistent hash ring with virtual nodes
-- ✅ Coordinator service with membership management
-- ✅ Node discovery (static and DNS)
-- ✅ Failure detection with heartbeats
-- ✅ Graceful node departure with Leave broadcasts
-- ✅ Six-layer synchronization system (pull, push, gossip, heartbeat, passive, discovery)
-- ✅ Router with connection pooling and circuit breakers
-- ✅ Cluster-aware client with smart routing
-- ✅ Protocol buffer definitions for cluster communication
-- ✅ Error handling with retry logic
-- ✅ Topology synchronization and epoch tracking
-- ✅ Broadcast deduplication and storm prevention
-
-### Phase 2 (Planned)
-
-- ⏳ Hinted handoff for temporary ownership transfer
-- ⏳ Hint storage and replay protocol
-- ⏳ Automatic data rebalancing on node addition
-- ⏳ Advanced load balancing strategies
-- ⏳ Multi-datacenter support
-
-## 10. References
+## 8. References
 
 - [Amazon Dynamo Paper](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
 - [Consistent Hashing with Bounded Loads](https://ai.googleblog.com/2017/04/consistent-hashing-with-bounded-loads.html)
-- [Cassandra Architecture](https://cassandra.apache.org/doc/latest/cassandra/architecture/)
-- [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
-- [buraksezer/consistent](https://github.com/buraksezer/consistent)
+- [Grafana dskit](https://github.com/grafana/dskit) - Production-grade distributed systems toolkit
+- [HashiCorp memberlist](https://github.com/hashicorp/memberlist) - SWIM-based gossip protocol
+- [SWIM Protocol Paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf)
