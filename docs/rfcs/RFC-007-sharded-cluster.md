@@ -402,7 +402,7 @@ message NodeTokens {
 - No replication
 - Data loss on node failure
 - Eventually consistent after recovery
-- No stale reads (data is either available or not)
+- Possible stale reads after node recovery (see Section 4.8.4)
 
 #### 4.7.2 Phase 2: Hinted Handoff (Planned)
 
@@ -410,6 +410,144 @@ message NodeTokens {
 - Hint storage for mutations during downtime
 - Replay protocol on recovery
 - Bounded inconsistency window
+
+### 4.8 Token Reassignment and Failure Handling
+
+This section describes how the cluster handles token ownership when nodes become unavailable and the implications for data availability and consistency.
+
+#### 4.8.1 Token Redistribution on Node Failure
+
+When a node becomes unavailable, tokens are **not explicitly reassigned** to other nodes. Instead, the dskit ring's consistent hashing naturally routes requests to the next available node:
+
+- For any key hash, the ring finds the first token >= hash value owned by an ACTIVE node
+- If the primary owner is unavailable, requests route to the next ACTIVE node in the token ring
+- Write availability is maintained for all keys (no write downtime)
+- Keys stored on the unavailable node return "not found" until the node recovers
+- No data migration occurs - the temporary owner only handles new writes
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant NodeA as Node A (Primary Owner)
+    participant NodeB as Node B (Next in Ring)
+    participant Ring as dskit Ring
+
+    Note over NodeA: Node A becomes unavailable
+
+    Client->>Ring: Get owner for key "foo"
+    Ring->>Ring: Find token owner (A unavailable)
+    Ring-->>Client: Return Node B (next ACTIVE)
+
+    Client->>NodeB: PUT key="foo"
+    NodeB-->>Client: Success (stored on B)
+
+    Note over NodeA: Node A recovers
+
+    Client->>Ring: Get owner for key "foo"
+    Ring-->>Client: Return Node A (primary)
+
+    Client->>NodeA: GET key="foo"
+    NodeA-->>Client: Not found (original data lost)
+```
+
+#### 4.8.2 Failure Detection and State Transitions
+
+**Failure Detection Timing:**
+
+| Detection Method | Timeout | Description |
+|------------------|---------|-------------|
+| Heartbeat Timeout | 60 seconds | Node marked unhealthy after missing heartbeats |
+| Graceful Shutdown | < 1 second | Node broadcasts LEAVING state via gossip |
+| Memberlist Suspicion | Configurable | SWIM protocol handles network delays |
+
+**State Transitions:**
+
+- **Crash/Force Kill**: ACTIVE → (heartbeat timeout) → DOWN/Unhealthy
+- **Graceful Shutdown**: ACTIVE → LEAVING → LEFT
+- **Recovery**: DOWN → JOINING → ACTIVE
+
+When the ring state changes, the epoch is recomputed and propagated via gossip. Clients detect epoch mismatches and refresh their topology.
+
+#### 4.8.3 Client-Side Routing During Failures
+
+When a node fails, clients handle routing as follows:
+
+1. **Epoch Mismatch Detection**: Server responds with new epoch, client detects mismatch
+2. **Topology Refresh**: Client fetches updated topology (rate-limited to 100ms minimum)
+3. **TokenRing Update**: Client rebuilds local token ring with only ACTIVE nodes
+4. **Atomic Switchover**: Lock-free reads via atomic pointer swap
+
+During the transition window (before topology refresh):
+- Requests may still route to the failed node
+- Router retries with exponential backoff (100ms initial, 5s max)
+- Circuit breaker opens after 5 consecutive failures (30s timeout)
+- After circuit breaker opens, requests fail fast
+
+#### 4.8.4 Stale Read Scenarios
+
+**Critical: Phase 1 has no protection against stale reads.**
+
+When a node fails and later recovers:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant NodeA as Node A
+    participant NodeB as Node B
+
+    Note over NodeA: Node A stores key="foo", value="v1"
+
+    NodeA->>NodeA: Node A fails
+
+    Client->>NodeB: PUT key="foo", value="v2"
+    Note over NodeB: Node B stores new value
+
+    NodeA->>NodeA: Node A recovers
+
+    Client->>NodeA: GET key="foo"
+    NodeA-->>Client: Returns "v1" (STALE!)
+
+    Note over Client: Client reads stale data
+```
+
+**Stale Read Conditions:**
+
+1. Node A fails while owning key K with value V1
+2. During A's downtime, client writes K=V2 to Node B (next in ring)
+3. Node A recovers and rejoins with original tokens
+4. Client reads K from A and receives V1 (stale)
+
+**Implications:**
+
+- No automatic data reconciliation between nodes
+- Clients may read outdated data from recovered nodes
+- Stale data persists until the key is explicitly overwritten
+- Applications requiring strong consistency must implement their own versioning
+
+#### 4.8.5 Recovery Behavior
+
+When a failed node comes back online:
+
+1. **Rejoins Ring**: Node registers with its persisted tokens (from disk)
+2. **State Transition**: JOINING → ACTIVE (after heartbeat)
+3. **Original Data**: Node retains data from before failure
+4. **No Sync**: No automatic data synchronization with other nodes
+5. **Token Ownership**: Resumes ownership of its original tokens
+
+**Data State After Recovery:**
+
+| Scenario | Data on Recovered Node | Data on Temporary Owner |
+|----------|----------------------|------------------------|
+| Key never written during failure | Original (current) | N/A |
+| Key written during failure | Original (STALE) | New value (current) |
+| Key deleted during failure | Original (STALE) | Not found |
+
+**Mitigation Strategies (Application-Level):**
+
+- Use short TTLs to limit stale data lifetime
+- Implement version vectors or timestamps in values
+- Add read-repair logic in application layer
+- Use external coordination for critical data
 
 ## 5. Performance Considerations
 
@@ -438,6 +576,8 @@ message NodeTokens {
 | Cascading failures     | Circuit breakers prevent overload | Automatic recovery when nodes return     |
 | DNS resolution failure | New nodes cannot join             | Existing gossip cluster continues        |
 | Connection failure     | Retries with exponential backoff  | Circuit breaker opens after threshold    |
+| Temporary unavailability | Writes route to next node in ring | Write availability maintained            |
+| Node recovery after failure | Possible stale reads         | No automatic reconciliation; app-level mitigation |
 
 ### 6.2 Error Types
 
