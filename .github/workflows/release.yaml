@@ -29,6 +29,7 @@ jobs:
             arch: aarch64
             goos: linux
             goarch: arm64
+            use_qemu: true
           - os: macos-latest
             arch: arm64
             goos: darwin
@@ -40,6 +41,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.use_qemu
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -150,11 +157,9 @@ jobs:
 
       - name: Get latest release tag
         id: get-release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
         run: |
-          # Get the latest release tag created by semantic-release
-          LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          # Get the tag that was just created by semantic-release from git
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           if [ -n "$LATEST_TAG" ]; then
             echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
             echo "Found release: $LATEST_TAG"
