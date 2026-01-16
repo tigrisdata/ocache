@@ -42,8 +42,8 @@ func TestCacheService_PutObjectAndGet(t *testing.T) {
 	_, err := svc.PutObject(ctx, &pb.PutRequest{Key: key, Data: value, TtlSeconds: 0})
 	assert.NoError(t, err)
 
-	// Test Get
-	req := &pb.GetRequest{Key: key}
+	// Test Get (end=-1 means read to EOF)
+	req := &pb.GetRequest{Key: key, End: -1}
 	stream := &mockGetServer{responses: []*pb.GetResponse{}}
 	err = svc.Get(req, stream)
 	assert.NoError(t, err)
@@ -86,7 +86,7 @@ func TestCacheService_Delete(t *testing.T) {
 	_, err = svc.Delete(ctx, &pb.DeleteRequest{Key: key})
 	assert.NoError(t, err)
 
-	req := &pb.GetRequest{Key: key}
+	req := &pb.GetRequest{Key: key, End: -1}
 	stream := &mockGetServer{responses: []*pb.GetResponse{}}
 	err = svc.Get(req, stream)
 	assert.Error(t, err) // should be not found
@@ -293,7 +293,7 @@ func TestCacheService_Put_TTL(t *testing.T) {
 	_, err := svc.PutObject(ctx, &pb.PutRequest{Key: key, Data: value, TtlSeconds: 1})
 	assert.NoError(t, err)
 
-	req := &pb.GetRequest{Key: key}
+	req := &pb.GetRequest{Key: key, End: -1}
 	stream := &mockGetServer{responses: []*pb.GetResponse{}}
 	err = svc.Get(req, stream)
 	assert.NoError(t, err)

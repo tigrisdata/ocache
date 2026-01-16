@@ -185,9 +185,10 @@ func TestMemoryCache_GetRange(t *testing.T) {
 		{"full range", 0, 9, []byte("0123456789"), false}, // inclusive: bytes 0-9
 		{"partial range", 2, 4, []byte("234"), false},     // inclusive: bytes 2-4
 		{"from start", 0, 4, []byte("01234"), false},      // inclusive: bytes 0-4
-		{"to end", 5, 0, []byte("56789"), false},          // end=0 means read to EOF
+		{"to end", 5, -1, []byte("56789"), false},         // end < 0 means read to EOF
 		{"invalid start", 20, 25, nil, true},              // start beyond data
 		{"single byte", 5, 5, []byte("5"), false},         // inclusive: byte 5 only
+		{"byte 0 only", 0, 0, []byte("0"), false},         // inclusive: byte 0 only
 		{"invalid range start > end", 5, 3, nil, true},    // invalid: start > end
 	}
 

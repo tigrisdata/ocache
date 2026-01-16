@@ -177,13 +177,13 @@ func (m *mockCacheServiceServer) Get(req *pb.GetRequest, stream pb.CacheService_
 		return status.Error(codes.NotFound, "key not found")
 	}
 
-	// Handle range requests (inclusive end semantics)
+	// Handle range requests (inclusive end semantics; end < 0 means read to EOF)
 	start := int64(0)
 	end := int64(len(data)) - 1 // inclusive: last valid index
 	if req.Start > 0 {
 		start = req.Start
 	}
-	if req.End > 0 {
+	if req.End >= 0 {
 		end = req.End
 		if end >= int64(len(data)) {
 			end = int64(len(data)) - 1

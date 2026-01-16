@@ -134,12 +134,12 @@ func (m *MemoryCache) GetRange(ctx context.Context, key string, start, end int64
 
 	dataLen := int64(len(entry.value))
 
-	// Normalize range (inclusive end semantics)
+	// Normalize range (inclusive end semantics; end < 0 means read to EOF)
 	if start < 0 {
 		start = 0
 	}
-	// end=0 means "read to EOF", convert to last valid index
-	if end <= 0 {
+	// end < 0 means "read to EOF", convert to last valid index
+	if end < 0 {
 		end = dataLen - 1
 	} else if end >= dataLen {
 		end = dataLen - 1
