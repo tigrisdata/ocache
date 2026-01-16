@@ -351,42 +351,42 @@ func TestGetRange_BasicOperations(t *testing.T) {
 			name:  "valid range middle",
 			key:   testKey,
 			start: 10,
-			end:   20,
+			end:   19, // inclusive: bytes 10-19
 			want:  testData[10:20],
 		},
 		{
 			name:  "full range with zeros",
 			key:   testKey,
 			start: 0,
-			end:   0,
+			end:   0, // end=0 means read to EOF
 			want:  testData,
 		},
 		{
 			name:  "start only",
 			key:   testKey,
 			start: 10,
-			end:   0,
+			end:   0, // end=0 means read to EOF
 			want:  testData[10:],
 		},
 		{
 			name:  "end only",
 			key:   testKey,
 			start: 0,
-			end:   20,
+			end:   19, // inclusive: bytes 0-19
 			want:  testData[0:20],
 		},
 		{
 			name:  "single byte",
 			key:   testKey,
 			start: 5,
-			end:   6,
+			end:   5, // inclusive: byte 5 only
 			want:  testData[5:6],
 		},
 		{
 			name:  "last byte",
 			key:   testKey,
 			start: int64(len(testData) - 1),
-			end:   0,
+			end:   0, // end=0 means read to EOF
 			want:  testData[len(testData)-1:],
 		},
 		{
@@ -409,7 +409,7 @@ func TestGetRange_BasicOperations(t *testing.T) {
 			name:    "non-existent key",
 			key:     "non-existent",
 			start:   0,
-			end:     10,
+			end:     9, // inclusive: bytes 0-9
 			wantErr: true,
 			errCode: codes.NotFound,
 		},
@@ -469,28 +469,28 @@ func TestGetRangeStream_BasicOperations(t *testing.T) {
 			name:  "valid range middle",
 			key:   testKey,
 			start: 10,
-			end:   20,
+			end:   19, // inclusive: bytes 10-19
 			want:  testData[10:20],
 		},
 		{
 			name:  "full range with zeros",
 			key:   testKey,
 			start: 0,
-			end:   0,
+			end:   0, // end=0 means read to EOF
 			want:  testData,
 		},
 		{
 			name:  "start only",
 			key:   testKey,
 			start: 10,
-			end:   0,
+			end:   0, // end=0 means read to EOF
 			want:  testData[10:],
 		},
 		{
 			name:  "end only",
 			key:   testKey,
 			start: 0,
-			end:   20,
+			end:   19, // inclusive: bytes 0-19
 			want:  testData[0:20],
 		},
 		{
@@ -505,7 +505,7 @@ func TestGetRangeStream_BasicOperations(t *testing.T) {
 			name:    "non-existent key",
 			key:     "non-existent-stream",
 			start:   0,
-			end:     10,
+			end:     9, // inclusive: bytes 0-9
 			wantErr: true,
 			errCode: codes.NotFound,
 		},
@@ -754,7 +754,7 @@ func TestGetRange_LargeData(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("get first MB", func(t *testing.T) {
-		data, err := client.GetRange(ctx, testKey, 0, 1024*1024)
+		data, err := client.GetRange(ctx, testKey, 0, 1024*1024-1) // inclusive: bytes 0 to 1MB-1
 		require.NoError(t, err)
 		assert.Len(t, data, 1024*1024)
 		assert.Equal(t, largeData[0:1024*1024], data)
@@ -762,11 +762,11 @@ func TestGetRange_LargeData(t *testing.T) {
 
 	t.Run("get middle 2MB", func(t *testing.T) {
 		start := int64(4 * 1024 * 1024)
-		end := int64(6 * 1024 * 1024)
+		end := int64(6*1024*1024 - 1) // inclusive: bytes 4MB to 6MB-1
 		data, err := client.GetRange(ctx, testKey, start, end)
 		require.NoError(t, err)
 		assert.Len(t, data, 2*1024*1024)
-		assert.Equal(t, largeData[start:end], data)
+		assert.Equal(t, largeData[start:end+1], data)
 	})
 
 	t.Run("stream last MB", func(t *testing.T) {

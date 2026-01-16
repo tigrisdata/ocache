@@ -747,28 +747,28 @@ func TestRetry_GetData(t *testing.T) {
 				name:  "start=0 end=0 (regular Get)",
 				key:   "test-key-1",
 				start: 0,
-				end:   0,
+				end:   0, // end=0 means read to EOF
 				want:  testData,
 			},
 			{
 				name:  "start>0 end=0",
 				key:   "test-key-2",
 				start: 10,
-				end:   0,
+				end:   0, // end=0 means read to EOF
 				want:  testData[10:],
 			},
 			{
 				name:  "start=0 end>0",
 				key:   "test-key-3",
 				start: 0,
-				end:   20,
+				end:   19, // inclusive: bytes 0-19
 				want:  testData[0:20],
 			},
 			{
 				name:  "start>0 end>0",
 				key:   "test-key-4",
 				start: 10,
-				end:   20,
+				end:   19, // inclusive: bytes 10-19
 				want:  testData[10:20],
 			},
 		}
@@ -798,28 +798,28 @@ func TestRetry_GetData(t *testing.T) {
 				name:  "start=0 end=0 (regular GetStream)",
 				key:   "stream-key-1",
 				start: 0,
-				end:   0,
+				end:   0, // end=0 means read to EOF
 				want:  testData,
 			},
 			{
 				name:  "start>0 end=0",
 				key:   "stream-key-2",
 				start: 10,
-				end:   0,
+				end:   0, // end=0 means read to EOF
 				want:  testData[10:],
 			},
 			{
 				name:  "start=0 end>0",
 				key:   "stream-key-3",
 				start: 0,
-				end:   20,
+				end:   19, // inclusive: bytes 0-19
 				want:  testData[0:20],
 			},
 			{
 				name:  "start>0 end>0",
 				key:   "stream-key-4",
 				start: 10,
-				end:   20,
+				end:   19, // inclusive: bytes 10-19
 				want:  testData[10:20],
 			},
 		}

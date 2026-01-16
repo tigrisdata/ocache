@@ -665,14 +665,14 @@ func (br *byteRangeReader) Read(p []byte) (n int, err error) {
 		br.seeked = true
 	}
 
-	// Apply end limit if specified
-	if br.end > 0 && br.pos >= br.end {
+	// Apply end limit if specified (inclusive: end byte is included)
+	if br.end > 0 && br.pos > br.end {
 		return 0, io.EOF
 	}
 
-	// Limit read size if we have an end boundary
-	if br.end > 0 && br.pos+int64(len(p)) > br.end {
-		p = p[:br.end-br.pos]
+	// Limit read size if we have an end boundary (inclusive)
+	if br.end > 0 && br.pos+int64(len(p)) > br.end+1 {
+		p = p[:br.end-br.pos+1]
 	}
 
 	// Read from underlying reader

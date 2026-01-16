@@ -182,12 +182,13 @@ func TestMemoryCache_GetRange(t *testing.T) {
 		expected  []byte
 		expectErr bool
 	}{
-		{"full range", 0, 10, []byte("0123456789"), false},
-		{"partial range", 2, 5, []byte("234"), false},
-		{"from start", 0, 5, []byte("01234"), false},
-		{"to end", 5, 0, []byte("56789"), false},
-		{"invalid start", 20, 25, nil, true},
-		{"start equals end", 5, 5, nil, true},
+		{"full range", 0, 9, []byte("0123456789"), false}, // inclusive: bytes 0-9
+		{"partial range", 2, 4, []byte("234"), false},     // inclusive: bytes 2-4
+		{"from start", 0, 4, []byte("01234"), false},      // inclusive: bytes 0-4
+		{"to end", 5, 0, []byte("56789"), false},          // end=0 means read to EOF
+		{"invalid start", 20, 25, nil, true},              // start beyond data
+		{"single byte", 5, 5, []byte("5"), false},         // inclusive: byte 5 only
+		{"invalid range start > end", 5, 3, nil, true},    // invalid: start > end
 	}
 
 	for _, tt := range tests {
@@ -207,7 +208,7 @@ func TestMemoryCache_GetRangeNotFound(t *testing.T) {
 	cache := NewMemoryCache()
 	ctx := context.Background()
 
-	_, err := cache.GetRange(ctx, "missing", 0, 10)
+	_, err := cache.GetRange(ctx, "missing", 0, 9) // inclusive: bytes 0-9
 	require.Error(t, err)
 	st, _ := status.FromError(err)
 	assert.Equal(t, codes.NotFound, st.Code())
@@ -252,7 +253,7 @@ func TestMemoryCache_GetRangeStream(t *testing.T) {
 	require.NoError(t, cache.Put(ctx, key, data, 0))
 
 	var buf bytes.Buffer
-	err := cache.GetRangeStream(ctx, key, 2, 7, &buf)
+	err := cache.GetRangeStream(ctx, key, 2, 6, &buf) // inclusive: bytes 2-6
 	require.NoError(t, err)
 	assert.Equal(t, []byte("23456"), buf.Bytes())
 }
