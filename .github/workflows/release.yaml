@@ -1,0 +1,174 @@
+name: release
+on:
+  push:
+    branches:
+      - "release"
+
+env:
+  GO_VERSION: "1.24.2"
+  ROCKSDB_VERSION: "10.4.2"
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+    permissions:
+      actions: write
+      contents: read
+      packages: write
+
+  build-binaries:
+    needs: [test]
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-latest
+            arch: aarch64
+            goos: linux
+            goarch: arm64
+          - os: macos-latest
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.os }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Set OS name
+        id: os-name
+        run: |
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libgflags-dev \
+            libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake snappy lz4 zstd
+
+      - name: Cache RocksDB static artifact
+        uses: actions/cache@v4
+        id: cache-rocksdb-static
+        with:
+          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+
+      - name: Download pre-built RocksDB artifact
+        if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
+        run: |
+          # Try to download from GitHub releases first
+          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
+
+          if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
+            echo "Downloaded pre-built artifact from release"
+          else
+            echo "Pre-built artifact not found, building from source..."
+            ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
+            OS=${{ steps.os-name.outputs.os_name }} \
+            ARCH=${{ matrix.arch }} \
+            make build-rocksdb-static
+            mv rocksdb-static/rocksdb-static-*.tar.gz .
+          fi
+
+      - name: Extract RocksDB static artifact
+        run: |
+          mkdir -p rocksdb-static/artifact
+          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          ls -la rocksdb-static/artifact/
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Generate proto files
+        run: make proto
+
+      - name: Build binaries
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} STATIC_BUILD=true make all
+
+      - name: Rename binaries with platform suffix
+        run: |
+          mkdir -p dist
+          mv ocache dist/ocache-${{ matrix.goos }}-${{ matrix.goarch }}
+          mv ocachecli dist/ocachecli-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          retention-days: 1
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build-binaries]
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: npx semantic-release --debug
+
+      - name: Get latest release tag
+        id: get-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          # Get the latest release tag created by semantic-release
+          LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          if [ -n "$LATEST_TAG" ]; then
+            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            echo "Found release: $LATEST_TAG"
+          else
+            echo "No release found"
+          fi
+
+      - name: Upload binaries to release
+        if: steps.get-release.outputs.tag != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          TAG="${{ steps.get-release.outputs.tag }}"
+          for binary in artifacts/*; do
+            echo "Uploading $(basename $binary) to $TAG..."
+            gh release upload "$TAG" "$binary"
+          done
