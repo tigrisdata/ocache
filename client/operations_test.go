@@ -358,14 +358,14 @@ func TestGetRange_BasicOperations(t *testing.T) {
 			name:  "full range to EOF",
 			key:   testKey,
 			start: 0,
-			end:   -1, // end < 0 means read to EOF
+			end:   0, // end <= 0 means read to EOF
 			want:  testData,
 		},
 		{
 			name:  "start only",
 			key:   testKey,
 			start: 10,
-			end:   -1, // end < 0 means read to EOF
+			end:   0, // end <= 0 means read to EOF
 			want:  testData[10:],
 		},
 		{
@@ -383,17 +383,10 @@ func TestGetRange_BasicOperations(t *testing.T) {
 			want:  testData[5:6],
 		},
 		{
-			name:  "byte 0 only",
-			key:   testKey,
-			start: 0,
-			end:   0, // inclusive: byte 0 only
-			want:  testData[0:1],
-		},
-		{
 			name:  "last byte",
 			key:   testKey,
 			start: int64(len(testData) - 1),
-			end:   -1, // end < 0 means read to EOF
+			end:   0, // end <= 0 means read to EOF
 			want:  testData[len(testData)-1:],
 		},
 		{
@@ -408,7 +401,7 @@ func TestGetRange_BasicOperations(t *testing.T) {
 			name:    "start beyond data length",
 			key:     testKey,
 			start:   1000,
-			end:     -1, // end < 0 means read to EOF
+			end:     0, // end <= 0 means read to EOF
 			wantErr: true,
 			errCode: codes.InvalidArgument,
 		},
@@ -483,14 +476,14 @@ func TestGetRangeStream_BasicOperations(t *testing.T) {
 			name:  "full range to EOF",
 			key:   testKey,
 			start: 0,
-			end:   -1, // end < 0 means read to EOF
+			end:   0, // end <= 0 means read to EOF
 			want:  testData,
 		},
 		{
 			name:  "start only",
 			key:   testKey,
 			start: 10,
-			end:   -1, // end < 0 means read to EOF
+			end:   0, // end <= 0 means read to EOF
 			want:  testData[10:],
 		},
 		{
@@ -779,7 +772,7 @@ func TestGetRange_LargeData(t *testing.T) {
 	t.Run("stream last MB", func(t *testing.T) {
 		start := int64(9 * 1024 * 1024)
 		var buf bytes.Buffer
-		err := client.GetRangeStream(ctx, testKey, start, -1, &buf) // end < 0 means read to EOF
+		err := client.GetRangeStream(ctx, testKey, start, 0, &buf) // end <= 0 means read to EOF
 		require.NoError(t, err)
 		assert.Len(t, buf.Bytes(), 1024*1024)
 		assert.Equal(t, largeData[start:], buf.Bytes())

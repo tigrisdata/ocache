@@ -114,7 +114,7 @@ func (o *Operations) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("no healthy connections available")
 	}
 
-	stream, err := client.Get(ctx, &pb.GetRequest{Key: key, End: -1})
+	stream, err := client.Get(ctx, &pb.GetRequest{Key: key})
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +153,7 @@ func (o *Operations) GetStream(ctx context.Context, key string, w io.Writer) err
 		return fmt.Errorf("no healthy connections available")
 	}
 
-	stream, err := client.Get(ctx, &pb.GetRequest{Key: key, End: -1})
+	stream, err := client.Get(ctx, &pb.GetRequest{Key: key})
 	if err != nil {
 		return err
 	}

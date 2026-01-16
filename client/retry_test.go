@@ -744,17 +744,17 @@ func TestRetry_GetData(t *testing.T) {
 			want  []byte
 		}{
 			{
-				name:  "start=0 end<0 (read to EOF)",
+				name:  "start=0 end=0 (read to EOF)",
 				key:   "test-key-1",
 				start: 0,
-				end:   -1, // end < 0 means read to EOF
+				end:   0, // end <= 0 means read to EOF
 				want:  testData,
 			},
 			{
-				name:  "start>0 end<0",
+				name:  "start>0 end=0",
 				key:   "test-key-2",
 				start: 10,
-				end:   -1, // end < 0 means read to EOF
+				end:   0, // end <= 0 means read to EOF
 				want:  testData[10:],
 			},
 			{
@@ -795,17 +795,17 @@ func TestRetry_GetData(t *testing.T) {
 			want  []byte
 		}{
 			{
-				name:  "start=0 end<0 (read to EOF)",
+				name:  "start=0 end=0 (read to EOF)",
 				key:   "stream-key-1",
 				start: 0,
-				end:   -1, // end < 0 means read to EOF
+				end:   0, // end <= 0 means read to EOF
 				want:  testData,
 			},
 			{
-				name:  "start>0 end<0",
+				name:  "start>0 end=0",
 				key:   "stream-key-2",
 				start: 10,
-				end:   -1, // end < 0 means read to EOF
+				end:   0, // end <= 0 means read to EOF
 				want:  testData[10:],
 			},
 			{

@@ -18,7 +18,7 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(value), 0)
 	assert.NoError(t, err, "Put failed")
 
-	r, found, err := s.Get(key, 0, -1)
+	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed")
 	assert.True(t, found, "Get did not find key")
 	got, err := io.ReadAll(r)
@@ -30,7 +30,7 @@ func TestStorage_PutGetDelete_SmallObject(t *testing.T) {
 
 	err = s.DeleteKey(key)
 	assert.NoError(t, err, "DeleteKey failed")
-	_, found, err = s.Get(key, 0, -1)
+	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get after delete failed")
 	assert.False(t, found, "expected key to be deleted")
 }
@@ -43,7 +43,7 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(value), 0)
 	assert.NoError(t, err, "Put failed")
 
-	r, found, err := s.Get(key, 0, -1)
+	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed")
 	assert.True(t, found, "Get did not find key")
 	got, err := io.ReadAll(r)
@@ -55,7 +55,7 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 
 	err = s.DeleteKey(key)
 	assert.NoError(t, err, "DeleteKey failed")
-	_, found, err = s.Get(key, 0, -1)
+	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get after delete failed")
 	assert.False(t, found, "expected key to be deleted")
 }
@@ -83,7 +83,7 @@ func TestStorage_PutGet_TTL(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(value), 1) // 1 second TTL
 	assert.NoError(t, err, "Put failed")
 
-	r, found, err := s.Get(key, 0, -1)
+	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed (before expiry)")
 	assert.True(t, found, "Get did not find key (before expiry)")
 	got, err := io.ReadAll(r)
@@ -93,7 +93,7 @@ func TestStorage_PutGet_TTL(t *testing.T) {
 	t.Log("Waiting for TTL to expire...")
 	time.Sleep(2 * time.Second)
 
-	_, found, err = s.Get(key, 0, -1)
+	_, found, err = s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed (after expiry)")
 	assert.False(t, found, "expected key to be expired and deleted")
 }
@@ -255,9 +255,9 @@ func TestStorage_Get_ByteRange_SmallObject(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "Full read (end=-1 for EOF)",
+			name:     "Full read (end=0 for EOF)",
 			start:    0,
-			end:      -1, // end < 0 means read to EOF
+			end:      0, // end <= 0 means read to EOF
 			expected: "0123456789abcdefghijklmnopqrstuvwxyz",
 		},
 		{
@@ -281,14 +281,8 @@ func TestStorage_Get_ByteRange_SmallObject(t *testing.T) {
 		{
 			name:     "Read from offset to end",
 			start:    20,
-			end:      -1, // end < 0 means read to EOF
+			end:      0, // end <= 0 means read to EOF
 			expected: "klmnopqrstuvwxyz",
-		},
-		{
-			name:     "Single byte at start (byte 0)",
-			start:    0,
-			end:      0, // inclusive: byte 0 only
-			expected: "0",
 		},
 		{
 			name:     "Single byte in middle",
@@ -368,7 +362,7 @@ func TestStorage_Get_ByteRange_LargeObject(t *testing.T) {
 		{
 			name:     "Read from offset to end",
 			start:    995,
-			end:      -1, // end < 0 means read to EOF
+			end:      0, // end <= 0 means read to EOF
 			expected: "56789",
 		},
 	}
@@ -412,7 +406,7 @@ func TestStorage_Get_ByteRange_EdgeCases(t *testing.T) {
 		{
 			name:     "Start beyond data length",
 			start:    100,
-			end:      -1, // end < 0 means read to EOF
+			end:      0, // end <= 0 means read to EOF
 			expected: "",
 			desc:     "Should return empty when start is beyond data",
 		},
@@ -445,18 +439,11 @@ func TestStorage_Get_ByteRange_EdgeCases(t *testing.T) {
 			desc:     "Should return empty when end < start",
 		},
 		{
-			name:     "Read to EOF with end=-1",
+			name:     "Read to EOF with end=0",
 			start:    0,
-			end:      -1, // end < 0 means read to EOF
+			end:      0, // end <= 0 means read to EOF
 			expected: "0123456789",
-			desc:     "Should return full data when end < 0 (read to EOF)",
-		},
-		{
-			name:     "Read byte 0 only",
-			start:    0,
-			end:      0, // inclusive: byte 0 only
-			expected: "0",
-			desc:     "Should return only byte 0 when start=0, end=0",
+			desc:     "Should return full data when end <= 0 (read to EOF)",
 		},
 	}
 
@@ -498,7 +485,7 @@ func TestStorage_Get_ByteRange_MultipleReads(t *testing.T) {
 	assert.NoError(t, err2, "Second Get failed")
 	assert.True(t, found2, "Second Get: key not found")
 
-	r3, found3, err3 := s.Get(key, 20, -1) // end < 0 means read to EOF
+	r3, found3, err3 := s.Get(key, 20, 0) // end <= 0 means read to EOF
 	assert.NoError(t, err3, "Third Get failed")
 	assert.True(t, found3, "Third Get: key not found")
 

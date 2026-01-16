@@ -490,8 +490,8 @@ func TestConnection_State(t *testing.T) {
 		ctx := context.Background()
 		client := conn.getClient()
 
-		// Try a simple operation (End: -1 means read to EOF)
-		stream, err := client.Get(ctx, &pb.GetRequest{Key: "test", End: -1})
+		// Try a simple operation (End=0 or omitted means read to EOF)
+		stream, err := client.Get(ctx, &pb.GetRequest{Key: "test"})
 		// Will fail with NotFound, but connection should work
 		_ = stream
 		_ = err

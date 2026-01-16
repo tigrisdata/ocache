@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"sync/atomic"
 	"syscall"
@@ -604,8 +603,8 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	metrics.StorageBytes.WithLabelValues("get", storageType).Add(float64(valueMsg.ValueLength))
 	metrics.ObjectSize.WithLabelValues("get").Observe(float64(valueMsg.ValueLength))
 
-	// Apply byte-range if specified (end >= 0 means inclusive end position; end < 0 means read to EOF)
-	if start > 0 || (end >= 0 && end >= start) {
+	// Apply byte-range if specified (end > 0 means inclusive end position; end <= 0 means read to EOF)
+	if start > 0 || end > 0 {
 		reader = s.applyByteRange(reader, start, end)
 	}
 
@@ -666,14 +665,13 @@ func (br *byteRangeReader) Read(p []byte) (n int, err error) {
 		br.seeked = true
 	}
 
-	// Apply end limit if specified (inclusive: end byte is included; end < 0 means no limit)
-	if br.end >= 0 && br.pos > br.end {
+	// Apply end limit if specified (inclusive: end byte is included; end <= 0 means no limit)
+	if br.end > 0 && br.pos > br.end {
 		return 0, io.EOF
 	}
 
 	// Limit read size if we have an end boundary (inclusive)
-	// Guard against overflow when br.end is MaxInt64
-	if br.end >= 0 && br.end < math.MaxInt64 && br.pos+int64(len(p)) > br.end+1 {
+	if br.end > 0 && br.pos+int64(len(p)) > br.end+1 {
 		p = p[:br.end-br.pos+1]
 	}
 
