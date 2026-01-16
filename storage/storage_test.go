@@ -255,51 +255,45 @@ func TestStorage_Get_ByteRange_SmallObject(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "Full read (0, 0)",
+			name:     "Full read (end=0 for EOF)",
 			start:    0,
-			end:      0,
+			end:      0, // end <= 0 means read to EOF
 			expected: "0123456789abcdefghijklmnopqrstuvwxyz",
 		},
 		{
 			name:     "Read first 10 bytes",
 			start:    0,
-			end:      10,
+			end:      9, // inclusive: bytes 0-9
 			expected: "0123456789",
 		},
 		{
 			name:     "Read middle 10 bytes",
 			start:    10,
-			end:      20,
+			end:      19, // inclusive: bytes 10-19
 			expected: "abcdefghij",
 		},
 		{
 			name:     "Read last 10 bytes",
 			start:    26,
-			end:      36,
+			end:      35, // inclusive: bytes 26-35
 			expected: "qrstuvwxyz",
 		},
 		{
 			name:     "Read from offset to end",
 			start:    20,
-			end:      0,
+			end:      0, // end <= 0 means read to EOF
 			expected: "klmnopqrstuvwxyz",
-		},
-		{
-			name:     "Single byte at start",
-			start:    0,
-			end:      1,
-			expected: "0",
 		},
 		{
 			name:     "Single byte in middle",
 			start:    15,
-			end:      16,
+			end:      15, // inclusive: byte 15 only
 			expected: "f",
 		},
 		{
 			name:     "Single byte at end",
 			start:    35,
-			end:      36,
+			end:      35, // inclusive: byte 35 only
 			expected: "z",
 		},
 	}
@@ -344,31 +338,31 @@ func TestStorage_Get_ByteRange_LargeObject(t *testing.T) {
 		{
 			name:     "Read first pattern",
 			start:    0,
-			end:      10,
+			end:      9, // inclusive: bytes 0-9
 			expected: "0123456789",
 		},
 		{
 			name:     "Read across pattern boundary",
 			start:    5,
-			end:      15,
+			end:      14, // inclusive: bytes 5-14
 			expected: "5678901234",
 		},
 		{
 			name:     "Read middle section",
 			start:    500,
-			end:      510,
+			end:      509, // inclusive: bytes 500-509
 			expected: "0123456789",
 		},
 		{
 			name:     "Read last 10 bytes",
 			start:    990,
-			end:      1000,
+			end:      999, // inclusive: bytes 990-999
 			expected: "0123456789",
 		},
 		{
 			name:     "Read from offset to end",
 			start:    995,
-			end:      0,
+			end:      0, // end <= 0 means read to EOF
 			expected: "56789",
 		},
 	}
@@ -412,14 +406,14 @@ func TestStorage_Get_ByteRange_EdgeCases(t *testing.T) {
 		{
 			name:     "Start beyond data length",
 			start:    100,
-			end:      0,
+			end:      0, // end <= 0 means read to EOF
 			expected: "",
 			desc:     "Should return empty when start is beyond data",
 		},
 		{
 			name:     "End beyond data length",
 			start:    5,
-			end:      100,
+			end:      100, // inclusive, but clamped to 9
 			expected: "56789",
 			desc:     "Should read until actual end of data",
 		},
@@ -433,9 +427,9 @@ func TestStorage_Get_ByteRange_EdgeCases(t *testing.T) {
 		{
 			name:     "End equals start",
 			start:    5,
-			end:      5,
-			expected: "",
-			desc:     "Should return empty when end equals start",
+			end:      5, // inclusive: returns single byte at position 5
+			expected: "5",
+			desc:     "Should return single byte when end equals start (inclusive)",
 		},
 		{
 			name:     "End less than start",
@@ -445,11 +439,11 @@ func TestStorage_Get_ByteRange_EdgeCases(t *testing.T) {
 			desc:     "Should return empty when end < start",
 		},
 		{
-			name:     "Zero-length range at start",
+			name:     "Read to EOF with end=0",
 			start:    0,
-			end:      0,
+			end:      0, // end <= 0 means read to EOF
 			expected: "0123456789",
-			desc:     "Should return full data when both are 0",
+			desc:     "Should return full data when end <= 0 (read to EOF)",
 		},
 	}
 
@@ -482,16 +476,16 @@ func TestStorage_Get_ByteRange_MultipleReads(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(data), 0)
 	assert.NoError(t, err, "Put failed")
 
-	// Get multiple readers with different ranges
-	r1, found1, err1 := s.Get(key, 0, 10)
+	// Get multiple readers with different ranges (inclusive end)
+	r1, found1, err1 := s.Get(key, 0, 9) // inclusive: bytes 0-9
 	assert.NoError(t, err1, "First Get failed")
 	assert.True(t, found1, "First Get: key not found")
 
-	r2, found2, err2 := s.Get(key, 10, 20)
+	r2, found2, err2 := s.Get(key, 10, 19) // inclusive: bytes 10-19
 	assert.NoError(t, err2, "Second Get failed")
 	assert.True(t, found2, "Second Get: key not found")
 
-	r3, found3, err3 := s.Get(key, 20, 0)
+	r3, found3, err3 := s.Get(key, 20, 0) // end <= 0 means read to EOF
 	assert.NoError(t, err3, "Third Get failed")
 	assert.True(t, found3, "Third Get: key not found")
 
@@ -528,8 +522,8 @@ func TestStorage_Get_ByteRange_PartialReads(t *testing.T) {
 	err := s.Put(key, bytes.NewReader(data), 0)
 	assert.NoError(t, err, "Put failed")
 
-	// Get a reader for a specific range
-	r, found, err := s.Get(key, 10, 30)
+	// Get a reader for a specific range (inclusive: bytes 10-29)
+	r, found, err := s.Get(key, 10, 29)
 	assert.NoError(t, err, "Get failed")
 	assert.True(t, found, "Key not found")
 	defer func() {

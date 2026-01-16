@@ -42,7 +42,7 @@ func TestCacheService_PutObjectAndGet(t *testing.T) {
 	_, err := svc.PutObject(ctx, &pb.PutRequest{Key: key, Data: value, TtlSeconds: 0})
 	assert.NoError(t, err)
 
-	// Test Get
+	// Test Get (end=0 or omitted means read to EOF)
 	req := &pb.GetRequest{Key: key}
 	stream := &mockGetServer{responses: []*pb.GetResponse{}}
 	err = svc.Get(req, stream)
