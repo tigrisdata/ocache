@@ -185,7 +185,7 @@ func (h *IntegrationTestHarness) PutObjectStream(key string, data []byte, ttl in
 func (h *IntegrationTestHarness) GetObject(key string) ([]byte, error) {
 	h.Metrics.TotalReads.Add(1)
 
-	reader, exists, err := h.Storage.Get(key, 0, 0)
+	reader, exists, err := h.Storage.Get(key, 0, -1)
 	if err != nil {
 		h.Metrics.ErrorCount.Add(1)
 		return nil, err
@@ -289,7 +289,7 @@ func (h *IntegrationTestHarness) FlushAccessUpdates() {
 func (h *IntegrationTestHarness) VerifyStorageType(key string, expectedType string) error {
 	// This would inspect the actual storage to verify the type
 	// For now, we'll use size-based inference
-	reader, exists, err := h.Storage.Get(key, 0, 0)
+	reader, exists, err := h.Storage.Get(key, 0, -1)
 	if err != nil {
 		return err
 	}

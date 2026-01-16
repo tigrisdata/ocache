@@ -176,7 +176,7 @@ func VerifyStorageType(t *testing.T, storageDir string, key string, expectedType
 
 // VerifyKeyExists verifies that a key exists in storage
 func VerifyKeyExists(t *testing.T, storage *storage.Storage, key string) {
-	reader, exists, err := storage.Get(key, 0, 0)
+	reader, exists, err := storage.Get(key, 0, -1)
 	require.NoError(t, err, "Error getting key: %s", key)
 	require.True(t, exists, "Key should exist: %s", key)
 
@@ -198,7 +198,7 @@ func VerifyKeyExists(t *testing.T, storage *storage.Storage, key string) {
 
 // VerifyKeyNotExists verifies that a key does not exist in storage
 func VerifyKeyNotExists(t *testing.T, storage *storage.Storage, key string) {
-	_, exists, err := storage.Get(key, 0, 0)
+	_, exists, err := storage.Get(key, 0, -1)
 	require.NoError(t, err, "Error getting key: %s", key)
 	assert.False(t, exists, "Key should not exist: %s", key)
 }
@@ -311,7 +311,7 @@ func VerifyConcurrentAccess(t *testing.T, storage *storage.Storage, keys []strin
 	// Concurrent reads
 	for _, key := range keys {
 		go func(k string) {
-			reader, exists, err := storage.Get(k, 0, 0)
+			reader, exists, err := storage.Get(k, 0, -1)
 			if err != nil {
 				results <- result{key: k, err: err}
 				return
@@ -350,7 +350,7 @@ func VerifyConcurrentAccess(t *testing.T, storage *storage.Storage, keys []strin
 // VerifyChecksums verifies checksums for all objects
 func VerifyChecksums(t *testing.T, storage *storage.Storage, objects []TestObject) {
 	for _, obj := range objects {
-		reader, exists, err := storage.Get(obj.Key, 0, 0)
+		reader, exists, err := storage.Get(obj.Key, 0, -1)
 		require.NoError(t, err, "Failed to get key: %s", obj.Key)
 		require.True(t, exists, "Key should exist: %s", obj.Key)
 
@@ -371,7 +371,7 @@ func VerifyChecksums(t *testing.T, storage *storage.Storage, objects []TestObjec
 
 // VerifyStreamingRead verifies that streaming reads work correctly
 func VerifyStreamingRead(t *testing.T, storage *storage.Storage, key string, expectedSize int64) {
-	reader, exists, err := storage.Get(key, 0, 0)
+	reader, exists, err := storage.Get(key, 0, -1)
 	require.NoError(t, err)
 	require.True(t, exists, "Key should exist: %s", key)
 
