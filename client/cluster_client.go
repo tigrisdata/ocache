@@ -228,6 +228,7 @@ func (c *ClusterClient) Put(ctx context.Context, key string, data []byte, ttlSec
 // Get retrieves a value with retry logic
 func (c *ClusterClient) Get(ctx context.Context, key string) ([]byte, error) {
 	// We need custom logic to track if partial data was received
+	// Pass end=0 to indicate reading to EOF (end <= 0 means read to EOF)
 	return c.getDataWithRetry(ctx, key, 0, 0, 1)
 }
 
@@ -293,6 +294,7 @@ func (c *ClusterClient) getDataWithRetry(ctx context.Context, key string, start,
 // GetStream streams a value with retry logic
 func (c *ClusterClient) GetStream(ctx context.Context, key string, w io.Writer) error {
 	// We need custom logic to track if partial data was written
+	// Pass end=0 to indicate reading to EOF (end <= 0 means read to EOF)
 	return c.getStreamDataWithRetry(ctx, key, 0, 0, w, 1)
 }
 

@@ -134,20 +134,24 @@ func (m *MemoryCache) GetRange(ctx context.Context, key string, start, end int64
 
 	dataLen := int64(len(entry.value))
 
-	// Normalize range
+	// Normalize range (inclusive end semantics; end <= 0 means read to EOF)
 	if start < 0 {
 		start = 0
 	}
-	if end <= 0 || end > dataLen {
-		end = dataLen
+	// end <= 0 means "read to EOF", convert to last valid index
+	if end <= 0 {
+		end = dataLen - 1
+	} else if end >= dataLen {
+		end = dataLen - 1
 	}
-	if start >= dataLen || start >= end {
+	// Validation: start > end is invalid (start == end returns 1 byte)
+	if start >= dataLen || start > end {
 		return nil, status.Error(codes.InvalidArgument, "invalid range")
 	}
 
-	// Return a copy of the range
-	result := make([]byte, end-start)
-	copy(result, entry.value[start:end])
+	// Return a copy (inclusive: end-start+1 bytes)
+	result := make([]byte, end-start+1)
+	copy(result, entry.value[start:end+1])
 	return result, nil
 }
 

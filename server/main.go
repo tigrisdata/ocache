@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"os/signal"
 	"strings"
@@ -39,6 +40,7 @@ var (
 	listenHTTP     = flag.String("listen-http", ":9001", "Listen address for HTTP/grpc-gateway server")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
+	showVersion    = flag.Bool("version", false, "Print version information and exit")
 
 	// Cluster configuration flags
 	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")
@@ -199,6 +201,14 @@ func RunServer() {
 
 func main() {
 	flag.Parse()
+
+	// Print version and exit if requested
+	if *showVersion {
+		fmt.Printf("ocache version %s\n", Version)
+		fmt.Printf("  commit: %s\n", Commit)
+		fmt.Printf("  built:  %s\n", BuildTime)
+		os.Exit(0)
+	}
 
 	// Parse seed nodes if provided
 	if *seedsStr != "" {

@@ -177,19 +177,22 @@ func (m *mockCacheServiceServer) Get(req *pb.GetRequest, stream pb.CacheService_
 		return status.Error(codes.NotFound, "key not found")
 	}
 
-	// Handle range requests
+	// Handle range requests (inclusive end semantics; end <= 0 means read to EOF)
 	start := int64(0)
-	end := int64(len(data))
+	end := int64(len(data)) - 1 // inclusive: last valid index
 	if req.Start > 0 {
 		start = req.Start
 	}
-	if req.End > 0 && req.End < end {
+	if req.End > 0 {
 		end = req.End
+		if end >= int64(len(data)) {
+			end = int64(len(data)) - 1
+		}
 	}
 	if start >= int64(len(data)) || start > end {
 		return status.Error(codes.InvalidArgument, "invalid range")
 	}
-	data = data[start:end]
+	data = data[start : end+1] // +1 because Go slices are exclusive
 
 	// Handle simulated partial data errors
 	if partialBytes, hasPartial := m.partialData[req.Key]; hasPartial {

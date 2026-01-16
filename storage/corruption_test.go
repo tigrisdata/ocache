@@ -50,7 +50,7 @@ func TestStorage_CorruptionHandling(t *testing.T) {
 		require.NoError(t, err)
 
 		// Try to get the corrupted key
-		_, found, err := stor.Get(key, 0, -1)
+		_, found, err := stor.Get(key, 0, 0)
 
 		// Should return a corruption error
 		assert.Error(t, err)
@@ -89,7 +89,7 @@ func TestStorage_CorruptionHandling(t *testing.T) {
 		require.NoError(t, err)
 
 		// Try to get the key with unknown type
-		_, found, err := stor.Get(key, 0, -1)
+		_, found, err := stor.Get(key, 0, 0)
 
 		// Should return a corruption error
 		assert.Error(t, err)
@@ -116,7 +116,7 @@ func TestStorage_CorruptionHandling(t *testing.T) {
 		err := stor.Put(key, bytes.NewReader(value), 0)
 		require.NoError(t, err)
 
-		reader, found, err := stor.Get(key, 0, -1)
+		reader, found, err := stor.Get(key, 0, 0)
 		require.NoError(t, err)
 		assert.True(t, found)
 
@@ -140,7 +140,7 @@ func TestStorage_CorruptionHandling(t *testing.T) {
 		require.NoError(t, err)
 
 		// Get should return non-retryable corruption error
-		_, _, err = stor.Get(key, 0, -1)
+		_, _, err = stor.Get(key, 0, 0)
 		require.Error(t, err)
 
 		// Verify it's a non-retryable corruption error
@@ -175,7 +175,7 @@ func TestStorage_IOErrorHandling(t *testing.T) {
 		require.NoError(t, err)
 
 		// Try to get the key - should fail with IO error
-		_, found, err := stor.Get(key, 0, -1)
+		_, found, err := stor.Get(key, 0, 0)
 
 		// Should return an IO error that is retryable
 		assert.Error(t, err)
@@ -213,7 +213,7 @@ func TestStorage_IOErrorHandling(t *testing.T) {
 		require.NoError(t, err)
 
 		// Try to get the key - should fail with IO error
-		_, found, err := stor.Get(key, 0, -1)
+		_, found, err := stor.Get(key, 0, 0)
 
 		// Should return an IO error that is retryable
 		assert.Error(t, err)

@@ -4,6 +4,11 @@
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
+# Version information (can be overridden)
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_TIME := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
 # Allow custom RocksDB installation path
 ROCKSDB_PREFIX ?= /usr/local
 
@@ -45,6 +50,9 @@ endif
 .PHONY: all
 all: build build-cli
 
+# Version ldflags for injecting build info
+VERSION_LDFLAGS := -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
+
 # Static build configuration
 STATIC_BUILD ?= false
 ifeq ($(STATIC_BUILD),true)
@@ -60,10 +68,13 @@ ifeq ($(STATIC_BUILD),true)
     endif
     # macOS doesn't support fully static binaries, so we only statically link RocksDB
     ifeq ($(UNAME_S),Darwin)
-        LDFLAGS := -ldflags "-s -w"
+        LDFLAGS := -ldflags "-s -w $(VERSION_LDFLAGS)"
     else
-        LDFLAGS := -ldflags "-linkmode external -extldflags '-static'"
+        LDFLAGS := -ldflags "-linkmode external -extldflags '-static' $(VERSION_LDFLAGS)"
     endif
+else
+    # Non-static builds still get version info
+    LDFLAGS := -ldflags "$(VERSION_LDFLAGS)"
 endif
 
 .PHONY: build
@@ -76,7 +87,7 @@ build-static:
 
 .PHONY: build-cli
 build-cli:
-	go build -o ocachecli ./client/cmd/
+	go build -ldflags "$(VERSION_LDFLAGS)" -o ocachecli ./client/cmd/
 
 .PHONY: proto
 proto: proto-api proto-storage proto-cluster
