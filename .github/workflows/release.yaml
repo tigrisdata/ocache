@@ -21,15 +21,15 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: namespace-profile-ubuntu-2404
             arch: x86_64
             goos: linux
             goarch: amd64
-          - os: ubuntu-24.04-arm64
+          - os: namespace-profile-ubuntu-2404-arm
             arch: aarch64
             goos: linux
             goarch: arm64
-          - os: macos-latest
+          - os: namespace-profile-macos-1561-arm
             arch: arm64
             goos: darwin
             goarch: arm64

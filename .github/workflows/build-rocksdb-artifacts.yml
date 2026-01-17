@@ -7,10 +7,6 @@ on:
         description: 'RocksDB version to build'
         required: true
         default: '10.4.2'
-  push:
-    paths:
-      - 'scripts/build-rocksdb-static.sh'
-      - '.github/workflows/build-rocksdb-artifacts.yml'
 
 env:
   ROCKSDB_VERSION: ${{ github.event.inputs.rocksdb_version || '10.4.2' }}
@@ -20,26 +16,17 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: namespace-profile-ubuntu-2404
             arch: x86_64
-          - os: ubuntu-latest
+          - os: namespace-profile-ubuntu-2404-arm
             arch: aarch64
-            use_qemu: true
-          - os: macos-latest
-            arch: x86_64
-          - os: macos-latest
+          - os: namespace-profile-macos-1561-arm
             arch: arm64
     runs-on: ${{ matrix.os }}
     
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Set up QEMU
-        if: matrix.use_qemu
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-      
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -65,9 +52,9 @@ jobs:
           name: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ runner.os }}-${{ matrix.arch }}
           path: rocksdb-static/rocksdb-static-*.tar.gz
           retention-days: 90
-  
+
   create-release:
-    needs: build-artifacts
+    needs: [build-artifacts]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     
@@ -89,11 +76,10 @@ jobs:
           release_name: RocksDB ${{ env.ROCKSDB_VERSION }} Static Libraries
           body: |
             Pre-built static RocksDB libraries for various platforms.
-            
+
             ## Supported Platforms
             - Linux x86_64
             - Linux aarch64
-            - macOS x86_64
             - macOS arm64
             
             ## Usage
