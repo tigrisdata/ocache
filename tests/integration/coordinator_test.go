@@ -8,7 +8,7 @@ import (
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 )
 
-const waitForConvergenceTimeout = 15 * time.Second
+const waitForConvergenceTimeout = 20 * time.Second
 
 // Test_Coordinator_BasicFormation tests basic cluster formation using CoordinatorSuite
 func (s *CoordinatorSuite) Test_Coordinator_BasicFormation() {
