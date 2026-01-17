@@ -21,11 +21,15 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: namespace-profile-ubuntu-2404
             arch: x86_64
             goos: linux
             goarch: amd64
-          - os: macos-latest
+          - os: namespace-profile-ubuntu-2404-arm
+            arch: aarch64
+            goos: linux
+            goarch: arm64
+          - os: namespace-profile-macos-1561-arm
             arch: arm64
             goos: darwin
             goarch: arm64
@@ -114,18 +118,9 @@ jobs:
           path: dist/
           retention-days: 1
 
-  build-arm64:
-    needs: [test]
-    uses: ./.github/workflows/build-arm64.yml
-    with:
-      build_type: release
-      # Note: env context not available in reusable workflow inputs, keep in sync with env above
-      go_version: "1.24.2"
-      rocksdb_version: "10.4.2"
-
   release:
     runs-on: ubuntu-latest
-    needs: [build-binaries, build-arm64]
+    needs: [build-binaries]
     permissions:
       contents: write
       issues: write
