@@ -115,6 +115,7 @@ jobs:
           retention-days: 1
 
   build-arm64:
+    needs: [test]
     uses: ./.github/workflows/build-arm64.yml
     with:
       build_type: release
