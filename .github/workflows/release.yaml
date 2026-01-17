@@ -118,6 +118,9 @@ jobs:
     uses: ./.github/workflows/build-arm64.yml
     with:
       build_type: release
+      # Note: env context not available in reusable workflow inputs, keep in sync with env above
+      go_version: "1.24.2"
+      rocksdb_version: "10.4.2"
 
   release:
     runs-on: ubuntu-latest
