@@ -143,21 +143,33 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Get tags before release
+        id: before-release
+        run: |
+          # Fetch existing tags since actions/checkout does a shallow clone
+          git fetch --tags
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Tag before semantic-release: ${LATEST_TAG:-none}"
+
       - name: Run semantic-release
         env:
           GITHUB_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
         run: npx semantic-release --debug
 
-      - name: Get latest release tag
+      - name: Get new release tag
         id: get-release
         run: |
-          # Get the tag that was just created by semantic-release from git
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -n "$LATEST_TAG" ]; then
-            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-            echo "Found release: $LATEST_TAG"
+          # Fetch any new tags created by semantic-release
+          git fetch --tags
+          NEW_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          BEFORE_TAG="${{ steps.before-release.outputs.tag }}"
+
+          if [ -n "$NEW_TAG" ] && [ "$NEW_TAG" != "$BEFORE_TAG" ]; then
+            echo "tag=$NEW_TAG" >> $GITHUB_OUTPUT
+            echo "New release created: $NEW_TAG"
           else
-            echo "No release found"
+            echo "No new release created (tag unchanged: ${BEFORE_TAG:-none})"
           fi
 
       - name: Upload binaries to release
