@@ -7,6 +7,8 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    # Skip validation for release PRs (main -> release branch)
+    if: github.event.pull_request.base.ref != 'release'
     steps:
       - name: Validate PR title
         uses: amannn/action-semantic-pull-request@v5
