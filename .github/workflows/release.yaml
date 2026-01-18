@@ -146,6 +146,8 @@ jobs:
       - name: Get tags before release
         id: before-release
         run: |
+          # Fetch existing tags since actions/checkout does a shallow clone
+          git fetch --tags
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
           echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
           echo "Tag before semantic-release: ${LATEST_TAG:-none}"
