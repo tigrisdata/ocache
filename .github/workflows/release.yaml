@@ -128,6 +128,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:
@@ -182,3 +184,36 @@ jobs:
             echo "Uploading $(basename $binary) to $TAG..."
             gh release upload "$TAG" "$binary"
           done
+
+      - name: Create per-module Go tags
+        if: steps.get-release.outputs.tag != ''
+        run: |
+          TAG="${{ steps.get-release.outputs.tag }}"
+          echo "Creating per-module tags for Go module consumption..."
+
+          # Configure git for tagging
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Module tagging order (dependencies first):
+          # 1. Leaf modules (no internal dependencies)
+          # 2. Modules that depend on leaves
+          # 3. Client and server modules
+          MODULES=(
+            "common"
+            "coordinator/proto"
+            "proto"
+            "coordinator"
+            "storage"
+            "client"
+            "server"
+          )
+
+          for module in "${MODULES[@]}"; do
+            MODULE_TAG="${module}/${TAG}"
+            echo "Creating tag: $MODULE_TAG"
+            git tag "$MODULE_TAG" || { echo "Error: Tag $MODULE_TAG already exists"; exit 1; }
+          done
+
+          echo "Pushing per-module tags..."
+          git push origin --tags
