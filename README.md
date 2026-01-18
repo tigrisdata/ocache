@@ -50,9 +50,26 @@ make all
   put mykey "distributed value"
 ```
 
+### Docker
+
+```bash
+# Single node
+docker run -d -p 9000:9000 -p 9001:9001 \
+  -v ocache-data:/data tigrisdata/ocache:latest
+
+# Or use docker-compose
+docker-compose -f docker/docker-compose.yml up -d
+
+# 3-node cluster
+docker-compose -f docker/docker-compose-cluster.yml up -d
+```
+
+See [Docker Guide](docs/docker.md) for detailed configuration options.
+
 ## Documentation
 
 - [Installation Guide](docs/installation.md) - Build options and dependencies
+- [Docker Guide](docs/docker.md) - Docker deployment and configuration
 - [Cluster Mode](docs/cluster.md) - Distributed caching setup and operations
 - [Client Documentation](docs/client.md) - Go client library
 - [CLI Client](docs/cli.md) - Command-line client usage

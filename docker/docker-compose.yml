@@ -1,0 +1,25 @@
+services:
+  ocache:
+    image: tigrisdata/ocache:latest
+    container_name: ocache
+    ports:
+      - "9000:9000"  # gRPC
+      - "9001:9001"  # HTTP
+    volumes:
+      - ocache-data:/data
+    environment:
+      - OCACHE_DISK=/data
+      - OCACHE_TTL=${OCACHE_TTL:-0}
+      - OCACHE_MAX_DISK_USAGE=${OCACHE_MAX_DISK_USAGE:-0}
+      - OCACHE_REQUEST_LOGGING=${OCACHE_REQUEST_LOGGING:-false}
+    command:
+      - "-disk=/data"
+      - "-listen-addr=:9000"
+      - "-listen-http=:9001"
+      - "-ttl=${OCACHE_TTL:-0}"
+      - "-max-disk-usage=${OCACHE_MAX_DISK_USAGE:-0}"
+      - "-request-logging=${OCACHE_REQUEST_LOGGING:-false}"
+    restart: unless-stopped
+
+volumes:
+  ocache-data:
