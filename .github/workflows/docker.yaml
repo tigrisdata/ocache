@@ -59,12 +59,21 @@ jobs:
           username: ${{ secrets.GH_DOCKER_ACCESS_USER }}
           password: ${{ secrets.GH_DOCKER_ACCESS_TOKEN }}
 
+      - name: Determine tags
+        id: tags
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          TAGS="tigrisdata/ocache:${VERSION}"
+          # Only add 'latest' tag when triggered by release workflow, not manual dispatch
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            TAGS="${TAGS},tigrisdata/ocache:latest"
+          fi
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
       - uses: docker/build-push-action@v5
         with:
           context: docker
           file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            tigrisdata/ocache:${{ steps.version.outputs.version }}
-            tigrisdata/ocache:latest
+          tags: ${{ steps.tags.outputs.tags }}
