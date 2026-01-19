@@ -458,7 +458,6 @@ check: fmt-check vet test
 .PHONY: clean
 clean:
 	rm -f ocache ocachecli ocache.log ocache.pid
-	rm -f proto/*.pb.go proto/*.pb.gw.go
 	rm -f coverage.out coverage.html coverage-integration.out coverage-integration.html
 	rm -rf /tmp/ocache /tmp/ocache-demo /tmp/ocache-integration-test-*
 
