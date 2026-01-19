@@ -197,7 +197,87 @@ To test cluster functionality:
 ./ocachecli --addr "localhost:9001,localhost:9002,localhost:9003" put test "value"
 ```
 
+## Using OCache Client in External Projects
+
+The ocache client library can be used in external Go projects. Add the client module to your `go.mod` file:
+
+```go
+// In your project's go.mod
+require (
+    github.com/tigrisdata/ocache/client v1.0.0
+)
+```
+
+**Usage Example:**
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+
+    "github.com/tigrisdata/ocache/client"
+)
+
+func main() {
+    // Create a simple client for single-node mode
+    c, err := client.NewSimpleClient(context.Background(), "localhost:9000")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer c.Close()
+
+    // Put and get objects
+    err = c.Put(context.Background(), "my-key", []byte("my-value"), 0)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    data, err := c.Get(context.Background(), "my-key")
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("Got: %s", data)
+}
+```
+
+**Releasing Module Tags:**
+
+Per-module tags are automatically created during the release workflow (see `.github/workflows/release.yaml`).
+
 ## Important Development Patterns
+
+**Commit Messages (Conventional Commits)**
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/) for semantic versioning. All commit messages and PR titles must follow this format:
+
+```
+<type>: <description>
+
+[optional body]
+```
+
+Available types:
+- `feat` - New feature (triggers minor version bump)
+- `fix` - Bug fix (triggers patch version bump)
+- `perf` - Performance improvement
+- `docs` - Documentation changes
+- `style` - Code style changes (formatting, etc.)
+- `refactor` - Code refactoring
+- `test` - Adding or updating tests
+- `build` - Build system changes
+- `ci` - CI/CD configuration changes
+- `chore` - Maintenance tasks
+- `revert` - Reverting a previous commit
+
+Examples:
+```bash
+feat: add support for custom TTL per key
+fix: resolve race condition in segment compaction
+docs: update API documentation for streaming endpoints
+ci: add per-module Go tags to release workflow
+```
 
 **Code Formatting**
 
