@@ -7,11 +7,9 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/coordinator v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/storage v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/common v1.1.0
+	github.com/tigrisdata/ocache/coordinator v1.1.0
+	github.com/tigrisdata/ocache/storage v1.1.0
 	google.golang.org/grpc v1.72.2
 )
 
@@ -86,14 +84,3 @@ require (
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-// We want to import the local modules
-replace github.com/tigrisdata/ocache/proto => ../proto
-
-replace github.com/tigrisdata/ocache/storage => ../storage
-
-replace github.com/tigrisdata/ocache/common => ../common
-
-replace github.com/tigrisdata/ocache/coordinator => ../coordinator
-
-replace github.com/tigrisdata/ocache/coordinator/proto => ../coordinator/proto

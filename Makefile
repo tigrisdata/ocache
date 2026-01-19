@@ -402,11 +402,19 @@ lint:
 	@cd client && go vet ./...
 	@echo "Running gofmt..."
 	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
+
+.PHONY: tidy
+tidy:
 	@echo "Running go mod tidy..."
 	@go work sync
 	@cd server && go mod tidy
 	@cd client && go mod tidy
 	@cd proto && go mod tidy
+	@cd coordinator && go mod tidy
+	@cd coordinator/proto && go mod tidy
+	@cd storage && go mod tidy
+	@cd common && go mod tidy
+	@cd tests/integration && go mod tidy
 
 .PHONY: lint-ci
 lint-ci:
@@ -450,7 +458,6 @@ check: fmt-check vet test
 .PHONY: clean
 clean:
 	rm -f ocache ocachecli ocache.log ocache.pid
-	rm -f proto/*.pb.go proto/*.pb.gw.go
 	rm -f coverage.out coverage.html coverage-integration.out coverage-integration.html
 	rm -rf /tmp/ocache /tmp/ocache-demo /tmp/ocache-integration-test-*
 
