@@ -1,9 +1,5 @@
 .vscode/
 
-# Generated files
-*.pb.go
-*.pb.gw.go
-
 # Go build artifacts
 **/ocache
 **/ocachecli

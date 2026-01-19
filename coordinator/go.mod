@@ -11,9 +11,9 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/common v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/coordinator/proto v0.0.0-00010101000000-000000000000
-	github.com/tigrisdata/ocache/proto v0.0.0-00010101000000-000000000000
+	github.com/tigrisdata/ocache/common v1.1.0
+	github.com/tigrisdata/ocache/coordinator/proto v1.1.0
+	github.com/tigrisdata/ocache/proto v1.1.0
 	google.golang.org/grpc v1.72.2
 )
 
@@ -33,7 +33,6 @@ require (
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/btree v1.0.1 // indirect
-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.26.3 // indirect
 	github.com/hashicorp/consul/api v1.15.3 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
@@ -80,10 +79,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250303144028-a0af3efb3deb // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-)
-
-replace (
-	github.com/tigrisdata/ocache/common => ../common
-	github.com/tigrisdata/ocache/coordinator/proto => ./proto
-	github.com/tigrisdata/ocache/proto => ../proto
 )

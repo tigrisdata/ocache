@@ -198,6 +198,13 @@ github.com/spaolacci/murmur3 v1.1.0/go.mod h1:JwIasOWyU6f++ZhiEuf87xNszmSA2myDM2
 github.com/spf13/afero v1.10.0/go.mod h1:UBogFpq8E9Hx+xc5CNTTEpTnuHVmXDwZcZcE1eb/UhQ=
 github.com/spiffe/go-spiffe/v2 v2.5.0/go.mod h1:P+NxobPc6wXhVtINNtFjNWGBTreew1GBUCwT2wPmb7g=
 github.com/spiffe/go-spiffe/v2 v2.6.0/go.mod h1:gm2SeUoMZEtpnzPNs2Csc0D/gX33k1xIx7lEzqblHEs=
+github.com/tigrisdata/ocache/client v1.1.0/go.mod h1:MUH2D1yh318i82EKzrGzuqfU7SJcqIZC6PdVQSVRI28=
+github.com/tigrisdata/ocache/common v1.1.0/go.mod h1:5dy2d/b+59f2TljpvOTbYuwtSQxh9fSUhCLhCITV1F4=
+github.com/tigrisdata/ocache/coordinator v1.1.0/go.mod h1:xokCl8KEsiy03wbxm6YD92fA9DuYLXcqMfWUEmlXYhY=
+github.com/tigrisdata/ocache/coordinator/proto v1.1.0/go.mod h1:VJRxHBf/TquQ8vtMaJX5VYSxHFe20N61TqgUWJb1ySM=
+github.com/tigrisdata/ocache/proto v1.1.0/go.mod h1:opN1gXsE/wSSJ6M2CRAD5hBX6d5oM9I8cAkwHikkvK8=
+github.com/tigrisdata/ocache/server v1.1.0/go.mod h1:/4BBYtAQXvB2T3hutEbAgOMWU1SBE9V4uqxx0ttTBcU=
+github.com/tigrisdata/ocache/storage v1.1.0/go.mod h1:jOvvtASo1r6EupYNcw0n8xmYeOybYz9hykR4viD2EuY=
 github.com/xhit/go-str2duration/v2 v2.1.0/go.mod h1:ohY8p+0f07DiV6Em5LKB0s2YpLtXVyJfNt1+BlmyAsU=
 github.com/yuin/gopher-lua v0.0.0-20210529063254-f4c35e4016d9/go.mod h1:E1AXubJBdNmFERAOucpDIxNzeGfLzg0mYh+UfMWdChA=
 github.com/zeebo/errs v1.4.0/go.mod h1:sgbWHsvVuTPHcqJJGQ1WhI5KbWlHYz+2+2C/LSEtCw4=
