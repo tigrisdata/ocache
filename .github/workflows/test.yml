@@ -41,19 +41,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://${{ github.token }}@github.com/".insteadOf "https://github.com/"
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go.work.sum
-
-      - name: Verify Go workspace
-        run: |
-          echo "GOWORK=$GOWORK"
-          echo "PWD=$(pwd)"
-          ls -la go.work go.work.sum
-          cat go.work
-          go env GOWORK
 
       - name: Install system dependencies
         run: |
