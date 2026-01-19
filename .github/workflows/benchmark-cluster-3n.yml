@@ -45,6 +45,13 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go.work.sum
 
+      - name: Verify Go workspace
+        run: |
+          echo "GOWORK=$GOWORK"
+          ls -la go.work go.work.sum
+          go env GOWORK
+          go work sync
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
