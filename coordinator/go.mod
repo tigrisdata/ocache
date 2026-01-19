@@ -12,6 +12,8 @@ require (
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tigrisdata/ocache/common v1.1.0
+	github.com/tigrisdata/ocache/coordinator/proto v1.1.0
+	github.com/tigrisdata/ocache/proto v1.1.0
 	google.golang.org/grpc v1.72.2
 )
 
