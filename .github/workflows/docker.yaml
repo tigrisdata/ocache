@@ -30,7 +30,7 @@ jobs:
             echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           else
             git fetch --tags
-            VERSION=$(git describe --tags --abbrev=0)
+            VERSION=$(git tag --list 'v*' --sort=-version:refname | head -1)
             echo "version=$VERSION" >> $GITHUB_OUTPUT
           fi
 

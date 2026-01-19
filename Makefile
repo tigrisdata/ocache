@@ -87,7 +87,11 @@ build-static:
 
 .PHONY: build-cli
 build-cli:
-	go build -ldflags "$(VERSION_LDFLAGS)" -o ocachecli ./client/cmd/
+ifeq ($(STATIC_BUILD),true)
+	CGO_ENABLED=0 go build -ldflags "-s -w $(VERSION_LDFLAGS)" -o ocachecli ./client/cmd/
+else
+	CGO_ENABLED=0 go build -ldflags "$(VERSION_LDFLAGS)" -o ocachecli ./client/cmd/
+endif
 
 .PHONY: proto
 proto: proto-api proto-storage proto-cluster
