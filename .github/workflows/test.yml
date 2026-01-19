@@ -54,7 +54,6 @@ jobs:
           ls -la go.work go.work.sum
           cat go.work
           go env GOWORK
-          go work sync
 
       - name: Install system dependencies
         run: |
