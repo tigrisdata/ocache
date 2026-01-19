@@ -19,6 +19,7 @@ on:
 env:
   GO_VERSION: "1.24.2"
   ROCKSDB_VERSION: "10.4.2"
+  GOWORK: ${{ github.workspace }}/go.work
 
 jobs:
   benchmark-single:
