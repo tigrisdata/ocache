@@ -402,11 +402,19 @@ lint:
 	@cd client && go vet ./...
 	@echo "Running gofmt..."
 	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
+
+.PHONY: tidy
+tidy:
 	@echo "Running go mod tidy..."
 	@go work sync
 	@cd server && go mod tidy
 	@cd client && go mod tidy
 	@cd proto && go mod tidy
+	@cd coordinator && go mod tidy
+	@cd coordinator/proto && go mod tidy
+	@cd storage && go mod tidy
+	@cd common && go mod tidy
+	@cd tests/integration && go mod tidy
 
 .PHONY: lint-ci
 lint-ci:
