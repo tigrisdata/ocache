@@ -20,12 +20,13 @@ const (
 
 // Config contains the configuration for the coordinator
 type Config struct {
-	Enabled     bool     // Whether the coordinator is enabled
-	MyNodeID    string   // The ID of the node
-	ClusterAddr string   // The address for memberlist gossip (host:port format, e.g., "0.0.0.0:7946")
-	ListenAddr  string   // The address the node listens on for client requests (Put/Get/Delete and cluster topology)
-	Seeds       []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
-	DiskPath    string   // The path to the disk for persisting ring tokens
+	Enabled       bool     // Whether the coordinator is enabled
+	MyNodeID      string   // The ID of the node
+	ClusterAddr   string   // The address for memberlist gossip (host:port format, e.g., "0.0.0.0:7946")
+	ListenAddr    string   // The address the node listens on for client requests (Put/Get/Delete and cluster topology)
+	AdvertiseAddr string   // The address advertised to other nodes for routing (if different from ListenAddr)
+	Seeds         []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
+	DiskPath      string   // The path to the disk for persisting ring tokens
 
 	// LifecyclerConfig allows advanced ring configuration (optional).
 	// Mainly used for testing.
@@ -114,7 +115,12 @@ func New(config *Config) (*Coordinator, error) {
 	}
 
 	// Create lifecycler config
-	if err := ring.SetupLifecyclerConfig(config.MyNodeID, config.ListenAddr, config.DiskPath, &config.LifecyclerConfig); err != nil {
+	// Use AdvertiseAddr for ring topology if specified, otherwise fall back to ListenAddr
+	ringAddr := config.AdvertiseAddr
+	if ringAddr == "" {
+		ringAddr = config.ListenAddr
+	}
+	if err := ring.SetupLifecyclerConfig(config.MyNodeID, ringAddr, config.DiskPath, &config.LifecyclerConfig); err != nil {
 		_ = memberlistKV.Stop(context.Background()) // Cleanup on failure
 		return nil, fmt.Errorf("failed to create lifecycler config: %w", err)
 	}

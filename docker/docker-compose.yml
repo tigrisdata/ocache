@@ -20,6 +20,12 @@ services:
       - "-max-disk-usage=${OCACHE_MAX_DISK_USAGE:-0}"
       - "-request-logging=${OCACHE_REQUEST_LOGGING:-false}"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
 volumes:
   ocache-data:

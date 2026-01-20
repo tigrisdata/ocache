@@ -1,6 +1,12 @@
 x-ocache-common: &ocache-common
   image: tigrisdata/ocache:latest
   restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
 
 services:
   ocache-node1:
@@ -16,6 +22,7 @@ services:
     command:
       - "-disk=/data"
       - "-listen-addr=:9000"
+      - "-advertise-addr=ocache-node1:9000"
       - "-listen-http=:9001"
       - "-cluster-enabled"
       - "-node-id=node1"
@@ -40,6 +47,7 @@ services:
     command:
       - "-disk=/data"
       - "-listen-addr=:9000"
+      - "-advertise-addr=ocache-node2:9000"
       - "-listen-http=:9001"
       - "-cluster-enabled"
       - "-node-id=node2"
@@ -66,6 +74,7 @@ services:
     command:
       - "-disk=/data"
       - "-listen-addr=:9000"
+      - "-advertise-addr=ocache-node3:9000"
       - "-listen-http=:9001"
       - "-cluster-enabled"
       - "-node-id=node3"
