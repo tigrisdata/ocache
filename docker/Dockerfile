@@ -3,7 +3,7 @@ FROM alpine:3.19
 ARG TARGETARCH
 
 # Install minimal runtime dependencies
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget
 
 # Create non-root user
 RUN addgroup -g 1000 ocache && \
@@ -21,7 +21,7 @@ VOLUME ["/data"]
 EXPOSE 9000 9001 7000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD ocachecli --addr localhost:9000 list > /dev/null 2>&1 || exit 1
+    CMD wget -q --spider http://localhost:9001/health || exit 1
 
 ENTRYPOINT ["ocache"]
 CMD ["-disk", "/data"]
