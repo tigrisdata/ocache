@@ -16,6 +16,7 @@ services:
     command:
       - "-disk=/data"
       - "-listen-addr=:9000"
+      - "-advertise-addr=ocache-node1:9000"
       - "-listen-http=:9001"
       - "-cluster-enabled"
       - "-node-id=node1"
@@ -40,6 +41,7 @@ services:
     command:
       - "-disk=/data"
       - "-listen-addr=:9000"
+      - "-advertise-addr=ocache-node2:9000"
       - "-listen-http=:9001"
       - "-cluster-enabled"
       - "-node-id=node2"
@@ -66,6 +68,7 @@ services:
     command:
       - "-disk=/data"
       - "-listen-addr=:9000"
+      - "-advertise-addr=ocache-node3:9000"
       - "-listen-http=:9001"
       - "-cluster-enabled"
       - "-node-id=node3"

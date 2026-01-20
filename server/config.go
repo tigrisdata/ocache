@@ -33,6 +33,7 @@ type Config struct {
 	NodeID         string   // Unique node identifier in cluster
 	ClusterAddr    string   // Address for cluster communication
 	Seeds          []string // Seed nodes for joining cluster
+	AdvertiseAddr  string   // Address advertised to other nodes for routing (defaults to ListenAddr)
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -65,5 +66,15 @@ func LoadConfig() {
 		NodeID:                 *nodeID,
 		ClusterAddr:            *clusterAddr,
 		Seeds:                  seeds,
+		AdvertiseAddr:          resolveAdvertiseAddr(*listenAddr, *advertiseAddr),
 	}
+}
+
+// resolveAdvertiseAddr returns the effective advertised address.
+// If advertiseAddr is empty, returns listenAddr for backward compatibility.
+func resolveAdvertiseAddr(listenAddr, advertiseAddr string) string {
+	if advertiseAddr != "" {
+		return advertiseAddr
+	}
+	return listenAddr
 }
