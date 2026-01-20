@@ -185,7 +185,35 @@ func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, list
 	}
 }
 
-func StartGRPCGatewayServer(grpcAddr string, listenHTTP string) {
+// healthHandler returns a simple HTTP handler for liveness checks.
+// Returns 200 OK if the process is alive.
+func healthHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
+	}
+}
+
+// readyHandler returns an HTTP handler for readiness checks.
+// In cluster mode, checks if the coordinator is in ACTIVE state.
+func readyHandler(coord *coordinator.Coordinator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// In cluster mode, check if coordinator is ready
+		if coord != nil && !coord.IsReady() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"not_ready","reason":"coordinator not active"}`))
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ready"}`))
+	}
+}
+
+func StartGRPCGatewayServer(coord *coordinator.Coordinator, grpcAddr string, listenHTTP string) {
 	ctx := context.Background()
 	mux := http.NewServeMux()
 
@@ -195,6 +223,13 @@ func StartGRPCGatewayServer(grpcAddr string, listenHTTP string) {
 	if err := pb.RegisterCacheServiceHandlerFromEndpoint(ctx, gwMux, grpcAddr, opts); err != nil {
 		zlog.Fatal().Err(err).Msg("failed to register grpc-gateway handler")
 	}
+
+	// Health check endpoints for Docker/Kubernetes
+	mux.HandleFunc("/health", healthHandler())
+	mux.HandleFunc("/healthz", healthHandler()) // Kubernetes convention
+	mux.HandleFunc("/ready", readyHandler(coord))
+	mux.HandleFunc("/readyz", readyHandler(coord)) // Kubernetes convention
+	zlog.Info().Msg("Health endpoints available at /health, /healthz, /ready, /readyz")
 
 	// Add Prometheus metrics endpoint
 	mux.Handle("/metrics", promhttp.Handler())
