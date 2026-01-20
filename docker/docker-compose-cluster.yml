@@ -1,6 +1,12 @@
 x-ocache-common: &ocache-common
   image: tigrisdata/ocache:latest
   restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-q", "--spider", "http://localhost:9001/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
 
 services:
   ocache-node1:

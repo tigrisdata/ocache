@@ -130,7 +130,7 @@ func initializeStorage() *stor.Storage {
 // startUserServices starts the user-facing gRPC and HTTP gateway services
 func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
 	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging) // Start gRPC server in goroutine
-	go service.StartGRPCGatewayServer(*listenAddr, *listenHTTP)              // Start grpc-gateway on different address
+	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)       // Start grpc-gateway on different address
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error
