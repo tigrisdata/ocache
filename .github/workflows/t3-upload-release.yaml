@@ -32,20 +32,23 @@ jobs:
 
       - name: Get version
         id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "Using manual version: ${{ github.event.inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "version=$INPUT_VERSION" >> $GITHUB_OUTPUT
+            echo "Using manual version: $INPUT_VERSION"
           else
-            # Get latest semantic version tag (excludes rocksdb-* tags)
+            # Get the tag pointing to the workflow_run commit SHA
             git fetch --tags
-            VERSION=$(git tag --list 'v*' --sort=-version:refname | head -1)
+            VERSION=$(git tag --points-at "$WORKFLOW_RUN_SHA" | grep '^v' | head -1)
             if [ -z "$VERSION" ]; then
-              echo "Error: No version tag found"
+              echo "Error: No version tag found for commit $WORKFLOW_RUN_SHA"
               exit 1
             fi
             echo "version=$VERSION" >> $GITHUB_OUTPUT
-            echo "Using latest version: $VERSION"
+            echo "Using version from workflow_run: $VERSION"
           fi
 
       - name: Verify release exists
