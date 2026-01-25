@@ -1,0 +1,191 @@
+name: Upload RocksDB to T3
+
+on:
+  workflow_run:
+    workflows: ["Build RocksDB Artifacts"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "RocksDB version (e.g., 10.4.2)"
+        required: true
+
+env:
+  S3_BUCKET: ocache-releases
+  S3_ENDPOINT: https://t3.storage.dev
+
+jobs:
+  upload-to-t3:
+    runs-on: ubuntu-latest
+    # Only run if build workflow succeeded, or if manually triggered
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "version=$INPUT_VERSION" >> $GITHUB_OUTPUT
+            echo "Using manual version: $INPUT_VERSION"
+          else
+            # Get the tag pointing to the workflow_run commit SHA
+            git fetch --tags
+            TAG=$(git tag --points-at "$WORKFLOW_RUN_SHA" | grep '^rocksdb-v' | head -1)
+            if [ -z "$TAG" ]; then
+              echo "Error: No rocksdb version tag found for commit $WORKFLOW_RUN_SHA"
+              exit 1
+            fi
+            # Extract version from tag (rocksdb-v10.4.2 -> 10.4.2)
+            VERSION="${TAG#rocksdb-v}"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Using version from workflow_run: $VERSION (tag: $TAG)"
+          fi
+
+      - name: Verify release exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          TAG="rocksdb-v$VERSION"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Error: Release $TAG not found"
+            exit 1
+          fi
+          echo "Verified release $TAG exists"
+
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GH_BOT_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          TAG="rocksdb-v$VERSION"
+          mkdir -p artifacts
+
+          # Define all expected artifacts
+          ARTIFACTS=(
+            "rocksdb-static-$VERSION-Linux-aarch64.tar.gz"
+            "rocksdb-static-$VERSION-Linux-x86_64.tar.gz"
+            "rocksdb-static-$VERSION-macOS-arm64.tar.gz"
+          )
+
+          # Download each artifact
+          for artifact in "${ARTIFACTS[@]}"; do
+            echo "Downloading $artifact..."
+            if ! gh release download "$TAG" -p "$artifact" -O "artifacts/$artifact"; then
+              echo "Error: Failed to download $artifact"
+              exit 1
+            fi
+          done
+
+          echo "Downloaded artifacts:"
+          ls -la artifacts/
+
+      - name: Configure AWS CLI for S3-compatible endpoint
+        run: |
+          aws configure set default.s3.signature_version s3v4
+
+      - name: Upload artifacts to T3 (versioned directory)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Uploading artifacts to s3://$S3_BUCKET/rocksdb/$VERSION/"
+
+          for artifact in artifacts/*; do
+            FILENAME=$(basename "$artifact")
+            echo "Uploading $FILENAME..."
+            aws s3 cp "$artifact" "s3://$S3_BUCKET/rocksdb/$VERSION/$FILENAME" \
+              --endpoint-url "$S3_ENDPOINT" \
+              --content-type "application/gzip"
+          done
+
+          echo "Versioned upload complete"
+
+      - name: Update latest directory
+        # Only update 'latest' when triggered by build workflow, not manual dispatch
+        if: github.event_name == 'workflow_run'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Updating rocksdb/latest/ directory to $VERSION..."
+
+          # Upload with version-agnostic names so files get replaced on each release
+          # e.g., rocksdb-static-10.4.2-Linux-x86_64.tar.gz -> rocksdb-static-Linux-x86_64.tar.gz
+          for artifact in artifacts/*; do
+            FILENAME=$(basename "$artifact")
+            # Remove version from filename: rocksdb-static-{VERSION}-{OS}-{ARCH}.tar.gz -> rocksdb-static-{OS}-{ARCH}.tar.gz
+            LATEST_FILENAME=$(echo "$FILENAME" | sed "s/-$VERSION//")
+            echo "Updating latest/$LATEST_FILENAME..."
+            aws s3 cp "$artifact" "s3://$S3_BUCKET/rocksdb/latest/$LATEST_FILENAME" \
+              --endpoint-url "$S3_ENDPOINT" \
+              --content-type "application/gzip"
+          done
+
+          echo "Latest directory updated"
+
+      - name: Verify upload
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "Verifying uploaded files..."
+          echo ""
+          echo "Files in rocksdb/$VERSION/:"
+          aws s3 ls "s3://$S3_BUCKET/rocksdb/$VERSION/" --endpoint-url "$S3_ENDPOINT"
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo ""
+            echo "Files in rocksdb/latest/:"
+            aws s3 ls "s3://$S3_BUCKET/rocksdb/latest/" --endpoint-url "$S3_ENDPOINT"
+          fi
+
+      - name: Create upload summary
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          echo "## T3 Upload Summary (RocksDB)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Bucket:** $S3_BUCKET" >> $GITHUB_STEP_SUMMARY
+          echo "**Endpoint:** $S3_ENDPOINT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Uploaded Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | T3 Path |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|---------|" >> $GITHUB_STEP_SUMMARY
+          for artifact in artifacts/*; do
+            FILENAME=$(basename "$artifact")
+            echo "| $FILENAME | s3://$S3_BUCKET/rocksdb/$VERSION/$FILENAME |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Latest Directory" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Files uploaded with version-agnostic names:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for artifact in artifacts/*; do
+              FILENAME=$(basename "$artifact")
+              LATEST_FILENAME=$(echo "$FILENAME" | sed "s/-$VERSION//")
+              echo "- \`$LATEST_FILENAME\`" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
