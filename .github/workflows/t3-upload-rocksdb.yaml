@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: ["Build RocksDB Artifacts"]
     types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
@@ -125,10 +126,14 @@ jobs:
 
           echo "Updating rocksdb/latest/ directory to $VERSION..."
 
+          # Upload with version-agnostic names so files get replaced on each release
+          # e.g., rocksdb-static-10.4.2-Linux-x86_64.tar.gz -> rocksdb-static-Linux-x86_64.tar.gz
           for artifact in artifacts/*; do
             FILENAME=$(basename "$artifact")
-            echo "Updating latest/$FILENAME..."
-            aws s3 cp "$artifact" "s3://$S3_BUCKET/rocksdb/latest/$FILENAME" \
+            # Remove version from filename: rocksdb-static-{VERSION}-{OS}-{ARCH}.tar.gz -> rocksdb-static-{OS}-{ARCH}.tar.gz
+            LATEST_FILENAME=$(echo "$FILENAME" | sed "s/-$VERSION//")
+            echo "Updating latest/$LATEST_FILENAME..."
+            aws s3 cp "$artifact" "s3://$S3_BUCKET/rocksdb/latest/$LATEST_FILENAME" \
               --endpoint-url "$S3_ENDPOINT" \
               --content-type "application/gzip"
           done
@@ -174,5 +179,13 @@ jobs:
 
           if [ "${{ github.event_name }}" = "workflow_run" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Note:** \`rocksdb/latest/\` directory also updated" >> $GITHUB_STEP_SUMMARY
+            echo "### Latest Directory" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Files uploaded with version-agnostic names:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for artifact in artifacts/*; do
+              FILENAME=$(basename "$artifact")
+              LATEST_FILENAME=$(echo "$FILENAME" | sed "s/-$VERSION//")
+              echo "- \`$LATEST_FILENAME\`" >> $GITHUB_STEP_SUMMARY
+            done
           fi
