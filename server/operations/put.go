@@ -83,32 +83,52 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 	buf, release := bufferpool.AcquireBuffer(DefaultStreamBufferSize)
 	defer release()
 
-	first := true
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	// Always send the first message with key and TTL, even if data is empty
+	firstReq := &pb.PutRequest{
+		Key:        key,
+		TtlSeconds: int64(ttl),
+	}
 
-		n, err := body.Read(buf)
-		if n > 0 {
-			req := &pb.PutRequest{Data: buf[:n]}
-			if first {
-				req.Key = key
-				req.TtlSeconds = int64(ttl)
-				first = false
+	// Read first chunk of data
+	n, err := body.Read(buf)
+	if n > 0 {
+		firstReq.Data = buf[:n]
+	}
+	if sendErr := stream.Send(firstReq); sendErr != nil {
+		return sendErr
+	}
+	if n > 0 {
+		recordBytesTransferred("upload", int64(n))
+	}
+
+	// If first read hit EOF, we're done (handles empty data case)
+	if err == io.EOF {
+		// Continue to CloseAndRecv below
+	} else if err != nil {
+		return err
+	} else {
+		// Stream remaining data
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
-			if sendErr := stream.Send(req); sendErr != nil {
-				return sendErr
+
+			n, err := body.Read(buf)
+			if n > 0 {
+				req := &pb.PutRequest{Data: buf[:n]}
+				if sendErr := stream.Send(req); sendErr != nil {
+					return sendErr
+				}
+				recordBytesTransferred("upload", int64(n))
 			}
-			recordBytesTransferred("upload", int64(n))
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
 		}
 	}
 
