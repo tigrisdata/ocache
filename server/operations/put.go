@@ -37,27 +37,26 @@ func (o *Operations) Put(ctx context.Context, key string, body io.Reader, ttl in
 	return err
 }
 
-// PutLocal stores data in local storage directly with retry support.
-// The body must implement io.Seeker (e.g., bytes.Reader) for retries to work correctly.
-// For non-seekable readers (e.g., io.PipeReader from streaming), use PutLocalDirect instead.
+// PutLocal stores data in local storage directly.
+// If the body implements io.Seeker (e.g., bytes.Reader), retries are enabled with automatic reset.
+// For non-seekable readers (e.g., io.PipeReader from streaming), no retries are attempted
+// since the reader cannot be rewound.
 func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, ttl int) error {
+	// Check if we can retry (reader is seekable)
+	seeker, canRetry := body.(io.Seeker)
+
+	if !canRetry {
+		// Non-seekable reader (e.g., io.PipeReader) - no retry possible
+		return o.storage.Put(key, body, ttl)
+	}
+
+	// Seekable reader (e.g., bytes.Reader) - retry with reset
 	return retry.DoWithKey(ctx, retry.DefaultConfig(), "Put", key, func() error {
-		// Reset reader position if it's a seeker (e.g., bytes.Reader)
-		// This ensures retries start from the beginning of the data
-		if seeker, ok := body.(io.Seeker); ok {
-			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-				return err
-			}
+		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+			return err
 		}
 		return o.storage.Put(key, body, ttl)
 	})
-}
-
-// PutLocalDirect stores data in local storage directly without retry.
-// This is used for streaming Put operations where the reader (io.PipeReader)
-// cannot be rewound for retries. The client would need to resend the entire stream.
-func (o *Operations) PutLocalDirect(ctx context.Context, key string, body io.Reader, ttl int) error {
-	return o.storage.Put(key, body, ttl)
 }
 
 // putRemote sends data to a remote node via gRPC streaming.
