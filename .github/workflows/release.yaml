@@ -212,6 +212,7 @@ jobs:
             "proto"
             "coordinator"
             "storage"
+            "embedded"
             "client"
             "server"
           )
