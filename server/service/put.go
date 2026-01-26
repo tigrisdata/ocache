@@ -53,11 +53,11 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 
-	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
+	// Start the put operation in a goroutine so it can consume the pipe as we write to it
 	go func() {
 		// Note: We don't retry streaming Put operations at service layer since
 		// the client would need to resend the entire stream
-		errCh <- s.storage.Put(key, pr, ttl)
+		errCh <- s.ops.PutLocal(stream.Context(), key, pr, ttl)
 	}()
 
 	// Write the first chunk's data if any
