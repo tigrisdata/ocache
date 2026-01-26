@@ -37,7 +37,7 @@ func (s *CacheService) Put(stream pb.CacheService_PutServer) error {
 	}
 
 	// If clustering is enabled, handle routing
-	if s.coordinator != nil && !s.coordinator.IsLocal(key) {
+	if s.coordinator != nil && !s.ops.IsLocal(key) {
 		return s.forwardStreamingPut(stream, firstChunk)
 	}
 
