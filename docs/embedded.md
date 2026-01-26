@@ -96,7 +96,7 @@ func main() {
     cache, err := embedded.New(&embedded.Config{
         DiskPath:     "/var/cache/myapp",
         TTL:          time.Hour,
-        MaxDiskUsage: 10 * 1024 * 1024 * 1024, // 10GB
+        MaxDiskUsage: 100 * 1024 * 1024 * 1024, // 100GB
     })
     if err != nil {
         log.Fatal(err)
@@ -164,7 +164,7 @@ func main() {
     cache, err := embedded.New(&embedded.Config{
         DiskPath:      "/var/cache/myapp",
         TTL:           time.Hour,
-        MaxDiskUsage:  10 * 1024 * 1024 * 1024,
+        MaxDiskUsage:  100 * 1024 * 1024 * 1024, // 100GB
         NodeID:        nodeID,
         ClusterAddr:   clusterAddr,
         GRPCAddr:      grpcAddr,
@@ -213,60 +213,6 @@ func main() {
     }
     log.Printf("Found %d sessions across cluster", len(keys))
 }
-```
-
-### Kubernetes StatefulSet Example
-
-Example Kubernetes deployment for a 3-node cluster:
-
-```yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: myapp
-spec:
-  serviceName: myapp
-  replicas: 3
-  selector:
-    matchLabels:
-      app: myapp
-  template:
-    metadata:
-      labels:
-        app: myapp
-    spec:
-      containers:
-      - name: myapp
-        image: myapp:latest
-        env:
-        - name: NODE_ID
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: CLUSTER_ADDR
-          value: ":7000"
-        - name: GRPC_ADDR
-          value: ":9000"
-        - name: ADVERTISE
-          value: "$(NODE_ID).myapp.default.svc.cluster.local:9000"
-        - name: SEEDS
-          value: "myapp-0.myapp:7000,myapp-1.myapp:7000,myapp-2.myapp:7000"
-        ports:
-        - containerPort: 7000
-          name: cluster
-        - containerPort: 9000
-          name: grpc
-        volumeMounts:
-        - name: cache
-          mountPath: /var/cache/myapp
-  volumeClaimTemplates:
-  - metadata:
-      name: cache
-    spec:
-      accessModes: ["ReadWriteOnce"]
-      resources:
-        requests:
-          storage: 10Gi
 ```
 
 ## Operations
@@ -401,7 +347,7 @@ mypb.RegisterMyServiceServer(cache.GetGRPCServer(), myService)
 config := &embedded.Config{
     DiskPath:     "/var/cache/myapp",
     TTL:          time.Hour,
-    MaxDiskUsage: 10 * 1024 * 1024 * 1024, // 10GB limit
+    MaxDiskUsage: 100 * 1024 * 1024 * 1024, // 100GB limit
 
     // Tune inline threshold based on your data:
     // - Smaller values: More files, better for large objects
