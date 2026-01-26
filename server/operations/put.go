@@ -7,6 +7,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/bufferpool"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
 )
@@ -36,8 +37,9 @@ func (o *Operations) Put(ctx context.Context, key string, body io.Reader, ttl in
 	return err
 }
 
-// PutLocal stores data in local storage directly.
-// This is used by CacheService for streaming and by embedded clients for local access.
+// PutLocal stores data in local storage directly with retry support.
+// The body must implement io.Seeker (e.g., bytes.Reader) for retries to work correctly.
+// For non-seekable readers (e.g., io.PipeReader from streaming), use PutLocalDirect instead.
 func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, ttl int) error {
 	return retry.DoWithKey(ctx, retry.DefaultConfig(), "Put", key, func() error {
 		// Reset reader position if it's a seeker (e.g., bytes.Reader)
@@ -51,8 +53,22 @@ func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, t
 	})
 }
 
+// PutLocalDirect stores data in local storage directly without retry.
+// This is used for streaming Put operations where the reader (io.PipeReader)
+// cannot be rewound for retries. The client would need to resend the entire stream.
+func (o *Operations) PutLocalDirect(ctx context.Context, key string, body io.Reader, ttl int) error {
+	return o.storage.Put(key, body, ttl)
+}
+
 // putRemote sends data to a remote node via gRPC streaming.
 func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, ttl int) error {
+	// Increment hop count for forwarding loop detection
+	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
+	if err != nil {
+		zlog.Warn().Err(err).Str("key", key).Msg("Hop count limit exceeded for put")
+		return err
+	}
+
 	client, err := o.Route(key)
 	if err != nil {
 		zlog.Warn().Err(err).Str("key", key).Msg("Failed to route key for put")

@@ -6,6 +6,7 @@ import (
 	"io"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
@@ -56,6 +57,13 @@ func (o *Operations) GetLocal(ctx context.Context, key string, start, end int64)
 // getRemote fetches data from a remote node via gRPC.
 // Returns (reader, found, error) to be consistent with GetLocal.
 func (o *Operations) getRemote(ctx context.Context, key string, start, end int64) (io.Reader, bool, error) {
+	// Increment hop count for forwarding loop detection
+	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
+	if err != nil {
+		zlog.Warn().Err(err).Str("key", key).Msg("Hop count limit exceeded for get")
+		return nil, false, err
+	}
+
 	client, err := o.Route(key)
 	if err != nil {
 		zlog.Warn().Err(err).Str("key", key).Msg("Failed to route key")
