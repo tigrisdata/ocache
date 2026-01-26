@@ -128,7 +128,7 @@ func New(cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
 
-	// Create coordinator if cluster mode is enabled
+	// Create and start coordinator if cluster mode is enabled
 	var coord *coordinator.Coordinator
 	if cfg.IsClusterMode() {
 		coordCfg := &coordinator.Config{
@@ -144,6 +144,13 @@ func New(cfg *Config) (*Client, error) {
 		if err != nil {
 			storage.Close()
 			return nil, fmt.Errorf("failed to create coordinator: %w", err)
+		}
+
+		// Start the coordinator to begin memberlist gossip and ring lifecycler
+		if err := coord.Start(context.Background()); err != nil {
+			coord.Stop()
+			storage.Close()
+			return nil, fmt.Errorf("failed to start coordinator: %w", err)
 		}
 	}
 
@@ -318,16 +325,9 @@ func (c *Client) Close() error {
 
 	var errs []error
 
-	// Stop gRPC server
+	// Stop gRPC server (GracefulStop also closes the listener)
 	if c.grpcServer != nil {
 		c.grpcServer.GracefulStop()
-	}
-
-	// Close gRPC listener
-	if c.grpcLis != nil {
-		if err := c.grpcLis.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close gRPC listener: %w", err))
-		}
 	}
 
 	// Stop coordinator
