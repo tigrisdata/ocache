@@ -40,6 +40,13 @@ func (o *Operations) Put(ctx context.Context, key string, body io.Reader, ttl in
 // This is used by CacheService for streaming and by embedded clients for local access.
 func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, ttl int) error {
 	return retry.DoWithKey(ctx, retry.DefaultConfig(), "Put", key, func() error {
+		// Reset reader position if it's a seeker (e.g., bytes.Reader)
+		// This ensures retries start from the beginning of the data
+		if seeker, ok := body.(io.Seeker); ok {
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+		}
 		return o.storage.Put(key, body, ttl)
 	})
 }

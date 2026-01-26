@@ -179,9 +179,18 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 	}
 
 	// Parse continuation token if provided
-	nodeCursors, err := o.parseContinuationToken(continuationToken, prefix)
+	nodeCursors, isPlainStartKey, err := o.parseContinuationToken(continuationToken, prefix)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("invalid continuation token: %w", err)
+	}
+
+	// If the token is a plain start key (for backwards compatibility with single-node mode),
+	// initialize all nodes to start from this key
+	if isPlainStartKey && continuationToken != "" {
+		nodeCursors = make(map[string]string)
+		for _, node := range nodes {
+			nodeCursors[node.ID] = continuationToken
+		}
 	}
 
 	zlog.Debug().
@@ -391,30 +400,37 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 	return result, nodeCursors, hasMore, nil
 }
 
-// parseContinuationToken decodes the continuation token
-func (o *Operations) parseContinuationToken(token string, prefix string) (map[string]string, error) {
+// parseContinuationToken decodes the continuation token.
+// Returns (nodeCursors, isPlainStartKey, error).
+// If the token is not a valid cluster token (e.g., a plain start key for backwards compatibility),
+// returns (nil, true, nil) to indicate the token should be treated as a plain start key.
+func (o *Operations) parseContinuationToken(token string, prefix string) (map[string]string, bool, error) {
 	if token == "" {
-		return make(map[string]string), nil
+		return make(map[string]string), false, nil
 	}
 
 	// Decode base64
 	decoded, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
-		return nil, fmt.Errorf("invalid base64: %w", err)
+		// Not a valid cluster token - treat as plain start key for backwards compatibility
+		zlog.Debug().Str("token", token).Msg("Token is not base64, treating as plain start key")
+		return nil, true, nil
 	}
 
 	// Parse JSON
 	var ct ContinuationToken
 	if err := json.Unmarshal(decoded, &ct); err != nil {
-		return nil, fmt.Errorf("invalid JSON: %w", err)
+		// Valid base64 but not valid JSON - treat as plain start key
+		zlog.Debug().Str("token", token).Msg("Token is not valid JSON, treating as plain start key")
+		return nil, true, nil
 	}
 
 	// Validate prefix matches
 	if ct.Prefix != prefix {
-		return nil, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", ct.Prefix, prefix)
+		return nil, false, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", ct.Prefix, prefix)
 	}
 
-	return ct.NodeCursors, nil
+	return ct.NodeCursors, false, nil
 }
 
 // encodeContinuationToken creates a continuation token from node cursors

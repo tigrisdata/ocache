@@ -8,6 +8,8 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Get retrieves data for the given key with automatic routing.
@@ -27,12 +29,9 @@ func (o *Operations) Get(ctx context.Context, key string, start, end int64) (io.
 	}
 
 	// Remote key - fetch via gRPC
-	reader, err := o.getRemote(ctx, key, start, end)
+	reader, found, err := o.getRemote(ctx, key, start, end)
 	done(err)
-	if err != nil {
-		return nil, false, err
-	}
-	return reader, true, nil
+	return reader, found, err
 }
 
 // GetLocal retrieves data from local storage directly.
@@ -55,12 +54,12 @@ func (o *Operations) GetLocal(ctx context.Context, key string, start, end int64)
 }
 
 // getRemote fetches data from a remote node via gRPC.
-// Returns an io.Reader that reads from the gRPC stream.
-func (o *Operations) getRemote(ctx context.Context, key string, start, end int64) (io.Reader, error) {
+// Returns (reader, found, error) to be consistent with GetLocal.
+func (o *Operations) getRemote(ctx context.Context, key string, start, end int64) (io.Reader, bool, error) {
 	client, err := o.Route(key)
 	if err != nil {
 		zlog.Warn().Err(err).Str("key", key).Msg("Failed to route key")
-		return nil, err
+		return nil, false, err
 	}
 
 	req := &pb.GetRequest{
@@ -71,7 +70,11 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 
 	stream, err := client.Get(ctx, req)
 	if err != nil {
-		return nil, err
+		// Check for NotFound status - return (nil, false, nil) for consistency
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 
 	// Collect all data from the stream into a buffer
@@ -84,7 +87,11 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 			break
 		}
 		if err != nil {
-			return nil, err
+			// Check for NotFound status during streaming
+			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+				return nil, false, nil
+			}
+			return nil, false, err
 		}
 		if len(resp.Data) > 0 {
 			buf.Write(resp.Data)
@@ -92,7 +99,7 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 		}
 	}
 
-	return &buf, nil
+	return &buf, true, nil
 }
 
 // GetBytes retrieves data as a byte slice with automatic routing.
@@ -103,14 +110,16 @@ func (o *Operations) GetBytes(ctx context.Context, key string) ([]byte, bool, er
 		return nil, found, err
 	}
 
+	// Ensure reader is closed even if ReadAll fails
+	defer func() {
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, false, err
-	}
-
-	// Close the reader if it's a closer
-	if closer, ok := reader.(io.Closer); ok {
-		closer.Close()
 	}
 
 	return data, true, nil
@@ -123,14 +132,16 @@ func (o *Operations) GetRange(ctx context.Context, key string, start, end int64)
 		return nil, found, err
 	}
 
+	// Ensure reader is closed even if ReadAll fails
+	defer func() {
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, false, err
-	}
-
-	// Close the reader if it's a closer
-	if closer, ok := reader.(io.Closer); ok {
-		closer.Close()
 	}
 
 	return data, true, nil
