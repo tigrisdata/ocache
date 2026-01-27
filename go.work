@@ -5,6 +5,7 @@ use (
 	./common
 	./coordinator
 	./coordinator/proto
+	./embedded
 	./proto
 	./server
 	./storage
