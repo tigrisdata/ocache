@@ -37,7 +37,7 @@ func (s *CacheService) Put(stream pb.CacheService_PutServer) error {
 	}
 
 	// If clustering is enabled, handle routing
-	if s.coordinator != nil && !s.coordinator.IsLocal(key) {
+	if s.coordinator != nil && !s.ops.IsLocal(key) {
 		return s.forwardStreamingPut(stream, firstChunk)
 	}
 
@@ -53,11 +53,11 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 
-	// Start storage.Put in a goroutine so it can consume the pipe as we write to it
+	// Start the put operation in a goroutine so it can consume the pipe as we write to it
 	go func() {
-		// Note: We don't retry streaming Put operations at service layer since
-		// the client would need to resend the entire stream
-		errCh <- s.storage.Put(key, pr, ttl)
+		// Note: PutLocal auto-detects that io.PipeReader is not seekable,
+		// so it won't attempt retries. The client would need to resend the entire stream.
+		errCh <- s.ops.PutLocal(stream.Context(), key, pr, ttl)
 	}()
 
 	// Write the first chunk's data if any

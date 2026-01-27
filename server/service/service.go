@@ -10,6 +10,7 @@ import (
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/operations"
 	stor "github.com/tigrisdata/ocache/storage"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 
@@ -28,6 +29,7 @@ type CacheService struct {
 	pb.UnimplementedCacheServiceServer
 	coordinator *coordinator.Coordinator
 	storage     *stor.Storage
+	ops         *operations.Operations
 }
 
 // NewCacheService creates a new cache service, optionally with clustering support
@@ -35,7 +37,14 @@ func NewCacheService(coord *coordinator.Coordinator, storage *stor.Storage) *Cac
 	return &CacheService{
 		coordinator: coord,
 		storage:     storage,
+		ops:         operations.New(storage, coord),
 	}
+}
+
+// Operations returns the underlying operations layer for embedded use.
+// This allows embedded clients to access the routing logic directly.
+func (s *CacheService) Operations() *operations.Operations {
+	return s.ops
 }
 
 // GetTopology returns the current cluster topology (for cluster-aware clients)

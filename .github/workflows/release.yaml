@@ -206,6 +206,7 @@ jobs:
           # 1. Leaf modules (no internal dependencies)
           # 2. Modules that depend on leaves
           # 3. Client and server modules
+          # 4. Embedded module (depends on client and server)
           MODULES=(
             "common"
             "coordinator/proto"
@@ -214,6 +215,7 @@ jobs:
             "storage"
             "client"
             "server"
+            "embedded"
           )
 
           for module in "${MODULES[@]}"; do

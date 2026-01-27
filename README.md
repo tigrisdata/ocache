@@ -72,6 +72,7 @@ See [Docker Guide](docs/docker.md) for detailed configuration options.
 - [Docker Guide](docs/docker.md) - Docker deployment and configuration
 - [Cluster Mode](docs/cluster.md) - Distributed caching setup and operations
 - [Client Documentation](docs/client.md) - Go client library
+- [Embedded Client](docs/embedded.md) - Embed OCache in your Go application
 - [CLI Client](docs/cli.md) - Command-line client usage
 - [HTTP API Reference](docs/http_api.md) - HTTP REST API
 - [Configuration](docs/configuration.md) - Server flags and tuning

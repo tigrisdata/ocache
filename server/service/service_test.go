@@ -33,9 +33,7 @@ func setupTestStorage(t *testing.T) *stor.Storage {
 
 func TestCacheService_PutObjectAndGet(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	key := "testkey"
 	value := []byte("hello world")
 	ctx := context.Background()
@@ -74,9 +72,7 @@ func (m *mockGetServer) Context() context.Context {
 
 func TestCacheService_Delete(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	key := "delkey"
 	value := []byte("bye")
 	ctx := context.Background()
@@ -94,9 +90,7 @@ func TestCacheService_Delete(t *testing.T) {
 
 func TestCacheService_List(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	ctx := context.Background()
 	keys := []string{"a", "b", "c"}
 	for _, k := range keys {
@@ -121,9 +115,7 @@ func TestCacheService_List(t *testing.T) {
 
 func TestCacheService_ListWithPrefix(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	ctx := context.Background()
 
 	// Create test keys with different prefixes
@@ -198,9 +190,7 @@ func TestCacheService_ListWithPrefix(t *testing.T) {
 
 func TestCacheService_List_Pagination(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	ctx := context.Background()
 
 	// Create 50 keys to test pagination
@@ -254,9 +244,7 @@ func TestCacheService_List_Pagination(t *testing.T) {
 
 func TestCacheService_ListLocal(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	ctx := context.Background()
 
 	// Create test keys
@@ -284,9 +272,7 @@ func TestCacheService_ListLocal(t *testing.T) {
 
 func TestCacheService_Put_TTL(t *testing.T) {
 	s := setupTestStorage(t)
-	svc := &CacheService{
-		storage: s,
-	}
+	svc := NewCacheService(nil, s)
 	key := "ttlkey"
 	value := []byte("with ttl")
 	ctx := context.Background()

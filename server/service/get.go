@@ -9,7 +9,6 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
-	"github.com/tigrisdata/ocache/storage/retry"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -26,18 +25,12 @@ func (s *CacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 	defer metrics.StreamsActive.Dec()
 
 	// If clustering is enabled, handle routing
-	if s.coordinator != nil && !s.coordinator.IsLocal(req.Key) {
+	if s.coordinator != nil && !s.ops.IsLocal(req.Key) {
 		return s.forwardStreamingGet(req, stream)
 	}
 
-	// Wrap Get with retry logic for retryable errors
-	var r io.Reader
-	var found bool
-	err := retry.DoWithKey(stream.Context(), retry.DefaultConfig(), "Get", req.Key, func() error {
-		var getErr error
-		r, found, getErr = s.storage.Get(req.Key, req.Start, req.End)
-		return getErr
-	})
+	// Use operations layer for local storage access
+	r, found, err := s.ops.GetLocal(stream.Context(), req.Key, req.Start, req.End)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Get", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "Get").Inc()
