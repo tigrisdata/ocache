@@ -140,10 +140,9 @@ func New(config *Config) (*Coordinator, error) {
 	// Create router with ring manager, passing through any custom dial options
 	var router *Router
 	if config.RouterConfig != nil {
-		if len(config.GRPCDialOptions) > 0 {
-			config.RouterConfig.GRPCDialOptions = append(config.RouterConfig.GRPCDialOptions, config.GRPCDialOptions...)
-		}
-		router = NewRouterWithConfig(ringManager, config.MyNodeID, config.RouterConfig)
+		routerCfg := *config.RouterConfig
+		routerCfg.GRPCDialOptions = append(routerCfg.GRPCDialOptions, config.GRPCDialOptions...)
+		router = NewRouterWithConfig(ringManager, config.MyNodeID, &routerCfg)
 	} else {
 		routerCfg := DefaultRouterConfig()
 		routerCfg.GRPCDialOptions = config.GRPCDialOptions
