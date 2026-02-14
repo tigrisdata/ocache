@@ -58,6 +58,14 @@ type Config struct {
 
 	// RequestLogging enables logging of gRPC requests (default: false)
 	RequestLogging bool
+
+	// GRPCServerOptions are additional gRPC server options (e.g., auth interceptors).
+	// These are appended after the default options (message size limits, epoch interceptors).
+	GRPCServerOptions []grpc.ServerOption
+
+	// GRPCDialOptions are additional gRPC dial options for inter-node connections (e.g., auth interceptors).
+	// These are appended after the default options (transport credentials, keepalive, message size).
+	GRPCDialOptions []grpc.DialOption
 }
 
 // SetDefaults sets default values for unspecified config fields.
@@ -132,13 +140,14 @@ func New(cfg *Config) (*Client, error) {
 	var coord *coordinator.Coordinator
 	if cfg.IsClusterMode() {
 		coordCfg := &coordinator.Config{
-			Enabled:       true,
-			MyNodeID:      cfg.NodeID,
-			ClusterAddr:   cfg.ClusterAddr,
-			ListenAddr:    cfg.GRPCAddr,
-			AdvertiseAddr: cfg.AdvertiseAddr,
-			Seeds:         cfg.SeedNodes,
-			DiskPath:      cfg.DiskPath,
+			Enabled:         true,
+			MyNodeID:        cfg.NodeID,
+			ClusterAddr:     cfg.ClusterAddr,
+			ListenAddr:      cfg.GRPCAddr,
+			AdvertiseAddr:   cfg.AdvertiseAddr,
+			Seeds:           cfg.SeedNodes,
+			DiskPath:        cfg.DiskPath,
+			GRPCDialOptions: cfg.GRPCDialOptions,
 		}
 		coord, err = coordinator.New(coordCfg)
 		if err != nil {
@@ -189,6 +198,9 @@ func (c *Client) StartGRPCServer() error {
 			grpc.ChainStreamInterceptor(coordinator.StreamServerEpochInterceptor(c.coordinator.GetEpoch)),
 		)
 	}
+
+	// Append any custom server options (e.g., auth interceptors)
+	opts = append(opts, c.config.GRPCServerOptions...)
 
 	c.grpcServer = grpc.NewServer(opts...)
 	pb.RegisterCacheServiceServer(c.grpcServer, c.service)
