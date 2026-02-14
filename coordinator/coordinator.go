@@ -141,7 +141,7 @@ func New(config *Config) (*Coordinator, error) {
 	var router *Router
 	if config.RouterConfig != nil {
 		if len(config.GRPCDialOptions) > 0 {
-			config.RouterConfig.GRPCDialOptions = config.GRPCDialOptions
+			config.RouterConfig.GRPCDialOptions = append(config.RouterConfig.GRPCDialOptions, config.GRPCDialOptions...)
 		}
 		router = NewRouterWithConfig(ringManager, config.MyNodeID, config.RouterConfig)
 	} else {
