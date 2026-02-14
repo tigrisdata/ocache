@@ -11,6 +11,7 @@ import (
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -34,6 +35,10 @@ type Config struct {
 
 	// Router configuration
 	RouterConfig *RouterConfig
+
+	// GRPCDialOptions are additional gRPC dial options for inter-node connections.
+	// These are passed through to the Router and appended to outgoing connections.
+	GRPCDialOptions []grpc.DialOption
 
 	// Registerer is the prometheus registerer to use. If nil, uses prometheus.DefaultRegisterer.
 	// This is useful for tests to avoid duplicate registration panics.
@@ -132,12 +137,17 @@ func New(config *Config) (*Coordinator, error) {
 		return nil, fmt.Errorf("failed to create ring manager: %w", err)
 	}
 
-	// Create router with ring manager
+	// Create router with ring manager, passing through any custom dial options
 	var router *Router
 	if config.RouterConfig != nil {
+		if len(config.GRPCDialOptions) > 0 {
+			config.RouterConfig.GRPCDialOptions = config.GRPCDialOptions
+		}
 		router = NewRouterWithConfig(ringManager, config.MyNodeID, config.RouterConfig)
 	} else {
-		router = NewRouter(ringManager, config.MyNodeID)
+		routerCfg := DefaultRouterConfig()
+		routerCfg.GRPCDialOptions = config.GRPCDialOptions
+		router = NewRouterWithConfig(ringManager, config.MyNodeID, routerCfg)
 	}
 
 	coord := &Coordinator{
