@@ -51,6 +51,9 @@ type RouterConfig struct {
 	// Circuit breaker parameters
 	CircuitBreakerThreshold int           // Number of consecutive failures to open circuit
 	CircuitBreakerTimeout   time.Duration // How long to wait before attempting to close circuit
+	// GRPCDialOptions are additional gRPC dial options applied to all outgoing connections.
+	// These are appended after the default options (transport credentials, keepalive, message size).
+	GRPCDialOptions []grpc.DialOption
 }
 
 // DefaultRouterConfig returns a RouterConfig with sensible defaults
@@ -301,8 +304,8 @@ func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
 		PermitWithoutStream: true,
 	}
 
-	// Create connection without blocking
-	conn, err := grpc.DialContext(ctx, address,
+	// Build dial options with defaults, then append any custom options
+	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepaliveParams),
 		grpc.WithDefaultCallOptions(
@@ -310,7 +313,10 @@ func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
 			grpc.MaxCallSendMsgSize(r.config.MaxSendMsgSize),
 		),
 		grpc.WithBlock(),
-	)
+	}
+	dialOpts = append(dialOpts, r.config.GRPCDialOptions...)
+
+	conn, err := grpc.DialContext(ctx, address, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC client for node %s: %w", address, err)
 	}
