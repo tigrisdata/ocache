@@ -33,6 +33,12 @@ func (z *zerologAdapter) Log(keyvals ...interface{}) error {
 					event = zlog.Warn()
 				case "info":
 					event = zlog.Info()
+				case "debug":
+					// Map dskit debug to zerolog Trace to reduce noise.
+					// Memberlist gossip emits very frequent debug messages
+					// (e.g., "Invalidating forwarded broadcast", "CAS attempt failed")
+					// that are not useful for normal verbose logging.
+					event = zlog.Trace()
 				default:
 					event = zlog.Debug()
 				}
