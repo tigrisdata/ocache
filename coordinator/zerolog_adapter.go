@@ -33,6 +33,9 @@ func (z *zerologAdapter) Log(keyvals ...interface{}) error {
 					event = zlog.Warn()
 				case "info":
 					event = zlog.Info()
+				case "debug":
+					// Map dskit debug to zerolog Trace to reduce noise.
+					event = zlog.Trace()
 				default:
 					event = zlog.Debug()
 				}
