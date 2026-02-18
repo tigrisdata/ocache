@@ -22,23 +22,32 @@ func (z *zerologAdapter) Log(keyvals ...interface{}) error {
 			continue
 		}
 
-		// Check for "level" key to set appropriate log level
+		// Check for "level" key to set appropriate log level.
+		// Handle both fmt.Stringer (go-kit level.Value) and plain string
+		// (dskit's memberlist logger fallback for unrecognized levels).
 		if key == "level" {
-			levelStr, ok := keyvals[i+1].(fmt.Stringer)
-			if ok {
-				switch levelStr.String() {
-				case "error":
-					event = zlog.Error()
-				case "warn":
-					event = zlog.Warn()
-				case "info":
-					event = zlog.Info()
-				case "debug":
-					// Map dskit debug to zerolog Trace to reduce noise.
-					event = zlog.Trace()
-				default:
-					event = zlog.Debug()
-				}
+			var lvl string
+			switch v := keyvals[i+1].(type) {
+			case fmt.Stringer:
+				lvl = v.String()
+			case string:
+				lvl = v
+			}
+
+			switch lvl {
+			case "error":
+				event = zlog.Error()
+			case "warn":
+				event = zlog.Warn()
+			case "info":
+				event = zlog.Info()
+			case "debug":
+				// Map dskit debug to zerolog Trace to reduce noise.
+				event = zlog.Trace()
+			case "":
+				// Unrecognized type; keep the default INFO level.
+			default:
+				event = zlog.Debug()
 			}
 			continue
 		}
