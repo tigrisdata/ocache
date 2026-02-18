@@ -102,6 +102,28 @@ func TestZerologAdapter_DebugSuppressedAtInfoLevel(t *testing.T) {
 	assert.Empty(t, buf.String())
 }
 
+func TestZerologAdapter_UnrecognizedLevelType(t *testing.T) {
+	// When level value is neither fmt.Stringer nor string (e.g., int),
+	// the adapter should preserve the default INFO level.
+	var buf bytes.Buffer
+	origLogger := zlog.Logger
+	origLevel := zerolog.GlobalLevel()
+	zlog.Logger = zerolog.New(&buf)
+	zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	defer func() {
+		zlog.Logger = origLogger
+		zerolog.SetGlobalLevel(origLevel)
+	}()
+
+	adapter := &zerologAdapter{}
+	err := adapter.Log("level", 42, "msg", "unrecognized level type")
+	require.NoError(t, err)
+
+	output := buf.String()
+	assert.Contains(t, output, `"level":"info"`)
+	assert.Contains(t, output, `"msg":"unrecognized level type"`)
+}
+
 func TestZerologAdapter_KeyValueTypes(t *testing.T) {
 	var buf bytes.Buffer
 	origLogger := zlog.Logger

@@ -44,6 +44,8 @@ func (z *zerologAdapter) Log(keyvals ...interface{}) error {
 			case "debug":
 				// Map dskit debug to zerolog Trace to reduce noise.
 				event = zlog.Trace()
+			case "":
+				// Unrecognized type; keep the default INFO level.
 			default:
 				event = zlog.Debug()
 			}
