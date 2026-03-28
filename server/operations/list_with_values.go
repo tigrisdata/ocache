@@ -217,12 +217,6 @@ func (o *Operations) fetchKVFromAllNodes(ctx context.Context, nodes []*ring.Node
 
 // kWayMergeKV performs K-way merge of sorted key-value responses from nodes.
 func (o *Operations) kWayMergeKV(ctx context.Context, nodeResponses map[string]*NodeKVResponse, limit int) ([]*pb.KeyValue, map[string]string, bool, error) {
-	type kvHeapNode struct {
-		entry  *pb.KeyValue
-		nodeID string
-		index  int
-	}
-
 	// Simple slice-based min selection (same logic as kWayMerge but with KV entries)
 	nodeCursors := make(map[string]string)
 	nodeIndices := make(map[string]int)
