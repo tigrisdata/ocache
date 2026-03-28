@@ -433,6 +433,171 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	return keyList, lastKey, hasMore, nil
 }
 
+// KeyValue holds a key and its associated value bytes.
+type KeyValue struct {
+	Key   string
+	Value []byte
+}
+
+// ListKeyValuesWithPagination returns paginated, sorted key-value pairs from RocksDB.
+// For inline values the data is returned directly; for file/segment values the data is
+// read from disk. Returns: (entries, lastKey, hasMore, error).
+func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string, limit int) ([]KeyValue, string, bool, error) {
+	storageType := "unknown"
+	start := time.Now()
+	defer func() {
+		metrics.StorageOperationDuration.WithLabelValues("list_kv_paginated", storageType).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
+	ro := metadata.CreateReadOptions(true, false)
+	it := s.meta.Handle().NewIterator(ro)
+	defer it.Close()
+
+	var entries []KeyValue
+	var lastKey string
+
+	// Determine where to start iteration
+	var seekKey []byte
+	if startKey != "" {
+		seekKey = keys.MakeMetadataKey(startKey)
+	} else if userPrefix != "" {
+		seekKey = keys.MakeMetadataKey(userPrefix)
+	} else {
+		seekKey = []byte(keys.MetadataPrefix)
+	}
+
+	// Construct the prefix boundary for iteration
+	var prefixBoundary []byte
+	if userPrefix != "" {
+		prefixBoundary = keys.MakeMetadataKey(userPrefix)
+	} else {
+		prefixBoundary = []byte(keys.MetadataPrefix)
+	}
+
+	// Seek to start position
+	it.Seek(seekKey)
+
+	// If we have a startKey, skip it (pagination is exclusive)
+	if startKey != "" && it.Valid() {
+		k := it.Key().Data()
+		currentUserKey := keys.ExtractUserKey(k)
+		if currentUserKey == startKey {
+			it.Key().Free()
+			it.Value().Free()
+			it.Next()
+		}
+	}
+
+	// Collect up to limit key-value pairs
+	for it.ValidForPrefix(prefixBoundary) {
+		if limit > 0 && len(entries) >= limit {
+			break
+		}
+
+		k := it.Key().Data()
+		v := it.Value().Data()
+
+		// Try to decode as proto ValueMessage to check expiry
+		valueMsg := &pb.ValueMessage{}
+		if err := proto.Unmarshal(v, valueMsg); err == nil {
+			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
+				it.Key().Free()
+				it.Value().Free()
+				it.Next()
+				continue
+			}
+		} else {
+			// Cannot decode metadata — skip entry
+			it.Key().Free()
+			it.Value().Free()
+			it.Next()
+			continue
+		}
+
+		userKey := keys.ExtractUserKey(k)
+
+		// Read the value bytes based on storage type
+		var data []byte
+		switch valueMsg.ValueType {
+		case pb.ValueType_INLINE:
+			data = make([]byte, len(valueMsg.Data))
+			copy(data, valueMsg.Data)
+		case pb.ValueType_SEGMENT:
+			r, err := s.segmentManager.ReadEntry(userKey, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
+			if err != nil || r == nil {
+				it.Key().Free()
+				it.Value().Free()
+				it.Next()
+				continue
+			}
+			data, err = io.ReadAll(r)
+			if closer, ok := r.(io.Closer); ok {
+				closer.Close()
+			}
+			if err != nil {
+				it.Key().Free()
+				it.Value().Free()
+				it.Next()
+				continue
+			}
+		case pb.ValueType_RAW_FILE:
+			r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+			if err != nil || r == nil {
+				it.Key().Free()
+				it.Value().Free()
+				it.Next()
+				continue
+			}
+			data, err = io.ReadAll(r)
+			if closer, ok := r.(io.Closer); ok {
+				closer.Close()
+			}
+			if err != nil {
+				it.Key().Free()
+				it.Value().Free()
+				it.Next()
+				continue
+			}
+		default:
+			it.Key().Free()
+			it.Value().Free()
+			it.Next()
+			continue
+		}
+
+		entries = append(entries, KeyValue{Key: userKey, Value: data})
+		lastKey = userKey
+
+		it.Key().Free()
+		it.Value().Free()
+		it.Next()
+	}
+
+	if err := it.Err(); err != nil {
+		metrics.StorageOperations.WithLabelValues("list_kv_paginated", storageType, "error").Inc()
+		metrics.Errors.WithLabelValues("rocksdb", "list_kv_paginated").Inc()
+		return nil, "", false, mapRocksDBError("ListKeyValuesWithPagination", "", err)
+	}
+
+	// Check if there are more keys
+	hasMore := it.ValidForPrefix(prefixBoundary)
+	if hasMore {
+		k := it.Key().Data()
+		nextUserKey := keys.ExtractUserKey(k)
+		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
+			hasMore = false
+		}
+		it.Key().Free()
+	}
+
+	if !hasMore {
+		lastKey = ""
+	}
+
+	metrics.StorageOperations.WithLabelValues("list_kv_paginated", storageType, "success").Inc()
+	return entries, lastKey, hasMore, nil
+}
+
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) error {
 	storageType := "unknown"

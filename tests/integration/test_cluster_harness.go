@@ -607,6 +607,25 @@ func (h *ClusterTestHarness) ListPage(prefix string, limit int, continuationToke
 	return keys, nextToken, hasMore, nil
 }
 
+// ListPageWithValues returns a page of key-value pairs with pagination support
+func (h *ClusterTestHarness) ListPageWithValues(prefix string, limit int, continuationToken string) (entries []KeyValueEntry, nextToken string, hasMore bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	clientEntries, nextToken, hasMore, err := h.Client.ListPageWithValues(ctx, prefix, limit, continuationToken)
+	if err != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return nil, "", false, err
+	}
+
+	entries = make([]KeyValueEntry, len(clientEntries))
+	for i, e := range clientEntries {
+		entries[i] = KeyValueEntry{Key: e.Key, Value: e.Value}
+	}
+
+	return entries, nextToken, hasMore, nil
+}
+
 // GetStorageStats returns aggregate storage statistics across all nodes
 func (h *ClusterTestHarness) GetStorageStats() StorageStats {
 	h.mu.RLock()

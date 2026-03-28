@@ -4,6 +4,12 @@ import (
 	"time"
 )
 
+// KeyValueEntry holds a key and its associated value bytes for test harness use.
+type KeyValueEntry struct {
+	Key   string
+	Value []byte
+}
+
 // TestHarnessInterface defines the common interface for both single-node and cluster test harnesses
 type TestHarnessInterface interface {
 	// Object operations
@@ -15,6 +21,7 @@ type TestHarnessInterface interface {
 	// List operations
 	List(prefix string) ([]string, error)
 	ListPage(prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error)
+	ListPageWithValues(prefix string, limit int, continuationToken string) (entries []KeyValueEntry, nextToken string, hasMore bool, err error)
 
 	// Storage inspection
 	GetStorageStats() StorageStats

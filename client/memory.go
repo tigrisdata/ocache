@@ -261,6 +261,30 @@ func (m *MemoryCache) ListPage(ctx context.Context, prefix string, limit int, co
 	return keys, nextToken, hasMore, nil
 }
 
+// ListPageWithValues returns a paginated list of key-value pairs matching the prefix.
+func (m *MemoryCache) ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) (entries []KeyValue, nextToken string, hasMore bool, err error) {
+	keys, nextToken, hasMore, err := m.ListPage(ctx, prefix, limit, continuationToken)
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entries = make([]KeyValue, 0, len(keys))
+	for _, key := range keys {
+		entry, exists := m.data[key]
+		if !exists {
+			continue
+		}
+		valueCopy := make([]byte, len(entry.value))
+		copy(valueCopy, entry.value)
+		entries = append(entries, KeyValue{Key: key, Value: valueCopy})
+	}
+
+	return entries, nextToken, hasMore, nil
+}
+
 // Close clears the cache. This is a no-op for cleanup purposes.
 func (m *MemoryCache) Close() error {
 	m.mu.Lock()
