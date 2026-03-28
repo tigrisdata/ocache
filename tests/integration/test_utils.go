@@ -246,6 +246,22 @@ func (h *IntegrationTestHarness) ListPage(prefix string, limit int, continuation
 	return keys, lastKey, hasMore, nil
 }
 
+// ListPageWithValues returns a page of key-value pairs with pagination support
+func (h *IntegrationTestHarness) ListPageWithValues(prefix string, limit int, continuationToken string) (entries []KeyValueEntry, nextToken string, hasMore bool, err error) {
+	storageEntries, lastKey, more, listErr := h.Storage.ListKeyValuesWithPagination(prefix, continuationToken, limit)
+	if listErr != nil {
+		h.Metrics.ErrorCount.Add(1)
+		return nil, "", false, listErr
+	}
+
+	entries = make([]KeyValueEntry, len(storageEntries))
+	for i, e := range storageEntries {
+		entries[i] = KeyValueEntry{Key: e.Key, Value: e.Value}
+	}
+
+	return entries, lastKey, more, nil
+}
+
 // WaitForCompaction waits for compaction to complete or timeout
 func (h *IntegrationTestHarness) WaitForCompaction(timeout time.Duration) error {
 	start := time.Now()

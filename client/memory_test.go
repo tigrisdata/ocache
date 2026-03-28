@@ -167,6 +167,72 @@ func TestMemoryCache_ListPage(t *testing.T) {
 	}
 }
 
+func TestMemoryCache_ListPageWithValues(t *testing.T) {
+	cache := NewMemoryCache()
+	ctx := context.Background()
+
+	// Put multiple keys with distinct values
+	for i := 0; i < 10; i++ {
+		key := "key" + string(rune('a'+i))
+		require.NoError(t, cache.Put(ctx, key, []byte("value-"+key), 0))
+	}
+
+	// First page
+	entries, nextToken, hasMore, err := cache.ListPageWithValues(ctx, "", 3, "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 3)
+	assert.True(t, hasMore)
+	assert.NotEmpty(t, nextToken)
+
+	// Verify keys are sorted and values match
+	for i := 1; i < len(entries); i++ {
+		assert.LessOrEqual(t, entries[i-1].Key, entries[i].Key)
+	}
+	for _, e := range entries {
+		assert.Equal(t, []byte("value-"+e.Key), e.Value)
+	}
+
+	// Second page
+	entries2, nextToken2, hasMore2, err := cache.ListPageWithValues(ctx, "", 3, nextToken)
+	require.NoError(t, err)
+	assert.Len(t, entries2, 3)
+	assert.True(t, hasMore2)
+
+	// Verify no overlap with first page
+	firstKeys := make(map[string]bool)
+	for _, e := range entries {
+		firstKeys[e.Key] = true
+	}
+	for _, e := range entries2 {
+		assert.False(t, firstKeys[e.Key], "key %s should not appear in second page", e.Key)
+		assert.Equal(t, []byte("value-"+e.Key), e.Value)
+	}
+
+	// Continue until no more
+	token := nextToken2
+	for hasMore2 {
+		entries2, token, hasMore2, err = cache.ListPageWithValues(ctx, "", 3, token)
+		require.NoError(t, err)
+		for _, e := range entries2 {
+			assert.Equal(t, []byte("value-"+e.Key), e.Value)
+		}
+	}
+
+	// Prefix filter
+	entries, _, _, err = cache.ListPageWithValues(ctx, "keya", 10, "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+	assert.Equal(t, "keya", entries[0].Key)
+	assert.Equal(t, []byte("value-keya"), entries[0].Value)
+
+	// Empty results
+	entries, nextToken, hasMore, err = cache.ListPageWithValues(ctx, "zzz", 10, "")
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+	assert.Empty(t, nextToken)
+	assert.False(t, hasMore)
+}
+
 func TestMemoryCache_GetRange(t *testing.T) {
 	cache := NewMemoryCache()
 	ctx := context.Background()

@@ -34,6 +34,15 @@ service CacheService {
   // Returns sorted, paginated keys from this node's storage
   rpc ListLocal (ListRequest) returns (ListResponse);
 
+  rpc ListWithValues (ListRequest) returns (ListWithValuesResponse) {
+    option (google.api.http) = {
+      get: "/v1/cache-entries"
+    };
+  }
+  // ListLocalWithValues is an internal RPC for cluster mode: queries local node only
+  // Returns sorted, paginated key-value pairs from this node's storage
+  rpc ListLocalWithValues (ListRequest) returns (ListWithValuesResponse);
+
   rpc GetTopology (GetTopologyRequest) returns (GetTopologyResponse) {
     option (google.api.http) = {
       get: "/v1/topology"
@@ -82,6 +91,17 @@ message ListResponse {
   repeated string keys = 1;
   string continuation_token = 2; // Token to resume listing from where this response ended
   bool has_more = 3; // True if more keys are available beyond this page
+}
+
+message KeyValue {
+  string key = 1;
+  bytes value = 2;
+}
+
+message ListWithValuesResponse {
+  repeated KeyValue entries = 1;
+  string continuation_token = 2; // Token to resume listing from where this response ended
+  bool has_more = 3; // True if more entries are available beyond this page
 }
 
 message GetTopologyRequest {

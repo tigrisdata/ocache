@@ -279,12 +279,18 @@ func (m *mockCacheServiceServer) List(ctx context.Context, req *pb.ListRequest) 
 		limit = 1000
 	}
 
+	// Support both StartKey and ContinuationToken for pagination
+	startKey := req.StartKey
+	if startKey == "" {
+		startKey = req.ContinuationToken
+	}
+
 	startIdx := 0
-	foundStart := req.StartKey == ""
-	if req.StartKey != "" {
+	foundStart := startKey == ""
+	if startKey != "" {
 		// Find first key after startKey
 		for i, k := range keys {
-			if k > req.StartKey {
+			if k > startKey {
 				startIdx = i
 				foundStart = true
 				break
@@ -318,6 +324,36 @@ func (m *mockCacheServiceServer) List(ctx context.Context, req *pb.ListRequest) 
 // ListLocal is identical to List for the mock
 func (m *mockCacheServiceServer) ListLocal(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
 	return m.List(ctx, req)
+}
+
+// ListWithValues returns key-value pairs with the same pagination as List
+func (m *mockCacheServiceServer) ListWithValues(ctx context.Context, req *pb.ListRequest) (*pb.ListWithValuesResponse, error) {
+	listResp, err := m.List(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	m.dataMu.RLock()
+	defer m.dataMu.RUnlock()
+
+	entries := make([]*pb.KeyValue, len(listResp.Keys))
+	for i, key := range listResp.Keys {
+		entries[i] = &pb.KeyValue{
+			Key:   key,
+			Value: m.data[key],
+		}
+	}
+
+	return &pb.ListWithValuesResponse{
+		Entries:           entries,
+		ContinuationToken: listResp.ContinuationToken,
+		HasMore:           listResp.HasMore,
+	}, nil
+}
+
+// ListLocalWithValues is identical to ListWithValues for the mock
+func (m *mockCacheServiceServer) ListLocalWithValues(ctx context.Context, req *pb.ListRequest) (*pb.ListWithValuesResponse, error) {
+	return m.ListWithValues(ctx, req)
 }
 
 // SetClusterTopology safely sets the cluster topology

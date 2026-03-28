@@ -261,6 +261,74 @@ func (m *MemoryCache) ListPage(ctx context.Context, prefix string, limit int, co
 	return keys, nextToken, hasMore, nil
 }
 
+// ListPageWithValues returns a paginated list of key-value pairs matching the prefix.
+func (m *MemoryCache) ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) (entries []KeyValue, nextToken string, hasMore bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, err
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Build sorted key list under a single lock to avoid TOCTOU between key scan and value reads
+	var allKeys []string
+	now := time.Now()
+	for key, entry := range m.data {
+		if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+			continue
+		}
+		if prefix == "" || strings.HasPrefix(key, prefix) {
+			allKeys = append(allKeys, key)
+		}
+	}
+	sort.Strings(allKeys)
+
+	// Default limit
+	if limit <= 0 {
+		limit = 1000
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	// Find starting position based on continuation token
+	startIdx := 0
+	if continuationToken != "" {
+		for i, k := range allKeys {
+			if k > continuationToken {
+				startIdx = i
+				break
+			}
+		}
+		if startIdx == 0 && len(allKeys) > 0 && continuationToken >= allKeys[len(allKeys)-1] {
+			return nil, "", false, nil
+		}
+	}
+
+	endIdx := startIdx + limit
+	if endIdx > len(allKeys) {
+		endIdx = len(allKeys)
+	}
+
+	pageKeys := allKeys[startIdx:endIdx]
+	hasMore = endIdx < len(allKeys)
+
+	if hasMore && len(pageKeys) > 0 {
+		nextToken = pageKeys[len(pageKeys)-1]
+	}
+
+	// Read values under the same lock
+	entries = make([]KeyValue, 0, len(pageKeys))
+	for _, key := range pageKeys {
+		entry := m.data[key]
+		valueCopy := make([]byte, len(entry.value))
+		copy(valueCopy, entry.value)
+		entries = append(entries, KeyValue{Key: key, Value: valueCopy})
+	}
+
+	return entries, nextToken, hasMore, nil
+}
+
 // Close clears the cache. This is a no-op for cleanup purposes.
 func (m *MemoryCache) Close() error {
 	m.mu.Lock()
