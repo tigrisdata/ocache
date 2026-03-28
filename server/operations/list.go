@@ -53,12 +53,36 @@ func (h *keyHeap) Pop() interface{} {
 	return x
 }
 
-// NodeResponse holds the response from a single node
+// NodeResponse holds the response from a single node.
+// In keys-only mode, Keys is populated. In withValues mode, Entries is populated.
 type NodeResponse struct {
 	NodeID            string
-	Keys              []string
+	Keys              []string       // populated in keys-only mode
+	Entries           []*pb.KeyValue // populated in withValues mode
 	ContinuationToken string
 	HasMore           bool
+}
+
+// itemCount returns the number of items in this response.
+func (nr *NodeResponse) itemCount() int {
+	if len(nr.Entries) > 0 {
+		return len(nr.Entries)
+	}
+	return len(nr.Keys)
+}
+
+// keyAt returns the key at the given index.
+func (nr *NodeResponse) keyAt(i int) string {
+	if len(nr.Entries) > 0 {
+		return nr.Entries[i].Key
+	}
+	return nr.Keys[i]
+}
+
+// mergeResult holds the output of the unified K-way merge.
+type mergeResult struct {
+	Keys    []string       // always populated
+	Entries []*pb.KeyValue // non-nil only in withValues mode
 }
 
 // List returns all keys matching prefix across the entire cluster.
@@ -121,9 +145,12 @@ func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, con
 
 	// If clustering is enabled, perform K-way merge
 	if o.IsClusterMode() {
-		keys, token, hasMore, err := o.listClusterWide(ctx, prefix, limit, continuationToken)
+		merged, token, hasMore, err := o.listClusterWide(ctx, prefix, limit, continuationToken, false)
 		done(err)
-		return keys, token, hasMore, err
+		if err != nil {
+			return nil, "", false, err
+		}
+		return merged.Keys, token, hasMore, nil
 	}
 
 	// Single-node mode: query local storage directly
@@ -168,8 +195,10 @@ func (o *Operations) ListLocal(ctx context.Context, prefix string, limit int, co
 	return keys, nextToken, hasMore, nil
 }
 
-// listClusterWide performs K-way merge of responses from all nodes
-func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit int, continuationToken string) ([]string, string, bool, error) {
+// listClusterWide performs K-way merge of responses from all nodes.
+// When withValues is true, responses include full key-value entries.
+// Returns (mergeResult, continuationToken, hasMore, error).
+func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit int, continuationToken string, withValues bool) (*mergeResult, string, bool, error) {
 	// Get all active nodes from the ring
 	ringMgr := o.GetRing()
 	nodes := ringMgr.GetActiveNodes()
@@ -197,21 +226,22 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 		Str("prefix", prefix).
 		Int("node_count", len(nodes)).
 		Int("limit", limit).
+		Bool("with_values", withValues).
 		Interface("node_cursors", nodeCursors).
 		Msg("Starting cluster-wide List with K-way merge")
 
-	// Fetch keys from all nodes
-	nodeResponses, err := o.fetchFromAllNodes(ctx, nodes, prefix, limit, nodeCursors)
+	// Fetch from all nodes
+	nodeResponses, err := o.fetchFromAllNodes(ctx, nodes, prefix, limit, nodeCursors, withValues)
 	if err != nil {
 		return nil, "", false, err
 	}
 
 	if len(nodeResponses) == 0 {
-		return []string{}, "", false, nil
+		return &mergeResult{Keys: []string{}}, "", false, nil
 	}
 
 	// Perform K-way merge
-	result, newCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit)
+	merged, newCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -226,11 +256,11 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 		}
 	}
 
-	return result, newToken, hasMore, nil
+	return merged, newToken, hasMore, nil
 }
 
-// fetchFromAllNodes fetches keys from all nodes in parallel
-func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, nodeCursors map[string]string) (map[string]*NodeResponse, error) {
+// fetchFromAllNodes fetches keys (or key-value pairs) from all nodes in parallel.
+func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, nodeCursors map[string]string, withValues bool) (map[string]*NodeResponse, error) {
 	localNodeID := o.GetLocalNodeID()
 	router := o.GetRouter()
 
@@ -249,36 +279,46 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 				startKey = cursor
 			}
 
-			var keys []string
-			var nextToken string
-			var hasMore bool
+			resp := &NodeResponse{NodeID: n.ID}
 			var err error
 
-			// If this is the local node, call directly
 			if n.ID == localNodeID {
-				keys, nextToken, hasMore, err = o.ListLocal(ctx, prefix, limit, startKey)
+				if withValues {
+					resp.Entries, resp.ContinuationToken, resp.HasMore, err = o.ListLocalWithValues(ctx, prefix, limit, startKey)
+				} else {
+					resp.Keys, resp.ContinuationToken, resp.HasMore, err = o.ListLocal(ctx, prefix, limit, startKey)
+				}
 			} else {
-				// Remote node: get client
 				client, clientErr := router.GetClientForNode(n.ID)
 				if clientErr != nil {
 					zlog.Warn().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
 					return
 				}
 
-				// Build request for remote node
 				req := &pb.ListRequest{
 					Prefix:   prefix,
 					StartKey: startKey,
 					Limit:    int32(limit),
 				}
 
-				resp, respErr := client.ListLocal(ctx, req)
-				if respErr != nil {
-					err = respErr
+				if withValues {
+					pbResp, respErr := client.ListLocalWithValues(ctx, req)
+					if respErr != nil {
+						err = respErr
+					} else {
+						resp.Entries = pbResp.Entries
+						resp.ContinuationToken = pbResp.ContinuationToken
+						resp.HasMore = pbResp.HasMore
+					}
 				} else {
-					keys = resp.Keys
-					nextToken = resp.ContinuationToken
-					hasMore = resp.HasMore
+					pbResp, respErr := client.ListLocal(ctx, req)
+					if respErr != nil {
+						err = respErr
+					} else {
+						resp.Keys = pbResp.Keys
+						resp.ContinuationToken = pbResp.ContinuationToken
+						resp.HasMore = pbResp.HasMore
+					}
 				}
 			}
 
@@ -287,29 +327,26 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 				return
 			}
 
-			// Store response
 			mu.Lock()
-			responses[n.ID] = &NodeResponse{
-				NodeID:            n.ID,
-				Keys:              keys,
-				ContinuationToken: nextToken,
-				HasMore:           hasMore,
-			}
+			responses[n.ID] = resp
 			mu.Unlock()
 		}(node)
 	}
 
 	wg.Wait()
 
-	zlog.Debug().Int("response_count", len(responses)).Int("node_count", len(nodes)).Msg("Fetched keys from nodes")
+	zlog.Debug().Int("response_count", len(responses)).Int("node_count", len(nodes)).Msg("Fetched from nodes")
 	return responses, nil
 }
 
-// kWayMerge performs K-way merge of sorted responses from nodes
-func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int) ([]string, map[string]string, bool, error) {
+// kWayMerge performs K-way merge of sorted responses from nodes using a min-heap.
+// Works for both keys-only and withValues modes via NodeResponse.keyAt/itemCount.
+func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int) (*mergeResult, map[string]string, bool, error) {
 	// Initialize min-heap
 	h := &keyHeap{}
 	heap.Init(h)
+
+	withValues := false
 
 	// Track node cursors (last key from each node)
 	nodeCursors := make(map[string]string)
@@ -319,9 +356,12 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 
 	// Prime the heap with first key from each node
 	for nodeID, nodeResp := range nodeResponses {
-		if len(nodeResp.Keys) > 0 {
+		if nodeResp.itemCount() > 0 {
+			if len(nodeResp.Entries) > 0 {
+				withValues = true
+			}
 			heap.Push(h, &heapNode{
-				key:    nodeResp.Keys[0],
+				key:    nodeResp.keyAt(0),
 				nodeID: nodeID,
 				done:   false,
 			})
@@ -333,11 +373,16 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 	}
 
 	// Collect merged results
-	result := make([]string, 0, limit)
+	result := &mergeResult{
+		Keys: make([]string, 0, limit),
+	}
+	if withValues {
+		result.Entries = make([]*pb.KeyValue, 0, limit)
+	}
 	seenKeys := make(map[string]bool) // Deduplication (defensive)
 
 	// Merge until we have enough keys or heap is empty
-	for h.Len() > 0 && len(result) < limit {
+	for h.Len() > 0 && len(result.Keys) < limit {
 		select {
 		case <-ctx.Done():
 			return nil, nil, false, ctx.Err()
@@ -353,7 +398,12 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		// Deduplicate (shouldn't happen with proper partitioning, but handle it)
 		addedToResult := false
 		if !seenKeys[minNode.key] {
-			result = append(result, minNode.key)
+			result.Keys = append(result.Keys, minNode.key)
+			if withValues {
+				nodeResp := nodeResponses[minNode.nodeID]
+				idx := nodeIndices[minNode.nodeID]
+				result.Entries = append(result.Entries, nodeResp.Entries[idx])
+			}
 			seenKeys[minNode.key] = true
 			addedToResult = true
 		}
@@ -363,10 +413,10 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		currentIndex := nodeIndices[minNode.nodeID]
 		nextIndex := currentIndex + 1
 
-		if nextIndex < len(nodeResp.Keys) {
+		if nextIndex < nodeResp.itemCount() {
 			// More keys available in this node's response
 			heap.Push(h, &heapNode{
-				key:    nodeResp.Keys[nextIndex],
+				key:    nodeResp.keyAt(nextIndex),
 				nodeID: minNode.nodeID,
 				done:   false,
 			})
@@ -374,7 +424,7 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		}
 
 		// If we hit limit due to a duplicate key, continue to fill up to limit
-		if !addedToResult && len(result) >= limit {
+		if !addedToResult && len(result.Keys) >= limit {
 			break
 		}
 	}
@@ -387,7 +437,7 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		for nodeID, nodeResp := range nodeResponses {
 			if nodeResp.HasMore {
 				idx := nodeIndices[nodeID]
-				if idx >= len(nodeResp.Keys)-1 {
+				if idx >= nodeResp.itemCount()-1 {
 					hasMore = true
 					if nodeResp.ContinuationToken != "" {
 						nodeCursors[nodeID] = nodeResp.ContinuationToken
