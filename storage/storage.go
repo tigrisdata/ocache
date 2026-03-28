@@ -497,7 +497,10 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 		k := it.Key().Data()
 		v := it.Value().Data()
 
-		// Try to decode as proto ValueMessage to check expiry
+		// Try to decode as proto ValueMessage to check expiry.
+		// If unmarshal fails, include the key with nil value to keep
+		// page boundaries consistent with ListKeysWithPagination.
+		var data []byte
 		valueMsg := &pb.ValueMessage{}
 		if err := proto.Unmarshal(v, valueMsg); err == nil {
 			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
@@ -506,65 +509,39 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 				it.Next()
 				continue
 			}
-		} else {
-			// Cannot decode metadata — skip entry
-			it.Key().Free()
-			it.Value().Free()
-			it.Next()
-			continue
+
+			storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
+
+			switch valueMsg.ValueType {
+			case pb.ValueType_INLINE:
+				data = make([]byte, len(valueMsg.Data))
+				copy(data, valueMsg.Data)
+			case pb.ValueType_SEGMENT:
+				r, readErr := s.segmentManager.ReadEntry(keys.ExtractUserKey(k), valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
+				if readErr == nil && r != nil {
+					data, readErr = io.ReadAll(r)
+					if closer, ok := r.(io.Closer); ok {
+						closer.Close()
+					}
+					if readErr != nil {
+						data = nil
+					}
+				}
+			case pb.ValueType_RAW_FILE:
+				r, readErr := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+				if readErr == nil && r != nil {
+					data, readErr = io.ReadAll(r)
+					if closer, ok := r.(io.Closer); ok {
+						closer.Close()
+					}
+					if readErr != nil {
+						data = nil
+					}
+				}
+			}
 		}
 
 		userKey := keys.ExtractUserKey(k)
-
-		// Read the value bytes based on storage type
-		var data []byte
-		switch valueMsg.ValueType {
-		case pb.ValueType_INLINE:
-			data = make([]byte, len(valueMsg.Data))
-			copy(data, valueMsg.Data)
-		case pb.ValueType_SEGMENT:
-			r, err := s.segmentManager.ReadEntry(userKey, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
-			if err != nil || r == nil {
-				it.Key().Free()
-				it.Value().Free()
-				it.Next()
-				continue
-			}
-			data, err = io.ReadAll(r)
-			if closer, ok := r.(io.Closer); ok {
-				closer.Close()
-			}
-			if err != nil {
-				it.Key().Free()
-				it.Value().Free()
-				it.Next()
-				continue
-			}
-		case pb.ValueType_RAW_FILE:
-			r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
-			if err != nil || r == nil {
-				it.Key().Free()
-				it.Value().Free()
-				it.Next()
-				continue
-			}
-			data, err = io.ReadAll(r)
-			if closer, ok := r.(io.Closer); ok {
-				closer.Close()
-			}
-			if err != nil {
-				it.Key().Free()
-				it.Value().Free()
-				it.Next()
-				continue
-			}
-		default:
-			it.Key().Free()
-			it.Value().Free()
-			it.Next()
-			continue
-		}
-
 		entries = append(entries, KeyValue{Key: userKey, Value: data})
 		lastKey = userKey
 

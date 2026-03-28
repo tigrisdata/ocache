@@ -241,7 +241,7 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 	}
 
 	// Perform K-way merge
-	merged, newCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit)
+	merged, newCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit, withValues)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -341,12 +341,10 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 
 // kWayMerge performs K-way merge of sorted responses from nodes using a min-heap.
 // Works for both keys-only and withValues modes via NodeResponse.keyAt/itemCount.
-func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int) (*mergeResult, map[string]string, bool, error) {
+func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int, withValues bool) (*mergeResult, map[string]string, bool, error) {
 	// Initialize min-heap
 	h := &keyHeap{}
 	heap.Init(h)
-
-	withValues := false
 
 	// Track node cursors (last key from each node)
 	nodeCursors := make(map[string]string)
@@ -357,9 +355,6 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 	// Prime the heap with first key from each node
 	for nodeID, nodeResp := range nodeResponses {
 		if nodeResp.itemCount() > 0 {
-			if len(nodeResp.Entries) > 0 {
-				withValues = true
-			}
 			heap.Push(h, &heapNode{
 				key:    nodeResp.keyAt(0),
 				nodeID: nodeID,
