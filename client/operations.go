@@ -361,3 +361,43 @@ func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, con
 
 	return resp.Keys, resp.ContinuationToken, resp.HasMore, nil
 }
+
+// ListPageWithValues returns a single page of key-value pairs with pagination support.
+// Returns: (entries, continuationToken, hasMore, error)
+func (o *Operations) ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) ([]KeyValue, string, bool, error) {
+	conn, err := o.router.RoundRobinRoute()
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	client := conn.getClient()
+	if client == nil {
+		return nil, "", false, fmt.Errorf("no healthy connections available")
+	}
+
+	if limit <= 0 || limit > MaxPageLimit {
+		limit = MaxPageLimit
+	}
+
+	req := &pb.ListRequest{
+		Prefix:            prefix,
+		Limit:             int32(limit),
+		ContinuationToken: continuationToken,
+	}
+
+	resp, err := client.ListWithValues(ctx, req)
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	// Convert proto entries to client KeyValue
+	entries := make([]KeyValue, len(resp.Entries))
+	for i, e := range resp.Entries {
+		entries[i] = KeyValue{
+			Key:   e.Key,
+			Value: e.Value,
+		}
+	}
+
+	return entries, resp.ContinuationToken, resp.HasMore, nil
+}

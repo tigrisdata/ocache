@@ -5,6 +5,12 @@ import (
 	"io"
 )
 
+// KeyValue holds a key and its associated value bytes.
+type KeyValue struct {
+	Key   string
+	Value []byte
+}
+
 // CacheClient is the common interface for both SimpleClient and ClusterClient
 type CacheClient interface {
 	// Basic operations
@@ -13,6 +19,7 @@ type CacheClient interface {
 	Delete(ctx context.Context, key string) error
 	List(ctx context.Context, prefix string) ([]string, error)
 	ListPage(ctx context.Context, prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error)
+	ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) (entries []KeyValue, nextToken string, hasMore bool, err error)
 
 	// Streaming operations
 	PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error

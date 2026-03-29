@@ -313,6 +313,97 @@ func TestListPage_BasicOperations(t *testing.T) {
 	})
 }
 
+// TestListPageWithValues_BasicOperations tests ListPageWithValues pagination with values
+func TestListPageWithValues_BasicOperations(t *testing.T) {
+	server, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer server.Stop()
+
+	client, err := NewWithConfig(&ClientConfig{
+		Addrs: []string{server.address},
+		Mode:  ModeSimple,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		},
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// Setup test data - 15 keys with values
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("item-%02d", i)
+		server.cacheService.data[key] = []byte(fmt.Sprintf("value-%d", i))
+	}
+
+	t.Run("first page with values", func(t *testing.T) {
+		entries, token, hasMore, err := client.ListPageWithValues(ctx, "", 5, "")
+		require.NoError(t, err)
+		assert.Len(t, entries, 5)
+		assert.True(t, hasMore)
+		assert.NotEmpty(t, token)
+
+		// Verify sorted keys
+		for i := 1; i < len(entries); i++ {
+			assert.LessOrEqual(t, entries[i-1].Key, entries[i].Key)
+		}
+
+		// Verify values match
+		for _, e := range entries {
+			expected := server.cacheService.data[e.Key]
+			assert.Equal(t, expected, e.Value, "value mismatch for key %s", e.Key)
+		}
+	})
+
+	t.Run("second page with values", func(t *testing.T) {
+		_, token, hasMore, err := client.ListPageWithValues(ctx, "", 5, "")
+		require.NoError(t, err)
+		require.True(t, hasMore)
+
+		entries, token2, hasMore2, err := client.ListPageWithValues(ctx, "", 5, token)
+		require.NoError(t, err)
+		assert.Len(t, entries, 5)
+		assert.True(t, hasMore2)
+		assert.NotEmpty(t, token2)
+
+		// Verify values match
+		for _, e := range entries {
+			expected := server.cacheService.data[e.Key]
+			assert.Equal(t, expected, e.Value)
+		}
+	})
+
+	t.Run("full iteration collects all entries", func(t *testing.T) {
+		var all []KeyValue
+		token := ""
+		for {
+			entries, nextToken, hasMore, err := client.ListPageWithValues(ctx, "", 5, token)
+			require.NoError(t, err)
+			all = append(all, entries...)
+			if !hasMore {
+				break
+			}
+			token = nextToken
+		}
+		assert.Len(t, all, 15)
+
+		// Verify all values
+		for _, e := range all {
+			expected := server.cacheService.data[e.Key]
+			assert.Equal(t, expected, e.Value)
+		}
+	})
+
+	t.Run("empty results", func(t *testing.T) {
+		entries, token, hasMore, err := client.ListPageWithValues(ctx, "non-existent-", 10, "")
+		require.NoError(t, err)
+		assert.Empty(t, entries)
+		assert.Empty(t, token)
+		assert.False(t, hasMore)
+	})
+}
+
 // TestGetRange_BasicOperations tests basic GetRange functionality
 func TestGetRange_BasicOperations(t *testing.T) {
 	// Create server

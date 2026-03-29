@@ -105,6 +105,7 @@ func (c *SimpleClient) RoundRobinRoute() (*connection, error) {
 // - Delete
 // - List
 // - ListPage
+// - ListPageWithValues
 
 // Close closes all connections
 func (c *SimpleClient) Close() error {

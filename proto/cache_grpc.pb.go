@@ -19,13 +19,15 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	CacheService_Put_FullMethodName         = "/cache.CacheService/Put"
-	CacheService_PutObject_FullMethodName   = "/cache.CacheService/PutObject"
-	CacheService_Get_FullMethodName         = "/cache.CacheService/Get"
-	CacheService_Delete_FullMethodName      = "/cache.CacheService/Delete"
-	CacheService_List_FullMethodName        = "/cache.CacheService/List"
-	CacheService_ListLocal_FullMethodName   = "/cache.CacheService/ListLocal"
-	CacheService_GetTopology_FullMethodName = "/cache.CacheService/GetTopology"
+	CacheService_Put_FullMethodName                 = "/cache.CacheService/Put"
+	CacheService_PutObject_FullMethodName           = "/cache.CacheService/PutObject"
+	CacheService_Get_FullMethodName                 = "/cache.CacheService/Get"
+	CacheService_Delete_FullMethodName              = "/cache.CacheService/Delete"
+	CacheService_List_FullMethodName                = "/cache.CacheService/List"
+	CacheService_ListLocal_FullMethodName           = "/cache.CacheService/ListLocal"
+	CacheService_ListWithValues_FullMethodName      = "/cache.CacheService/ListWithValues"
+	CacheService_ListLocalWithValues_FullMethodName = "/cache.CacheService/ListLocalWithValues"
+	CacheService_GetTopology_FullMethodName         = "/cache.CacheService/GetTopology"
 )
 
 // CacheServiceClient is the client API for CacheService service.
@@ -40,6 +42,10 @@ type CacheServiceClient interface {
 	// ListLocal is an internal RPC for cluster mode: queries local node only
 	// Returns sorted, paginated keys from this node's storage
 	ListLocal(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
+	ListWithValues(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListWithValuesResponse, error)
+	// ListLocalWithValues is an internal RPC for cluster mode: queries local node only
+	// Returns sorted, paginated key-value pairs from this node's storage
+	ListLocalWithValues(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListWithValuesResponse, error)
 	GetTopology(ctx context.Context, in *GetTopologyRequest, opts ...grpc.CallOption) (*GetTopologyResponse, error)
 }
 
@@ -153,6 +159,24 @@ func (c *cacheServiceClient) ListLocal(ctx context.Context, in *ListRequest, opt
 	return out, nil
 }
 
+func (c *cacheServiceClient) ListWithValues(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListWithValuesResponse, error) {
+	out := new(ListWithValuesResponse)
+	err := c.cc.Invoke(ctx, CacheService_ListWithValues_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *cacheServiceClient) ListLocalWithValues(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListWithValuesResponse, error) {
+	out := new(ListWithValuesResponse)
+	err := c.cc.Invoke(ctx, CacheService_ListLocalWithValues_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *cacheServiceClient) GetTopology(ctx context.Context, in *GetTopologyRequest, opts ...grpc.CallOption) (*GetTopologyResponse, error) {
 	out := new(GetTopologyResponse)
 	err := c.cc.Invoke(ctx, CacheService_GetTopology_FullMethodName, in, out, opts...)
@@ -174,6 +198,10 @@ type CacheServiceServer interface {
 	// ListLocal is an internal RPC for cluster mode: queries local node only
 	// Returns sorted, paginated keys from this node's storage
 	ListLocal(context.Context, *ListRequest) (*ListResponse, error)
+	ListWithValues(context.Context, *ListRequest) (*ListWithValuesResponse, error)
+	// ListLocalWithValues is an internal RPC for cluster mode: queries local node only
+	// Returns sorted, paginated key-value pairs from this node's storage
+	ListLocalWithValues(context.Context, *ListRequest) (*ListWithValuesResponse, error)
 	GetTopology(context.Context, *GetTopologyRequest) (*GetTopologyResponse, error)
 	mustEmbedUnimplementedCacheServiceServer()
 }
@@ -199,6 +227,12 @@ func (UnimplementedCacheServiceServer) List(context.Context, *ListRequest) (*Lis
 }
 func (UnimplementedCacheServiceServer) ListLocal(context.Context, *ListRequest) (*ListResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListLocal not implemented")
+}
+func (UnimplementedCacheServiceServer) ListWithValues(context.Context, *ListRequest) (*ListWithValuesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListWithValues not implemented")
+}
+func (UnimplementedCacheServiceServer) ListLocalWithValues(context.Context, *ListRequest) (*ListWithValuesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListLocalWithValues not implemented")
 }
 func (UnimplementedCacheServiceServer) GetTopology(context.Context, *GetTopologyRequest) (*GetTopologyResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetTopology not implemented")
@@ -335,6 +369,42 @@ func _CacheService_ListLocal_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CacheService_ListWithValues_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CacheServiceServer).ListWithValues(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CacheService_ListWithValues_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CacheServiceServer).ListWithValues(ctx, req.(*ListRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CacheService_ListLocalWithValues_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CacheServiceServer).ListLocalWithValues(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CacheService_ListLocalWithValues_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CacheServiceServer).ListLocalWithValues(ctx, req.(*ListRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _CacheService_GetTopology_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetTopologyRequest)
 	if err := dec(in); err != nil {
@@ -375,6 +445,14 @@ var CacheService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListLocal",
 			Handler:    _CacheService_ListLocal_Handler,
+		},
+		{
+			MethodName: "ListWithValues",
+			Handler:    _CacheService_ListWithValues_Handler,
+		},
+		{
+			MethodName: "ListLocalWithValues",
+			Handler:    _CacheService_ListLocalWithValues_Handler,
 		},
 		{
 			MethodName: "GetTopology",

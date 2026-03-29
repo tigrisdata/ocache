@@ -290,6 +290,24 @@ func (c *Client) ListPage(ctx context.Context, prefix string, limit int, continu
 	return c.ops.ListPage(ctx, prefix, limit, continuationToken)
 }
 
+// ListPageWithValues returns a page of key-value pairs with pagination support.
+func (c *Client) ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) (entries []cacheclient.KeyValue, nextToken string, hasMore bool, err error) {
+	pbEntries, token, more, err := c.ops.ListPageWithValues(ctx, prefix, limit, continuationToken)
+	if err != nil {
+		return nil, "", false, err
+	}
+
+	entries = make([]cacheclient.KeyValue, len(pbEntries))
+	for i, e := range pbEntries {
+		entries[i] = cacheclient.KeyValue{
+			Key:   e.Key,
+			Value: e.Value,
+		}
+	}
+
+	return entries, token, more, nil
+}
+
 // PutStream stores data from a reader for the given key.
 func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
 	return c.ops.Put(ctx, key, r, int(ttlSeconds))
