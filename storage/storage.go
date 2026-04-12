@@ -136,6 +136,20 @@ type Storage struct {
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
 func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
+	// Apply defaults for unset fields
+	if config.InlineThreshold <= 0 {
+		config.InlineThreshold = DefaultInlineThreshold
+	}
+	if config.CompactThreshold <= 0 {
+		config.CompactThreshold = DefaultCompactThreshold
+	}
+	if config.SegmentSize <= 0 {
+		config.SegmentSize = DefaultSegmentSize
+	}
+	if config.FdCacheSize <= 0 {
+		config.FdCacheSize = DefaultFdCacheSize
+	}
+
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
 		zlog.Error().Err(err).Str("path", config.DiskPath).Msg("storage: failed to create data directory")
