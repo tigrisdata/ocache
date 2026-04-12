@@ -137,6 +137,9 @@ type Storage struct {
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
 func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Apply defaults for unset fields
+	if config.InlineThreshold <= 0 {
+		config.InlineThreshold = DefaultInlineThreshold
+	}
 	if config.CompactThreshold <= 0 {
 		config.CompactThreshold = DefaultCompactThreshold
 	}
