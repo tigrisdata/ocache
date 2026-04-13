@@ -11,10 +11,12 @@ import (
 	"net"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	zlog "github.com/rs/zerolog/log"
 	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/coordinator"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/operations"
 	"github.com/tigrisdata/ocache/server/service"
@@ -66,14 +68,37 @@ type Config struct {
 	// GRPCDialOptions are additional gRPC dial options for inter-node connections (e.g., auth interceptors).
 	// These are appended after the default options (transport credentials, keepalive, message size).
 	GRPCDialOptions []grpc.DialOption
+
+	// Storage provides advanced tuning for the local storage layer (compaction,
+	// segment sizing, RocksDB block cache, fd cache, TTL cleanup interval, etc.).
+	// When set, its fields are applied as the base; the top-level DiskPath, TTL,
+	// MaxDiskUsage, and InlineThreshold fields above take precedence when non-zero.
+	// Unset fields fall through to storage-layer defaults.
+	Storage *stor.StorageConfig
+
+	// Lifecycler provides advanced cluster ring tuning (heartbeat period/timeout,
+	// replication factor, num tokens, observe period, tokens file path, etc.).
+	// Ignored when cluster mode is not enabled.
+	Lifecycler *ring.LifecyclerConfig
+
+	// Router provides advanced inter-node routing tuning (connection timeout,
+	// retry/backoff, keepalive, circuit breaker, message sizes).
+	// When nil, coordinator defaults are used.
+	// Ignored when cluster mode is not enabled.
+	Router *coordinator.RouterConfig
+
+	// Registerer is the Prometheus registerer used for cluster metrics.
+	// When nil, prometheus.DefaultRegisterer is used. Provide a dedicated
+	// registerer to avoid duplicate-registration panics when embedding
+	// multiple instances or integrating with a custom metrics registry.
+	Registerer prometheus.Registerer
 }
 
 // SetDefaults sets default values for unspecified config fields.
-func (c *Config) SetDefaults() {
-	if c.InlineThreshold <= 0 {
-		c.InlineThreshold = 64 * 1024 // 64KB default
-	}
-}
+// Storage-layer fields (InlineThreshold, segment sizes, etc.) are defaulted
+// by storage.NewStorageWithConfig and are intentionally not touched here so
+// that values set via Config.Storage flow through unchanged.
+func (c *Config) SetDefaults() {}
 
 // Validate checks that required configuration is provided.
 func (c *Config) Validate() error {
@@ -89,6 +114,25 @@ func (c *Config) Validate() error {
 // IsClusterMode returns true if cluster configuration is provided.
 func (c *Config) IsClusterMode() bool {
 	return c.NodeID != "" && c.ClusterAddr != ""
+}
+
+// buildStorageConfig merges the top-level storage fields onto any caller-supplied
+// Storage config. Top-level fields win when set; unset top-level fields fall
+// through to the Storage config, then to storage-layer defaults.
+func (c *Config) buildStorageConfig() stor.StorageConfig {
+	var sc stor.StorageConfig
+	if c.Storage != nil {
+		sc = *c.Storage
+	}
+	sc.DiskPath = c.DiskPath
+	sc.TTL = int(c.TTL.Seconds())
+	if c.MaxDiskUsage != 0 {
+		sc.MaxDiskUsage = c.MaxDiskUsage
+	}
+	if c.InlineThreshold > 0 {
+		sc.InlineThreshold = c.InlineThreshold
+	}
+	return sc
 }
 
 // Client provides embedded cache access with cluster routing.
@@ -124,14 +168,10 @@ func New(cfg *Config) (*Client, error) {
 		Str("node_id", cfg.NodeID).
 		Msg("Creating embedded cache client")
 
-	// Create storage
-	storageConfig := &stor.StorageConfig{
-		DiskPath:        cfg.DiskPath,
-		TTL:             int(cfg.TTL.Seconds()),
-		MaxDiskUsage:    cfg.MaxDiskUsage,
-		InlineThreshold: cfg.InlineThreshold,
-	}
-	storage, err := stor.NewStorageWithConfig(storageConfig)
+	// Create storage. Start from the caller-supplied Storage config (if any),
+	// then overlay the top-level fields so they always take precedence when set.
+	storageConfig := cfg.buildStorageConfig()
+	storage, err := stor.NewStorageWithConfig(&storageConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
@@ -148,6 +188,11 @@ func New(cfg *Config) (*Client, error) {
 			Seeds:           cfg.SeedNodes,
 			DiskPath:        cfg.DiskPath,
 			GRPCDialOptions: cfg.GRPCDialOptions,
+			RouterConfig:    cfg.Router,
+			Registerer:      cfg.Registerer,
+		}
+		if cfg.Lifecycler != nil {
+			coordCfg.LifecyclerConfig = *cfg.Lifecycler
 		}
 		coord, err = coordinator.New(coordCfg)
 		if err != nil {
