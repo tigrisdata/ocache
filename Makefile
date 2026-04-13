@@ -227,10 +227,10 @@ TESTRUN ?=
 TESTFLAGS := $(if $(TEST),-run $(TEST),$(if $(TESTRUN),-run $(TESTRUN),))
 
 .PHONY: test
-test: test-server test-storage test-client test-coordinator
+test: test-server test-storage test-client test-coordinator test-embedded
 
 .PHONY: test-all
-test-all: test-server test-storage test-client test-coordinator test-integration test-e2e
+test-all: test-server test-storage test-client test-coordinator test-embedded test-integration test-e2e
 
 .PHONY: test-server
 test-server: proto
@@ -256,30 +256,46 @@ test-coordinator: proto
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd coordinator && go test -v -timeout 30s $(TESTFLAGS) ./...
 
+.PHONY: test-embedded
+test-embedded: proto
+	@echo "Running embedded tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
+
 .PHONY: test-race
 test-race: proto
 	@echo "Running race tests for server..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 60s $(TESTFLAGS) ./...
+	@echo "Running race tests for storage..."
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 60s $(TESTFLAGS) ./...
 	@echo "Running race tests for coordinator..."
 	@cd coordinator && go test -race -v -timeout 30s $(TESTFLAGS) ./...
 	@echo "Running race tests for client..."
 	@cd client && go test -race -v -timeout 30s $(TESTFLAGS) ./...
+	@echo "Running race tests for embedded..."
+	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -v -timeout 60s $(TESTFLAGS) ./...
 
 .PHONY: test-coverage
 test-coverage: proto
 	@echo "Running coverage tests for server..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../coverage-server.out -timeout 60s $(TESTFLAGS) ./...
+	@echo "Running coverage tests for storage..."
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../coverage-storage.out -timeout 60s $(TESTFLAGS) ./...
 	@echo "Running coverage tests for client..."
 	@cd client && go test -coverprofile=../coverage-client.out -timeout 30s $(TESTFLAGS) ./...
 	@echo "Running coverage tests for coordinator..."
 	@cd coordinator && go test -coverprofile=../coverage-coordinator.out -timeout 30s $(TESTFLAGS) ./...
+	@echo "Running coverage tests for embedded..."
+	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -coverprofile=../coverage-embedded.out -timeout 60s $(TESTFLAGS) ./...
 	@echo "Combining coverage reports..."
 	@echo "mode: set" > coverage.out
 	@tail -n +2 coverage-server.out >> coverage.out 2>/dev/null || true
+	@tail -n +2 coverage-storage.out >> coverage.out 2>/dev/null || true
 	@tail -n +2 coverage-client.out >> coverage.out 2>/dev/null || true
 	@tail -n +2 coverage-coordinator.out >> coverage.out 2>/dev/null || true
+	@tail -n +2 coverage-embedded.out >> coverage.out 2>/dev/null || true
 	@rm -f coverage-*.out
 	@go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report generated at coverage.html"
@@ -404,6 +420,7 @@ lint:
 	@echo "Running go vet..."
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet $(LDFLAGS) ./...
 	@cd client && go vet ./...
+	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet $(LDFLAGS) ./...
 	@echo "Running gofmt..."
 	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
 
@@ -445,6 +462,7 @@ lint-fix:
 vet:
 	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet $(LDFLAGS) ./...
 	@cd client && go vet ./...
+	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go vet $(LDFLAGS) ./...
 
 .PHONY: fmt
 fmt:

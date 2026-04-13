@@ -57,6 +57,30 @@ type Config struct {
     // SeedNodes is a list of seed nodes for cluster discovery
     // Example: []string{"node1:7000", "node2:7000"}
     SeedNodes []string
+
+    // RequestLogging enables logging of gRPC requests (default: false)
+    RequestLogging bool
+
+    // GRPCServerOptions are additional gRPC server options (e.g., auth interceptors).
+    GRPCServerOptions []grpc.ServerOption
+
+    // GRPCDialOptions are additional gRPC dial options for inter-node connections.
+    GRPCDialOptions []grpc.DialOption
+
+    // Storage provides advanced tuning for the local storage layer.
+    // See "Advanced Storage Tuning" below.
+    Storage *storage.StorageConfig
+
+    // Lifecycler provides advanced ring/lifecycler tuning for cluster mode.
+    Lifecycler *ring.LifecyclerConfig
+
+    // Router provides advanced inter-node routing tuning for cluster mode.
+    Router *coordinator.RouterConfig
+
+    // Registerer is the Prometheus registerer. When nil, prometheus.DefaultRegisterer
+    // is used. Provide a dedicated registerer to avoid duplicate-registration
+    // panics when embedding multiple instances.
+    Registerer prometheus.Registerer
 }
 ```
 
@@ -353,6 +377,68 @@ config := &embedded.Config{
     // - Smaller values: More files, better for large objects
     // - Larger values: More RocksDB usage, better for small objects
     InlineThreshold: 64 * 1024, // 64KB default
+}
+```
+
+### Advanced Storage Tuning
+
+For settings beyond the top-level fields (compaction behavior, segment sizing,
+RocksDB block cache, fd cache, TTL cleanup cadence, etc.), pass a
+`storage.StorageConfig` via `Config.Storage`. Top-level `DiskPath`, `TTL`,
+`MaxDiskUsage`, and `InlineThreshold` override the matching fields on the
+nested config when set; any unset top-level field falls through to the nested
+value, and any unset nested field falls through to the storage-layer default.
+
+```go
+import stor "github.com/tigrisdata/ocache/storage"
+
+config := &embedded.Config{
+    DiskPath:     "/var/cache/myapp",
+    TTL:          time.Hour,
+    MaxDiskUsage: 100 << 30,
+
+    Storage: &stor.StorageConfig{
+        CompactionThreads:    4,              // parallel compaction workers
+        SegmentSize:          256 << 20,      // 256MB segments
+        CompactThreshold:     16 << 20,       // compact objects under 16MB
+        FdCacheSize:          4096,           // open-file cache capacity
+        MetadataCacheSize:    512 << 20,      // RocksDB block cache
+        FragThreshold:        0.5,            // recompact when >50% fragmented
+        MinSegmentAge:        24 * time.Hour,
+        RecompactionInterval: time.Hour,
+        CleanupInterval:      time.Minute,    // TTL sweep cadence
+    },
+}
+```
+
+### Cluster Tuning
+
+`Config.Lifecycler`, `Config.Router`, and `Config.Registerer` expose the
+coordinator's ring, routing, and metrics knobs. All are optional and only
+apply in cluster mode (Registerer is used for cluster metrics).
+
+```go
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/tigrisdata/ocache/coordinator"
+    "github.com/tigrisdata/ocache/coordinator/ring"
+)
+
+config := &embedded.Config{
+    // ... base + cluster fields ...
+
+    Lifecycler: &ring.LifecyclerConfig{
+        NumTokens:     128,
+        ObservePeriod: 5 * time.Second,
+    },
+    Router: &coordinator.RouterConfig{
+        ConnectionTimeout:       3 * time.Second,
+        MaxRetries:              5,
+        CircuitBreakerThreshold: 10,
+    },
+    // Dedicated registerer avoids panics when embedding multiple instances
+    // or sharing a process with another Prometheus-using library.
+    Registerer: prometheus.NewRegistry(),
 }
 ```
 
