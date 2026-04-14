@@ -76,14 +76,29 @@ type ValueMessage struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	ValueType     ValueType `protobuf:"varint,1,opt,name=value_type,json=valueType,proto3,enum=storage.ValueType" json:"value_type,omitempty"` // Location of the value bytes
-	Data          []byte    `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`                                                    // The actual value bytes
-	Expiry        int64     `protobuf:"varint,3,opt,name=expiry,proto3" json:"expiry,omitempty"`                                               // Expiry timestamp (unix seconds), 0 if no expiry
-	RawFilePath   string    `protobuf:"bytes,4,opt,name=raw_file_path,json=rawFilePath,proto3" json:"raw_file_path,omitempty"`                 // Optional: raw file path for large objects (if used)
-	SegmentPath   string    `protobuf:"bytes,5,opt,name=segment_path,json=segmentPath,proto3" json:"segment_path,omitempty"`                   // Optional: segment file storing the value for large objects (if used)
-	SegmentOffset int64     `protobuf:"varint,6,opt,name=segment_offset,json=segmentOffset,proto3" json:"segment_offset,omitempty"`            // Byte offset within the segment where the value starts
-	ValueLength   int64     `protobuf:"varint,7,opt,name=value_length,json=valueLength,proto3" json:"value_length,omitempty"`                  // Length of the value in bytes within the segment
-	Checksum      uint32    `protobuf:"varint,8,opt,name=checksum,proto3" json:"checksum,omitempty"`                                           // CRC32 checksum of the value
+	ValueType ValueType `protobuf:"varint,1,opt,name=value_type,json=valueType,proto3,enum=storage.ValueType" json:"value_type,omitempty"` // Location of the value bytes
+	Data      []byte    `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`                                                    // The actual value bytes
+	Expiry    int64     `protobuf:"varint,3,opt,name=expiry,proto3" json:"expiry,omitempty"`                                               // Expiry timestamp (unix seconds), 0 if no expiry
+	// raw_file_path: path to the external raw file storing the value.
+	//
+	// Invariant for STORED values:
+	//   - Non-empty iff value_type == RAW_FILE.
+	//   - Always empty for INLINE and SEGMENT.
+	//
+	// Overload for MERGE OPERANDS:
+	//   - On a SEGMENT-typed merge operand written by the background
+	//     compactor, raw_file_path carries the CAS precondition (the
+	//     raw-file path the compactor observed when it began migrating
+	//     this entry). The merge operator (mergeMetadataCAS) compares it
+	//     against the current base's raw_file_path to decide whether to
+	//     apply the rewrite, and clears it before persisting the result.
+	//     This overload is confined to transient merge operands — stored
+	//     SEGMENT values never carry raw_file_path.
+	RawFilePath   string `protobuf:"bytes,4,opt,name=raw_file_path,json=rawFilePath,proto3" json:"raw_file_path,omitempty"`
+	SegmentPath   string `protobuf:"bytes,5,opt,name=segment_path,json=segmentPath,proto3" json:"segment_path,omitempty"`        // Optional: segment file storing the value for large objects (if used)
+	SegmentOffset int64  `protobuf:"varint,6,opt,name=segment_offset,json=segmentOffset,proto3" json:"segment_offset,omitempty"` // Byte offset within the segment where the value starts
+	ValueLength   int64  `protobuf:"varint,7,opt,name=value_length,json=valueLength,proto3" json:"value_length,omitempty"`       // Length of the value in bytes within the segment
+	Checksum      uint32 `protobuf:"varint,8,opt,name=checksum,proto3" json:"checksum,omitempty"`                                // CRC32 checksum of the value
 }
 
 func (x *ValueMessage) Reset() {

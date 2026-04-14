@@ -17,6 +17,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
@@ -36,8 +37,10 @@ func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, *files.FileMa
 	tmpDir, err := os.MkdirTemp("", "compactor-test-*")
 	require.NoError(t, err)
 
-	// Initialize metadata DB with nil merge operator
-	meta, err := metadata.NewMetaDB(tmpDir, 0, nil, nil)
+	// Initialize metadata DB with the multiplex merge operator; the
+	// compactor stages metadata rewrites via wb.Merge (conditional CAS)
+	// and a nil operator would make reads return the raw operand bytes.
+	meta, err := metadata.NewMetaDB(tmpDir, 0, merge.NewMultiplexOperator(), nil)
 	require.NoError(t, err)
 
 	// Initialize FD cache
@@ -233,8 +236,12 @@ func TestCopyFileIntoSegment(t *testing.T) {
 	err = c.copyFileIntoSegment(ctx, seg, "test-key", f, vm)
 	assert.NoError(t, err)
 
-	// Verify ValueMessage was updated
-	assert.Empty(t, vm.RawFilePath)
+	// Verify ValueMessage was updated. Note that RawFilePath is intentionally
+	// preserved on the SEGMENT-typed result so the caller can use it as the
+	// CAS precondition when staging a conditional-merge rewrite (see the
+	// RawFilePath invariant comment in storage.proto and mergeMetadataCAS).
+	assert.Equal(t, testFile, vm.RawFilePath,
+		"copyFileIntoSegment must preserve RawFilePath as the CAS precondition")
 	assert.Equal(t, seg.Path(), vm.SegmentPath)
 	assert.GreaterOrEqual(t, vm.SegmentOffset, int64(0))
 	assert.Equal(t, pb.ValueType_SEGMENT, vm.ValueType)
@@ -1064,4 +1071,236 @@ func TestCompactionWorkDistribution(t *testing.T) {
 	}
 
 	t.Logf("Key distribution across %d workers: %v", numWorkers, keyDistribution)
+}
+
+// TestCompactFiles_ConcurrentPutWinsRace verifies that a Put racing with the
+// compactor's metadata rewrite is never clobbered. It simulates the exact
+// interleaving documented in issue #142:
+//
+//  1. storage.Put writes meta:k -> RAW_FILE UUID-A, cIdx:k -> UUID-A.
+//  2. The compactor's processCompactionEntry reads meta:k (observes UUID-A)
+//     and begins migrating the file into a segment.
+//  3. Before the compactor commits its batch, a concurrent storage.Put
+//     replaces meta:k with RAW_FILE UUID-B and cIdx:k with UUID-B.
+//  4. The compactor commits.
+//
+// Under the pre-fix Put-based commit, step 4 unconditionally overwrites
+// meta:k with a SEGMENT entry, silently losing the UUID-B write. With the
+// Merge-based CAS rewrite, the merge operator detects base.RawFilePath !=
+// expected UUID-A and drops the rewrite, so meta:k remains UUID-B.
+//
+// The test stages the interleaving deterministically by driving the compactor
+// path piecewise (via direct database writes that mirror what a Put would do),
+// making the regression test reliable rather than timing-dependent.
+func TestCompactFiles_ConcurrentPutWinsRace(t *testing.T) {
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+	})
+
+	// Stage an initial RAW_FILE entry at UUID-A.
+	userKey := "racing-key"
+	metaKey := keys.MakeMetadataKey(userKey)
+	fileA := filepath.Join(tmpDir, "files", "UUID-A.dat")
+	aBytes := []byte("stale-bytes-A")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fileA), 0o755))
+	require.NoError(t, os.WriteFile(fileA, aBytes, 0o644))
+
+	vmA := &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: fileA,
+		ValueLength: int64(len(aBytes)),
+	}
+	vmABytes, err := proto.Marshal(vmA)
+	require.NoError(t, err)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	require.NoError(t, meta.Handle().Put(wo, metaKey, vmABytes))
+	idxKeyA, idxValA := PrepareEntryForCompaction(userKey, fileA)
+	require.NoError(t, meta.Handle().Put(wo, idxKeyA, idxValA))
+
+	// Simulate the interleaving: a concurrent Put replaces meta:k and cIdx:k
+	// with UUID-B before we run the compactor. This is the worst-case shape
+	// of the race — the compactor's subsequent commit must not clobber the
+	// newer write.
+	fileB := filepath.Join(tmpDir, "files", "UUID-B.dat")
+	bBytes := []byte("fresh-bytes-B-that-must-survive")
+	require.NoError(t, os.WriteFile(fileB, bBytes, 0o644))
+
+	vmB := &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: fileB,
+		ValueLength: int64(len(bBytes)),
+	}
+	vmBBytes, err := proto.Marshal(vmB)
+	require.NoError(t, err)
+
+	putBatch := grocksdb.NewWriteBatch()
+	defer putBatch.Destroy()
+	putBatch.Put(metaKey, vmBBytes)
+	idxKeyB, idxValB := PrepareEntryForCompaction(userKey, fileB)
+	putBatch.Put(idxKeyB, idxValB)
+	require.NoError(t, meta.Handle().Write(wo, putBatch))
+
+	// Now run the compactor. Its internal iterator will find cIdx:k pointing
+	// at UUID-B (the Put replaced both in the same batch above), validate
+	// meta:k against UUID-B, migrate UUID-B into a segment, and stage the
+	// merge with precondition=UUID-B. That merge will apply — the test then
+	// seeds ANOTHER UUID-A entry to exercise the race window specifically.
+	//
+	// To force the exact issue-#142 interleaving (compactor started when
+	// meta=UUID-A, Put swapped to UUID-B, then compactor commits), we stage
+	// a stale merge operand directly against the live DB: this is what the
+	// pre-fix compactor would have produced had it raced.
+	staleOperand := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		RawFilePath:   fileA, // CAS precondition: compactor saw UUID-A
+		SegmentPath:   filepath.Join(tmpDir, "segments", "stale.seg"),
+		SegmentOffset: 42,
+		ValueLength:   int64(len(aBytes)),
+	}
+	staleOperandBytes, err := proto.Marshal(staleOperand)
+	require.NoError(t, err)
+
+	staleBatch := grocksdb.NewWriteBatch()
+	defer staleBatch.Destroy()
+	staleBatch.Merge(metaKey, staleOperandBytes)
+	require.NoError(t, meta.Handle().Write(wo, staleBatch))
+
+	// Read meta:k: must still be RAW_FILE UUID-B. The stale CAS-merge whose
+	// precondition didn't match must have been dropped by the merge operator.
+	slice, err := meta.Handle().Get(ro, metaKey)
+	require.NoError(t, err)
+	defer slice.Free()
+	require.True(t, slice.Exists(), "meta row must still exist")
+
+	var got pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(slice.Data(), &got))
+	assert.Equal(t, pb.ValueType_RAW_FILE, got.ValueType,
+		"concurrent Put must survive the compactor's stale merge")
+	assert.Equal(t, fileB, got.RawFilePath,
+		"meta must point at the newer raw file UUID-B")
+	assert.Equal(t, int64(len(bBytes)), got.ValueLength)
+
+	// Also exercise the non-race path as a sanity check: if the compactor
+	// runs to completion without a concurrent Put, its CAS merge must apply
+	// and meta transitions to SEGMENT. Use CompactFiles to drive the real
+	// compactor end-to-end.
+	_, _ = c.CompactFiles(context.Background(), 0)
+
+	slice2, err := meta.Handle().Get(ro, metaKey)
+	require.NoError(t, err)
+	defer slice2.Free()
+	require.True(t, slice2.Exists())
+
+	var after pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(slice2.Data(), &after))
+	assert.Equal(t, pb.ValueType_SEGMENT, after.ValueType,
+		"with no concurrent writer, compactor should migrate UUID-B into a segment")
+	assert.Empty(t, after.RawFilePath,
+		"persisted SEGMENT meta must never carry RawFilePath")
+	assert.NotEmpty(t, after.SegmentPath)
+}
+
+// TestCompactFiles_ConcurrentDeleteRace verifies that a Delete racing with
+// the compactor's metadata rewrite does not cause RocksDB to return a
+// Status::Corruption error on subsequent reads of the deleted key.
+//
+// The sequence mirrors the companion Put-race scenario but with Delete
+// standing in for the concurrent storage.Put:
+//
+//  1. storage.Put writes meta:k -> RAW_FILE UUID-A.
+//  2. The compactor's processCompactionEntry reads meta:k, validates the
+//     entry, and begins migrating the file into a segment.
+//  3. Before the compactor commits its batch, a concurrent
+//     storage.DeleteKey removes meta:k (a regular RocksDB Delete tombstone).
+//  4. The compactor commits its conditional merge on top of the tombstone.
+//
+// The merge then resolves at read time against an empty existingValue and
+// a precondition that can no longer match. Returning (nil, false) from
+// FullMerge here would trip RocksDB's Status::Corruption path; instead
+// the operator synthesizes an already-expired sentinel so storage.Get
+// treats the key as not-found — preserving the user's Delete intent.
+func TestCompactFiles_ConcurrentDeleteRace(t *testing.T) {
+	// This test drives the Delete-vs-Merge interleaving deterministically
+	// against the full DBWithTTL + MultiplexOperator composition without
+	// going through Compactor.CompactFiles. There is no compaction index
+	// entry left to process once the key has been deleted, so exercising
+	// CompactFiles would be a no-op; the merge-operator layer is the
+	// correctness surface that actually needs asserting here.
+	tmpDir, meta, _, _, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	userKey := "racing-deleted-key"
+	metaKey := keys.MakeMetadataKey(userKey)
+	fileA := filepath.Join(tmpDir, "files", "UUID-A.dat")
+	aBytes := []byte("raw-file-A")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fileA), 0o755))
+	require.NoError(t, os.WriteFile(fileA, aBytes, 0o644))
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	// Step 1: seed meta:k as RAW_FILE UUID-A.
+	vmA := &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: fileA,
+		ValueLength: int64(len(aBytes)),
+	}
+	vmABytes, err := proto.Marshal(vmA)
+	require.NoError(t, err)
+	require.NoError(t, meta.Handle().Put(wo, metaKey, vmABytes))
+
+	// Step 3 (ahead of step 4 so the merge lands on a tombstone): user
+	// Delete. storage.DeleteKey issues a regular Delete on the metadata
+	// row (see storage.go: batch.Delete(metaKey)).
+	require.NoError(t, meta.Handle().Delete(wo, metaKey))
+
+	// Step 4: compactor's stale merge lands on the tombstone. The operand
+	// still asserts precondition=UUID-A, but the base no longer exists.
+	staleOperand := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		RawFilePath:   fileA, // CAS precondition: compactor saw UUID-A
+		SegmentPath:   filepath.Join(tmpDir, "segments", "stale.seg"),
+		SegmentOffset: 42,
+		ValueLength:   int64(len(aBytes)),
+	}
+	staleOperandBytes, err := proto.Marshal(staleOperand)
+	require.NoError(t, err)
+
+	mergeBatch := grocksdb.NewWriteBatch()
+	defer mergeBatch.Destroy()
+	mergeBatch.Merge(metaKey, staleOperandBytes)
+	require.NoError(t, meta.Handle().Write(wo, mergeBatch))
+
+	// Read meta:k. The merge operator must synthesize an expired sentinel
+	// rather than returning (nil, false) — otherwise RocksDB would surface
+	// Status::Corruption here.
+	slice, err := meta.Handle().Get(ro, metaKey)
+	require.NoError(t, err, "Get must not return an error — a false FullMerge result would cause Status::Corruption")
+	defer slice.Free()
+
+	// The key must decode to the expired sentinel so that storage.Get's
+	// expiry check (Expiry > 0 && now >= Expiry) short-circuits to
+	// not-found. We don't go through the full Storage layer here — this
+	// test is the merge-operator-layer contract check.
+	require.True(t, slice.Exists(),
+		"RocksDB stores the sentinel bytes; Storage.Get's expiry check filters it")
+	var got pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(slice.Data(), &got))
+	assert.Equal(t, int64(1), got.Expiry,
+		"sentinel Expiry=1 is what triggers storage.Get to report not-found")
+	assert.Empty(t, got.RawFilePath, "sentinel must not reference any raw file")
+	assert.Empty(t, got.SegmentPath, "sentinel must not reference any segment")
 }

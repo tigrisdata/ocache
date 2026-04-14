@@ -3,6 +3,7 @@ module github.com/tigrisdata/ocache/embedded
 go 1.24.2
 
 require (
+	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/tigrisdata/ocache/client v1.1.0
 	github.com/tigrisdata/ocache/common v1.1.0

@@ -6,9 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/embedded"
+	stor "github.com/tigrisdata/ocache/storage"
 )
 
 func TestEmbeddedClient_BasicOperations(t *testing.T) {
@@ -206,13 +208,19 @@ func TestEmbeddedClient_ListPageWithValues(t *testing.T) {
 	}
 
 	// Full iteration collects all entries with correct values
-	var all []struct{ key string; value []byte }
+	var all []struct {
+		key   string
+		value []byte
+	}
 	tok := ""
 	for {
 		page, nextTok, more, err := client.ListPageWithValues(ctx, "", 4, tok)
 		require.NoError(t, err)
 		for _, e := range page {
-			all = append(all, struct{ key string; value []byte }{e.Key, e.Value})
+			all = append(all, struct {
+				key   string
+				value []byte
+			}{e.Key, e.Value})
 		}
 		if !more {
 			break
@@ -276,6 +284,36 @@ func TestEmbeddedClient_GetConnectedNodes(t *testing.T) {
 	nodes := client.GetConnectedNodes()
 	// Single-node mode returns slice with empty node ID
 	assert.NotNil(t, nodes)
+}
+
+// TestEmbeddedClient_AdvancedConfig exercises the Storage and Registerer
+// plumbing to confirm advanced options flow through without breaking the
+// client end-to-end. The specific tuning values here are chosen to be safe
+// for a short-lived single-node cache.
+func TestEmbeddedClient_AdvancedConfig(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	client, err := embedded.New(&embedded.Config{
+		DiskPath:   t.TempDir(),
+		TTL:        time.Hour,
+		Registerer: reg,
+		Storage: &stor.StorageConfig{
+			CompactionThreads: 2,
+			SegmentSize:       16 << 20,
+			FdCacheSize:       128,
+			MetadataCacheSize: 32 << 20,
+			CleanupInterval:   5 * time.Minute,
+		},
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx := context.Background()
+	require.NoError(t, client.Put(ctx, "advanced", []byte("ok"), 0))
+
+	data, err := client.Get(ctx, "advanced")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("ok"), data)
 }
 
 func TestEmbeddedClient_IsReady(t *testing.T) {
