@@ -156,15 +156,35 @@ func TestMergeMetadataCAS_MultipleOperands_AppliedInOrder(t *testing.T) {
 	assert.Empty(t, got.RawFilePath)
 }
 
-func TestMergeMetadataCAS_NoBase_NoApplicableOperand_ReturnsNoValue(t *testing.T) {
-	// If there's no base and no operand applies (e.g., a stray merge without
-	// a prior Put), return (nil, false) so RocksDB treats the key as absent.
+func TestMergeMetadataCAS_NoBase_ReturnsExpiredSentinel(t *testing.T) {
+	// Models the Delete-vs-Merge race (follow-up to #142/#144): a user's
+	// Delete landed between the compactor's metadata validation and the
+	// commit of its CAS merge. By the time FullMerge runs, the base has
+	// been tombstoned (existingValue == nil) and the operand's precondition
+	// cannot match.
+	//
+	// Returning (nil, false) here would trip RocksDB's
+	// Status::Corruption path; returning (nil, true) would silently
+	// resurrect the key as empty inline bytes. Instead we synthesize a
+	// ValueMessage with Expiry=1 so the storage.Get expiry check treats
+	// the key as not-found and the cleaner removes the sentinel later.
 	op := NewMultiplexOperator()
 	key := metaKey(t, "user:alice")
 	operand := marshal(t, segmentOperand("files/UUID-A", "segments/seg_1.seg", 128, 4096))
 
-	_, ok := op.FullMerge(key, nil, [][]byte{operand})
-	assert.False(t, ok, "merge should not synthesize a value out of thin air")
+	result, ok := op.FullMerge(key, nil, [][]byte{operand})
+	require.True(t, ok, "must not return false — would cause RocksDB Status::Corruption")
+	require.NotNil(t, result, "must return a sentinel so RocksDB has something to store")
+
+	got := unmarshal(t, result)
+	assert.Equal(t, int64(1), got.Expiry,
+		"sentinel must carry an always-expired Expiry so the read path short-circuits")
+	// The other fields stay at their zero value; it's the Expiry that makes
+	// the sentinel harmless.
+	assert.Empty(t, got.Data)
+	assert.Empty(t, got.RawFilePath)
+	assert.Empty(t, got.SegmentPath)
+	assert.Zero(t, got.ValueLength)
 }
 
 func TestMergeMetadataCAS_MalformedOperand_SkippedBaseUntouched(t *testing.T) {

@@ -1210,3 +1210,100 @@ func TestCompactFiles_ConcurrentPutWinsRace(t *testing.T) {
 		"persisted SEGMENT meta must never carry RawFilePath")
 	assert.NotEmpty(t, after.SegmentPath)
 }
+
+// TestCompactFiles_ConcurrentDeleteRace verifies that a Delete racing with
+// the compactor's metadata rewrite does not cause RocksDB to return a
+// Status::Corruption error on subsequent reads of the deleted key.
+//
+// The sequence mirrors the companion Put-race scenario but with Delete
+// standing in for the concurrent storage.Put:
+//
+//  1. storage.Put writes meta:k -> RAW_FILE UUID-A.
+//  2. The compactor's processCompactionEntry reads meta:k, validates the
+//     entry, and begins migrating the file into a segment.
+//  3. Before the compactor commits its batch, a concurrent
+//     storage.DeleteKey removes meta:k (a regular RocksDB Delete tombstone).
+//  4. The compactor commits its conditional merge on top of the tombstone.
+//
+// The merge then resolves at read time against an empty existingValue and
+// a precondition that can no longer match. Returning (nil, false) from
+// FullMerge here would trip RocksDB's Status::Corruption path; instead
+// the operator synthesizes an already-expired sentinel so storage.Get
+// treats the key as not-found — preserving the user's Delete intent.
+func TestCompactFiles_ConcurrentDeleteRace(t *testing.T) {
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Compactor is constructed but not started; we drive the race by hand
+	// so the interleaving is deterministic.
+	_ = NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+	})
+
+	userKey := "racing-deleted-key"
+	metaKey := keys.MakeMetadataKey(userKey)
+	fileA := filepath.Join(tmpDir, "files", "UUID-A.dat")
+	aBytes := []byte("raw-file-A")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fileA), 0o755))
+	require.NoError(t, os.WriteFile(fileA, aBytes, 0o644))
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+
+	// Step 1: seed meta:k as RAW_FILE UUID-A.
+	vmA := &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: fileA,
+		ValueLength: int64(len(aBytes)),
+	}
+	vmABytes, err := proto.Marshal(vmA)
+	require.NoError(t, err)
+	require.NoError(t, meta.Handle().Put(wo, metaKey, vmABytes))
+
+	// Step 3 (ahead of step 4 so the merge lands on a tombstone): user
+	// Delete. storage.DeleteKey issues a regular Delete on the metadata
+	// row (see storage.go: batch.Delete(metaKey)).
+	require.NoError(t, meta.Handle().Delete(wo, metaKey))
+
+	// Step 4: compactor's stale merge lands on the tombstone. The operand
+	// still asserts precondition=UUID-A, but the base no longer exists.
+	staleOperand := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		RawFilePath:   fileA, // CAS precondition: compactor saw UUID-A
+		SegmentPath:   filepath.Join(tmpDir, "segments", "stale.seg"),
+		SegmentOffset: 42,
+		ValueLength:   int64(len(aBytes)),
+	}
+	staleOperandBytes, err := proto.Marshal(staleOperand)
+	require.NoError(t, err)
+
+	mergeBatch := grocksdb.NewWriteBatch()
+	defer mergeBatch.Destroy()
+	mergeBatch.Merge(metaKey, staleOperandBytes)
+	require.NoError(t, meta.Handle().Write(wo, mergeBatch))
+
+	// Read meta:k. The merge operator must synthesize an expired sentinel
+	// rather than returning (nil, false) — otherwise RocksDB would surface
+	// Status::Corruption here.
+	slice, err := meta.Handle().Get(ro, metaKey)
+	require.NoError(t, err, "Get must not return an error — a false FullMerge result would cause Status::Corruption")
+	defer slice.Free()
+
+	// The key must decode to the expired sentinel so that storage.Get's
+	// expiry check (Expiry > 0 && now >= Expiry) short-circuits to
+	// not-found. We don't go through the full Storage layer here — this
+	// test is the merge-operator-layer contract check.
+	require.True(t, slice.Exists(),
+		"RocksDB stores the sentinel bytes; Storage.Get's expiry check filters it")
+	var got pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(slice.Data(), &got))
+	assert.Equal(t, int64(1), got.Expiry,
+		"sentinel Expiry=1 is what triggers storage.Get to report not-found")
+	assert.Empty(t, got.RawFilePath, "sentinel must not reference any raw file")
+	assert.Empty(t, got.SegmentPath, "sentinel must not reference any segment")
+}

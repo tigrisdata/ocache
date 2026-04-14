@@ -156,8 +156,34 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 	}
 
 	if !hadBase {
-		// No base and no operand applied: nothing to write.
-		return nil, false
+		// Reached when the meta key was deleted (or never existed) before
+		// the compactor's stale merge landed — see #144's follow-up on the
+		// Delete-vs-Merge race. Returning (nil, false) here is NOT safe:
+		// RocksDB treats a false return from FullMerge as
+		// Status::Corruption, which fails Get on the key and stalls
+		// background LSM compactions that process it.
+		//
+		// Returning (nil, true) is also unsafe: RocksDB would store an
+		// empty-bytes Put (db/merge_helper.cc: the kTypeValue branch),
+		// which unmarshals to a default ValueMessage (ValueType=INLINE,
+		// Data=nil) — silently resurrecting the deleted key as an empty
+		// inline value.
+		//
+		// Instead we synthesize an already-expired sentinel: a
+		// ValueMessage with Expiry = 1 (Unix epoch + 1s, always in the
+		// past). The read path's existing expiry check
+		// (storage.Storage.Get) short-circuits and returns "not found"
+		// without error, and the background cleaner will sweep the
+		// sentinel row on its next pass. This cannot collide with a
+		// legitimate user-set TTL, which is always computed as
+		// time.Now().Add(ttl*time.Second).Unix() — billions, never 1.
+		sentinel, err := proto.Marshal(&pb.ValueMessage{Expiry: 1})
+		if err != nil {
+			// proto.Marshal of a message with a single scalar field is
+			// effectively infallible; defensive fallback only.
+			return nil, false
+		}
+		return sentinel, true
 	}
 
 	result, err := proto.Marshal(&base)
