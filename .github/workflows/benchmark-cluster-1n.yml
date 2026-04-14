@@ -179,6 +179,15 @@ jobs:
           echo "=== Running cluster benchmark with 10 MB objects ==="
           ./ocachecli bench --addr "localhost:9001" --mode cluster --connection-pool-size 4 --num-ops 10000 --value-size 10485760 --workload "read=80,update=20" --no-progress | tee cluster-10mb-read-80-update-20.log
 
+      - name: Run cluster compaction-interleaved benchmark - 256 KB, high churn
+        run: |
+          echo "=== 256KB values, narrow keyspace, update-heavy → continuous raw-file → segment compaction under write pressure ==="
+          # Values land in the RAW_FILE tier (> InlineThreshold 64KB, < CompactThreshold 16MB) and
+          # the narrow keyspace drives many updates per key, so the background compactor is racing
+          # with Put on the same keys throughout the run. This is the workload shape of issue #142
+          # and serves as a performance-regression guard on the compactor commit path.
+          ./ocachecli bench --addr "localhost:9001" --mode cluster --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee cluster-256kb-compaction-churn.log
+
       - name: Stop cluster nodes
         if: always()
         run: |
