@@ -3,13 +3,41 @@
 package merge
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 
 	"github.com/tigrisdata/ocache/storage/keys"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 
 	"google.golang.org/protobuf/proto"
 )
+
+// expiredSentinel is the precomputed wire-format encoding of
+// &pb.ValueMessage{Expiry: 1}. mergeMetadataCAS emits this when a Delete
+// tombstones a key before the compactor's stale CAS merge lands, so
+// RocksDB never sees the Status::Corruption that a (nil, false) return
+// would trigger. The read path's expiry check then reports the key as
+// not-found, matching the user's Delete intent.
+//
+// Wire encoding: field 3 (Expiry, int64/varint) — tag = (3<<3)|0 = 0x18,
+// value = varint(1) = 0x01. Precomputing this byte slice lets us avoid a
+// proto.Marshal call inside FullMerge, so no marshal-failure fallback can
+// reintroduce the (nil, false) error path we exist to avoid. The init()
+// below verifies the bytes still match the schema at package load time.
+var expiredSentinel = []byte{0x18, 0x01}
+
+func init() {
+	want, err := proto.Marshal(&pb.ValueMessage{Expiry: 1})
+	if err != nil || !bytes.Equal(want, expiredSentinel) {
+		panic(fmt.Sprintf(
+			"merge: expiredSentinel out of sync with ValueMessage schema; "+
+				"precomputed=%x, proto.Marshal=%x (err=%v). "+
+				"Update expiredSentinel if the ValueMessage proto changed.",
+			expiredSentinel, want, err,
+		))
+	}
+}
 
 // MultiplexOperator is a merge operator that routes to different merge strategies
 // based on key prefixes. This allows us to support multiple merge types in a single
@@ -169,21 +197,19 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 		// Data=nil) — silently resurrecting the deleted key as an empty
 		// inline value.
 		//
-		// Instead we synthesize an already-expired sentinel: a
-		// ValueMessage with Expiry = 1 (Unix epoch + 1s, always in the
-		// past). The read path's existing expiry check
-		// (storage.Storage.Get) short-circuits and returns "not found"
-		// without error, and the background cleaner will sweep the
-		// sentinel row on its next pass. This cannot collide with a
-		// legitimate user-set TTL, which is always computed as
-		// time.Now().Add(ttl*time.Second).Unix() — billions, never 1.
-		sentinel, err := proto.Marshal(&pb.ValueMessage{Expiry: 1})
-		if err != nil {
-			// proto.Marshal of a message with a single scalar field is
-			// effectively infallible; defensive fallback only.
-			return nil, false
-		}
-		return sentinel, true
+		// Instead we emit an already-expired sentinel: a ValueMessage
+		// with Expiry = 1 (Unix epoch + 1s, always in the past). The read
+		// path's existing expiry check (storage.Storage.Get) short-circuits
+		// and returns "not found" without error, and the background
+		// cleaner sweeps the sentinel row on its next pass. This cannot
+		// collide with a legitimate user-set TTL, which is always computed
+		// as time.Now().Add(ttl*time.Second).Unix() — billions, never 1.
+		//
+		// The sentinel bytes are precomputed (see expiredSentinel above) so
+		// there is no proto.Marshal call here whose failure could quietly
+		// fall back to the (nil, false) error path this branch exists to
+		// avoid.
+		return expiredSentinel, true
 	}
 
 	result, err := proto.Marshal(&base)

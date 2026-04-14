@@ -1231,17 +1231,14 @@ func TestCompactFiles_ConcurrentPutWinsRace(t *testing.T) {
 // the operator synthesizes an already-expired sentinel so storage.Get
 // treats the key as not-found — preserving the user's Delete intent.
 func TestCompactFiles_ConcurrentDeleteRace(t *testing.T) {
-	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	// This test drives the Delete-vs-Merge interleaving deterministically
+	// against the full DBWithTTL + MultiplexOperator composition without
+	// going through Compactor.CompactFiles. There is no compaction index
+	// entry left to process once the key has been deleted, so exercising
+	// CompactFiles would be a no-op; the merge-operator layer is the
+	// correctness surface that actually needs asserting here.
+	tmpDir, meta, _, _, cleanup := setupTestEnvironment(t)
 	defer cleanup()
-
-	// Compactor is constructed but not started; we drive the race by hand
-	// so the interleaving is deterministic.
-	_ = NewCompactorWithConfig(&CompactorConfig{
-		MetaDB:         meta,
-		FileManager:    fm,
-		SegmentManager: sm,
-		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
-	})
 
 	userKey := "racing-deleted-key"
 	metaKey := keys.MakeMetadataKey(userKey)
