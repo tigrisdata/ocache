@@ -208,13 +208,19 @@ func TestEmbeddedClient_ListPageWithValues(t *testing.T) {
 	}
 
 	// Full iteration collects all entries with correct values
-	var all []struct{ key string; value []byte }
+	var all []struct {
+		key   string
+		value []byte
+	}
 	tok := ""
 	for {
 		page, nextTok, more, err := client.ListPageWithValues(ctx, "", 4, tok)
 		require.NoError(t, err)
 		for _, e := range page {
-			all = append(all, struct{ key string; value []byte }{e.Key, e.Value})
+			all = append(all, struct {
+				key   string
+				value []byte
+			}{e.Key, e.Value})
 		}
 		if !more {
 			break
