@@ -16,7 +16,22 @@ message ValueMessage {
   ValueType value_type = 1; // Location of the value bytes
   bytes data = 2; // The actual value bytes
   int64 expiry = 3; // Expiry timestamp (unix seconds), 0 if no expiry
-  string raw_file_path = 4; // Optional: raw file path for large objects (if used)
+  // raw_file_path: path to the external raw file storing the value.
+  //
+  // Invariant for STORED values:
+  //   - Non-empty iff value_type == RAW_FILE.
+  //   - Always empty for INLINE and SEGMENT.
+  //
+  // Overload for MERGE OPERANDS:
+  //   - On a SEGMENT-typed merge operand written by the background
+  //     compactor, raw_file_path carries the CAS precondition (the
+  //     raw-file path the compactor observed when it began migrating
+  //     this entry). The merge operator (mergeMetadataCAS) compares it
+  //     against the current base's raw_file_path to decide whether to
+  //     apply the rewrite, and clears it before persisting the result.
+  //     This overload is confined to transient merge operands — stored
+  //     SEGMENT values never carry raw_file_path.
+  string raw_file_path = 4;
   string segment_path = 5; // Optional: segment file storing the value for large objects (if used)
   int64 segment_offset = 6; // Byte offset within the segment where the value starts
   int64 value_length = 7; // Length of the value in bytes within the segment

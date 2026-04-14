@@ -36,6 +36,9 @@ func (m *MultiplexOperator) FullMerge(key, existingValue []byte, operands [][]by
 	case keys.IsDeleteIndexKey(key):
 		return m.mergeDeleteIndex(key, existingValue, operands)
 
+	case keys.IsMetadataKey(key):
+		return m.mergeMetadataCAS(key, existingValue, operands)
+
 	// Add more cases here for future merge types:
 	// case keys.IsCounterKey(key):
 	//     return m.mergeCounter(key, existingValue, operands)
@@ -81,6 +84,86 @@ func (m *MultiplexOperator) mergeDeleteIndex(key, existingValue []byte, operands
 		return nil, false
 	}
 
+	return result, true
+}
+
+// mergeMetadataCAS handles compare-and-swap rewrites for metadata keys, used by
+// the background compactor to migrate a raw-file entry into a segment entry
+// without racing against a concurrent Put on the same key.
+//
+// Operand encoding (see Option A convention, no dedicated operand type):
+//
+//   - The operand is a marshalled ValueMessage with ValueType == SEGMENT.
+//   - On an operand, RawFilePath is overloaded to carry the CAS precondition:
+//     the raw-file path the compactor observed when it started migrating this
+//     entry. This is the only context in which a SEGMENT-typed ValueMessage
+//     carries RawFilePath; stored SEGMENT values never do.
+//
+// CAS semantics: for each operand we apply the rewrite only when the current
+// base is a RAW_FILE entry whose RawFilePath equals the operand's precondition.
+// Otherwise a concurrent Put replaced the raw file between the compactor's read
+// and this merge; we drop the operand and keep the existing base so the newer
+// write wins. The segment bytes the compactor already wrote become dead space,
+// reclaimable by the segment recompactor.
+//
+// Multiple operands are applied in order so that stacked compactor passes
+// resolve correctly; an operand that fails its precondition is skipped without
+// affecting subsequent ones.
+func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands [][]byte) ([]byte, bool) {
+	var base pb.ValueMessage
+	if len(existingValue) > 0 {
+		if err := proto.Unmarshal(existingValue, &base); err != nil {
+			// Unparseable base: keep existing bytes verbatim rather than
+			// silently corrupting by applying merges to a nil base.
+			return existingValue, true
+		}
+	}
+
+	hadBase := len(existingValue) > 0
+	for _, operandBytes := range operands {
+		var op pb.ValueMessage
+		if err := proto.Unmarshal(operandBytes, &op); err != nil {
+			continue // malformed operand — skip, keep current base
+		}
+
+		// CAS precondition: must be a RAW_FILE → SEGMENT transition with a
+		// non-empty expected path carried on the operand.
+		if !hadBase ||
+			base.ValueType != pb.ValueType_RAW_FILE ||
+			op.ValueType != pb.ValueType_SEGMENT ||
+			op.RawFilePath == "" ||
+			base.RawFilePath != op.RawFilePath {
+			continue
+		}
+
+		// CAS matched — advance base to the new SEGMENT meta, clearing the
+		// overloaded precondition field so persisted SEGMENT values remain
+		// well-formed (RawFilePath always empty). Build fresh via field
+		// copy; direct struct assignment would copy the embedded proto
+		// lock.
+		base = pb.ValueMessage{
+			ValueType:     op.ValueType,
+			Data:          op.Data,
+			Expiry:        op.Expiry,
+			SegmentPath:   op.SegmentPath,
+			SegmentOffset: op.SegmentOffset,
+			ValueLength:   op.ValueLength,
+			Checksum:      op.Checksum,
+			// RawFilePath intentionally omitted (CAS precondition, not a
+			// live file reference).
+		}
+		hadBase = true
+	}
+
+	if !hadBase {
+		// No base and no operand applied: nothing to write.
+		return nil, false
+	}
+
+	result, err := proto.Marshal(&base)
+	if err != nil {
+		return nil, false
+	}
 	return result, true
 }
 

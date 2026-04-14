@@ -536,10 +536,19 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 		Str("key", entry.userKey).
 		Msg("compactor: successfully copied file to segment")
 
-	// Update metadata
-	metaBytes, _ := proto.Marshal(entry.metadata)
+	// Stage the metadata rewrite as a conditional merge rather than an
+	// unconditional Put so we don't silently clobber a concurrent
+	// storage.Put that replaced the raw file between our read of meta and
+	// this commit. The operand is a SEGMENT-typed ValueMessage whose
+	// RawFilePath field is overloaded to carry the CAS precondition (the
+	// raw-file path we observed when we started migrating this entry).
+	// See merge.mergeMetadataCAS for the precondition semantics; on a
+	// mismatch the operand is dropped and the concurrent Put wins, with
+	// the segment bytes we wrote becoming dead space reclaimable by the
+	// segment recompactor.
+	operandBytes, _ := proto.Marshal(entry.metadata)
 	metaKey := keys.MakeMetadataKey(entry.userKey)
-	wb.Put(metaKey, metaBytes)
+	wb.Merge(metaKey, operandBytes)
 
 	return nil
 }
@@ -557,7 +566,13 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 		return err
 	}
 
-	vm.RawFilePath = ""
+	// NOTE: vm.RawFilePath is deliberately NOT cleared here. The caller
+	// marshals vm as the operand bytes for a conditional-merge write
+	// (see compactEntry and merge.mergeMetadataCAS), and that merge needs
+	// the original raw-file path as its CAS precondition. The merge
+	// operator clears RawFilePath before persisting the resolved SEGMENT
+	// value, preserving the invariant that stored SEGMENT ValueMessages
+	// carry no RawFilePath.
 	vm.SegmentPath = seg.Path()
 	vm.SegmentOffset = segOff
 	vm.ValueType = pb.ValueType_SEGMENT
