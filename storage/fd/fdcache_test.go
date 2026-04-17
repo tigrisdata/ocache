@@ -752,3 +752,345 @@ func TestFdCache_RaceConditionExtended(t *testing.T) {
 
 	fdCache = nil
 }
+
+// TestFdCache_RemoveKeepsFileOpenForActiveReaders verifies that calling Remove()
+// while a reader still holds a reference does NOT close the underlying file.
+// The file must remain usable by the active holder until Release() is called.
+//
+// Regression test for a race where background compaction (which calls Remove)
+// closed descriptors that concurrent readers were still using, causing reads
+// to fail with "file already closed".
+func TestFdCache_RemoveKeepsFileOpenForActiveReaders(t *testing.T) {
+	fdCache = nil
+	cache := NewFdCache(10)
+	defer func() { fdCache = nil }()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "data.bin")
+	payload := []byte("the quick brown fox jumps over the lazy dog")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := cache.Acquire(path)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	// Evict the entry while the holder's ref is still outstanding.
+	cache.Remove(path)
+
+	// The underlying file descriptor must remain valid for the active holder.
+	buf := make([]byte, len(payload))
+	n, err := entry.File().ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt on active entry after Remove failed: %v", err)
+	}
+	if n != len(payload) || string(buf) != string(payload) {
+		t.Fatalf("ReadAt returned wrong data: got %q, want %q", buf[:n], payload)
+	}
+
+	// Release drops the last ref; the file should now be closed.
+	cache.Release(path, entry)
+	if _, err := entry.File().ReadAt(buf, 0); err == nil {
+		t.Fatal("expected ReadAt to fail after final Release closed the file, got nil")
+	}
+}
+
+// TestFdCache_RemoveClosesWhenNoActiveReaders verifies that Remove() still
+// closes the file (and releases its FD) when no callers hold a reference.
+func TestFdCache_RemoveClosesWhenNoActiveReaders(t *testing.T) {
+	fdCache = nil
+	cache := NewFdCache(10)
+	defer func() { fdCache = nil }()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "data.bin")
+	if err := os.WriteFile(path, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := cache.Acquire(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.Release(path, entry)
+
+	// Re-acquire and manually decrement refs to put the entry into the
+	// defensive "in map with refs=0" state. Normal code never leaves an
+	// in-map entry at refs=0 (Release transitions 1 → -1 atomically), so
+	// this simulates a recovery/defensive scenario where Remove must still
+	// close the FD.
+	entry, err = cache.Acquire(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	atomic.AddInt32(&entry.refs, -1)
+	if got := atomic.LoadInt32(&entry.refs); got != 0 {
+		t.Fatalf("setup: expected refs=0, got %d", got)
+	}
+
+	cache.Remove(path)
+
+	// With no active holders at Remove time, the FD must be closed now.
+	if _, err := entry.File().ReadAt(make([]byte, 1), 0); err == nil {
+		t.Fatal("expected ReadAt to fail because Remove should have closed the file")
+	}
+}
+
+// TestFileEntry_TryAcquireRefRefusesClosed verifies that tryAcquireRef
+// refuses to bump refs once an entry has been claimed for closing.
+// Regression test for the race where Acquire loaded an entry, then a
+// concurrent Release brought refs to zero and closed the FD, then Acquire
+// bumped refs back to 1 and returned the now-dead entry.
+func TestFileEntry_TryAcquireRefRefusesClosed(t *testing.T) {
+	e := &FileEntry{refs: refsClosed}
+	if e.tryAcquireRef() {
+		t.Fatal("tryAcquireRef must refuse entries in the closing state (refs=-1)")
+	}
+	if got := atomic.LoadInt32(&e.refs); got != refsClosed {
+		t.Errorf("refs mutated: got %d, want %d", got, refsClosed)
+	}
+
+	e = &FileEntry{refs: 0}
+	if e.tryAcquireRef() {
+		t.Fatal("tryAcquireRef must refuse entries at refs=0")
+	}
+	if got := atomic.LoadInt32(&e.refs); got != 0 {
+		t.Errorf("refs mutated: got %d, want 0", got)
+	}
+
+	e = &FileEntry{refs: 5}
+	if !e.tryAcquireRef() {
+		t.Fatal("tryAcquireRef must accept entries with refs>0")
+	}
+	if got := atomic.LoadInt32(&e.refs); got != 6 {
+		t.Errorf("refs not incremented: got %d, want 6", got)
+	}
+}
+
+// TestFileEntry_DropRefClaimsCloseAtomically verifies the 1 → -1 transition
+// in dropRef. This transition is what prevents a concurrent Acquire from
+// reviving a reference on an entry that is about to be closed.
+func TestFileEntry_DropRefClaimsCloseAtomically(t *testing.T) {
+	// Last holder dropping its ref must claim the close.
+	e := &FileEntry{refs: 1}
+	if !e.dropRef() {
+		t.Fatal("dropRef must return true when transitioning from refs=1")
+	}
+	if got := atomic.LoadInt32(&e.refs); got != refsClosed {
+		t.Errorf("refs should be %d after last dropRef, got %d", refsClosed, got)
+	}
+
+	// Non-last holder must not claim.
+	e = &FileEntry{refs: 3}
+	if e.dropRef() {
+		t.Fatal("dropRef must return false when other holders remain")
+	}
+	if got := atomic.LoadInt32(&e.refs); got != 2 {
+		t.Errorf("refs should be 2 after non-last dropRef, got %d", got)
+	}
+
+	// dropRef on a closed entry must be a safe no-op.
+	e = &FileEntry{refs: refsClosed}
+	if e.dropRef() {
+		t.Fatal("dropRef on already-closed entry must return false")
+	}
+	if got := atomic.LoadInt32(&e.refs); got != refsClosed {
+		t.Errorf("refs mutated after dropRef on closed entry: got %d", got)
+	}
+}
+
+// TestFdCache_AcquireRacesRelease reproduces a race where Acquire loads the
+// entry from the map, and before it increments refs, a concurrent Release
+// brings refs to zero and closes the underlying FD. The original refs++ code
+// would then bump refs back to 1 and return an entry whose file was already
+// closed; the next read on it would fail with "file already closed".
+//
+// With CAS-based tryAcquireRef / dropRef, Acquire either succeeds with a live
+// FD or falls through to open a fresh one. No reader should ever see a closed
+// FD.
+func TestFdCache_AcquireRacesRelease(t *testing.T) {
+	fdCache = nil
+	cache := NewFdCache(100)
+	defer func() { fdCache = nil }()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "data.bin")
+	payload := []byte("abcdefghijklmnopqrstuvwxyz")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const iterations = 2000
+	var readErrors int32
+	buf := make([]byte, len(payload))
+
+	for i := 0; i < iterations; i++ {
+		// Establish an entry in the cache with refs=1 (held by this goroutine).
+		entry1, err := cache.Acquire(path)
+		if err != nil {
+			t.Fatalf("iter %d: initial Acquire failed: %v", i, err)
+		}
+
+		var (
+			wg     sync.WaitGroup
+			entry2 *FileEntry
+			err2   error
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			entry2, err2 = cache.Acquire(path)
+		}()
+
+		// Release races with the goroutine's Acquire. Without the fix, the
+		// goroutine's Load returns the entry, then this Release brings refs
+		// to zero, CompareAndDelete evicts and closes — then the goroutine
+		// bumps refs back up and returns an entry with a closed FD.
+		cache.Release(path, entry1)
+		wg.Wait()
+
+		if err2 != nil {
+			t.Fatalf("iter %d: racing Acquire returned err: %v", i, err2)
+		}
+		if entry2 == nil {
+			t.Fatalf("iter %d: racing Acquire returned nil entry", i)
+		}
+		if _, err := entry2.File().ReadAt(buf, 0); err != nil {
+			atomic.AddInt32(&readErrors, 1)
+			t.Errorf("iter %d: ReadAt on racing-acquired entry failed: %v", i, err)
+		}
+		cache.Release(path, entry2)
+
+		if readErrors > 0 {
+			break
+		}
+	}
+
+	if got := atomic.LoadInt32(&readErrors); got != 0 {
+		t.Errorf("observed %d read errors under Acquire↔Release race (expected 0)", got)
+	}
+}
+
+// TestFdCache_AcquireReleaseStorm hammers Acquire/Release from many goroutines
+// on the same path. Each Acquire → ReadAt → Release cycle must always observe
+// a live FD (no "file already closed" errors), regardless of how the refcount
+// oscillates.
+func TestFdCache_AcquireReleaseStorm(t *testing.T) {
+	fdCache = nil
+	cache := NewFdCache(100)
+	defer func() { fdCache = nil }()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "data.bin")
+	payload := make([]byte, 256)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		workers    = 32
+		iterations = 2000
+	)
+
+	var wg sync.WaitGroup
+	var readErrors int32
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, len(payload))
+			for j := 0; j < iterations; j++ {
+				entry, err := cache.Acquire(path)
+				if err != nil {
+					atomic.AddInt32(&readErrors, 1)
+					continue
+				}
+				if _, err := entry.File().ReadAt(buf, 0); err != nil {
+					atomic.AddInt32(&readErrors, 1)
+				}
+				cache.Release(path, entry)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&readErrors); got != 0 {
+		t.Errorf("observed %d read errors under Acquire/Release storm (expected 0)", got)
+	}
+}
+
+// TestFdCache_RemoveWhileConcurrentReads stresses the Remove↔read race.
+// Reader workers repeatedly Acquire → ReadAt → Release while an evictor
+// goroutine hammers Remove on the same path. No read should ever fail with
+// "file already closed".
+func TestFdCache_RemoveWhileConcurrentReads(t *testing.T) {
+	fdCache = nil
+	cache := NewFdCache(10)
+	defer func() { fdCache = nil }()
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "data.bin")
+	payload := make([]byte, 4096)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		readers    = 16
+		iterations = 500
+	)
+
+	var readersWG sync.WaitGroup
+	var readErrors int32
+
+	for i := 0; i < readers; i++ {
+		readersWG.Add(1)
+		go func() {
+			defer readersWG.Done()
+			buf := make([]byte, len(payload))
+			for j := 0; j < iterations; j++ {
+				entry, err := cache.Acquire(path)
+				if err != nil {
+					atomic.AddInt32(&readErrors, 1)
+					continue
+				}
+				if _, err := entry.File().ReadAt(buf, 0); err != nil {
+					atomic.AddInt32(&readErrors, 1)
+				}
+				cache.Release(path, entry)
+			}
+		}()
+	}
+
+	stop := make(chan struct{})
+	evictorDone := make(chan struct{})
+	go func() {
+		defer close(evictorDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				cache.Remove(path)
+			}
+		}
+	}()
+
+	readersWG.Wait()
+	close(stop)
+	<-evictorDone
+
+	if got := atomic.LoadInt32(&readErrors); got != 0 {
+		t.Errorf("observed %d read errors under Remove race (expected 0)", got)
+	}
+}

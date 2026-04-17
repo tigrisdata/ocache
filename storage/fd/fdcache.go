@@ -2,6 +2,7 @@ package fd
 
 import (
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -9,6 +10,11 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/utils"
 )
+
+// refsClosed is the sentinel value for refs once a caller has claimed the
+// close of a FileEntry. Any further Acquire attempts must observe this state
+// and fall through to opening a fresh entry.
+const refsClosed int32 = -1
 
 // FileEntry wraps a cached os.File descriptor along with a per-file RWMutex and reference count.
 // The lock protects concurrent readers/writers on the underlying file while refs ensures that the
@@ -19,6 +25,16 @@ import (
 // (See https://pkg.go.dev/sync/atomic#pkg-note-BUG)
 //
 // Callers interact with it exclusively through the FdCache APIs.
+//
+// State machine for refs:
+//
+//	> 0 : active holders (normal "live" state)
+//	  0 : defensive/transient only (e.g. immediately after construction, or
+//	      after all waiters have dropped their refs in the open-failure path).
+//	      Steady-state code never leaves an in-map entry at refs == 0, because
+//	      Release transitions refs 1 → -1 atomically to claim the close.
+//	 -1 : "closed/closing" sentinel. No new Acquire may bump refs from here;
+//	      it must fall through to opening a fresh entry.
 
 type FileEntry struct {
 	refs   int32 // accessed atomically – keep first
@@ -51,6 +67,47 @@ func (e *FileEntry) RLock() {
 // RUnlock releases the read lock.
 func (e *FileEntry) RUnlock() {
 	e.mu.RUnlock()
+}
+
+// tryAcquireRef atomically increments refs if and only if refs > 0.
+// Returns true on success. Returns false if the entry has been claimed for
+// closing (refs <= 0), in which case the caller must fall through and create
+// a fresh entry instead of using this one.
+func (e *FileEntry) tryAcquireRef() bool {
+	for {
+		cur := atomic.LoadInt32(&e.refs)
+		if cur <= 0 {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&e.refs, cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// dropRef atomically decrements refs. Returns true if this caller transitioned
+// the count from 1 to the closing sentinel (-1), i.e. this caller now owns
+// the close and must perform the final cleanup via closeEntry. Returns false
+// if other holders remain or the entry has already been claimed.
+func (e *FileEntry) dropRef() (ownsClose bool) {
+	for {
+		cur := atomic.LoadInt32(&e.refs)
+		if cur <= 0 {
+			// Already closed/closing or never held. Defensive no-op.
+			return false
+		}
+		if cur > 1 {
+			if atomic.CompareAndSwapInt32(&e.refs, cur, cur-1) {
+				return false
+			}
+			continue
+		}
+		// cur == 1: try to claim the close atomically.
+		if atomic.CompareAndSwapInt32(&e.refs, 1, refsClosed) {
+			return true
+		}
+		// CAS failed: a concurrent tryAcquireRef revived the count. Retry.
+	}
 }
 
 // FdCache implements a capacity-bounded cache for open file descriptors. It allows multiple
@@ -90,157 +147,182 @@ func NewFdCache(capacity int) *FdCache {
 }
 
 // Acquire returns a cached *fileEntry for the given path, opening the file in read-only mode if
-// necessary. The lockProvider is used to obtain the RWMutex that guards access to a given file
-// path. The entry's reference count is incremented; callers MUST invoke Release when they are done
-// so the underlying descriptor can be closed (and the cache pruned) when no longer needed.
+// necessary. The entry's reference count is incremented; callers MUST invoke Release when they are
+// done so the underlying descriptor can be closed (and the cache pruned) when no longer needed.
+//
+// Acquire is race-free against concurrent Release and Remove: if the cached entry has been
+// claimed for closing (refs <= 0), Acquire transparently falls through and opens a fresh
+// descriptor rather than returning a stale FileEntry whose file has been closed.
 func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
-	// Fast-path: entry already in cache.
-	if v, ok := fc.entries.Load(path); ok {
-		e := v.(*FileEntry)
-		// Increment refs BEFORE waiting to prevent removal during acquire
-		atomic.AddInt32(&e.refs, 1)
-
-		// Wait for file to be ready if another goroutine is opening it
-		<-e.ready
-
-		// Check if opening failed
-		if e.f == nil {
-			// Decrement refs since we're not using it
-			atomic.AddInt32(&e.refs, -1)
-			return nil, utils.WrapError("failed to open raw file", path, nil)
-		}
-		// Track cache hit
-		metrics.FDCacheHits.Inc()
-		return e, nil
-	}
-
-	// Slow-path: need to open the file.
-	// Track cache miss
-	metrics.FDCacheMisses.Inc()
-
-	// Check if we're at capacity before creating a new entry
-	atCapacity := fc.capacity > 0 && atomic.LoadInt32(&fc.size) >= int32(fc.capacity)
-
-	// Create entry with ready channel
-	ready := make(chan struct{})
-	entry := &FileEntry{
-		refs:   1,
-		f:      nil,
-		mu:     GetFileLockManager().GetFileLock(path),
-		ready:  ready,
-		cached: !atCapacity, // Won't be cached if at capacity
-	}
-
-	// Try to store our entry atomically
-	actual, loaded := fc.entries.LoadOrStore(path, entry)
-	if loaded {
-		// Another goroutine already started opening, wait for it
-		existing := actual.(*FileEntry)
-		// Increment refs BEFORE waiting to prevent removal during acquire
-		atomic.AddInt32(&existing.refs, 1)
-
-		<-existing.ready
-		// Check if opening failed
-		if existing.f == nil {
-			// Decrement refs since we're not using it
-			atomic.AddInt32(&existing.refs, -1)
-			return nil, utils.WrapError("failed to open raw file", path, nil)
-		}
-		// Track as cache hit since another goroutine opened it for us
-		metrics.FDCacheHits.Inc()
-		return existing, nil
-	}
-
-	// We won the race to insert the entry, now open the file
-	f, err := os.OpenFile(path, os.O_RDONLY, 0o644)
-	if err != nil {
-		// Mark as failed (f remains nil) and signal waiters
-		close(ready)
-		// Remove our failed entry
-		fc.entries.Delete(path)
-
-		if os.IsNotExist(err) {
-			zlog.Warn().Str("path", path).Msg("fdCache: file not found")
-			return nil, utils.WrapError("raw file not found", path, err)
-		}
-		return nil, utils.WrapError("failed to open raw file", path, err)
-	}
-
-	// Set the file descriptor and signal success
-	entry.f = f
-	close(ready)
-
-	// Track size only if we're actually caching this entry
-	if entry.cached {
-		newSize := atomic.AddInt32(&fc.size, 1)
-		// Update cache size metric
-		metrics.FDCacheSize.Set(float64(newSize))
-	} else {
-		// Not cached due to capacity limit, remove from entries map
-		// but return the entry for this caller to use
-		fc.entries.Delete(path)
-		// Track not cached count due to capacity
-		metrics.FDCacheNotCached.Inc()
-	}
-
-	return entry, nil
-}
-
-// Release decrements the reference count for the given entry and, when it reaches zero, removes
-// the entry from the cache and closes the underlying file.
-func (fc *FdCache) Release(path string, e *FileEntry) {
-	newRefs := atomic.AddInt32(&e.refs, -1)
-	if newRefs == 0 {
-		// If this entry was cached, remove it
-		if e.cached {
-			// Try to remove from cache. We use CompareAndDelete to ensure we only
-			// remove our specific entry and not one that another goroutine may have added
-			if fc.entries.CompareAndDelete(path, e) {
-				// Successfully removed our entry, clean up
-				<-e.ready
-				if e.f != nil {
-					_ = e.f.Close()
-				}
-				newSize := atomic.AddInt32(&fc.size, -1)
-				// Update cache size metric
-				metrics.FDCacheSize.Set(float64(newSize))
-			} else {
-				// Either already removed or replaced by another goroutine
-				// Just close the file if it's ready
-				<-e.ready
-				if e.f != nil {
-					_ = e.f.Close()
-				}
+	for {
+		// Fast-path: entry already in cache.
+		if v, ok := fc.entries.Load(path); ok {
+			e := v.(*FileEntry)
+			if !e.tryAcquireRef() {
+				// Entry is being closed by a concurrent Release/Remove. The
+				// map entry will be removed shortly; yield briefly and retry
+				// the top-level Acquire so we either find a fresh entry or
+				// fall through to the slow path.
+				runtime.Gosched()
+				continue
 			}
-		} else {
-			// Not cached, just close the file
+
+			// Wait for file to be ready if another goroutine is opening it.
 			<-e.ready
-			if e.f != nil {
-				_ = e.f.Close()
+
+			// Check if opening failed.
+			if e.f == nil {
+				if e.dropRef() {
+					fc.closeEntry(path, e)
+				}
+				return nil, utils.WrapError("failed to open raw file", path, nil)
 			}
+
+			metrics.FDCacheHits.Inc()
+			return e, nil
 		}
-	} else if newRefs < 0 {
-		// This shouldn't happen in normal operation, but let's handle it gracefully
-		// Reset to 0 to prevent further decrements
-		atomic.StoreInt32(&e.refs, 0)
+
+		// Slow-path: need to open the file.
+		metrics.FDCacheMisses.Inc()
+
+		// Check if we're at capacity before creating a new entry.
+		atCapacity := fc.capacity > 0 && atomic.LoadInt32(&fc.size) >= int32(fc.capacity)
+
+		// Create entry with ready channel.
+		ready := make(chan struct{})
+		entry := &FileEntry{
+			refs:   1,
+			f:      nil,
+			mu:     GetFileLockManager().GetFileLock(path),
+			ready:  ready,
+			cached: !atCapacity,
+		}
+
+		// Try to store our entry atomically.
+		actual, loaded := fc.entries.LoadOrStore(path, entry)
+		if loaded {
+			// Another goroutine already started opening; wait for it.
+			existing := actual.(*FileEntry)
+			if !existing.tryAcquireRef() {
+				// The existing entry is being closed. Retry the outer loop;
+				// it will be evicted from the map shortly and we can either
+				// find a replacement or win the LoadOrStore ourselves.
+				runtime.Gosched()
+				continue
+			}
+
+			<-existing.ready
+			if existing.f == nil {
+				if existing.dropRef() {
+					fc.closeEntry(path, existing)
+				}
+				return nil, utils.WrapError("failed to open raw file", path, nil)
+			}
+
+			metrics.FDCacheHits.Inc()
+			return existing, nil
+		}
+
+		// We won the race to insert the entry; now open the file.
+		f, err := os.OpenFile(path, os.O_RDONLY, 0o644)
+		if err != nil {
+			// Mark as failed (f remains nil) and signal waiters.
+			close(ready)
+			// Remove our failed entry so new callers don't reuse it.
+			fc.entries.Delete(path)
+			// Drop our construction ref. If a waiter joined before we Deleted,
+			// the last dropper will run closeEntry (which is a no-op on a nil
+			// file beyond the map cleanup that already happened).
+			if entry.dropRef() {
+				fc.closeEntry(path, entry)
+			}
+
+			if os.IsNotExist(err) {
+				zlog.Warn().Str("path", path).Msg("fdCache: file not found")
+				return nil, utils.WrapError("raw file not found", path, err)
+			}
+			return nil, utils.WrapError("failed to open raw file", path, err)
+		}
+
+		// Set the file descriptor and signal success.
+		entry.f = f
+		close(ready)
+
+		// Track size only if we're actually caching this entry.
+		if entry.cached {
+			newSize := atomic.AddInt32(&fc.size, 1)
+			metrics.FDCacheSize.Set(float64(newSize))
+		} else {
+			// At capacity: remove from entries map but return the entry for
+			// this caller to use (its lifetime is bounded by Release).
+			fc.entries.Delete(path)
+			metrics.FDCacheNotCached.Inc()
+		}
+
+		return entry, nil
 	}
 }
 
-// Remove forcibly evicts the entry for `path` from the cache (if present) and closes the file.
-// This is primarily used when the file itself has been deleted from disk.
+// Release decrements the reference count for the given entry. When this is the
+// last holder, Release atomically claims the close via dropRef and invokes
+// closeEntry to finalize cleanup.
+func (fc *FdCache) Release(path string, e *FileEntry) {
+	if e.dropRef() {
+		fc.closeEntry(path, e)
+	}
+}
+
+// closeEntry finalizes cleanup after a caller has atomically claimed the close
+// via dropRef (refs transitioned 1 → refsClosed) or Remove's CAS from 0 →
+// refsClosed. It evicts the entry from the map (if still present and cached)
+// and closes the underlying file descriptor.
+//
+// closeEntry may safely observe that the entry has already been removed from
+// the map (CompareAndDelete returns false) when Remove raced to evict it; in
+// that case Remove has already performed the size/eviction accounting and we
+// need only close the FD.
+func (fc *FdCache) closeEntry(path string, e *FileEntry) {
+	<-e.ready
+	if e.cached {
+		if fc.entries.CompareAndDelete(path, e) {
+			newSize := atomic.AddInt32(&fc.size, -1)
+			metrics.FDCacheSize.Set(float64(newSize))
+		}
+	}
+	if e.f != nil {
+		_ = e.f.Close()
+	}
+}
+
+// Remove forcibly evicts the entry for `path` from the cache (if present).
+// This is primarily used when the file itself has been deleted from disk or
+// when the segment containing it has been compacted away.
+//
+// Remove never closes a file descriptor that an active holder still owns.
+// The close is always performed by the last Release (which transitions refs
+// 1 → -1 and runs closeEntry). If Remove happens to observe that no holder
+// exists (refs == 0, e.g. a defensive/manual state), it atomically claims
+// the close via CAS(0, refsClosed) and closes the FD itself.
 func (fc *FdCache) Remove(path string) {
 	if v, ok := fc.entries.LoadAndDelete(path); ok {
 		if e, ok2 := v.(*FileEntry); ok2 {
-			// Wait for file to be ready before closing (in case it's still opening)
+			// Wait for file to be ready (in case it's still opening).
 			<-e.ready
-			if e.f != nil {
-				_ = e.f.Close()
-			}
 			newSize := atomic.AddInt32(&fc.size, -1)
-			// Track forced eviction
 			metrics.FDCacheEvictions.Inc()
-			// Update cache size metric
 			metrics.FDCacheSize.Set(float64(newSize))
+
+			// Claim the close only if nobody else is actively using the
+			// entry. If refs > 0, the last Release will close via dropRef +
+			// closeEntry (its CompareAndDelete will see the map is empty
+			// and skip size accounting — which we've already done here).
+			// If refs is already refsClosed, a Release already owns the
+			// close and is about to run closeEntry.
+			if atomic.CompareAndSwapInt32(&e.refs, 0, refsClosed) {
+				if e.f != nil {
+					_ = e.f.Close()
+				}
+			}
 		}
 	}
 }
