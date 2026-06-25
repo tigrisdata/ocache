@@ -114,3 +114,40 @@ func TestStorage_Get_DanglingMediumRawFile_StaysRetryable(t *testing.T) {
 	gotPath, _ := rawFilePathOf(t, stor, key)
 	assert.Equal(t, rawPath, gotPath, "medium dangling key must not be purged")
 }
+
+// TestStorage_PurgeDanglingRawFile_ConcurrentOverwriteNotPurged covers the race
+// where a Put replaces the key (with a fresh file path) between a reader's
+// metadata snapshot and its stale ENOENT file read. The purge must observe that
+// the metadata no longer references the old path, decline to purge, and report
+// not-dangling so the caller retries instead of reporting a spurious miss.
+func TestStorage_PurgeDanglingRawFile_ConcurrentOverwriteNotPurged(t *testing.T) {
+	tmpDir := t.TempDir()
+	stor := danglingTestStorage(t, tmpDir)
+
+	key := "raced-large"
+	v1 := bytes.Repeat([]byte("a"), 8*1024) // large
+	require.NoError(t, stor.Put(key, bytes.NewReader(v1), 0))
+	p1, _ := rawFilePathOf(t, stor, key)
+
+	// A concurrent Put replaces the key with a fresh large value (new path).
+	v2 := bytes.Repeat([]byte("b"), 8*1024)
+	require.NoError(t, stor.Put(key, bytes.NewReader(v2), 0))
+	p2, _ := rawFilePathOf(t, stor, key)
+	require.NotEqual(t, p1, p2)
+
+	// A stale reader holding the p1 snapshot would call purge with the old path.
+	purged := stor.purgeDanglingRawFile(key, p1, int64(len(v1)))
+	assert.False(t, purged, "must not purge when metadata now references a different file")
+
+	// The live value (v2/p2) must be intact and still readable.
+	gotPath, _ := rawFilePathOf(t, stor, key)
+	assert.Equal(t, p2, gotPath, "live value must not be clobbered")
+	r, found, err := stor.Get(key, 0, 0)
+	require.NoError(t, err)
+	require.True(t, found)
+	got, _ := io.ReadAll(r)
+	assert.Equal(t, v2, got)
+	if rc, ok := r.(io.Closer); ok {
+		rc.Close()
+	}
+}
