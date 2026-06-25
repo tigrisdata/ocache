@@ -949,16 +949,17 @@ func TestCompactFilesWithCorruptedFile(t *testing.T) {
 	assert.False(t, slice.Exists(), "Compaction index entry should be removed for corrupted file")
 	slice.Free()
 
-	// Verify metadata was NOT updated to segment type
+	// The corrupted file is queued for deletion, so its metadata must be
+	// tombstoned (not left dangling) — mirroring recovery's StatusCorrupted
+	// handling. It is no longer a live RAW_FILE entry but the expired sentinel.
 	metaSlice, _ := meta.Handle().Get(ro, metaKey)
-	if metaSlice.Exists() {
-		checkVm := &pb.ValueMessage{}
-		err = proto.Unmarshal(metaSlice.Data(), checkVm)
-		assert.NoError(t, err)
-		assert.Equal(t, pb.ValueType_RAW_FILE, checkVm.ValueType, "Metadata should still show RAW_FILE type")
-		assert.Equal(t, testFile, checkVm.RawFilePath, "File path should remain unchanged")
-	}
+	require.True(t, metaSlice.Exists())
+	checkVm := &pb.ValueMessage{}
+	err = proto.Unmarshal(metaSlice.Data(), checkVm)
+	require.NoError(t, err)
 	metaSlice.Free()
+	assert.NotEqual(t, pb.ValueType_RAW_FILE, checkVm.ValueType, "corrupted-file metadata must be purged, not left dangling")
+	assert.Equal(t, int64(1), checkVm.Expiry, "metadata must be the expired sentinel")
 }
 
 func TestCompactFilesWithMultipleCorruptions(t *testing.T) {

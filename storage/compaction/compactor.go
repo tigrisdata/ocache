@@ -382,8 +382,15 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 			// Check if it's a file size mismatch error
 			var sizeMismatchErr *ErrFileSizeMismatch
 			if errors.As(err, &sizeMismatchErr) {
-				// Skip corrupted file - queue for deletion
+				// Skip corrupted file - queue it for deletion AND tombstone the
+				// metadata that references it. Like the ErrFileNotExist branch,
+				// this would otherwise leave the metadata orphaned (still
+				// RAW_FILE -> a file the compactor is about to delete) and
+				// unreachable by startup recovery, so every Get of the key fails
+				// indefinitely (#152). Mirrors recovery's StatusCorrupted, which
+				// deletes both the file and the metadata.
 				wb.Delete(k)
+				c.purgeDanglingMeta(wb, entry.userKey, entry.filePath)
 				if err := c.deletionQueue.Add(entry.filePath); err != nil {
 					zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: failed to queue corrupted file for deletion")
 				}
@@ -494,8 +501,16 @@ func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.Value
 // The tombstone is a conditional merge (see merge.MakeRawFilePurgeOperand /
 // merge.mergeMetadataCAS): it applies only when the metadata still references
 // filePath, so a concurrent Put (which writes a fresh path) or a prior
-// RAW_FILE->SEGMENT migration is never clobbered.
+// RAW_FILE->SEGMENT migration is never clobbered. ENOENT is treated as
+// permanent; a transient absence (e.g. a flapping network mount) would evict an
+// otherwise-healthy entry, but the cost is a cache miss + upstream re-fetch, not
+// data corruption, and local-disk ENOENT is reliably permanent.
 func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath string) {
+	if filePath == "" {
+		// No path to match against, so the conditional purge could not identify
+		// the dangling entry anyway; skip rather than emit a no-op operand.
+		return
+	}
 	operand, err := merge.MakeRawFilePurgeOperand(filePath)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to build dangling-metadata purge operand")
