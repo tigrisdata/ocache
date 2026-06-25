@@ -56,6 +56,17 @@ var (
 		[]string{"method"},
 	)
 
+	// GRPCPanicsRecovered counts panics recovered by the gRPC recovery
+	// interceptors. A non-zero value means a handler panicked and the RPC was
+	// failed in isolation instead of crashing the process.
+	GRPCPanicsRecovered = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_grpc_panics_recovered_total",
+			Help: "Total number of panics recovered by the gRPC recovery interceptors",
+		},
+		[]string{"method"},
+	)
+
 	// Storage Metrics
 	StorageOperations = promauto.NewCounterVec(
 		prometheus.CounterOpts{

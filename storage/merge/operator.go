@@ -154,6 +154,26 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			continue // malformed operand — skip, keep current base
 		}
 
+		// Purge-CAS: a RAW_FILE-typed operand carrying a RawFilePath
+		// precondition is a request from the read path (storage.Get) to
+		// tombstone a dangling raw-file reference whose backing file vanished
+		// after an unclean shutdown. Apply it only when the current base is
+		// still that exact RAW_FILE entry; otherwise a concurrent Put or
+		// compaction already replaced it and the newer state must win. Because
+		// storage.Put always writes a fresh UUID filename, a path match
+		// uniquely identifies the dangling file, so this can never clobber a
+		// live value. On a match we tombstone via the already-expired sentinel
+		// (Expiry == 1): the read path's expiry check reports the key as
+		// not-found and the background cleaner sweeps the row.
+		if op.ValueType == pb.ValueType_RAW_FILE && op.RawFilePath != "" {
+			if hadBase &&
+				base.ValueType == pb.ValueType_RAW_FILE &&
+				base.RawFilePath == op.RawFilePath {
+				base = pb.ValueMessage{Expiry: 1}
+			}
+			continue
+		}
+
 		// CAS precondition: must be a RAW_FILE → SEGMENT transition with a
 		// non-empty expected path carried on the operand.
 		if !hadBase ||

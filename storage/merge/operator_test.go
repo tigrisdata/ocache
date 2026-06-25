@@ -201,6 +201,67 @@ func TestMergeMetadataCAS_MalformedOperand_SkippedBaseUntouched(t *testing.T) {
 	assert.Equal(t, "files/UUID-A", got.RawFilePath)
 }
 
+func TestMergeMetadataCAS_PurgeMatches_Tombstones(t *testing.T) {
+	// The read path observed a RAW_FILE entry whose backing file is gone
+	// (issue #150) and issued a purge operand. The base still points at the
+	// same dangling file, so the precondition matches and the key is
+	// tombstoned via the already-expired sentinel.
+	op := NewMultiplexOperator()
+	key := metaKey(t, "user:alice")
+	base := marshal(t, rawFile("files/UUID-A", 32<<20))
+	operand, err := MakeRawFilePurgeOperand("files/UUID-A")
+	require.NoError(t, err)
+
+	result, ok := op.FullMerge(key, base, [][]byte{operand})
+	require.True(t, ok)
+
+	got := unmarshal(t, result)
+	assert.Equal(t, int64(1), got.Expiry, "purge must tombstone via the always-expired sentinel")
+	assert.Empty(t, got.RawFilePath)
+	assert.Zero(t, got.ValueLength)
+}
+
+func TestMergeMetadataCAS_PurgeMismatch_KeepsBase(t *testing.T) {
+	// A concurrent Put replaced the key with a fresh file (UUID-B) before the
+	// purge operand landed. Put always writes a new path, so the precondition
+	// (UUID-A) cannot match and the live value must be preserved.
+	op := NewMultiplexOperator()
+	key := metaKey(t, "user:alice")
+	base := marshal(t, rawFile("files/UUID-B", 64<<20))
+	operand, err := MakeRawFilePurgeOperand("files/UUID-A")
+	require.NoError(t, err)
+
+	result, ok := op.FullMerge(key, base, [][]byte{operand})
+	require.True(t, ok)
+
+	got := unmarshal(t, result)
+	assert.Equal(t, pb.ValueType_RAW_FILE, got.ValueType, "concurrent Put wins")
+	assert.Equal(t, "files/UUID-B", got.RawFilePath)
+	assert.NotEqual(t, int64(1), got.Expiry)
+}
+
+func TestMergeMetadataCAS_PurgeNonRawFileBase_KeepsBase(t *testing.T) {
+	// A compaction migrated the key to a SEGMENT before the purge landed. The
+	// purge precondition only matches a RAW_FILE base, so the now-valid
+	// SEGMENT entry must be preserved.
+	op := NewMultiplexOperator()
+	key := metaKey(t, "user:alice")
+	base := marshal(t, &pb.ValueMessage{
+		ValueType:   pb.ValueType_SEGMENT,
+		SegmentPath: "segments/seg_0.seg",
+		ValueLength: 4096,
+	})
+	operand, err := MakeRawFilePurgeOperand("files/UUID-A")
+	require.NoError(t, err)
+
+	result, ok := op.FullMerge(key, base, [][]byte{operand})
+	require.True(t, ok)
+
+	got := unmarshal(t, result)
+	assert.Equal(t, pb.ValueType_SEGMENT, got.ValueType, "migrated SEGMENT base untouched")
+	assert.Equal(t, "segments/seg_0.seg", got.SegmentPath)
+}
+
 // Routing smoke: delete-index keys must still go through mergeDeleteIndex and
 // not be mis-dispatched to mergeMetadataCAS.
 func TestFullMerge_RoutingPreserved_DeleteIndex(t *testing.T) {
