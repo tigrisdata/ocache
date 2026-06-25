@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"runtime/debug"
 	"strconv"
 
 	"github.com/rs/zerolog/log"
@@ -9,6 +10,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/tigrisdata/ocache/common/metrics"
 )
 
 const (
@@ -141,6 +144,52 @@ func SetResponseMetadata(ctx context.Context, resp ResponseMetadata) error {
 		header.Append(MetadataKeyForwardedBy, resp.ForwardedBy)
 	}
 	return grpc.SetHeader(ctx, header)
+}
+
+// UnaryServerRecoveryInterceptor returns a gRPC unary interceptor that recovers
+// from panics in downstream interceptors and handlers, failing only that single
+// RPC with a codes.Internal error instead of letting the panic unwind and crash
+// the whole process. gRPC does not recover handler panics by default, so without
+// this a single poison request (e.g. a nil-deref on a corrupt key) takes down
+// the node. This gives the inter-node gRPC path the same per-request isolation
+// that net/http already provides on the gateway path (issue #150).
+//
+// Install it as the OUTERMOST interceptor so it also covers panics raised by
+// inner interceptors.
+func UnaryServerRecoveryInterceptor() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				metrics.GRPCPanicsRecovered.WithLabelValues(info.FullMethod).Inc()
+				log.Error().
+					Str("method", info.FullMethod).
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("grpc: recovered from panic in unary handler")
+				err = status.Errorf(codes.Internal, "internal error")
+			}
+		}()
+		return handler(ctx, req)
+	}
+}
+
+// StreamServerRecoveryInterceptor is the streaming counterpart to
+// UnaryServerRecoveryInterceptor. Install it as the outermost stream interceptor.
+func StreamServerRecoveryInterceptor() grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				metrics.GRPCPanicsRecovered.WithLabelValues(info.FullMethod).Inc()
+				log.Error().
+					Str("method", info.FullMethod).
+					Interface("panic", r).
+					Bytes("stack", debug.Stack()).
+					Msg("grpc: recovered from panic in stream handler")
+				err = status.Errorf(codes.Internal, "internal error")
+			}
+		}()
+		return handler(srv, ss)
+	}
 }
 
 // UnaryServerEpochInterceptor creates a gRPC unary interceptor that:

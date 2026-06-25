@@ -144,9 +144,10 @@ func grpcStreamLoggingInterceptor(
 func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, listenAddr string, requestLogging bool) {
 	var opts []grpc.ServerOption
 
-	// Build interceptor chains
-	var unaryInterceptors []grpc.UnaryServerInterceptor
-	var streamInterceptors []grpc.StreamServerInterceptor
+	// Build interceptor chains. Recovery is outermost so a panic in any handler
+	// fails just that RPC instead of crashing the process (issue #150).
+	unaryInterceptors := []grpc.UnaryServerInterceptor{coordinator.UnaryServerRecoveryInterceptor()}
+	streamInterceptors := []grpc.StreamServerInterceptor{coordinator.StreamServerRecoveryInterceptor()}
 
 	// Add logging interceptors if enabled
 	if requestLogging {

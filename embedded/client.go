@@ -236,13 +236,21 @@ func (c *Client) StartGRPCServer() error {
 		grpc.MaxSendMsgSize(128*1024*1024), // 128MB
 	)
 
-	// Add epoch interceptors if cluster mode is enabled
+	// Recovery interceptors are always installed as the outermost interceptors
+	// so a panic in any handler (or inner interceptor) fails just that RPC
+	// instead of crashing the process — parity with net/http's per-request
+	// recovery on the gateway path (issue #150). Epoch interceptors are added
+	// after recovery (inner) only in cluster mode.
+	unaryInterceptors := []grpc.UnaryServerInterceptor{coordinator.UnaryServerRecoveryInterceptor()}
+	streamInterceptors := []grpc.StreamServerInterceptor{coordinator.StreamServerRecoveryInterceptor()}
 	if c.coordinator != nil {
-		opts = append(opts,
-			grpc.ChainUnaryInterceptor(coordinator.UnaryServerEpochInterceptor(c.coordinator.GetEpoch)),
-			grpc.ChainStreamInterceptor(coordinator.StreamServerEpochInterceptor(c.coordinator.GetEpoch)),
-		)
+		unaryInterceptors = append(unaryInterceptors, coordinator.UnaryServerEpochInterceptor(c.coordinator.GetEpoch))
+		streamInterceptors = append(streamInterceptors, coordinator.StreamServerEpochInterceptor(c.coordinator.GetEpoch))
 	}
+	opts = append(opts,
+		grpc.ChainUnaryInterceptor(unaryInterceptors...),
+		grpc.ChainStreamInterceptor(streamInterceptors...),
+	)
 
 	// Append any custom server options (e.g., auth interceptors)
 	opts = append(opts, c.config.GRPCServerOptions...)
