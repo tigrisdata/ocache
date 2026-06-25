@@ -1,6 +1,7 @@
 package fd
 
 import (
+	"errors"
 	"os"
 	"runtime"
 	"sync"
@@ -37,12 +38,29 @@ const refsClosed int32 = -1
 //	      it must fall through to opening a fresh entry.
 
 type FileEntry struct {
-	refs   int32 // accessed atomically – keep first
-	f      *os.File
-	mu     *sync.RWMutex // per-file lock shared with RawFileManager
-	ready  chan struct{} // closed when file is opened (for synchronization)
-	cached bool          // whether this entry is in the cache (for capacity management)
+	refs    int32 // accessed atomically – keep first
+	f       *os.File
+	openErr error         // set by the opener before closing ready; read by waiters when f == nil
+	mu      *sync.RWMutex // per-file lock shared with RawFileManager
+	ready   chan struct{} // closed when file is opened (for synchronization)
+	cached  bool          // whether this entry is in the cache (for capacity management)
 }
+
+// openFailureErr returns the error a waiter should surface when it observes a
+// failed entry (f == nil). It prefers the opener's recorded openErr (which
+// carries the real cause, e.g. os.ErrNotExist, so callers can self-heal) and
+// only falls back to a generic non-nil error if, defensively, none was set —
+// never nil, since a nil error here is what caused the issue #150 panic.
+func openFailureErr(path string, openErr error) error {
+	if openErr != nil {
+		return openErr
+	}
+	return utils.WrapError("failed to open raw file", path, errUnknownOpenFailure)
+}
+
+// errUnknownOpenFailure backstops openFailureErr so a failed entry can never
+// produce a nil error.
+var errUnknownOpenFailure = errors.New("unknown open failure")
 
 // File returns the underlying os.File descriptor.
 func (e *FileEntry) File() *os.File {
@@ -175,7 +193,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 				if e.dropRef() {
 					fc.closeEntry(path, e)
 				}
-				return nil, utils.WrapError("failed to open raw file", path, nil)
+				return nil, openFailureErr(path, e.openErr)
 			}
 
 			metrics.FDCacheHits.Inc()
@@ -216,7 +234,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 				if existing.dropRef() {
 					fc.closeEntry(path, existing)
 				}
-				return nil, utils.WrapError("failed to open raw file", path, nil)
+				return nil, openFailureErr(path, existing.openErr)
 			}
 
 			metrics.FDCacheHits.Inc()
@@ -226,6 +244,16 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 		// We won the race to insert the entry; now open the file.
 		f, err := os.OpenFile(path, os.O_RDONLY, 0o644)
 		if err != nil {
+			// Record the failure on the entry BEFORE signalling waiters so they
+			// observe the real cause (notably os.ErrNotExist) rather than a nil
+			// error. Returning (nil, nil) to a waiter here is what produced the
+			// nil-pointer panic in issue #150.
+			if os.IsNotExist(err) {
+				zlog.Warn().Str("path", path).Msg("fdCache: file not found")
+				entry.openErr = utils.WrapError("raw file not found", path, err)
+			} else {
+				entry.openErr = utils.WrapError("failed to open raw file", path, err)
+			}
 			// Mark as failed (f remains nil) and signal waiters.
 			close(ready)
 			// Remove our failed entry so new callers don't reuse it.
@@ -237,11 +265,7 @@ func (fc *FdCache) Acquire(path string) (*FileEntry, error) {
 				fc.closeEntry(path, entry)
 			}
 
-			if os.IsNotExist(err) {
-				zlog.Warn().Str("path", path).Msg("fdCache: file not found")
-				return nil, utils.WrapError("raw file not found", path, err)
-			}
-			return nil, utils.WrapError("failed to open raw file", path, err)
+			return nil, entry.openErr
 		}
 
 		// Set the file descriptor and signal success.

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -734,7 +735,31 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			return nil, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
-		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
+		r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+		if err != nil {
+			// A missing backing file for a never-compacted (large) object is a
+			// dangling reference: the write did not survive an unclean shutdown
+			// and no compactor will ever recreate it (issue #150). Issue a
+			// conditional purge and return a retryable error: the internal Get
+			// retry (retry.DoWithKey in GetLocal) then re-drives Get and serves
+			// the authoritative state — the purge tombstone yields a clean miss,
+			// or a concurrent Put's fresh value yields a hit. Letting the re-read
+			// produce the result (rather than inferring a miss here) avoids both
+			// a spurious miss when a Put raced this read and crash-looping on the
+			// dangling key. We do not count this as an "error" because it is an
+			// expected, self-healing condition, not a failure.
+			//
+			// Restricted to large objects (> compactThreshold): medium objects
+			// are migrated to segments by the compactor, which briefly unlinks
+			// the raw file before its RAW_FILE→SEGMENT CAS lands, so their ENOENT
+			// is transient and a retry recovers the value from the segment.
+			if errors.Is(err, os.ErrNotExist) && valueMsg.ValueLength > s.compactThreshold {
+				zlog.Warn().Str("key", key).Str("file", valueMsg.RawFilePath).
+					Msg("storage.Get: raw file missing for large object, purging dangling key")
+				s.purgeDanglingRawFile(key, valueMsg.RawFilePath)
+				return nil, false, storageErrors.NewIORetryableError("Get", key, err)
+			}
+
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).Msg("storage.Get: failed to read file")
@@ -1025,6 +1050,39 @@ func (s *Storage) notifyPut(size int64) {
 // notifyDelete updates the cleaner's size tracking when a key is deleted
 func (s *Storage) notifyDelete(size int64) {
 	s.cleaner.UpdateSize(-size)
+}
+
+// purgeDanglingRawFile tombstones a metadata entry whose backing raw file no
+// longer exists on disk (a dangling reference left by a write that did not
+// survive an unclean shutdown).
+//
+// The purge is a conditional merge (see merge.MakeRawFilePurgeOperand /
+// merge.mergeMetadataCAS): the key is tombstoned only when the metadata still
+// references rawFilePath, so a concurrent Put — which always writes a fresh
+// path — is never clobbered. The caller restricts this to large, never-compacted
+// objects, so no compactor is racing to migrate the file into a segment.
+//
+// It is best-effort and idempotent: the caller returns a retryable error, so the
+// internal Get retry re-reads the (now tombstoned, or concurrently rewritten)
+// metadata and serves the authoritative result. Disk-usage accounting is
+// intentionally not adjusted here — the dangling object's bytes stay counted
+// until the cleaner recomputes the total at next startup. That is a bounded
+// over-count in the safe direction (it can only make eviction more aggressive,
+// never let usage exceed the quota) and avoids the double-decrement that
+// side-channel accounting would cause when this races a Delete/eviction.
+func (s *Storage) purgeDanglingRawFile(key, rawFilePath string) {
+	operand, err := merge.MakeRawFilePurgeOperand(rawFilePath)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.purgeDanglingRawFile: failed to build purge operand")
+		return
+	}
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+
+	if err := s.meta.Handle().Merge(wo, keys.MakeMetadataKey(key), operand); err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.purgeDanglingRawFile: failed to purge dangling key")
+	}
 }
 
 // updateDeleteIndex updates the delete index for a segment when a key is deleted

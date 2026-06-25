@@ -229,6 +229,59 @@ func TestUnaryServerEpochInterceptor(t *testing.T) {
 	assert.Equal(t, codes.ResourceExhausted, st.Code())
 }
 
+func TestUnaryServerRecoveryInterceptor_RecoversPanic(t *testing.T) {
+	interceptor := UnaryServerRecoveryInterceptor()
+	require.NotNil(t, interceptor)
+
+	info := &grpc.UnaryServerInfo{FullMethod: "/ocache.CacheService/Get"}
+
+	// The handler panics (e.g. a nil-deref on a poison key). The interceptor
+	// must convert it into a codes.Internal error rather than letting it crash.
+	resp, err := interceptor(context.Background(), nil, info,
+		func(ctx context.Context, req interface{}) (interface{}, error) {
+			var p *int
+			_ = *p // nil-deref panic, mirroring the issue #150 crash
+			return nil, nil
+		})
+
+	assert.Nil(t, resp)
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.Internal, st.Code())
+}
+
+func TestUnaryServerRecoveryInterceptor_PassesThroughNormalResult(t *testing.T) {
+	interceptor := UnaryServerRecoveryInterceptor()
+	info := &grpc.UnaryServerInfo{FullMethod: "/ocache.CacheService/Get"}
+
+	sentinelErr := status.Error(codes.NotFound, "missing")
+	resp, err := interceptor(context.Background(), nil, info,
+		func(ctx context.Context, req interface{}) (interface{}, error) {
+			return "ok", sentinelErr
+		})
+
+	assert.Equal(t, "ok", resp)
+	assert.Equal(t, sentinelErr, err, "non-panicking handler results must pass through unchanged")
+}
+
+func TestStreamServerRecoveryInterceptor_RecoversPanic(t *testing.T) {
+	interceptor := StreamServerRecoveryInterceptor()
+	require.NotNil(t, interceptor)
+
+	info := &grpc.StreamServerInfo{FullMethod: "/ocache.CacheService/GetStream"}
+	ss := &mockServerStream{ctx: context.Background()}
+
+	err := interceptor(nil, ss, info, func(srv interface{}, stream grpc.ServerStream) error {
+		panic("boom")
+	})
+
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.Internal, st.Code())
+}
+
 func intToString(i int) string {
 	return string(rune('0' + i))
 }
