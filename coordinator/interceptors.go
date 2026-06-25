@@ -146,6 +146,22 @@ func SetResponseMetadata(ctx context.Context, resp ResponseMetadata) error {
 	return grpc.SetHeader(ctx, header)
 }
 
+// recoverPanic is the shared body of the unary and stream recovery
+// interceptors. Called from a deferred closure, it converts a recovered panic
+// into a codes.Internal error (assigned through errp) so a single bad request
+// fails in isolation instead of unwinding and crashing the process.
+func recoverPanic(method string, errp *error) {
+	if r := recover(); r != nil {
+		metrics.GRPCPanicsRecovered.WithLabelValues(method).Inc()
+		log.Error().
+			Str("method", method).
+			Interface("panic", r).
+			Bytes("stack", debug.Stack()).
+			Msg("grpc: recovered from panic in handler")
+		*errp = status.Errorf(codes.Internal, "internal error")
+	}
+}
+
 // UnaryServerRecoveryInterceptor returns a gRPC unary interceptor that recovers
 // from panics in downstream interceptors and handlers, failing only that single
 // RPC with a codes.Internal error instead of letting the panic unwind and crash
@@ -158,17 +174,7 @@ func SetResponseMetadata(ctx context.Context, resp ResponseMetadata) error {
 // inner interceptors.
 func UnaryServerRecoveryInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				metrics.GRPCPanicsRecovered.WithLabelValues(info.FullMethod).Inc()
-				log.Error().
-					Str("method", info.FullMethod).
-					Interface("panic", r).
-					Bytes("stack", debug.Stack()).
-					Msg("grpc: recovered from panic in unary handler")
-				err = status.Errorf(codes.Internal, "internal error")
-			}
-		}()
+		defer recoverPanic(info.FullMethod, &err)
 		return handler(ctx, req)
 	}
 }
@@ -177,17 +183,7 @@ func UnaryServerRecoveryInterceptor() grpc.UnaryServerInterceptor {
 // UnaryServerRecoveryInterceptor. Install it as the outermost stream interceptor.
 func StreamServerRecoveryInterceptor() grpc.StreamServerInterceptor {
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
-		defer func() {
-			if r := recover(); r != nil {
-				metrics.GRPCPanicsRecovered.WithLabelValues(info.FullMethod).Inc()
-				log.Error().
-					Str("method", info.FullMethod).
-					Interface("panic", r).
-					Bytes("stack", debug.Stack()).
-					Msg("grpc: recovered from panic in stream handler")
-				err = status.Errorf(codes.Internal, "internal error")
-			}
-		}()
+		defer recoverPanic(info.FullMethod, &err)
 		return handler(srv, ss)
 	}
 }

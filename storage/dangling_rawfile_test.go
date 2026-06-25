@@ -76,15 +76,18 @@ func TestStorage_Get_DanglingLargeRawFile_SelfHeals(t *testing.T) {
 	require.NoError(t, os.Remove(rawPath))
 	fd.GetFdCache().Remove(rawPath)
 
-	// The read must self-heal: a clean miss, not an error.
+	// First read observes ENOENT, issues the purge, and returns a retryable
+	// error so the internal Get retry (in GetLocal) re-drives and reads the
+	// tombstone. (storage.Get is called directly here, bypassing that retry.)
 	r2, found2, err2 := stor.Get(key, 0, 0)
-	assert.NoError(t, err2, "dangling large raw file must not surface as an error")
+	assert.Error(t, err2, "first dangling read returns a retryable error to drive the retry")
+	assert.True(t, storageErrors.IsRetryable(err2))
 	assert.False(t, found2)
 	assert.Nil(t, r2)
 
-	// The dangling key must be tombstoned so subsequent reads also miss.
+	// The purge tombstone is now visible, so subsequent reads are clean misses.
 	r3, found3, err3 := stor.Get(key, 0, 0)
-	assert.NoError(t, err3)
+	assert.NoError(t, err3, "after purge the dangling key reads as a clean miss")
 	assert.False(t, found3)
 	assert.Nil(t, r3)
 }
@@ -135,9 +138,10 @@ func TestStorage_PurgeDanglingRawFile_ConcurrentOverwriteNotPurged(t *testing.T)
 	p2, _ := rawFilePathOf(t, stor, key)
 	require.NotEqual(t, p1, p2)
 
-	// A stale reader holding the p1 snapshot would call purge with the old path.
-	purged := stor.purgeDanglingRawFile(key, p1, int64(len(v1)))
-	assert.False(t, purged, "must not purge when metadata now references a different file")
+	// A stale reader holding the p1 snapshot calls purge with the OLD path. The
+	// CAS precondition (p1) no longer matches the live metadata (p2), so the
+	// merge must be a no-op and leave the live value untouched.
+	stor.purgeDanglingRawFile(key, p1)
 
 	// The live value (v2/p2) must be intact and still readable.
 	gotPath, _ := rawFilePathOf(t, stor, key)
