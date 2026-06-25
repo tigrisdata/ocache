@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -133,6 +134,13 @@ type Storage struct {
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
 	closed           atomic.Bool           // True when storage has been closed
+
+	// danglingPurged dedups disk-size accounting for dangling raw files that
+	// are purged on read (see purgeDanglingRawFile): concurrent readers of the
+	// same missing file must decrement the cleaner's size counter at most once.
+	// Keyed by raw-file path; bounded by the number of distinct dangling files,
+	// which is rare.
+	danglingPurged sync.Map
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -1078,7 +1086,14 @@ func (s *Storage) purgeDanglingRawFile(key, rawFilePath string, valueLength int6
 	// The bytes are confirmed gone from disk (we observed ENOENT), so drop them
 	// from the cleaner's size tracking regardless of the CAS outcome: a
 	// concurrent Put that won the CAS accounts for its own new file separately.
-	s.notifyDelete(valueLength)
+	//
+	// Decrement at most once per dangling file: concurrent readers all observe
+	// the same ENOENT and reach here, but the file's bytes were only counted
+	// once. Over-decrementing would make the cleaner under-estimate disk usage
+	// and let it exceed the configured quota.
+	if _, loaded := s.danglingPurged.LoadOrStore(rawFilePath, struct{}{}); !loaded {
+		s.notifyDelete(valueLength)
+	}
 }
 
 // updateDeleteIndex updates the delete index for a segment when a key is deleted

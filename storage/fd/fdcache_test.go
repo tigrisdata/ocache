@@ -1,6 +1,7 @@
 package fd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -134,6 +135,48 @@ func TestFdCache_AcquireNonExistent(t *testing.T) {
 	}
 
 	fdCache = nil
+}
+
+// TestFdCache_AcquireMissing_ConcurrentWaitersGetNotExist guards against the
+// issue #150 regression: when one goroutine opens a missing file and fails,
+// goroutines waiting on the same entry must receive a non-nil error that wraps
+// os.ErrNotExist — never (nil, nil), which previously caused a nil-pointer
+// panic in callers and bypassed the read-path self-heal.
+func TestFdCache_AcquireMissing_ConcurrentWaitersGetNotExist(t *testing.T) {
+	fdCache = nil
+	cache := NewFdCache(10)
+	defer func() { fdCache = nil }()
+
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+
+	const goroutines = 32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	errs := make([]error, goroutines)
+	entries := make([]*FileEntry, goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-start // release all goroutines at once to race opener vs waiters
+			entries[idx], errs[idx] = cache.Acquire(missing)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < goroutines; i++ {
+		if errs[i] == nil {
+			t.Fatalf("goroutine %d: Acquire returned nil error for a missing file", i)
+		}
+		if entries[i] != nil {
+			t.Fatalf("goroutine %d: Acquire returned a non-nil entry alongside an error", i)
+		}
+		if !errors.Is(errs[i], os.ErrNotExist) {
+			t.Fatalf("goroutine %d: error must wrap os.ErrNotExist, got: %v", i, errs[i])
+		}
+	}
 }
 
 func TestFdCache_Release(t *testing.T) {
