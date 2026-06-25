@@ -484,7 +484,6 @@ func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.Value
 	return meta, nil
 }
 
-// compactEntry performs the actual compaction of a single entry
 // purgeDanglingMeta stages a conditional tombstone of userKey's metadata when it
 // still references filePath. It is used when the compactor drops a
 // compaction-index row for a file it found missing or corrupt: without it the
@@ -505,6 +504,7 @@ func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath
 	wb.Merge(keys.MakeMetadataKey(userKey), operand)
 }
 
+// compactEntry performs the actual compaction of a single entry
 func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch) error {
 	// Validate file size matches metadata
 	if entry.fileInfo.Size() != entry.metadata.ValueLength {
