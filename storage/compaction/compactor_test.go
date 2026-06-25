@@ -411,6 +411,12 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 	slice, _ := meta.Handle().Get(ro, idxKey)
 	assert.False(t, slice.Exists())
 	slice.Free()
+
+	// No metadata existed for this key, so the purge must not materialize a
+	// phantom (expired-sentinel) metadata row.
+	metaSlice, _ := meta.Handle().Get(ro, keys.MakeMetadataKey("key1"))
+	assert.False(t, metaSlice.Exists(), "purge must not create metadata for a key that had none")
+	metaSlice.Free()
 }
 
 // TestCompactFilesWithDanglingMetadata verifies that when the compactor drops a

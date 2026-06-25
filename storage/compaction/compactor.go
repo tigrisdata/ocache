@@ -511,12 +511,36 @@ func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath
 		// the dangling entry anyway; skip rather than emit a no-op operand.
 		return
 	}
+
+	metaKey := keys.MakeMetadataKey(userKey)
+
+	// Only purge when a metadata row actually exists. The ErrFileNotExist caller
+	// reaches here straight from os.Stat without loading metadata, so an index
+	// row with no metadata (e.g. a key already Deleted whose compaction-index
+	// row lingers) would otherwise stage a purge merge with no base — and
+	// mergeMetadataCAS's no-base path emits the expired sentinel, materializing
+	// a metadata key that never existed. Absence is already the desired state,
+	// so skip. (A Delete that races in after this check still falls into the
+	// benign sentinel path, which the cleaner sweeps.)
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	slice, err := c.meta.Handle().Get(ro, metaKey)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to read metadata for dangling purge")
+		return
+	}
+	exists := slice.Exists()
+	slice.Free()
+	if !exists {
+		return
+	}
+
 	operand, err := merge.MakeRawFilePurgeOperand(filePath)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to build dangling-metadata purge operand")
 		return
 	}
-	wb.Merge(keys.MakeMetadataKey(userKey), operand)
+	wb.Merge(metaKey, operand)
 }
 
 // compactEntry performs the actual compaction of a single entry
