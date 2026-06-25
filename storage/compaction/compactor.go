@@ -15,6 +15,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
@@ -358,8 +359,13 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 				wb.Delete(k)
 				continue
 			case errors.Is(err, utils.ErrFileNotExist):
-				// File doesn't exist - remove stale index
+				// File doesn't exist - remove the stale index row AND tombstone
+				// the now-dangling metadata. Without the latter the metadata is
+				// orphaned (still RAW_FILE -> a missing file) and, because
+				// startup recovery only scans the compaction index, never
+				// reconciled, so every Get of the key fails forever (#152).
 				wb.Delete(k)
+				c.purgeDanglingMeta(wb, userKey, filePath)
 				continue
 			default:
 				// Other errors - just continue
@@ -479,6 +485,26 @@ func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.Value
 }
 
 // compactEntry performs the actual compaction of a single entry
+// purgeDanglingMeta stages a conditional tombstone of userKey's metadata when it
+// still references filePath. It is used when the compactor drops a
+// compaction-index row for a file it found missing or corrupt: without it the
+// metadata is left dangling (still RAW_FILE -> a file that no longer exists) and,
+// because startup recovery only scans the compaction index, never reconciled, so
+// every Get of the key fails for the life of the process (#152).
+//
+// The tombstone is a conditional merge (see merge.MakeRawFilePurgeOperand /
+// merge.mergeMetadataCAS): it applies only when the metadata still references
+// filePath, so a concurrent Put (which writes a fresh path) or a prior
+// RAW_FILE->SEGMENT migration is never clobbered.
+func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath string) {
+	operand, err := merge.MakeRawFilePurgeOperand(filePath)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to build dangling-metadata purge operand")
+		return
+	}
+	wb.Merge(keys.MakeMetadataKey(userKey), operand)
+}
+
 func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch) error {
 	// Validate file size matches metadata
 	if entry.fileInfo.Size() != entry.metadata.ValueLength {
