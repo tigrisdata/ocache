@@ -411,6 +411,111 @@ func TestCompactFilesWithMissingFile(t *testing.T) {
 	slice, _ := meta.Handle().Get(ro, idxKey)
 	assert.False(t, slice.Exists())
 	slice.Free()
+
+	// No metadata existed for this key, so the purge must not materialize a
+	// phantom (expired-sentinel) metadata row.
+	metaSlice, _ := meta.Handle().Get(ro, keys.MakeMetadataKey("key1"))
+	assert.False(t, metaSlice.Exists(), "purge must not create metadata for a key that had none")
+	metaSlice.Free()
+}
+
+// TestCompactFilesWithDanglingMetadata verifies that when the compactor drops a
+// compaction-index row for a missing file, it also tombstones the now-dangling
+// metadata so it is not orphaned beyond the reach of startup recovery (#152).
+func TestCompactFilesWithDanglingMetadata(t *testing.T) {
+	_, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+	})
+
+	missingFile := "/non/existent/dangling-file"
+	wo := grocksdb.NewDefaultWriteOptions()
+
+	// Index row + RAW_FILE metadata pointing at a file that does not exist
+	// (a dangling reference, e.g. lost in an unclean shutdown).
+	idxKey, idxVal := PrepareEntryForCompaction("key1", missingFile)
+	require.NoError(t, meta.Handle().Put(wo, idxKey, idxVal))
+
+	vm := &pb.ValueMessage{
+		ValueLength: 1024,
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: missingFile,
+	}
+	vmBytes, _ := proto.Marshal(vm)
+	metaKey := keys.MakeMetadataKey("key1")
+	require.NoError(t, meta.Handle().Put(wo, metaKey, vmBytes))
+
+	c.CompactFiles(context.Background(), 0)
+
+	ro := grocksdb.NewDefaultReadOptions()
+
+	// Index row removed.
+	idxSlice, _ := meta.Handle().Get(ro, idxKey)
+	assert.False(t, idxSlice.Exists())
+	idxSlice.Free()
+
+	// Metadata tombstoned via the purge-CAS: it is no longer a live RAW_FILE
+	// entry but the already-expired sentinel, which the read path treats as a
+	// clean miss and the cleaner later sweeps.
+	metaSlice, _ := meta.Handle().Get(ro, metaKey)
+	require.True(t, metaSlice.Exists())
+	tombstoned := &pb.ValueMessage{}
+	require.NoError(t, proto.Unmarshal(metaSlice.Data(), tombstoned))
+	metaSlice.Free()
+	assert.NotEqual(t, pb.ValueType_RAW_FILE, tombstoned.ValueType, "dangling RAW_FILE metadata must be purged")
+	assert.Equal(t, int64(1), tombstoned.Expiry, "metadata must be the expired sentinel")
+}
+
+// TestCompactFilesWithDanglingMetadata_ConcurrentPutNotClobbered verifies the
+// purge-CAS precondition: if the metadata was replaced (a fresh Put) after the
+// index row was written, dropping the stale row must not tombstone the new value.
+func TestCompactFilesWithDanglingMetadata_ConcurrentPutNotClobbered(t *testing.T) {
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+	})
+
+	oldMissing := "/non/existent/old-file"
+	wo := grocksdb.NewDefaultWriteOptions()
+
+	// Stale index row references the old (missing) path...
+	idxKey, idxVal := PrepareEntryForCompaction("key1", oldMissing)
+	require.NoError(t, meta.Handle().Put(wo, idxKey, idxVal))
+
+	// ...but the metadata was since replaced by a fresh Put to a live file.
+	newFile := filepath.Join(tmpDir, "files", "new.dat")
+	require.NoError(t, os.WriteFile(newFile, []byte("live value"), 0o644))
+	vm := &pb.ValueMessage{
+		ValueLength: int64(len("live value")),
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: newFile,
+	}
+	vmBytes, _ := proto.Marshal(vm)
+	metaKey := keys.MakeMetadataKey("key1")
+	require.NoError(t, meta.Handle().Put(wo, metaKey, vmBytes))
+
+	c.CompactFiles(context.Background(), 0)
+
+	// The live metadata (pointing at newFile) must be untouched: the CAS
+	// precondition (oldMissing) no longer matches.
+	ro := grocksdb.NewDefaultReadOptions()
+	metaSlice, _ := meta.Handle().Get(ro, metaKey)
+	require.True(t, metaSlice.Exists())
+	got := &pb.ValueMessage{}
+	require.NoError(t, proto.Unmarshal(metaSlice.Data(), got))
+	metaSlice.Free()
+	assert.Equal(t, pb.ValueType_RAW_FILE, got.ValueType)
+	assert.Equal(t, newFile, got.RawFilePath, "live value must not be clobbered by stale-row cleanup")
 }
 
 func TestCompactFilesWithMissingMetadata(t *testing.T) {
@@ -850,16 +955,17 @@ func TestCompactFilesWithCorruptedFile(t *testing.T) {
 	assert.False(t, slice.Exists(), "Compaction index entry should be removed for corrupted file")
 	slice.Free()
 
-	// Verify metadata was NOT updated to segment type
+	// The corrupted file is queued for deletion, so its metadata must be
+	// tombstoned (not left dangling) — mirroring recovery's StatusCorrupted
+	// handling. It is no longer a live RAW_FILE entry but the expired sentinel.
 	metaSlice, _ := meta.Handle().Get(ro, metaKey)
-	if metaSlice.Exists() {
-		checkVm := &pb.ValueMessage{}
-		err = proto.Unmarshal(metaSlice.Data(), checkVm)
-		assert.NoError(t, err)
-		assert.Equal(t, pb.ValueType_RAW_FILE, checkVm.ValueType, "Metadata should still show RAW_FILE type")
-		assert.Equal(t, testFile, checkVm.RawFilePath, "File path should remain unchanged")
-	}
+	require.True(t, metaSlice.Exists())
+	checkVm := &pb.ValueMessage{}
+	err = proto.Unmarshal(metaSlice.Data(), checkVm)
+	require.NoError(t, err)
 	metaSlice.Free()
+	assert.NotEqual(t, pb.ValueType_RAW_FILE, checkVm.ValueType, "corrupted-file metadata must be purged, not left dangling")
+	assert.Equal(t, int64(1), checkVm.Expiry, "metadata must be the expired sentinel")
 }
 
 func TestCompactFilesWithMultipleCorruptions(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
@@ -358,8 +359,13 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 				wb.Delete(k)
 				continue
 			case errors.Is(err, utils.ErrFileNotExist):
-				// File doesn't exist - remove stale index
+				// File doesn't exist - remove the stale index row AND tombstone
+				// the now-dangling metadata. Without the latter the metadata is
+				// orphaned (still RAW_FILE -> a missing file) and, because
+				// startup recovery only scans the compaction index, never
+				// reconciled, so every Get of the key fails forever (#152).
 				wb.Delete(k)
+				c.purgeDanglingMeta(wb, userKey, filePath)
 				continue
 			default:
 				// Other errors - just continue
@@ -376,8 +382,15 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 			// Check if it's a file size mismatch error
 			var sizeMismatchErr *ErrFileSizeMismatch
 			if errors.As(err, &sizeMismatchErr) {
-				// Skip corrupted file - queue for deletion
+				// Skip corrupted file - queue it for deletion AND tombstone the
+				// metadata that references it. Like the ErrFileNotExist branch,
+				// this would otherwise leave the metadata orphaned (still
+				// RAW_FILE -> a file the compactor is about to delete) and
+				// unreachable by startup recovery, so every Get of the key fails
+				// indefinitely (#152). Mirrors recovery's StatusCorrupted, which
+				// deletes both the file and the metadata.
 				wb.Delete(k)
+				c.purgeDanglingMeta(wb, entry.userKey, entry.filePath)
 				if err := c.deletionQueue.Add(entry.filePath); err != nil {
 					zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: failed to queue corrupted file for deletion")
 				}
@@ -476,6 +489,58 @@ func (c *Compactor) loadAndValidateMetadata(userKey, filePath string) (*pb.Value
 	}
 
 	return meta, nil
+}
+
+// purgeDanglingMeta stages a conditional tombstone of userKey's metadata when it
+// still references filePath. It is used when the compactor drops a
+// compaction-index row for a file it found missing or corrupt: without it the
+// metadata is left dangling (still RAW_FILE -> a file that no longer exists) and,
+// because startup recovery only scans the compaction index, never reconciled, so
+// every Get of the key fails for the life of the process (#152).
+//
+// The tombstone is a conditional merge (see merge.MakeRawFilePurgeOperand /
+// merge.mergeMetadataCAS): it applies only when the metadata still references
+// filePath, so a concurrent Put (which writes a fresh path) or a prior
+// RAW_FILE->SEGMENT migration is never clobbered. ENOENT is treated as
+// permanent; a transient absence (e.g. a flapping network mount) would evict an
+// otherwise-healthy entry, but the cost is a cache miss + upstream re-fetch, not
+// data corruption, and local-disk ENOENT is reliably permanent.
+func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath string) {
+	if filePath == "" {
+		// No path to match against, so the conditional purge could not identify
+		// the dangling entry anyway; skip rather than emit a no-op operand.
+		return
+	}
+
+	metaKey := keys.MakeMetadataKey(userKey)
+
+	// Only purge when a metadata row actually exists. The ErrFileNotExist caller
+	// reaches here straight from os.Stat without loading metadata, so an index
+	// row with no metadata (e.g. a key already Deleted whose compaction-index
+	// row lingers) would otherwise stage a purge merge with no base — and
+	// mergeMetadataCAS's no-base path emits the expired sentinel, materializing
+	// a metadata key that never existed. Absence is already the desired state,
+	// so skip. (A Delete that races in after this check still falls into the
+	// benign sentinel path, which the cleaner sweeps.)
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	slice, err := c.meta.Handle().Get(ro, metaKey)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to read metadata for dangling purge")
+		return
+	}
+	exists := slice.Exists()
+	slice.Free()
+	if !exists {
+		return
+	}
+
+	operand, err := merge.MakeRawFilePurgeOperand(filePath)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", userKey).Msg("compactor: failed to build dangling-metadata purge operand")
+		return
+	}
+	wb.Merge(metaKey, operand)
 }
 
 // compactEntry performs the actual compaction of a single entry
