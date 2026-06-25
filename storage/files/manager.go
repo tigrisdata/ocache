@@ -128,6 +128,13 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 		return nil, err
 	}
 
+	// Defensive: Acquire must never return a nil entry without an error, but a
+	// nil entry slipping through here would nil-panic at RLock below (see
+	// issue #150). Mirror the guard the segment read path already has.
+	if e == nil {
+		return nil, fmt.Errorf("nil file entry for raw file: %s", filePath)
+	}
+
 	// Acquire shared read lock to protect against concurrent writers.
 	e.RLock()
 

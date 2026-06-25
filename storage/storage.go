@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -734,9 +735,30 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			return nil, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
-		if r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength); err != nil {
+		r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+		if err != nil {
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
+
+			// A missing backing file for a never-compacted (large) object is a
+			// dangling reference: the file write did not survive an unclean
+			// shutdown, and no compactor will ever recreate it. Retrying can
+			// never succeed, so self-heal by purging the key and reporting a
+			// cache miss instead of crash-looping on every read (issue #150).
+			//
+			// We restrict this to large objects (> compactThreshold) because
+			// medium objects are migrated to segments by the compactor, which
+			// briefly unlinks the raw file before its RAW_FILE→SEGMENT metadata
+			// CAS lands; for those, ENOENT is transient and a retry succeeds
+			// (or startup recovery cleans a genuine dangling medium entry).
+			if errors.Is(err, os.ErrNotExist) && valueMsg.ValueLength > s.compactThreshold {
+				zlog.Warn().Str("key", key).Str("file", valueMsg.RawFilePath).
+					Msg("storage.Get: raw file missing for large object, purging dangling key")
+				s.purgeDanglingRawFile(key, valueMsg.RawFilePath, valueMsg.ValueLength)
+				metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
+				return nil, false, nil
+			}
+
 			zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).Msg("storage.Get: failed to read file")
 			// Check if it's a lock error from file manager
 			if err == files.ErrFileLocked {
@@ -1025,6 +1047,38 @@ func (s *Storage) notifyPut(size int64) {
 // notifyDelete updates the cleaner's size tracking when a key is deleted
 func (s *Storage) notifyDelete(size int64) {
 	s.cleaner.UpdateSize(-size)
+}
+
+// purgeDanglingRawFile tombstones a metadata entry whose backing raw file no
+// longer exists on disk (a dangling reference left by a write that did not
+// survive an unclean shutdown). The purge is issued as a conditional merge (see
+// merge.MakeRawFilePurgeOperand / merge.mergeMetadataCAS) so a concurrent Put —
+// which always writes a fresh file path — is never clobbered: the tombstone
+// applies only if the metadata still references rawFilePath.
+//
+// Best-effort: if the merge fails the next read simply retries the purge. The
+// caller restricts this to large, never-compacted objects, so there is no
+// compactor racing to migrate this file into a segment.
+func (s *Storage) purgeDanglingRawFile(key, rawFilePath string, valueLength int64) {
+	operand, err := merge.MakeRawFilePurgeOperand(rawFilePath)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.purgeDanglingRawFile: failed to build purge operand")
+		return
+	}
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+
+	metaKey := keys.MakeMetadataKey(key)
+	if err := s.meta.Handle().Merge(wo, metaKey, operand); err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.purgeDanglingRawFile: failed to purge dangling key")
+		return
+	}
+
+	// The bytes are confirmed gone from disk (we observed ENOENT), so drop them
+	// from the cleaner's size tracking regardless of the CAS outcome: a
+	// concurrent Put that won the CAS accounts for its own new file separately.
+	s.notifyDelete(valueLength)
 }
 
 // updateDeleteIndex updates the delete index for a segment when a key is deleted
