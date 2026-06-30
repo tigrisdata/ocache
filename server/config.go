@@ -25,6 +25,7 @@ type Config struct {
 	RecompactDisable       bool          // Disable automatic segment recompaction
 	TTLCleanupInterval     time.Duration // TTL cleanup interval
 	RecoveryWorkers        int           // Number of parallel workers for startup file recovery
+	DeleteBatchSize        int           // File deletions processed per deletion-queue batch
 	RequestLogging         bool          // Enable request logging
 	// RocksDB tuning parameters
 	MetadataCacheSize int64 // RocksDB block cache size in bytes
@@ -62,6 +63,7 @@ func LoadConfig() {
 		RecompactDisable:       *recompactDisable,
 		TTLCleanupInterval:     *ttlCleanupInterval,
 		RecoveryWorkers:        *recoveryWorkers,
+		DeleteBatchSize:        *deleteBatchSize,
 		RequestLogging:         *requestLogging,
 		MetadataCacheSize:      *metadataCacheSize,
 		ClusterEnabled:         *clusterEnabled,

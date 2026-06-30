@@ -62,7 +62,7 @@ const (
 	DefaultAccessUpdateDelay      = 5 * time.Minute
 
 	// Default queue config
-	DeleteBatchSize = 1000 // Number of deletions to process per batch
+	DefaultDeleteBatchSize = 1000 // Number of deletions to process per batch
 
 	// Default segment recompaction settings
 	DefaultRecompactionDisabled          = false
@@ -101,6 +101,7 @@ type StorageConfig struct {
 	CleanupInterval      time.Duration // Cleanup interval
 	AccessUpdateDelay    time.Duration // Access update delay
 	RecoveryWorkers      int           // Number of parallel workers for startup file recovery (<= 0 = default)
+	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
 
 	// RocksDB-specific configuration
 	MetadataCacheSize int64 // RocksDB Block cache size in bytes (0 = use default)
@@ -155,6 +156,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	if config.FdCacheSize <= 0 {
 		config.FdCacheSize = DefaultFdCacheSize
 	}
+	if config.DeleteBatchSize <= 0 {
+		config.DeleteBatchSize = DefaultDeleteBatchSize
+	}
 
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
@@ -203,7 +207,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize and start the centralized deletion queue
 	deletionQueue := deletion.NewQueue(meta, deletion.Config{
-		BatchSize:       DeleteBatchSize,
+		BatchSize:       config.DeleteBatchSize,
 		ProcessInterval: DeleteProcessInterval,
 		PruneAge:        DeletePruneAge,
 		RetryDelay:      DeleteRetryDelay,
