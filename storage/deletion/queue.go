@@ -284,6 +284,7 @@ func (q *Queue) pruneOldEntries() {
 
 	prefix := []byte(keys.DeletionQueuePrefix)
 	pruned := 0
+	stuck := 0
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		// Check for shutdown
@@ -296,20 +297,34 @@ func (q *Queue) pruneOldEntries() {
 		key := it.Key()
 		keyData := key.Data()
 
-		// Extract timestamp from key
-		timestamp, _, err := keys.ParseDeletionQueueKey(keyData)
+		// Extract timestamp and filepath from key
+		timestamp, filepath, err := keys.ParseDeletionQueueKey(keyData)
 		if err == nil && timestamp > 0 && timestamp < cutoff {
-			batch.Delete(bytes.Clone(keyData))
-			pruned++
-			q.pruned++
-			// Increment pruned counter
-			metrics.DeletionQueuePruned.Inc()
-
-			_, filepath, _ := keys.ParseDeletionQueueKey(keyData)
-			zlog.Warn().
-				Str("filepath", filepath).
-				Dur("age", time.Since(time.Unix(0, timestamp))).
-				Msg("deletion queue: pruning old entry")
+			// The queue entry is the only durable record that this file must be
+			// deleted. Dropping it while the file still exists orphans the file
+			// permanently: it has no metadata, no compaction-index entry, and no
+			// queue entry, so it is invisible to the disk-usage cap, LRU
+			// eviction, and startup recovery (see issue #156). Only prune an
+			// entry once the file is confirmed gone; otherwise keep it for
+			// ProcessBatch to retry. Raw-file paths are UUIDs and never reused,
+			// so ENOENT is a safe terminal signal that the deletion is done.
+			if _, statErr := os.Stat(filepath); os.IsNotExist(statErr) {
+				batch.Delete(bytes.Clone(keyData))
+				pruned++
+				q.pruned++
+				// Increment pruned counter
+				metrics.DeletionQueuePruned.Inc()
+			} else {
+				// File still present (read-locked by an active reader, read-only
+				// filesystem, lost permissions, transient I/O error, ...). Keep
+				// the entry so the file is reclaimed once deletion succeeds
+				// rather than being abandoned on disk.
+				stuck++
+				zlog.Warn().
+					Str("filepath", filepath).
+					Dur("age", time.Since(time.Unix(0, timestamp))).
+					Msg("deletion queue: entry past prune age but file still exists; keeping for retry")
+			}
 		}
 
 		key.Free()
@@ -335,9 +350,15 @@ func (q *Queue) pruneOldEntries() {
 		}
 	}
 
-	if pruned > 0 {
+	// Surface entries that are past the prune age but whose file is still on
+	// disk. They are retried, not dropped; a sustained non-zero value means
+	// deletions are failing and disk may be leaking.
+	metrics.DeletionQueueStuck.Set(float64(stuck))
+
+	if pruned > 0 || stuck > 0 {
 		zlog.Info().
 			Int("pruned", pruned).
+			Int("stuck", stuck).
 			Dur("duration_ms", time.Since(startTime)).
 			Msg("deletion queue: pruned old entries")
 	}

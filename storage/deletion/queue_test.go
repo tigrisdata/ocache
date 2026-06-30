@@ -244,6 +244,45 @@ func TestQueue_PruneOldEntries(t *testing.T) {
 	require.Equal(t, int64(0), depth)
 }
 
+// TestQueue_PruneOldEntries_KeepsExistingFile is the regression test for the
+// secondary leak in issue #156: pruneOldEntries used to drop queue entries by
+// age alone, abandoning a file that was still on disk (e.g. a deletion that kept
+// failing because the file was read-locked). The queue entry is the only durable
+// record that the file must be deleted, so dropping it orphans the file
+// permanently. Prune must keep an aged entry whose file still exists; only the
+// normal retry path (ProcessBatch) may reclaim it once deletion succeeds.
+func TestQueue_PruneOldEntries_KeepsExistingFile(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set very short prune age so the entry ages out quickly.
+	queue.config.PruneAge = 100 * time.Millisecond
+
+	// A real file on disk that the queue is responsible for reclaiming.
+	tmpDir := t.TempDir()
+	existing := filepath.Join(tmpDir, "still-here.bin")
+	require.NoError(t, os.WriteFile(existing, []byte("data"), 0o644))
+
+	require.NoError(t, queue.Add(existing))
+
+	// Let the entry age past PruneAge.
+	time.Sleep(150 * time.Millisecond)
+
+	queue.pruneOldEntries()
+
+	// The file still exists, so the entry MUST NOT be pruned — dropping it would
+	// orphan the file permanently.
+	require.Equal(t, int64(0), queue.pruned, "entry whose file still exists must not be pruned")
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "aged entry must be kept for retry while its file exists")
+	require.FileExists(t, existing)
+
+	// The normal retry path still reclaims the file (and removes the entry) once
+	// the deletion can succeed.
+	queue.ProcessBatch()
+	require.NoFileExists(t, existing, "ProcessBatch should delete the file once it is no longer locked")
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "queue should drain after successful deletion")
+}
+
 func TestQueue_GetQueueDepth(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
