@@ -21,6 +21,7 @@ type Config struct {
 	BatchSize       int           // Number of deletions per batch
 	ProcessInterval time.Duration // Interval between batch processing
 	PruneAge        time.Duration // Age after which entries are pruned
+	RetryDelay      time.Duration // Backoff before a failed deletion is retried (0 = retry next cycle)
 }
 
 // Queue manages centralized file deletion
@@ -148,11 +149,15 @@ func (q *Queue) ProcessBatch() {
 
 	prefix := []byte(keys.DeletionQueuePrefix)
 	count := 0
+	nowNanos := time.Now().UnixNano()
 
 	// Scan from the head (oldest first), collecting up to BatchSize distinct
-	// filepaths. Entries whose deletion fails are re-enqueued at the tail (see
-	// below), so the head always advances and a run of undeletable files cannot
-	// starve newer, deletable files behind them.
+	// filepaths that are due (timestamp <= now). Entries whose deletion fails are
+	// re-enqueued at now+RetryDelay (see below), so the head always advances
+	// (no head-of-line starvation) and a persistently-stuck file is only retried
+	// once per RetryDelay rather than every cycle. Because keys are timestamp-
+	// ordered, the first not-yet-due entry means every entry after it is also in
+	// the future, so we can stop scanning.
 	for it.Seek(prefix); it.ValidForPrefix(prefix) && count < q.config.BatchSize; it.Next() {
 		// Check for shutdown
 		select {
@@ -164,12 +169,20 @@ func (q *Queue) ProcessBatch() {
 		key := it.Key()
 		keyData := key.Data()
 
-		// Extract filepath from key: !del/<timestamp>/<filepath>
-		_, filepath, err := keys.ParseDeletionQueueKey(keyData)
+		// Extract timestamp and filepath from key: !del/<timestamp>/<filepath>
+		ts, filepath, err := keys.ParseDeletionQueueKey(keyData)
 		if err != nil {
 			key.Free()
 			it.Value().Free()
 			continue
+		}
+
+		if ts > nowNanos {
+			// Not yet due (a re-enqueued entry still in its backoff window); all
+			// later entries are in the future too, so stop.
+			key.Free()
+			it.Value().Free()
+			break
 		}
 
 		// Keep only earliest entry for each filepath
@@ -205,16 +218,18 @@ func (q *Queue) ProcessBatch() {
 			metrics.DeletionQueueProcessed.Inc()
 		} else {
 			// Deletion failed and the file is still on disk (read-locked by an
-			// active reader, read-only filesystem, ...). Move the entry to the
-			// tail of the queue: delete the current key and re-add it under a
-			// fresh timestamp. This keeps the head advancing so a batch-sized
-			// run of undeletable files cannot starve newer, deletable entries,
-			// while never dropping the file — it is reclaimed once a later
-			// attempt succeeds. tryDelete already treats a missing file as
-			// success, so re-enqueued entries only ever reference files that
+			// active reader, read-only filesystem, ...). Re-enqueue the entry
+			// under a future timestamp (now+RetryDelay): delete the current key
+			// and re-add it. The head keeps advancing so a run of undeletable
+			// files cannot starve newer, deletable entries, and the backoff
+			// bounds how often a persistently-stuck file is rewritten — the scan
+			// above skips not-yet-due entries, so it is retried roughly once per
+			// RetryDelay instead of every cycle. The file is never dropped; it is
+			// reclaimed once a later attempt succeeds. tryDelete treats a missing
+			// file as success, so re-enqueued entries only reference files that
 			// still exist.
 			batch.Delete(queueKey)
-			batch.Put(keys.MakeDeletionQueueKey(time.Now().UnixNano(), filepath), []byte{0x01})
+			batch.Put(keys.MakeDeletionQueueKey(time.Now().Add(q.config.RetryDelay).UnixNano(), filepath), []byte{0x01})
 			failed++
 			q.failed++
 			// Increment failed counter

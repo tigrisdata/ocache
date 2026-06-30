@@ -359,6 +359,41 @@ func TestQueue_ProcessBatch_RequeuedStuckFileReclaimedAfterUnlock(t *testing.T) 
 	require.Equal(t, int64(0), queue.GetQueueDepth(), "queue should drain after successful deletion")
 }
 
+// TestQueue_ProcessBatch_RetryDelayDefersRetry verifies that a failed deletion
+// is re-enqueued under a future timestamp (now+RetryDelay) and is not retried
+// until that backoff elapses — bounding retry churn for persistently-stuck
+// files rather than rewriting them every cycle.
+func TestQueue_ProcessBatch_RetryDelayDefersRetry(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	queue.config.RetryDelay = 200 * time.Millisecond
+
+	tmp := t.TempDir()
+	f := filepath.Join(tmp, "locked.bin")
+	require.NoError(t, os.WriteFile(f, []byte("x"), 0o644))
+	require.NoError(t, queue.Add(f))
+
+	lock := fd.GetFileLockManager().GetFileLock(f)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	// First attempt fails (locked) and re-enqueues at now+RetryDelay.
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed)
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "entry stays queued for retry")
+
+	// Within the backoff window the entry is not due: a second cycle skips it,
+	// so there is no extra failure and no rewrite.
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed, "stuck entry must not be retried before RetryDelay elapses")
+
+	// After the backoff elapses the entry is due again and is retried.
+	time.Sleep(250 * time.Millisecond)
+	queue.ProcessBatch()
+	require.Equal(t, int64(2), queue.failed, "stuck entry must be retried after RetryDelay elapses")
+}
+
 func TestQueue_GetQueueDepth(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
