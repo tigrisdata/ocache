@@ -99,6 +99,11 @@ type StorageConfig struct {
 
 	// RocksDB-specific configuration
 	MetadataCacheSize int64 // RocksDB Block cache size in bytes (0 = use default)
+
+	// RecoveryWorkers is the number of parallel workers used for startup
+	// recovery/validation of the compaction index (0 = use default). Lower it
+	// to bound boot-time CPU and OS-thread fan-out on many-core hosts.
+	RecoveryWorkers int
 }
 
 // Storage wraps all RocksDB access and related logic
@@ -190,7 +195,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	// Run recovery for raw files BEFORE starting any services
-	recovery := files.NewRecoveryManager(meta, config.DiskPath)
+	recovery := files.NewRecoveryManager(meta, config.DiskPath).WithWorkers(config.RecoveryWorkers)
 	if err := recovery.RecoverOnStartup(); err != nil {
 		zlog.Error().Err(err).Msg("storage: file recovery failed")
 		return nil, storageErrors.NewInternalError("Init", err)

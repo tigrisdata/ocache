@@ -51,6 +51,18 @@ func NewRecoveryManager(meta *metadata.MetaDB, filesPath string) *RecoveryManage
 	}
 }
 
+// WithWorkers overrides the number of startup-recovery validation workers.
+// Values <= 0 are ignored and the default (MaxWorkers) is kept. Lowering this
+// bounds the boot-time CPU/thread fan-out of recovery (each worker holds an OS
+// thread across cgo metadata reads and os.Stat syscalls). Returns the receiver
+// for chaining.
+func (r *RecoveryManager) WithWorkers(n int) *RecoveryManager {
+	if n > 0 {
+		r.numWorkers = n
+	}
+	return r
+}
+
 // RecoverOnStartup validates all files in the compaction index and cleans up corrupted files
 func (r *RecoveryManager) RecoverOnStartup() error {
 	zlog.Info().Msg("files.recovery: starting startup recovery")

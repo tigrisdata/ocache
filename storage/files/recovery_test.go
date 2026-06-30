@@ -347,3 +347,16 @@ func TestParallelRecovery(t *testing.T) {
 		assert.True(t, os.IsNotExist(err), "Corrupted file %s should be deleted", fileName)
 	}
 }
+
+func TestWithWorkers(t *testing.T) {
+	// Default is MaxWorkers when not overridden.
+	r := NewRecoveryManager(nil, "")
+	assert.Equal(t, MaxWorkers, r.numWorkers)
+
+	// A positive value overrides the default.
+	assert.Equal(t, 4, NewRecoveryManager(nil, "").WithWorkers(4).numWorkers)
+
+	// Non-positive values are ignored, keeping the default.
+	assert.Equal(t, MaxWorkers, NewRecoveryManager(nil, "").WithWorkers(0).numWorkers)
+	assert.Equal(t, MaxWorkers, NewRecoveryManager(nil, "").WithWorkers(-1).numWorkers)
+}
