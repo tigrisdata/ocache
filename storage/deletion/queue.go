@@ -34,10 +34,9 @@ type Queue struct {
 	wg     sync.WaitGroup
 
 	// Stats
-	processed  int64
-	failed     int64
-	pruned     int64
-	queueDepth int64
+	processed int64
+	failed    int64
+	pruned    int64
 
 	// scanCursor remembers where the previous ProcessBatch scan stopped so a
 	// run of undeletable entries at the head of the timestamp-ordered queue
@@ -393,24 +392,12 @@ func (q *Queue) pruneOldEntries() {
 	}
 }
 
-// GetQueueDepth returns the current queue depth
+// GetQueueDepth returns the current number of entries in the deletion queue.
+// It shares scanStats' single iteration so depth has one source of truth; the
+// stuck-detection stat work there only touches entries already past PruneAge.
 func (q *Queue) GetQueueDepth() int64 {
-	ro := metadata.CreateReadOptions(true, false)
-	defer ro.Destroy()
-
-	it := q.meta.Handle().NewIterator(ro)
-	defer it.Close()
-
-	prefix := []byte(keys.DeletionQueuePrefix)
-	count := int64(0)
-
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		count++
-		it.Key().Free()
-		it.Value().Free()
-	}
-
-	return count
+	depth, _ := q.scanStats()
+	return depth
 }
 
 // scanStats walks the queue once and returns the total depth and the number of
