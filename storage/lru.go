@@ -139,8 +139,14 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 		// Delete associated files
 		switch valueMsg.ValueType {
 		case pb.ValueType_RAW_FILE:
-			if err := c.storage.fileManager.Remove(valueMsg.RawFilePath); err != nil {
-				zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to delete raw file during LRU eviction")
+			// Queue the raw file for asynchronous deletion instead of removing it
+			// inline: fileManager.Remove's non-blocking TryLock skips a file being
+			// read, and since this batch also drops the metadata, a skipped file
+			// would be orphaned permanently (no metadata, no compaction entry, no
+			// queue entry). The queue retries until the reader releases the lock.
+			// Mirrors cleanupExpiredKeys() and Storage.Delete().
+			if err := c.storage.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
+				zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to queue raw file for deletion during LRU eviction")
 			}
 		case pb.ValueType_SEGMENT:
 			// Update delete index to track this deletion for future garbage collection
