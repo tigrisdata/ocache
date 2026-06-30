@@ -283,20 +283,14 @@ func TestQueue_PruneOldEntries_KeepsExistingFile(t *testing.T) {
 	require.Equal(t, int64(0), queue.GetQueueDepth(), "queue should drain after successful deletion")
 }
 
-// TestQueue_ProcessBatch_StuckHeadDoesNotStarve guards against head-of-line
-// starvation: now that prune keeps (rather than drops) aged entries whose file
-// still exists, a batch-sized run of undeletable entries at the head of the
-// timestamp-ordered queue must not prevent newer, deletable entries behind them
-// from being processed. ProcessBatch resumes from a cursor so it advances past
-// the stuck head over successive cycles.
-func TestQueue_ProcessBatch_StuckHeadDoesNotStarve(t *testing.T) {
+// TestQueue_ProcessBatch_StuckEntriesDoNotBlockNewer checks that a small set of
+// undeletable entries kept at the head of the queue (read-locked, so their
+// deletion fails) does not prevent newer, deletable entries from being
+// reclaimed: with BatchSize well above the stuck count, ProcessBatch reaches the
+// newer entries in the same scan.
+func TestQueue_ProcessBatch_StuckEntriesDoNotBlockNewer(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
-
-	// BatchSize == number of stuck files, so without the cursor the stuck head
-	// would consume the entire batch every cycle and the deletable file would
-	// never be reached.
-	queue.config.BatchSize = 2
 
 	tmp := t.TempDir()
 
@@ -316,13 +310,9 @@ func TestQueue_ProcessBatch_StuckHeadDoesNotStarve(t *testing.T) {
 	require.NoError(t, os.WriteFile(free, []byte("x"), 0o644))
 	require.NoError(t, queue.Add(free))
 
-	// Run several cycles; the cursor must advance past the stuck head and reach
-	// the deletable file.
-	for i := 0; i < 5; i++ {
-		queue.ProcessBatch()
-	}
+	queue.ProcessBatch()
 
-	require.NoFileExists(t, free, "deletable file behind a stuck head must still be reclaimed")
+	require.NoFileExists(t, free, "deletable file must be reclaimed despite stuck entries at the head")
 	require.FileExists(t, stuck[0], "read-locked file must not be deleted")
 	require.FileExists(t, stuck[1], "read-locked file must not be deleted")
 }

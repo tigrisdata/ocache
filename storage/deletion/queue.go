@@ -37,12 +37,6 @@ type Queue struct {
 	processed int64
 	failed    int64
 	pruned    int64
-
-	// scanCursor remembers where the previous ProcessBatch scan stopped so a
-	// run of undeletable entries at the head of the timestamp-ordered queue
-	// cannot starve newer entries whose files can be removed. nil means start
-	// from the head. Only touched by the single-threaded processing loop.
-	scanCursor []byte
 }
 
 // NewQueue creates a new deletion queue
@@ -155,27 +149,14 @@ func (q *Queue) ProcessBatch() {
 	prefix := []byte(keys.DeletionQueuePrefix)
 	count := 0
 
-	// Resume scanning from where the previous batch stopped. The queue is
-	// ordered by timestamp, so always restarting at the head would let a
-	// batch-sized run of entries whose deletion keeps failing (e.g. read-locked
-	// files) be re-scanned every cycle and never reach newer, deletable entries
-	// behind them. The cursor advances past such entries and wraps back to the
-	// head at the end, so every entry is retried over successive cycles.
-	startKey := prefix
-	if q.scanCursor != nil {
-		startKey = q.scanCursor
-	}
-
-	var lastKey []byte
-	it.Seek(startKey)
-	// Seek lands on the cursor key itself when it still exists (its deletion
-	// failed last cycle); skip it to make forward progress. If it was deleted,
-	// Seek lands on the next key and there is nothing to skip.
-	if q.scanCursor != nil && it.ValidForPrefix(prefix) && bytes.Equal(it.Key().Data(), q.scanCursor) {
-		it.Next()
-	}
-
-	for it.ValidForPrefix(prefix) && count < q.config.BatchSize {
+	// Scan from the head, collecting up to BatchSize distinct filepaths. A small
+	// number of entries whose deletion keeps failing (e.g. read-locked files)
+	// stay at the head and are retried each cycle, but they only occupy a few of
+	// the BatchSize slots, so newer deletable entries behind them are still
+	// processed. (If a stuck set ever approached BatchSize it could stall newer
+	// entries; the DeletionQueueStuck gauge surfaces that long before it
+	// matters.)
+	for it.Seek(prefix); it.ValidForPrefix(prefix) && count < q.config.BatchSize; it.Next() {
 		// Check for shutdown
 		select {
 		case <-q.ctx.Done():
@@ -187,26 +168,21 @@ func (q *Queue) ProcessBatch() {
 		keyData := key.Data()
 
 		// Extract filepath from key: !del/<timestamp>/<filepath>
-		if _, filepath, err := keys.ParseDeletionQueueKey(keyData); err == nil {
-			// Keep only earliest entry for each filepath
-			if _, exists := seen[filepath]; !exists {
-				seen[filepath] = bytes.Clone(keyData)
-				count++
-			}
+		_, filepath, err := keys.ParseDeletionQueueKey(keyData)
+		if err != nil {
+			key.Free()
+			it.Value().Free()
+			continue
 		}
 
-		lastKey = bytes.Clone(keyData)
+		// Keep only earliest entry for each filepath
+		if _, exists := seen[filepath]; !exists {
+			seen[filepath] = bytes.Clone(keyData)
+			count++
+		}
+
 		key.Free()
 		it.Value().Free()
-		it.Next()
-	}
-
-	// Advance the cursor for the next cycle, wrapping to the head once the end
-	// of the queue is reached.
-	if it.ValidForPrefix(prefix) {
-		q.scanCursor = lastKey
-	} else {
-		q.scanCursor = nil
 	}
 
 	if len(seen) == 0 {
