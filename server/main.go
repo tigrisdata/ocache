@@ -34,6 +34,9 @@ var (
 	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
 	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
 
+	recoveryWorkers = flag.Int("recovery-workers", stor.DefaultRecoveryWorkers, "Number of parallel workers for startup file recovery")
+	deleteBatchSize = flag.Int("delete-batch-size", stor.DefaultDeleteBatchSize, "Number of file deletions processed per deletion-queue batch")
+
 	metadataCacheSize = flag.Int64("metadata-cache-size", stor.DefaultMetadataCacheSize, "Metadata cache size in bytes (default: 1GB)")
 
 	listenAddr     = flag.String("listen-addr", ":9000", "Listen address for gRPC server")
@@ -117,6 +120,8 @@ func initializeStorage() *stor.Storage {
 		DisableRecompaction: AppConfig.RecompactDisable,
 		CleanupInterval:     AppConfig.TTLCleanupInterval,
 		MetadataCacheSize:   AppConfig.MetadataCacheSize,
+		RecoveryWorkers:     AppConfig.RecoveryWorkers,
+		DeleteBatchSize:     AppConfig.DeleteBatchSize,
 	}
 
 	s, err := stor.NewStorageWithConfig(storageConfig)

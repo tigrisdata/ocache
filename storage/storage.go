@@ -62,7 +62,7 @@ const (
 	DefaultAccessUpdateDelay      = 5 * time.Minute
 
 	// Default queue config
-	DeleteBatchSize = 1000 // Number of deletions to process per batch
+	DefaultDeleteBatchSize = 1000 // Number of deletions to process per batch
 
 	// Default segment recompaction settings
 	DefaultRecompactionDisabled          = false
@@ -72,8 +72,12 @@ const (
 	DefaultRecompactionInterval          = 1 * time.Minute // Interval between segment recompaction runs
 
 	// Default delete queue settings
-	DeleteProcessInterval = time.Second    // Interval between batch processing
-	DeletePruneAge        = 24 * time.Hour // Age after which entries are pruned
+	DeleteProcessInterval = time.Second      // Interval between batch processing
+	DeletePruneAge        = 24 * time.Hour   // Age after which entries are pruned
+	DeleteRetryDelay      = 30 * time.Second // Backoff before retrying a failed deletion (bounds retry churn for stuck files)
+
+	// Default number of parallel workers for startup file recovery
+	DefaultRecoveryWorkers = files.MaxWorkers
 
 	// Default RocksDB configuration
 	DefaultMetadataCacheSize = metadata.DefaultRocksDBBlockCacheSize
@@ -96,6 +100,8 @@ type StorageConfig struct {
 	RecompactionInterval time.Duration // Interval between segment recompaction runs
 	CleanupInterval      time.Duration // Cleanup interval
 	AccessUpdateDelay    time.Duration // Access update delay
+	RecoveryWorkers      int           // Number of parallel workers for startup file recovery (<= 0 = default)
+	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
 
 	// RocksDB-specific configuration
 	MetadataCacheSize int64 // RocksDB Block cache size in bytes (0 = use default)
@@ -150,6 +156,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	if config.FdCacheSize <= 0 {
 		config.FdCacheSize = DefaultFdCacheSize
 	}
+	if config.DeleteBatchSize <= 0 {
+		config.DeleteBatchSize = DefaultDeleteBatchSize
+	}
 
 	// Create the data directory if it doesn't exist
 	if err := os.MkdirAll(config.DiskPath, 0o755); err != nil {
@@ -190,7 +199,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	// Run recovery for raw files BEFORE starting any services
-	recovery := files.NewRecoveryManager(meta, config.DiskPath)
+	recovery := files.NewRecoveryManager(meta, config.DiskPath, config.RecoveryWorkers)
 	if err := recovery.RecoverOnStartup(); err != nil {
 		zlog.Error().Err(err).Msg("storage: file recovery failed")
 		return nil, storageErrors.NewInternalError("Init", err)
@@ -198,9 +207,10 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 
 	// Initialize and start the centralized deletion queue
 	deletionQueue := deletion.NewQueue(meta, deletion.Config{
-		BatchSize:       DeleteBatchSize,
+		BatchSize:       config.DeleteBatchSize,
 		ProcessInterval: DeleteProcessInterval,
 		PruneAge:        DeletePruneAge,
+		RetryDelay:      DeleteRetryDelay,
 	})
 	deletionQueue.Start()
 
