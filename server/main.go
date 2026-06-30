@@ -36,6 +36,8 @@ var (
 
 	metadataCacheSize = flag.Int64("metadata-cache-size", stor.DefaultMetadataCacheSize, "Metadata cache size in bytes (default: 1GB)")
 
+	recoveryWorkers = flag.Int("recovery-workers", 0, "Parallel workers for startup recovery validation (0 = use default)")
+
 	listenAddr     = flag.String("listen-addr", ":9000", "Listen address for gRPC server")
 	listenHTTP     = flag.String("listen-http", ":9001", "Listen address for HTTP/grpc-gateway server")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
@@ -117,6 +119,7 @@ func initializeStorage() *stor.Storage {
 		DisableRecompaction: AppConfig.RecompactDisable,
 		CleanupInterval:     AppConfig.TTLCleanupInterval,
 		MetadataCacheSize:   AppConfig.MetadataCacheSize,
+		RecoveryWorkers:     AppConfig.RecoveryWorkers,
 	}
 
 	s, err := stor.NewStorageWithConfig(storageConfig)

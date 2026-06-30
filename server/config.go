@@ -27,6 +27,7 @@ type Config struct {
 	RequestLogging         bool          // Enable request logging
 	// RocksDB tuning parameters
 	MetadataCacheSize int64 // RocksDB block cache size in bytes
+	RecoveryWorkers   int   // Parallel workers for startup recovery validation (0 = use default)
 
 	// Cluster configuration
 	ClusterEnabled bool     // Enable cluster mode
@@ -62,6 +63,7 @@ func LoadConfig() {
 		TTLCleanupInterval:     *ttlCleanupInterval,
 		RequestLogging:         *requestLogging,
 		MetadataCacheSize:      *metadataCacheSize,
+		RecoveryWorkers:        *recoveryWorkers,
 		ClusterEnabled:         *clusterEnabled,
 		NodeID:                 *nodeID,
 		ClusterAddr:            *clusterAddr,
