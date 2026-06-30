@@ -21,6 +21,7 @@ type Config struct {
 	BatchSize       int           // Number of deletions per batch
 	ProcessInterval time.Duration // Interval between batch processing
 	PruneAge        time.Duration // Age after which entries are pruned
+	RetryDelay      time.Duration // Backoff before a failed deletion is retried (0 = retry next cycle)
 }
 
 // Queue manages centralized file deletion
@@ -34,10 +35,9 @@ type Queue struct {
 	wg     sync.WaitGroup
 
 	// Stats
-	processed  int64
-	failed     int64
-	pruned     int64
-	queueDepth int64
+	processed int64
+	failed    int64
+	pruned    int64
 }
 
 // NewQueue creates a new deletion queue
@@ -149,7 +149,15 @@ func (q *Queue) ProcessBatch() {
 
 	prefix := []byte(keys.DeletionQueuePrefix)
 	count := 0
+	nowNanos := time.Now().UnixNano()
 
+	// Scan from the head (oldest first), collecting up to BatchSize distinct
+	// filepaths that are due (timestamp <= now). Entries whose deletion fails are
+	// re-enqueued at now+RetryDelay (see below), so the head always advances
+	// (no head-of-line starvation) and a persistently-stuck file is only retried
+	// once per RetryDelay rather than every cycle. Because keys are timestamp-
+	// ordered, the first not-yet-due entry means every entry after it is also in
+	// the future, so we can stop scanning.
 	for it.Seek(prefix); it.ValidForPrefix(prefix) && count < q.config.BatchSize; it.Next() {
 		// Check for shutdown
 		select {
@@ -161,12 +169,20 @@ func (q *Queue) ProcessBatch() {
 		key := it.Key()
 		keyData := key.Data()
 
-		// Extract filepath from key: !del/<timestamp>/<filepath>
-		_, filepath, err := keys.ParseDeletionQueueKey(keyData)
+		// Extract timestamp and filepath from key: !del/<timestamp>/<filepath>
+		ts, filepath, err := keys.ParseDeletionQueueKey(keyData)
 		if err != nil {
 			key.Free()
 			it.Value().Free()
 			continue
+		}
+
+		if ts > nowNanos {
+			// Not yet due (a re-enqueued entry still in its backoff window); all
+			// later entries are in the future too, so stop.
+			key.Free()
+			it.Value().Free()
+			break
 		}
 
 		// Keep only earliest entry for each filepath
@@ -201,6 +217,19 @@ func (q *Queue) ProcessBatch() {
 			// Increment processed counter
 			metrics.DeletionQueueProcessed.Inc()
 		} else {
+			// Deletion failed and the file is still on disk (read-locked by an
+			// active reader, read-only filesystem, ...). Re-enqueue the entry
+			// under a future timestamp (now+RetryDelay): delete the current key
+			// and re-add it. The head keeps advancing so a run of undeletable
+			// files cannot starve newer, deletable entries, and the backoff
+			// bounds how often a persistently-stuck file is rewritten — the scan
+			// above skips not-yet-due entries, so it is retried roughly once per
+			// RetryDelay instead of every cycle. The file is never dropped; it is
+			// reclaimed once a later attempt succeeds. tryDelete treats a missing
+			// file as success, so re-enqueued entries only reference files that
+			// still exist.
+			batch.Delete(queueKey)
+			batch.Put(keys.MakeDeletionQueueKey(time.Now().Add(q.config.RetryDelay).UnixNano(), filepath), []byte{0x01})
 			failed++
 			q.failed++
 			// Increment failed counter
@@ -208,7 +237,7 @@ func (q *Queue) ProcessBatch() {
 		}
 	}
 
-	// Commit successful deletions
+	// Commit successful deletions and tail re-enqueues
 	if batch.Count() > 0 {
 		if err := q.meta.Handle().Write(wo, batch); err != nil {
 			zlog.Error().
@@ -284,6 +313,7 @@ func (q *Queue) pruneOldEntries() {
 
 	prefix := []byte(keys.DeletionQueuePrefix)
 	pruned := 0
+	stuck := 0
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		// Check for shutdown
@@ -296,20 +326,34 @@ func (q *Queue) pruneOldEntries() {
 		key := it.Key()
 		keyData := key.Data()
 
-		// Extract timestamp from key
-		timestamp, _, err := keys.ParseDeletionQueueKey(keyData)
+		// Extract timestamp and filepath from key
+		timestamp, filepath, err := keys.ParseDeletionQueueKey(keyData)
 		if err == nil && timestamp > 0 && timestamp < cutoff {
-			batch.Delete(bytes.Clone(keyData))
-			pruned++
-			q.pruned++
-			// Increment pruned counter
-			metrics.DeletionQueuePruned.Inc()
-
-			_, filepath, _ := keys.ParseDeletionQueueKey(keyData)
-			zlog.Warn().
-				Str("filepath", filepath).
-				Dur("age", time.Since(time.Unix(0, timestamp))).
-				Msg("deletion queue: pruning old entry")
+			// The queue entry is the only durable record that this file must be
+			// deleted. Dropping it while the file still exists orphans the file
+			// permanently: it has no metadata, no compaction-index entry, and no
+			// queue entry, so it is invisible to the disk-usage cap, LRU
+			// eviction, and startup recovery (see issue #156). Only prune an
+			// entry once the file is confirmed gone; otherwise keep it for
+			// ProcessBatch to retry. Raw-file paths are UUIDs and never reused,
+			// so ENOENT is a safe terminal signal that the deletion is done.
+			if _, statErr := os.Stat(filepath); os.IsNotExist(statErr) {
+				batch.Delete(bytes.Clone(keyData))
+				pruned++
+				q.pruned++
+				// Increment pruned counter
+				metrics.DeletionQueuePruned.Inc()
+			} else {
+				// File still present (read-locked by an active reader, read-only
+				// filesystem, lost permissions, transient I/O error, ...). Keep
+				// the entry so the file is reclaimed once deletion succeeds
+				// rather than being abandoned on disk.
+				stuck++
+				zlog.Warn().
+					Str("filepath", filepath).
+					Dur("age", time.Since(time.Unix(0, timestamp))).
+					Msg("deletion queue: entry past prune age but file still exists; keeping for retry")
+			}
 		}
 
 		key.Free()
@@ -339,11 +383,22 @@ func (q *Queue) pruneOldEntries() {
 		zlog.Info().
 			Int("pruned", pruned).
 			Dur("duration_ms", time.Since(startTime)).
-			Msg("deletion queue: pruned old entries")
+			Msg("deletion queue: pruned entries whose files were already gone")
+	}
+
+	// With ProcessBatch re-enqueuing failed deletions to the tail under fresh
+	// timestamps, an entry both past PruneAge and still backed by a file should
+	// not normally occur; surface it as a warning rather than mislabeling it as a
+	// prune.
+	if stuck > 0 {
+		zlog.Warn().
+			Int("stuck", stuck).
+			Dur("duration_ms", time.Since(startTime)).
+			Msg("deletion queue: aged entries still backed by a file, kept for retry")
 	}
 }
 
-// GetQueueDepth returns the current queue depth
+// GetQueueDepth returns the current number of entries in the deletion queue.
 func (q *Queue) GetQueueDepth() int64 {
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
@@ -363,7 +418,9 @@ func (q *Queue) GetQueueDepth() int64 {
 	return count
 }
 
-// logQueueDepth logs the current queue depth and stats
+// logQueueDepth logs the current queue depth and stats. A backlog that fails to
+// drain shows up as a sustained queue_depth together with a rising
+// DeletionQueueFailed rate, which is how persistently-undeletable files surface.
 func (q *Queue) logQueueDepth() {
 	depth := q.GetQueueDepth()
 

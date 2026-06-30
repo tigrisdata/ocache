@@ -72,8 +72,9 @@ const (
 	DefaultRecompactionInterval          = 1 * time.Minute // Interval between segment recompaction runs
 
 	// Default delete queue settings
-	DeleteProcessInterval = time.Second    // Interval between batch processing
-	DeletePruneAge        = 24 * time.Hour // Age after which entries are pruned
+	DeleteProcessInterval = time.Second      // Interval between batch processing
+	DeletePruneAge        = 24 * time.Hour   // Age after which entries are pruned
+	DeleteRetryDelay      = 30 * time.Second // Backoff before retrying a failed deletion (bounds retry churn for stuck files)
 
 	// Default RocksDB configuration
 	DefaultMetadataCacheSize = metadata.DefaultRocksDBBlockCacheSize
@@ -201,6 +202,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		BatchSize:       DeleteBatchSize,
 		ProcessInterval: DeleteProcessInterval,
 		PruneAge:        DeletePruneAge,
+		RetryDelay:      DeleteRetryDelay,
 	})
 	deletionQueue.Start()
 

@@ -244,6 +244,156 @@ func TestQueue_PruneOldEntries(t *testing.T) {
 	require.Equal(t, int64(0), depth)
 }
 
+// TestQueue_PruneOldEntries_KeepsExistingFile is the regression test for the
+// secondary leak in issue #156: pruneOldEntries used to drop queue entries by
+// age alone, abandoning a file that was still on disk (e.g. a deletion that kept
+// failing because the file was read-locked). The queue entry is the only durable
+// record that the file must be deleted, so dropping it orphans the file
+// permanently. Prune must keep an aged entry whose file still exists; only the
+// normal retry path (ProcessBatch) may reclaim it once deletion succeeds.
+func TestQueue_PruneOldEntries_KeepsExistingFile(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// Set very short prune age so the entry ages out quickly.
+	queue.config.PruneAge = 100 * time.Millisecond
+
+	// A real file on disk that the queue is responsible for reclaiming.
+	tmpDir := t.TempDir()
+	existing := filepath.Join(tmpDir, "still-here.bin")
+	require.NoError(t, os.WriteFile(existing, []byte("data"), 0o644))
+
+	require.NoError(t, queue.Add(existing))
+
+	// Let the entry age past PruneAge.
+	time.Sleep(150 * time.Millisecond)
+
+	queue.pruneOldEntries()
+
+	// The file still exists, so the entry MUST NOT be pruned — dropping it would
+	// orphan the file permanently.
+	require.Equal(t, int64(0), queue.pruned, "entry whose file still exists must not be pruned")
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "aged entry must be kept for retry while its file exists")
+	require.FileExists(t, existing)
+
+	// The normal retry path still reclaims the file (and removes the entry) once
+	// the deletion can succeed.
+	queue.ProcessBatch()
+	require.NoFileExists(t, existing, "ProcessBatch should delete the file once it is no longer locked")
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "queue should drain after successful deletion")
+}
+
+// TestQueue_ProcessBatch_StuckEntriesRequeuedDoNotStarve verifies that
+// undeletable entries (read-locked, so their deletion keeps failing) are
+// re-enqueued to the tail rather than left blocking the head, so newer deletable
+// entries are still reclaimed even when the stuck set EXCEEDS BatchSize. Without
+// re-enqueue the oldest BatchSize stuck entries would fill every scan and the
+// deletable file behind them would never be reached.
+func TestQueue_ProcessBatch_StuckEntriesRequeuedDoNotStarve(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// BatchSize smaller than the stuck set: the stuck head alone would fill a
+	// whole batch, so reaching the deletable file proves the head advances.
+	queue.config.BatchSize = 2
+
+	tmp := t.TempDir()
+
+	// Three read-locked files at the head whose deletion can't succeed.
+	stuck := []string{
+		filepath.Join(tmp, "a-stuck"),
+		filepath.Join(tmp, "b-stuck"),
+		filepath.Join(tmp, "c-stuck"),
+	}
+	for _, f := range stuck {
+		require.NoError(t, os.WriteFile(f, []byte("x"), 0o644))
+		require.NoError(t, queue.Add(f))
+		lock := fd.GetFileLockManager().GetFileLock(f)
+		lock.RLock()
+		defer lock.RUnlock()
+	}
+
+	// A newer, deletable file enqueued behind the (oversized) stuck head.
+	free := filepath.Join(tmp, "d-free")
+	require.NoError(t, os.WriteFile(free, []byte("x"), 0o644))
+	require.NoError(t, queue.Add(free))
+
+	// A few cycles: failed entries rotate to the tail until the deletable file
+	// reaches the head.
+	for i := 0; i < 5; i++ {
+		queue.ProcessBatch()
+	}
+
+	require.NoFileExists(t, free, "deletable file must be reclaimed even when the stuck set exceeds BatchSize")
+	for _, f := range stuck {
+		require.FileExists(t, f, "read-locked file must not be deleted")
+	}
+	// The stuck files are still tracked (re-enqueued), never dropped.
+	require.Equal(t, int64(len(stuck)), queue.GetQueueDepth(), "stuck files remain queued for retry")
+}
+
+// TestQueue_ProcessBatch_RequeuedStuckFileReclaimedAfterUnlock confirms a stuck,
+// re-enqueued file is reclaimed once it becomes deletable (its reader releases
+// the lock), i.e. re-enqueue defers deletion rather than dropping it.
+func TestQueue_ProcessBatch_RequeuedStuckFileReclaimedAfterUnlock(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	tmp := t.TempDir()
+	f := filepath.Join(tmp, "temporarily-locked.bin")
+	require.NoError(t, os.WriteFile(f, []byte("x"), 0o644))
+	require.NoError(t, queue.Add(f))
+
+	lock := fd.GetFileLockManager().GetFileLock(f)
+	lock.RLock()
+
+	// Deletion fails while locked; the entry is re-enqueued, not dropped.
+	queue.ProcessBatch()
+	require.FileExists(t, f, "locked file must not be deleted")
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "entry must stay queued for retry")
+
+	// Once unlocked, the next cycle reclaims it.
+	lock.RUnlock()
+	queue.ProcessBatch()
+	require.NoFileExists(t, f, "file must be reclaimed after the lock is released")
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "queue should drain after successful deletion")
+}
+
+// TestQueue_ProcessBatch_RetryDelayDefersRetry verifies that a failed deletion
+// is re-enqueued under a future timestamp (now+RetryDelay) and is not retried
+// until that backoff elapses — bounding retry churn for persistently-stuck
+// files rather than rewriting them every cycle.
+func TestQueue_ProcessBatch_RetryDelayDefersRetry(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	queue.config.RetryDelay = 200 * time.Millisecond
+
+	tmp := t.TempDir()
+	f := filepath.Join(tmp, "locked.bin")
+	require.NoError(t, os.WriteFile(f, []byte("x"), 0o644))
+	require.NoError(t, queue.Add(f))
+
+	lock := fd.GetFileLockManager().GetFileLock(f)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	// First attempt fails (locked) and re-enqueues at now+RetryDelay.
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed)
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "entry stays queued for retry")
+
+	// Within the backoff window the entry is not due: a second cycle skips it,
+	// so there is no extra failure and no rewrite.
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed, "stuck entry must not be retried before RetryDelay elapses")
+
+	// After the backoff elapses the entry is due again and is retried.
+	time.Sleep(250 * time.Millisecond)
+	queue.ProcessBatch()
+	require.Equal(t, int64(2), queue.failed, "stuck entry must be retried after RetryDelay elapses")
+}
+
 func TestQueue_GetQueueDepth(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
