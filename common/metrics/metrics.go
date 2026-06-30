@@ -411,13 +411,6 @@ var (
 		},
 	)
 
-	DeletionQueueStuck = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "ocache_deletion_queue_stuck",
-			Help: "Queue entries past the prune age whose file still exists on disk (deletion repeatedly failing). These are retried rather than dropped so the file is not orphaned; a sustained non-zero value means files cannot be deleted (e.g. read-locked, read-only filesystem, lost permissions) and disk may be leaking.",
-		},
-	)
-
 	DeletionQueueBatchDuration = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "ocache_deletion_queue_batch_duration_ms",
