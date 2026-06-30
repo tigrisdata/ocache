@@ -364,15 +364,22 @@ func (q *Queue) pruneOldEntries() {
 		}
 	}
 
-	// With ProcessBatch re-enqueuing failed deletions to the tail under fresh
-	// timestamps, an entry that is both past PruneAge and still backed by a file
-	// (stuck > 0) should not normally occur; logging it flags an unexpected case.
-	if pruned > 0 || stuck > 0 {
+	if pruned > 0 {
 		zlog.Info().
 			Int("pruned", pruned).
+			Dur("duration_ms", time.Since(startTime)).
+			Msg("deletion queue: pruned entries whose files were already gone")
+	}
+
+	// With ProcessBatch re-enqueuing failed deletions to the tail under fresh
+	// timestamps, an entry both past PruneAge and still backed by a file should
+	// not normally occur; surface it as a warning rather than mislabeling it as a
+	// prune.
+	if stuck > 0 {
+		zlog.Warn().
 			Int("stuck", stuck).
 			Dur("duration_ms", time.Since(startTime)).
-			Msg("deletion queue: pruned old entries")
+			Msg("deletion queue: aged entries still backed by a file, kept for retry")
 	}
 }
 
