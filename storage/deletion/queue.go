@@ -38,6 +38,12 @@ type Queue struct {
 	failed     int64
 	pruned     int64
 	queueDepth int64
+
+	// scanCursor remembers where the previous ProcessBatch scan stopped so a
+	// run of undeletable entries at the head of the timestamp-ordered queue
+	// cannot starve newer entries whose files can be removed. nil means start
+	// from the head. Only touched by the single-threaded processing loop.
+	scanCursor []byte
 }
 
 // NewQueue creates a new deletion queue
@@ -150,7 +156,27 @@ func (q *Queue) ProcessBatch() {
 	prefix := []byte(keys.DeletionQueuePrefix)
 	count := 0
 
-	for it.Seek(prefix); it.ValidForPrefix(prefix) && count < q.config.BatchSize; it.Next() {
+	// Resume scanning from where the previous batch stopped. The queue is
+	// ordered by timestamp, so always restarting at the head would let a
+	// batch-sized run of entries whose deletion keeps failing (e.g. read-locked
+	// files) be re-scanned every cycle and never reach newer, deletable entries
+	// behind them. The cursor advances past such entries and wraps back to the
+	// head at the end, so every entry is retried over successive cycles.
+	startKey := prefix
+	if q.scanCursor != nil {
+		startKey = q.scanCursor
+	}
+
+	var lastKey []byte
+	it.Seek(startKey)
+	// Seek lands on the cursor key itself when it still exists (its deletion
+	// failed last cycle); skip it to make forward progress. If it was deleted,
+	// Seek lands on the next key and there is nothing to skip.
+	if q.scanCursor != nil && it.ValidForPrefix(prefix) && bytes.Equal(it.Key().Data(), q.scanCursor) {
+		it.Next()
+	}
+
+	for it.ValidForPrefix(prefix) && count < q.config.BatchSize {
 		// Check for shutdown
 		select {
 		case <-q.ctx.Done():
@@ -162,21 +188,26 @@ func (q *Queue) ProcessBatch() {
 		keyData := key.Data()
 
 		// Extract filepath from key: !del/<timestamp>/<filepath>
-		_, filepath, err := keys.ParseDeletionQueueKey(keyData)
-		if err != nil {
-			key.Free()
-			it.Value().Free()
-			continue
+		if _, filepath, err := keys.ParseDeletionQueueKey(keyData); err == nil {
+			// Keep only earliest entry for each filepath
+			if _, exists := seen[filepath]; !exists {
+				seen[filepath] = bytes.Clone(keyData)
+				count++
+			}
 		}
 
-		// Keep only earliest entry for each filepath
-		if _, exists := seen[filepath]; !exists {
-			seen[filepath] = bytes.Clone(keyData)
-			count++
-		}
-
+		lastKey = bytes.Clone(keyData)
 		key.Free()
 		it.Value().Free()
+		it.Next()
+	}
+
+	// Advance the cursor for the next cycle, wrapping to the head once the end
+	// of the queue is reached.
+	if it.ValidForPrefix(prefix) {
+		q.scanCursor = lastKey
+	} else {
+		q.scanCursor = nil
 	}
 
 	if len(seen) == 0 {
@@ -350,11 +381,9 @@ func (q *Queue) pruneOldEntries() {
 		}
 	}
 
-	// Surface entries that are past the prune age but whose file is still on
-	// disk. They are retried, not dropped; a sustained non-zero value means
-	// deletions are failing and disk may be leaking.
-	metrics.DeletionQueueStuck.Set(float64(stuck))
-
+	// The DeletionQueueStuck gauge is published by logQueueDepth on a fixed
+	// cadence rather than here, so it reflects entries that ProcessBatch drains
+	// between prune runs instead of going stale for up to a full PruneAge.
 	if pruned > 0 || stuck > 0 {
 		zlog.Info().
 			Int("pruned", pruned).
@@ -384,17 +413,53 @@ func (q *Queue) GetQueueDepth() int64 {
 	return count
 }
 
+// scanStats walks the queue once and returns the total depth and the number of
+// "stuck" entries: entries older than PruneAge whose file is still on disk
+// (i.e. deletions that keep failing). Computing this on the periodic logging
+// cadence keeps the DeletionQueueStuck gauge fresh, so it drops back to zero
+// once ProcessBatch reclaims the files rather than staying stale until the next
+// prune run.
+func (q *Queue) scanStats() (depth int64, stuck int64) {
+	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
+
+	it := q.meta.Handle().NewIterator(ro)
+	defer it.Close()
+
+	cutoff := time.Now().Add(-q.config.PruneAge).UnixNano()
+	prefix := []byte(keys.DeletionQueuePrefix)
+
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		depth++
+
+		keyData := it.Key().Data()
+		if ts, filepath, err := keys.ParseDeletionQueueKey(keyData); err == nil && ts > 0 && ts < cutoff {
+			if _, statErr := os.Stat(filepath); statErr == nil {
+				stuck++
+			}
+		}
+
+		it.Key().Free()
+		it.Value().Free()
+	}
+
+	return depth, stuck
+}
+
 // logQueueDepth logs the current queue depth and stats
 func (q *Queue) logQueueDepth() {
-	depth := q.GetQueueDepth()
+	depth, stuck := q.scanStats()
 
-	// Update queue depth gauge metric
+	// Update queue gauges. Stuck is recomputed here (not only at prune time) so
+	// it reflects entries ProcessBatch has drained since the last prune.
 	metrics.DeletionQueueDepth.Set(float64(depth))
+	metrics.DeletionQueueStuck.Set(float64(stuck))
 
 	// Always log if there are items in the queue, or periodically log stats
 	if depth > 0 {
 		zlog.Info().
 			Int64("queue_depth", depth).
+			Int64("stuck", stuck).
 			Int64("total_processed", q.processed).
 			Int64("total_failed", q.failed).
 			Int64("total_pruned", q.pruned).

@@ -283,6 +283,83 @@ func TestQueue_PruneOldEntries_KeepsExistingFile(t *testing.T) {
 	require.Equal(t, int64(0), queue.GetQueueDepth(), "queue should drain after successful deletion")
 }
 
+// TestQueue_ProcessBatch_StuckHeadDoesNotStarve guards against head-of-line
+// starvation: now that prune keeps (rather than drops) aged entries whose file
+// still exists, a batch-sized run of undeletable entries at the head of the
+// timestamp-ordered queue must not prevent newer, deletable entries behind them
+// from being processed. ProcessBatch resumes from a cursor so it advances past
+// the stuck head over successive cycles.
+func TestQueue_ProcessBatch_StuckHeadDoesNotStarve(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// BatchSize == number of stuck files, so without the cursor the stuck head
+	// would consume the entire batch every cycle and the deletable file would
+	// never be reached.
+	queue.config.BatchSize = 2
+
+	tmp := t.TempDir()
+
+	// Two files at the head whose deletion can't succeed: hold a read lock so
+	// tryDelete's exclusive TryLock fails (exactly what a concurrent reader does).
+	stuck := []string{filepath.Join(tmp, "a-stuck"), filepath.Join(tmp, "b-stuck")}
+	for _, f := range stuck {
+		require.NoError(t, os.WriteFile(f, []byte("x"), 0o644))
+		require.NoError(t, queue.Add(f))
+		lock := fd.GetFileLockManager().GetFileLock(f)
+		lock.RLock()
+		defer lock.RUnlock()
+	}
+
+	// A newer, deletable file enqueued behind the stuck head.
+	free := filepath.Join(tmp, "c-free")
+	require.NoError(t, os.WriteFile(free, []byte("x"), 0o644))
+	require.NoError(t, queue.Add(free))
+
+	// Run several cycles; the cursor must advance past the stuck head and reach
+	// the deletable file.
+	for i := 0; i < 5; i++ {
+		queue.ProcessBatch()
+	}
+
+	require.NoFileExists(t, free, "deletable file behind a stuck head must still be reclaimed")
+	require.FileExists(t, stuck[0], "read-locked file must not be deleted")
+	require.FileExists(t, stuck[1], "read-locked file must not be deleted")
+}
+
+// TestQueue_ScanStats_CountsStuckAndIsFresh verifies the DeletionQueueStuck
+// signal source: scanStats counts only aged entries whose file still exists, and
+// recomputes from scratch so the count drops back to zero once the file is gone
+// (rather than going stale until the next prune run).
+func TestQueue_ScanStats_CountsStuckAndIsFresh(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	queue.config.PruneAge = 100 * time.Millisecond
+
+	tmp := t.TempDir()
+	existing := filepath.Join(tmp, "aged-existing.bin")
+	require.NoError(t, os.WriteFile(existing, []byte("data"), 0o644))
+	require.NoError(t, queue.Add(existing))
+
+	// A fresh entry (not yet past PruneAge) must not count as stuck.
+	depth, stuck := queue.scanStats()
+	require.Equal(t, int64(1), depth)
+	require.Equal(t, int64(0), stuck, "entry younger than PruneAge is not stuck")
+
+	// Once aged, the entry whose file still exists counts as stuck.
+	time.Sleep(150 * time.Millisecond)
+	depth, stuck = queue.scanStats()
+	require.Equal(t, int64(1), depth)
+	require.Equal(t, int64(1), stuck, "aged entry with an existing file is stuck")
+
+	// After the file is reclaimed, the count is recomputed back to zero — no
+	// stale leftover.
+	require.NoError(t, os.Remove(existing))
+	_, stuck = queue.scanStats()
+	require.Equal(t, int64(0), stuck, "stuck count must drop once the file is gone")
+}
+
 func TestQueue_GetQueueDepth(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
