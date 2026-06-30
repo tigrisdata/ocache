@@ -16,6 +16,15 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func TestNewRecoveryManager_NumWorkersConfigurable(t *testing.T) {
+	// An explicit positive value is honored.
+	require.Equal(t, 4, NewRecoveryManager(nil, "/tmp", 4).numWorkers)
+
+	// Zero and negative fall back to the default.
+	require.Equal(t, MaxWorkers, NewRecoveryManager(nil, "/tmp", 0).numWorkers)
+	require.Equal(t, MaxWorkers, NewRecoveryManager(nil, "/tmp", -1).numWorkers)
+}
+
 func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, func()) {
 	// Create temp directory
 	tmpDir, err := os.MkdirTemp("", "recovery_test")
@@ -73,7 +82,7 @@ func TestRecoveryDeletesCorruptedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run recovery
-	recovery := NewRecoveryManager(meta, filesDir)
+	recovery := NewRecoveryManager(meta, filesDir, 0)
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
@@ -130,7 +139,7 @@ func TestRecoveryHandlesStaleEntries(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run recovery
-	recovery := NewRecoveryManager(meta, filesDir)
+	recovery := NewRecoveryManager(meta, filesDir, 0)
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
@@ -181,7 +190,7 @@ func TestRecoveryHandlesOrphanedFiles(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run recovery
-	recovery := NewRecoveryManager(meta, filesDir)
+	recovery := NewRecoveryManager(meta, filesDir, 0)
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
@@ -231,7 +240,7 @@ func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run recovery - should validate even though entry is old
-	recovery := NewRecoveryManager(meta, filesDir)
+	recovery := NewRecoveryManager(meta, filesDir, 0)
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
@@ -322,7 +331,7 @@ func TestParallelRecovery(t *testing.T) {
 	}
 
 	// Run recovery with parallel validation
-	recovery := NewRecoveryManager(meta, filesDir)
+	recovery := NewRecoveryManager(meta, filesDir, 0)
 	err := recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
