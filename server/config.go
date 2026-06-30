@@ -24,6 +24,7 @@ type Config struct {
 	RecompactMinSegments   int           // Minimum number of segments for recompaction
 	RecompactDisable       bool          // Disable automatic segment recompaction
 	TTLCleanupInterval     time.Duration // TTL cleanup interval
+	RecoveryWorkers        int           // Number of parallel workers for startup file recovery
 	RequestLogging         bool          // Enable request logging
 	// RocksDB tuning parameters
 	MetadataCacheSize int64 // RocksDB block cache size in bytes
@@ -60,6 +61,7 @@ func LoadConfig() {
 		RecompactMinSegments:   *recompactMinSegments,
 		RecompactDisable:       *recompactDisable,
 		TTLCleanupInterval:     *ttlCleanupInterval,
+		RecoveryWorkers:        *recoveryWorkers,
 		RequestLogging:         *requestLogging,
 		MetadataCacheSize:      *metadataCacheSize,
 		ClusterEnabled:         *clusterEnabled,

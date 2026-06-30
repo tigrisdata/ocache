@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	// MaxWorkers is the maximum number of workers to use for validation
+	// MaxWorkers is the default number of workers to use for validation when a
+	// caller does not specify one (numWorkers <= 0).
 	MaxWorkers = 16
 
 	// entryBufferSize is the buffer size for the entries channel
@@ -42,12 +43,16 @@ type RecoveryManager struct {
 	numWorkers int
 }
 
-// NewRecoveryManager creates a new recovery manager
-func NewRecoveryManager(meta *metadata.MetaDB, filesPath string) *RecoveryManager {
+// NewRecoveryManager creates a new recovery manager. numWorkers sets the number
+// of parallel validation workers; values <= 0 fall back to MaxWorkers.
+func NewRecoveryManager(meta *metadata.MetaDB, filesPath string, numWorkers int) *RecoveryManager {
+	if numWorkers <= 0 {
+		numWorkers = MaxWorkers
+	}
 	return &RecoveryManager{
 		meta:       meta,
 		filesPath:  filesPath,
-		numWorkers: MaxWorkers,
+		numWorkers: numWorkers,
 	}
 }
 
