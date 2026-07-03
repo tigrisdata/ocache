@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -136,8 +137,15 @@ func initializeStorage() *stor.Storage {
 
 // startUserServices starts the user-facing gRPC and HTTP gateway services
 func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
-	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging, uint32(*grpcMaxConcurrentStreams)) // Start gRPC server in goroutine
-	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)                                          // Start grpc-gateway on different address
+	// grpc.MaxConcurrentStreams takes a uint32; clamp rather than silently wrap
+	// so an out-of-range value can't wrap to a small cap.
+	maxStreams := *grpcMaxConcurrentStreams
+	if maxStreams > math.MaxUint32 {
+		zlog.Warn().Uint("value", maxStreams).Msg("grpc-max-concurrent-streams exceeds uint32 max; clamping to 4294967295")
+		maxStreams = math.MaxUint32
+	}
+	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging, uint32(maxStreams)) // Start gRPC server in goroutine
+	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)                           // Start grpc-gateway on different address
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error

@@ -281,8 +281,17 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 		wg.Add(1)
 		go func(n *ring.NodeInfo) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+
+			// Acquire a fan-out slot, but bail promptly if the request is
+			// cancelled while queued behind the semaphore — otherwise queued
+			// goroutines would wait for a slow/hanging peer RPC to release a slot
+			// long after the caller's context is done.
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
 
 			// Determine start key for this node
 			startKey := ""
