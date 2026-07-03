@@ -282,14 +282,22 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 		go func(n *ring.NodeInfo) {
 			defer wg.Done()
 
-			// Acquire a fan-out slot, but bail promptly if the request is
-			// cancelled while queued behind the semaphore — otherwise queued
-			// goroutines would wait for a slow/hanging peer RPC to release a slot
-			// long after the caller's context is done.
+			// Bail if already cancelled before acquiring, and again after: a
+			// plain acquire would keep queued goroutines waiting on a slow peer
+			// RPC long past the deadline, while select picks randomly among ready
+			// cases — so with a free slot and a done context it could take the
+			// acquire branch and issue a doomed RPC (spurious error-log noise)
+			// instead of returning cleanly.
+			if ctx.Err() != nil {
+				return
+			}
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
+				return
+			}
+			if ctx.Err() != nil {
 				return
 			}
 
