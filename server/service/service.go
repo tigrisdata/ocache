@@ -141,7 +141,25 @@ func grpcStreamLoggingInterceptor(
 	return err
 }
 
-func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, listenAddr string, requestLogging bool) {
+// DefaultMaxConcurrentStreams bounds the number of concurrent HTTP/2 streams a
+// single client connection may open on the gRPC server. Since inter-node
+// peer-forwards reuse one pooled connection per peer, this caps how many
+// concurrent forwards any one peer can drive at a node — protecting a hot
+// key-owner during a degraded ring from unbounded inbound fan-out.
+const DefaultMaxConcurrentStreams uint32 = 256
+
+// EffectiveMaxConcurrentStreams returns v, or DefaultMaxConcurrentStreams when v
+// is 0 (unset). Shared by the standalone server and the embedded client so both
+// apply the same default.
+func EffectiveMaxConcurrentStreams(v uint32) uint32 {
+	if v == 0 {
+		return DefaultMaxConcurrentStreams
+	}
+	return v
+}
+
+func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, listenAddr string, requestLogging bool, maxConcurrentStreams uint32) {
+	maxConcurrentStreams = EffectiveMaxConcurrentStreams(maxConcurrentStreams)
 	var opts []grpc.ServerOption
 
 	// Build interceptor chains. Recovery is outermost so a panic in any handler
@@ -172,6 +190,7 @@ func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, list
 	opts = append(opts,
 		grpc.MaxRecvMsgSize(128*1024*1024), // 128MB - match client send limit
 		grpc.MaxSendMsgSize(128*1024*1024), // 128MB - match client recv limit
+		grpc.MaxConcurrentStreams(maxConcurrentStreams),
 	)
 
 	grpcServer := grpc.NewServer(opts...)

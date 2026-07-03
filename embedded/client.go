@@ -61,6 +61,11 @@ type Config struct {
 	// RequestLogging enables logging of gRPC requests (default: false)
 	RequestLogging bool
 
+	// MaxConcurrentStreams bounds concurrent HTTP/2 streams per client connection
+	// on this node's gRPC server, capping how many concurrent inter-node
+	// peer-forwards any one peer can drive (0 = service.DefaultMaxConcurrentStreams).
+	MaxConcurrentStreams uint32
+
 	// GRPCServerOptions are additional gRPC server options (e.g., auth interceptors).
 	// These are appended after the default options (message size limits, epoch interceptors).
 	GRPCServerOptions []grpc.ServerOption
@@ -234,6 +239,7 @@ func (c *Client) StartGRPCServer() error {
 	opts = append(opts,
 		grpc.MaxRecvMsgSize(128*1024*1024), // 128MB
 		grpc.MaxSendMsgSize(128*1024*1024), // 128MB
+		grpc.MaxConcurrentStreams(service.EffectiveMaxConcurrentStreams(c.config.MaxConcurrentStreams)),
 	)
 
 	// Recovery interceptors are always installed as the outermost interceptors

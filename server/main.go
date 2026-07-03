@@ -43,7 +43,9 @@ var (
 	listenHTTP     = flag.String("listen-http", ":9001", "Listen address for HTTP/grpc-gateway server")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
-	showVersion    = flag.Bool("version", false, "Print version information and exit")
+
+	grpcMaxConcurrentStreams = flag.Uint("grpc-max-concurrent-streams", uint(service.DefaultMaxConcurrentStreams), "Max concurrent HTTP/2 streams per client connection on the gRPC server (bounds inbound peer-forward fan-out)")
+	showVersion              = flag.Bool("version", false, "Print version information and exit")
 
 	// Cluster configuration flags
 	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")
@@ -134,8 +136,8 @@ func initializeStorage() *stor.Storage {
 
 // startUserServices starts the user-facing gRPC and HTTP gateway services
 func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
-	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging) // Start gRPC server in goroutine
-	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)       // Start grpc-gateway on different address
+	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging, uint32(*grpcMaxConcurrentStreams)) // Start gRPC server in goroutine
+	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)                                          // Start grpc-gateway on different address
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error

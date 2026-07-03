@@ -260,6 +260,10 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 }
 
 // fetchFromAllNodes fetches keys (or key-value pairs) from all nodes in parallel.
+// maxListNodeFanout bounds the number of concurrent per-node list RPCs issued
+// by a single cluster-wide List. Clusters smaller than this fan out fully.
+const maxListNodeFanout = 32
+
 func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, nodeCursors map[string]string, withValues bool) (map[string]*NodeResponse, error) {
 	localNodeID := o.GetLocalNodeID()
 	router := o.GetRouter()
@@ -268,10 +272,17 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// Bound how many peer list RPCs run concurrently per List so a large cluster
+	// (or many concurrent List requests) cannot fan out an unbounded number of
+	// blocking calls — each of which would otherwise pin a goroutine/connection.
+	sem := make(chan struct{}, maxListNodeFanout)
+
 	for _, node := range nodes {
 		wg.Add(1)
 		go func(n *ring.NodeInfo) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			// Determine start key for this node
 			startKey := ""
