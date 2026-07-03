@@ -355,6 +355,15 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 
 	wg.Wait()
 
+	// If the context was cancelled or its deadline passed, some nodes may have
+	// been skipped — queued behind the fan-out limit, or their RPC aborted — so
+	// the response set is incomplete. Surface the cancellation rather than
+	// returning a partial result that a downstream merge would treat as complete.
+	// (Individual node failures with a live context remain best-effort skips.)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	zlog.Debug().Int("response_count", len(responses)).Int("node_count", len(nodes)).Msg("Fetched from nodes")
 	return responses, nil
 }
