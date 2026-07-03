@@ -148,14 +148,25 @@ func grpcStreamLoggingInterceptor(
 // key-owner during a degraded ring from unbounded inbound fan-out.
 const DefaultMaxConcurrentStreams uint32 = 256
 
-// EffectiveMaxConcurrentStreams returns v, or DefaultMaxConcurrentStreams when v
-// is 0 (unset). Shared by the standalone server and the embedded client so both
-// apply the same default.
+// MaxAllowedConcurrentStreams is a sane guardrail ceiling on the per-connection
+// concurrent-stream cap. Real settings sit far below this (the default is 256);
+// the ceiling exists to reject typos / out-of-range configuration, not as a
+// recommended value.
+const MaxAllowedConcurrentStreams uint32 = 65535
+
+// EffectiveMaxConcurrentStreams resolves the configured per-connection stream
+// cap: 0 (unset) becomes DefaultMaxConcurrentStreams, values above
+// MaxAllowedConcurrentStreams are clamped to it, everything else is used as-is.
+// Shared by the standalone server and the embedded client so both behave alike.
 func EffectiveMaxConcurrentStreams(v uint32) uint32 {
-	if v == 0 {
+	switch {
+	case v == 0:
 		return DefaultMaxConcurrentStreams
+	case v > MaxAllowedConcurrentStreams:
+		return MaxAllowedConcurrentStreams
+	default:
+		return v
 	}
-	return v
 }
 
 func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, listenAddr string, requestLogging bool, maxConcurrentStreams uint32) {

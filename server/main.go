@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -137,12 +136,12 @@ func initializeStorage() *stor.Storage {
 
 // startUserServices starts the user-facing gRPC and HTTP gateway services
 func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
-	// grpc.MaxConcurrentStreams takes a uint32; clamp rather than silently wrap
-	// so an out-of-range value can't wrap to a small cap.
+	// Clamp to the allowed maximum before narrowing to uint32, so an out-of-range
+	// value can neither wrap to a small cap nor set an insane one.
 	maxStreams := *grpcMaxConcurrentStreams
-	if maxStreams > math.MaxUint32 {
-		zlog.Warn().Uint("value", maxStreams).Msg("grpc-max-concurrent-streams exceeds uint32 max; clamping to 4294967295")
-		maxStreams = math.MaxUint32
+	if maxStreams > uint(service.MaxAllowedConcurrentStreams) {
+		zlog.Warn().Uint("value", maxStreams).Uint32("max", service.MaxAllowedConcurrentStreams).Msg("grpc-max-concurrent-streams exceeds the allowed maximum; clamping")
+		maxStreams = uint(service.MaxAllowedConcurrentStreams)
 	}
 	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging, uint32(maxStreams)) // Start gRPC server in goroutine
 	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)                           // Start grpc-gateway on different address
