@@ -44,8 +44,7 @@ var (
 	verbose        = flag.Bool("v", false, "Enable debug logging")
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
 
-	grpcMaxConcurrentStreams = flag.Uint("grpc-max-concurrent-streams", uint(service.DefaultMaxConcurrentStreams), "Max concurrent HTTP/2 streams per client connection on the gRPC server (bounds inbound peer-forward fan-out)")
-	showVersion              = flag.Bool("version", false, "Print version information and exit")
+	showVersion = flag.Bool("version", false, "Print version information and exit")
 
 	// Cluster configuration flags
 	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")
@@ -136,15 +135,8 @@ func initializeStorage() *stor.Storage {
 
 // startUserServices starts the user-facing gRPC and HTTP gateway services
 func startUserServices(coord *coordinator.Coordinator, storage *stor.Storage) {
-	// Clamp to the allowed maximum before narrowing to uint32, so an out-of-range
-	// value can neither wrap to a small cap nor set an insane one.
-	maxStreams := *grpcMaxConcurrentStreams
-	if maxStreams > uint(service.MaxAllowedConcurrentStreams) {
-		zlog.Warn().Uint("value", maxStreams).Uint32("max", service.MaxAllowedConcurrentStreams).Msg("grpc-max-concurrent-streams exceeds the allowed maximum; clamping")
-		maxStreams = uint(service.MaxAllowedConcurrentStreams)
-	}
-	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging, uint32(maxStreams)) // Start gRPC server in goroutine
-	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)                           // Start grpc-gateway on different address
+	go service.StartGRPCServer(coord, storage, *listenAddr, *requestLogging) // Start gRPC server in goroutine
+	go service.StartGRPCGatewayServer(coord, *listenAddr, *listenHTTP)       // Start grpc-gateway on different address
 }
 
 // waitForShutdown waits for shutdown signal or coordinator error
