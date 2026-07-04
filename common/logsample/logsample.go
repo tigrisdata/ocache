@@ -21,15 +21,25 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
-// degradedRingSampler bounds the volume of the per-request failure-path logs
-// that fire during a ring outage. Burst lines per Period pass unconditionally;
-// beyond that, one in N is emitted. The pointer is shared across all call sites
-// so the bound is aggregate, not per-site.
-var degradedRingSampler = &zerolog.BurstSampler{
-	Burst:       5,
-	Period:      10 * time.Second,
-	NextSampler: &zerolog.BasicSampler{N: 1000},
+// newDegradedRingSampler builds the sampler used by DegradedRing. Burst lines
+// per Period pass unconditionally; beyond that, one in N is emitted.
+func newDegradedRingSampler() zerolog.Sampler {
+	return &zerolog.BurstSampler{
+		Burst:       5,
+		Period:      10 * time.Second,
+		NextSampler: &zerolog.BasicSampler{N: 1000},
+	}
 }
+
+// degradedRingSampler bounds the volume of the per-request failure-path logs
+// that fire during a ring outage. It is shared across all call sites, so the
+// bound (and the per-Period burst budget) is aggregate, not per-site: whichever
+// failure mode fires first during an incident may consume the burst before a
+// structurally distinct one (e.g. "Node not found in ring") gets a slot. That
+// is an accepted trade-off — the authoritative per-failure signal is the
+// Prometheus counter at each site, so triage the first seconds of an incident
+// from metrics, not from the variety of burst log lines.
+var degradedRingSampler = newDegradedRingSampler()
 
 // DegradedRing returns a Warn event on the shared rate-limited logger. Use it in
 // place of zlog.Warn() for per-request failure-path logs that can fire millions

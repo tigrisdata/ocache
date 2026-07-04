@@ -8,10 +8,21 @@ import (
 	zlog "github.com/rs/zerolog/log"
 )
 
+// resetSampler gives a test a fresh burst budget so its assertions don't depend
+// on how many lines earlier tests consumed from the process-global sampler.
+func resetSampler(t *testing.T) {
+	t.Helper()
+	orig := degradedRingSampler
+	degradedRingSampler = newDegradedRingSampler()
+	t.Cleanup(func() { degradedRingSampler = orig })
+}
+
 // TestDegradedRing_Samples verifies that a flood of DegradedRing() calls emits
 // far fewer lines than calls made -- the whole point of the sampler is to keep a
 // single-node outage from producing millions of identical WARN lines (#164).
 func TestDegradedRing_Samples(t *testing.T) {
+	resetSampler(t)
+
 	var buf bytes.Buffer
 	orig := zlog.Logger
 	zlog.Logger = zerolog.New(&buf)
@@ -36,18 +47,18 @@ func TestDegradedRing_Samples(t *testing.T) {
 }
 
 // TestDegradedRing_EmitsFields confirms the returned event still carries fields
-// and level, so switching a call site from zlog.Warn() is a drop-in change. The
-// sampler is process-global shared state, so we emit enough calls to guarantee a
-// surviving line rather than assuming any single call passes.
+// and level, so switching a call site from zlog.Warn() is a drop-in change. With
+// a fresh sampler the first burst lines pass unconditionally, so a single call
+// is guaranteed to emit.
 func TestDegradedRing_EmitsFields(t *testing.T) {
+	resetSampler(t)
+
 	var buf bytes.Buffer
 	orig := zlog.Logger
 	zlog.Logger = zerolog.New(&buf)
 	t.Cleanup(func() { zlog.Logger = orig })
 
-	for range 3000 {
-		DegradedRing().Str("node_id", "n1").Msg("Circuit breaker open for node")
-	}
+	DegradedRing().Str("node_id", "n1").Msg("Circuit breaker open for node")
 
 	if buf.Len() == 0 {
 		t.Fatal("expected at least one sampled line, got none")
