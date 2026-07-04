@@ -270,6 +270,12 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		return nil, fmt.Errorf("failed to listen on %s: %w", listenAddr, err)
 	}
 
+	// Storage is open and the peer listener is bound, so signal readiness to let
+	// the node advertise ACTIVE (issue #164). Production wires this into
+	// StartGRPCServer; this harness runs its own gRPC server, so it marks ready
+	// itself.
+	coord.MarkReady()
+
 	// Channel to signal when server is ready
 	serverStartedCh := make(chan struct{})
 

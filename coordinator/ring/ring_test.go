@@ -420,11 +420,18 @@ func TestReadinessGate_HoldsJoiningUntilMarkReady(t *testing.T) {
 	require.NoError(t, err)
 	defer rm.Stop(ctx)
 
-	// Without MarkReady the node must stay out of ACTIVE even though tokens are
-	// assigned quickly. Wait well past the token-assignment window and confirm it
-	// is still JOINING (not routable), so peers won't flood a still-booting node.
-	time.Sleep(1 * time.Second)
-	assert.NotEqual(t, ring.ACTIVE, rm.GetState(), "node must not be ACTIVE before MarkReady")
+	// Poll until the node has registered and reached JOINING (tokens assigned).
+	// This is exactly the point where, without the gate, it would transition to
+	// ACTIVE -- so reaching it proves the subsequent check is testing the gate,
+	// not merely that tokens weren't assigned yet.
+	require.Eventually(t, func() bool {
+		return rm.GetState() == ring.JOINING
+	}, 5*time.Second, 20*time.Millisecond, "node should register as JOINING")
+
+	// With the gate held, it must STAY JOINING and never advance to ACTIVE.
+	assert.Never(t, func() bool {
+		return rm.GetState() == ring.ACTIVE
+	}, 500*time.Millisecond, 20*time.Millisecond, "node must not reach ACTIVE before MarkReady")
 	assert.False(t, rm.IsReady(), "node must not report ready before MarkReady")
 
 	// Releasing the gate lets it transition to ACTIVE.
