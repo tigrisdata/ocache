@@ -271,6 +271,14 @@ func (c *Client) StartGRPCServer() error {
 
 	zlog.Info().Str("addr", c.config.GRPCAddr).Msg("Starting embedded gRPC server")
 
+	// Storage booted during New() and the peer-facing listener is now bound, so
+	// it is safe to advertise ACTIVE. Until this point the node stays JOINING and
+	// peers do not route keyspace to it, preventing a still-booting node from
+	// being flooded (issue #164).
+	if c.coordinator != nil {
+		c.coordinator.MarkReady()
+	}
+
 	// Start serving in a goroutine
 	go func() {
 		if err := c.grpcServer.Serve(c.grpcLis); err != nil {
