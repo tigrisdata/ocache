@@ -384,6 +384,61 @@ func TestLogMembershipChange_LogsEpochUpdate(t *testing.T) {
 	assert.Equal(t, 1, epochMsgs[0]["node_count"])
 }
 
+func TestReadinessGate_HoldsJoiningUntilMarkReady(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	logger := log.NewNopLogger()
+
+	nodeID := "test-node-readiness-gate"
+	clusterAddr := "0.0.0.0:17952"
+	seeds := []string{}
+
+	memberlistKV, err := gossip.NewMemberlist(nodeID, clusterAddr, seeds, logger, reg)
+	require.NoError(t, err, "failed to create memberlist")
+
+	cfg := LifecyclerConfig{
+		InstanceID:           nodeID,
+		InstanceAddr:         "localhost:19052",
+		NumTokens:            128,
+		UnregisterOnShutdown: true,
+		RingConfig: Config{
+			HeartbeatPeriod:   100 * time.Millisecond,
+			HeartbeatTimeout:  10 * time.Second,
+			ReplicationFactor: 1,
+		},
+	}
+	cfg.ApplyDefaults()
+
+	ctx := context.Background()
+	err = memberlistKV.Start(ctx)
+	require.NoError(t, err)
+	defer memberlistKV.Stop(ctx)
+
+	rm, err := NewRingManager(cfg, memberlistKV.Client(), logger, reg)
+	require.NoError(t, err)
+
+	err = rm.Start(ctx)
+	require.NoError(t, err)
+	defer rm.Stop(ctx)
+
+	// Without MarkReady the node must stay out of ACTIVE even though tokens are
+	// assigned quickly. Wait well past the token-assignment window and confirm it
+	// is still JOINING (not routable), so peers won't flood a still-booting node.
+	time.Sleep(1 * time.Second)
+	assert.NotEqual(t, ring.ACTIVE, rm.GetState(), "node must not be ACTIVE before MarkReady")
+	assert.False(t, rm.IsReady(), "node must not report ready before MarkReady")
+
+	// Releasing the gate lets it transition to ACTIVE.
+	rm.MarkReady()
+
+	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer waitCancel()
+	require.NoError(t, rm.WaitReady(waitCtx), "node should reach ACTIVE after MarkReady")
+	assert.Equal(t, ring.ACTIVE, rm.GetState())
+
+	// MarkReady is idempotent - a second call must not panic or block.
+	rm.MarkReady()
+}
+
 func TestAnnounceLeaving_TransitionsToLeavingState(t *testing.T) {
 	// Use fresh registry to avoid duplicate registration
 	reg := prometheus.NewRegistry()
@@ -425,6 +480,11 @@ func TestAnnounceLeaving_TransitionsToLeavingState(t *testing.T) {
 
 	err = rm.Start(ctx)
 	require.NoError(t, err)
+
+	// Release the readiness gate so the node can transition JOINING->ACTIVE.
+	// In production this is called once storage has booted and the gRPC server
+	// is listening (issue #164).
+	rm.MarkReady()
 
 	// Wait for ACTIVE state with extended timeout for test stability
 	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)

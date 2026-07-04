@@ -143,6 +143,14 @@ type RingManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// readyCh gates the JOINING->ACTIVE transition. It is closed by MarkReady
+	// once this node can actually serve requests (storage booted, gRPC server
+	// listening). Until then the node stays JOINING and peers do not route
+	// keyspace to it, so a still-booting or crashlooping node is never flooded
+	// (issue #164).
+	readyOnce sync.Once
+	readyCh   chan struct{}
+
 	// Logger adapter for dskit
 	logger log.Logger
 
@@ -160,6 +168,7 @@ func NewRingManager(cfg LifecyclerConfig, kvClient kv.Client, logger log.Logger,
 		logger:      logger,
 		reg:         reg,
 		epoch:       NewEpoch(),
+		readyCh:     make(chan struct{}),
 		// Pre-allocate the operation for GetPrimaryNode to avoid allocation on each call
 		allStatesOp: ring.NewOp([]ring.InstanceState{
 			ring.ACTIVE, ring.JOINING, ring.PENDING, ring.LEAVING,
@@ -581,6 +590,15 @@ func (rm *RingManager) GetState() ring.InstanceState {
 	return rm.lifecycler.GetState()
 }
 
+// MarkReady signals that this node can serve requests, releasing the gate that
+// holds it in JOINING and allowing it to advertise ACTIVE. It is called once
+// storage has booted and the gRPC server is listening. Idempotent, and safe to
+// call before or after the lifecycler has assigned tokens (it just closes the
+// gate; the activation goroutine proceeds whenever it observes it closed).
+func (rm *RingManager) MarkReady() {
+	rm.readyOnce.Do(func() { close(rm.readyCh) })
+}
+
 // IsReady returns true if this instance is ready to serve requests
 func (rm *RingManager) IsReady() bool {
 	return rm.lifecycler.GetState() == ring.ACTIVE
@@ -709,6 +727,16 @@ func (d *ringDelegate) OnRingInstanceTokens(lifecycler *ring.BasicLifecycler, to
 	// the lifecycler's starting() phase, and ChangeState() uses an actor channel that's only
 	// processed during the running() phase. Calling it synchronously would deadlock.
 	go func() {
+		// Gate the ACTIVE transition on readiness: stay JOINING (not routable)
+		// until MarkReady signals that storage has booted and the gRPC server is
+		// listening, so peers don't route keyspace to a still-booting node and a
+		// crashlooping node never advertises ACTIVE (issue #164).
+		select {
+		case <-d.rm.readyCh:
+		case <-d.rm.ctx.Done():
+			return
+		}
+
 		// Use the RingManager's context so this goroutine can be cancelled on shutdown
 		if err := lifecycler.ChangeState(d.rm.ctx, ring.ACTIVE); err != nil {
 			// Only log error if context wasn't cancelled (normal shutdown)

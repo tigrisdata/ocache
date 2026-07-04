@@ -352,6 +352,14 @@ func (c *Coordinator) GetEpoch() uint64 {
 	return c.ringManager.GetEpoch()
 }
 
+// MarkReady signals that this node can serve requests, allowing it to advertise
+// ACTIVE in the ring. Call it once storage has booted and the gRPC server is
+// listening; until then the node stays JOINING and peers do not route to it
+// (issue #164). Idempotent.
+func (c *Coordinator) MarkReady() {
+	c.ringManager.MarkReady()
+}
+
 // IsReady returns true if the coordinator is ready to serve requests
 func (c *Coordinator) IsReady() bool {
 	return c.ringManager.IsReady()
