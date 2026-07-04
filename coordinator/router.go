@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -153,8 +155,10 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			// Wait before retry with exponential backoff
-			time.Sleep(backoff)
+			// Wait before retry with jittered exponential backoff. Jitter spreads
+			// retries so a degraded ring's survivors don't all reconnect to a
+			// recovered node in lockstep (thundering herd, issue #164).
+			time.Sleep(jittered(backoff))
 			backoff = r.calculateBackoff(backoff)
 
 			metrics.ClusterRetryAttempts.WithLabelValues(node.ID).Inc()
@@ -239,7 +243,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	}
 
 	if nodeAddr == "" {
-		zlog.Warn().
+		logsample.DegradedRing().
 			Str("node_id", nodeID).
 			Msg("Node not found in ring")
 
@@ -263,7 +267,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	if err != nil {
 		r.recordFailureAndOpenCircuit(state, nodeID)
 
-		zlog.Warn().
+		logsample.DegradedRing().
 			Str("node_id", nodeID).
 			Str("address", nodeAddr).
 			Msg("Failed to create connection to node")
@@ -331,7 +335,7 @@ func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
 func (r *Router) getConnectionHealth(state *clientState, nodeID string) error {
 	// Check if circuit breaker is open
 	if r.isCircuitOpen(state, nodeID) {
-		zlog.Warn().
+		logsample.DegradedRing().
 			Str("node_id", nodeID).
 			Msg("Circuit breaker open for node")
 
@@ -411,6 +415,18 @@ func (r *Router) calculateBackoff(current time.Duration) time.Duration {
 		return r.config.MaxRetryBackoff
 	}
 	return next
+}
+
+// jittered applies equal jitter to a backoff duration, returning a random value
+// in [d/2, d]. Randomizing each node's retry sleep keeps a degraded ring's
+// survivors from retrying (and reconnecting to a recovered node) in lockstep,
+// which would otherwise re-concentrate the thundering herd on every attempt.
+func jittered(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
 }
 
 func (r *Router) IsLocal(key string) bool {

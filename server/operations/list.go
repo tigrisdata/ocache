@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
@@ -319,7 +320,7 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 			} else {
 				client, clientErr := router.GetClientForNode(n.ID)
 				if clientErr != nil {
-					zlog.Warn().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
+					logsample.DegradedRing().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
 					return
 				}
 
@@ -351,7 +352,7 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 			}
 
 			if err != nil {
-				zlog.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to list from node, skipping")
+				logsample.DegradedRing().Err(err).Str("node_id", n.ID).Msg("Failed to list from node, skipping")
 				return
 			}
 
