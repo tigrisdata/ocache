@@ -65,6 +65,14 @@ func (o *Operations) GetLocal(ctx context.Context, key string, start, end int64)
 // (it is part of the return signature) without draining the rest of the stream.
 // Callers that stop reading early should Close the reader to tear down the
 // stream; GetBytes/GetStream/GetRange(Stream) already do.
+//
+// Streaming trade-off: a failure that occurs after the first chunk surfaces from
+// Read, not from this function's return (found is already resolved). So a caller
+// may have received a truncated prefix before the error, and a mid-stream peer
+// error is delivered as a read error rather than a not-found miss. That is
+// inherent to not buffering the whole object, and matches how the local read
+// path already behaves. Such post-first-chunk failures are counted via
+// recordStreamError so they stay visible in error metrics.
 func (o *Operations) getRemote(ctx context.Context, key string, start, end int64) (io.Reader, bool, error) {
 	// Increment hop count for forwarding loop detection
 	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
@@ -140,6 +148,10 @@ type grpcStreamReader struct {
 func (r *grpcStreamReader) Read(p []byte) (int, error) {
 	for len(r.pending) == 0 {
 		if r.done {
+			// Terminal state: release the stream/context now so a caller that
+			// drains to EOF (or hits an error) without calling Close still tears
+			// it down, rather than leaking until the parent ctx expires.
+			r.release()
 			if r.err != nil {
 				return 0, r.err
 			}
@@ -149,7 +161,11 @@ func (r *grpcStreamReader) Read(p []byte) (int, error) {
 		if err != nil {
 			r.done = true
 			if err != io.EOF {
+				// A failure after the first chunk can no longer be reported via
+				// Operations.Get's return value (found was already resolved), so
+				// count it here to keep cross-node read errors visible (#162).
 				r.err = err
+				recordStreamError()
 			}
 			continue
 		}
@@ -163,13 +179,18 @@ func (r *grpcStreamReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// release tears down the underlying stream/context. Idempotent.
+func (r *grpcStreamReader) release() {
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+}
+
 // Close tears down the underlying stream. Safe to call multiple times and after
 // the stream has been fully consumed.
 func (r *grpcStreamReader) Close() error {
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil // mark teardown done; makes repeat Close a clear no-op
-	}
+	r.release()
 	return nil
 }
 

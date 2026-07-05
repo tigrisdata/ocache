@@ -95,6 +95,38 @@ func TestGrpcStreamReader_EmptyStream(t *testing.T) {
 	}
 }
 
+// TestGrpcStreamReader_ReleasesOnEOF verifies the reader tears down its stream
+// when drained to EOF, without the caller having to call Close.
+func TestGrpcStreamReader_ReleasesOnEOF(t *testing.T) {
+	released := false
+	r := &grpcStreamReader{
+		stream: &mockGetClient{chunks: [][]byte{[]byte("x")}},
+		cancel: func() { released = true },
+	}
+	if _, err := io.ReadAll(r); err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !released {
+		t.Fatal("stream not released on EOF")
+	}
+}
+
+// TestGrpcStreamReader_ReleasesOnError verifies teardown also happens when the
+// stream ends in an error rather than EOF.
+func TestGrpcStreamReader_ReleasesOnError(t *testing.T) {
+	released := false
+	r := &grpcStreamReader{
+		stream: &mockGetClient{chunks: [][]byte{[]byte("x")}, tailErr: errors.New("boom")},
+		cancel: func() { released = true },
+	}
+	if _, err := io.ReadAll(r); err == nil {
+		t.Fatal("expected error")
+	}
+	if !released {
+		t.Fatal("stream not released on error")
+	}
+}
+
 func TestGrpcStreamReader_CloseCancels(t *testing.T) {
 	cancelled := false
 	r := &grpcStreamReader{stream: &mockGetClient{}, cancel: func() { cancelled = true }}
