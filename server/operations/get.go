@@ -110,7 +110,7 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 	}
 	if err != nil {
 		cancel()
-		// Check for NotFound status during streaming
+		// NotFound surfaces on the first Recv - treat as a miss for consistency.
 		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
 			return nil, false, nil
 		}
@@ -168,6 +168,7 @@ func (r *grpcStreamReader) Read(p []byte) (int, error) {
 func (r *grpcStreamReader) Close() error {
 	if r.cancel != nil {
 		r.cancel()
+		r.cancel = nil // mark teardown done; makes repeat Close a clear no-op
 	}
 	return nil
 }
