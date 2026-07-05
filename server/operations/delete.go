@@ -4,6 +4,7 @@ import (
 	"context"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
@@ -41,13 +42,13 @@ func (o *Operations) deleteRemote(ctx context.Context, key string) error {
 	// Increment hop count for forwarding loop detection
 	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
 	if err != nil {
-		zlog.Warn().Err(err).Str("key", key).Msg("Hop count limit exceeded for delete")
+		logsample.DegradedRing().Err(err).Str("key", key).Msg("Hop count limit exceeded for delete")
 		return err
 	}
 
 	client, err := o.Route(key)
 	if err != nil {
-		zlog.Warn().Err(err).Str("key", key).Msg("Failed to route key for delete")
+		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key for delete")
 		return err
 	}
 

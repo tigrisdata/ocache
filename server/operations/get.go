@@ -6,6 +6,7 @@ import (
 	"io"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
@@ -56,17 +57,33 @@ func (o *Operations) GetLocal(ctx context.Context, key string, start, end int64)
 
 // getRemote fetches data from a remote node via gRPC.
 // Returns (reader, found, error) to be consistent with GetLocal.
+//
+// The returned reader streams chunks from the peer on demand rather than
+// buffering the whole object in memory, so a cross-node read of a large object
+// holds at most one chunk instead of the entire object (issue #162). The first
+// message is received eagerly so found/not-found can be resolved synchronously
+// (it is part of the return signature) without draining the rest of the stream.
+// Callers that stop reading early should Close the reader to tear down the
+// stream; GetBytes/GetStream/GetRange(Stream) already do.
+//
+// Streaming trade-off: a failure that occurs after the first chunk surfaces from
+// Read, not from this function's return (found is already resolved). So a caller
+// may have received a truncated prefix before the error, and a mid-stream peer
+// error is delivered as a read error rather than a not-found miss. That is
+// inherent to not buffering the whole object, and matches how the local read
+// path already behaves. Such post-first-chunk failures are counted via
+// recordStreamError so they stay visible in error metrics.
 func (o *Operations) getRemote(ctx context.Context, key string, start, end int64) (io.Reader, bool, error) {
 	// Increment hop count for forwarding loop detection
 	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
 	if err != nil {
-		zlog.Warn().Err(err).Str("key", key).Msg("Hop count limit exceeded for get")
+		logsample.DegradedRing().Err(err).Str("key", key).Msg("Hop count limit exceeded for get")
 		return nil, false, err
 	}
 
 	client, err := o.Route(key)
 	if err != nil {
-		zlog.Warn().Err(err).Str("key", key).Msg("Failed to route key")
+		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key")
 		return nil, false, err
 	}
 
@@ -76,8 +93,14 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 		End:   end,
 	}
 
-	stream, err := client.Get(ctx, req)
+	// Cancellable context so the returned reader can tear down the stream on
+	// Close (e.g. a partial/ranged read that never drains to EOF) rather than
+	// leaking it until the caller's context expires.
+	streamCtx, cancel := context.WithCancel(ctx)
+
+	stream, err := client.Get(streamCtx, req)
 	if err != nil {
+		cancel()
 		// Check for NotFound status - return (nil, false, nil) for consistency
 		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
 			return nil, false, nil
@@ -85,29 +108,90 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 		return nil, false, err
 	}
 
-	// Collect all data from the stream into a buffer
-	// Note: For very large objects, we might want to implement a streaming reader
-	// that reads from the gRPC stream on demand. For now, we buffer everything.
-	var buf bytes.Buffer
-	for {
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
+	// Receive the first message eagerly to resolve found/not-found before
+	// returning, without buffering the rest of the object.
+	first, err := stream.Recv()
+	if err == io.EOF {
+		// Object exists but is empty.
+		cancel()
+		return bytes.NewReader(nil), true, nil
+	}
+	if err != nil {
+		cancel()
+		// NotFound surfaces on the first Recv - treat as a miss for consistency.
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, false, nil
 		}
-		if err != nil {
-			// Check for NotFound status during streaming
-			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
-				return nil, false, nil
-			}
-			return nil, false, err
-		}
-		if len(resp.Data) > 0 {
-			buf.Write(resp.Data)
-			recordBytesTransferred("download", int64(len(resp.Data)))
-		}
+		return nil, false, err
 	}
 
-	return &buf, true, nil
+	r := &grpcStreamReader{stream: stream, cancel: cancel}
+	if len(first.Data) > 0 {
+		recordBytesTransferred("download", int64(len(first.Data)))
+		r.pending = first.Data
+	}
+	return r, true, nil
+}
+
+// grpcStreamReader adapts a server-streaming CacheService_GetClient into an
+// io.Reader that pulls chunks from the peer on demand, so a cross-node read
+// never holds more than one chunk of the object in memory (issue #162).
+type grpcStreamReader struct {
+	stream  pb.CacheService_GetClient
+	cancel  context.CancelFunc
+	pending []byte // bytes received but not yet consumed by Read
+	done    bool
+	err     error
+}
+
+// Read drains any pending bytes before pulling the next message from the stream.
+func (r *grpcStreamReader) Read(p []byte) (int, error) {
+	for len(r.pending) == 0 {
+		if r.done {
+			// Terminal state: release the stream/context now so a caller that
+			// drains to EOF (or hits an error) without calling Close still tears
+			// it down, rather than leaking until the parent ctx expires.
+			r.release()
+			if r.err != nil {
+				return 0, r.err
+			}
+			return 0, io.EOF
+		}
+		resp, err := r.stream.Recv()
+		if err != nil {
+			r.done = true
+			if err != io.EOF {
+				// A failure after the first chunk can no longer be reported via
+				// Operations.Get's return value (found was already resolved), so
+				// count it here to keep cross-node read errors visible (#162).
+				r.err = err
+				recordStreamError()
+			}
+			continue
+		}
+		if len(resp.Data) > 0 {
+			recordBytesTransferred("download", int64(len(resp.Data)))
+			r.pending = resp.Data
+		}
+	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
+}
+
+// release tears down the underlying stream/context. Idempotent.
+func (r *grpcStreamReader) release() {
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+}
+
+// Close tears down the underlying stream. Safe to call multiple times and after
+// the stream has been fully consumed.
+func (r *grpcStreamReader) Close() error {
+	r.release()
+	return nil
 }
 
 // GetBytes retrieves data as a byte slice with automatic routing.

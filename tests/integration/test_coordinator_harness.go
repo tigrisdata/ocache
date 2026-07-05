@@ -178,6 +178,11 @@ func (h *CoordinatorTestHarness) StartNode(nodeIndex int) (*CoordinatorTestNode,
 		return nil, fmt.Errorf("failed to listen on %s: %w", listenAddr, err)
 	}
 
+	// The peer listener is bound, so signal readiness to let the node advertise
+	// ACTIVE (issue #164). Production wires this into StartGRPCServer; this
+	// harness runs its own gRPC server, so it marks ready itself.
+	coord.MarkReady()
+
 	// Start gRPC server in background
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {

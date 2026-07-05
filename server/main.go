@@ -43,7 +43,8 @@ var (
 	listenHTTP     = flag.String("listen-http", ":9001", "Listen address for HTTP/grpc-gateway server")
 	verbose        = flag.Bool("v", false, "Enable debug logging")
 	requestLogging = flag.Bool("request-logging", false, "Enable request logging")
-	showVersion    = flag.Bool("version", false, "Print version information and exit")
+
+	showVersion = flag.Bool("version", false, "Print version information and exit")
 
 	// Cluster configuration flags
 	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")

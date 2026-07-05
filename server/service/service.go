@@ -190,6 +190,15 @@ func StartGRPCServer(coord *coordinator.Coordinator, storage *stor.Storage, list
 		zlog.Fatal().Err(err).Msg("failed to listen for gRPC")
 	}
 	zlog.Info().Msgf("gRPC server listening on %s", listenAddr)
+
+	// Storage has finished booting (it is initialized before this call) and the
+	// peer-facing listener is now bound, so it is safe to advertise ACTIVE. Until
+	// this point the node stays JOINING and peers do not route keyspace to it,
+	// preventing a still-booting node from being flooded (issue #164).
+	if coord != nil {
+		coord.MarkReady()
+	}
+
 	if err := grpcServer.Serve(lis); err != nil {
 		zlog.Fatal().Err(err).Msg("gRPC server failed")
 	}

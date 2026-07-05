@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/storage/retry"
@@ -260,6 +261,10 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 }
 
 // fetchFromAllNodes fetches keys (or key-value pairs) from all nodes in parallel.
+// maxListNodeFanout bounds the number of concurrent per-node list RPCs issued
+// by a single cluster-wide List. Clusters smaller than this fan out fully.
+const maxListNodeFanout = 32
+
 func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, nodeCursors map[string]string, withValues bool) (map[string]*NodeResponse, error) {
 	localNodeID := o.GetLocalNodeID()
 	router := o.GetRouter()
@@ -268,10 +273,34 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// Bound how many peer list RPCs run concurrently per List so a large cluster
+	// (or many concurrent List requests) cannot fan out an unbounded number of
+	// blocking calls — each of which would otherwise pin a goroutine/connection.
+	sem := make(chan struct{}, maxListNodeFanout)
+
 	for _, node := range nodes {
 		wg.Add(1)
 		go func(n *ring.NodeInfo) {
 			defer wg.Done()
+
+			// Bail if already cancelled before acquiring, and again after: a
+			// plain acquire would keep queued goroutines waiting on a slow peer
+			// RPC long past the deadline, while select picks randomly among ready
+			// cases — so with a free slot and a done context it could take the
+			// acquire branch and issue a doomed RPC (spurious error-log noise)
+			// instead of returning cleanly.
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
 
 			// Determine start key for this node
 			startKey := ""
@@ -291,7 +320,7 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 			} else {
 				client, clientErr := router.GetClientForNode(n.ID)
 				if clientErr != nil {
-					zlog.Warn().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
+					logsample.DegradedRing().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
 					return
 				}
 
@@ -323,7 +352,7 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 			}
 
 			if err != nil {
-				zlog.Warn().Err(err).Str("node_id", n.ID).Msg("Failed to list from node, skipping")
+				logsample.DegradedRing().Err(err).Str("node_id", n.ID).Msg("Failed to list from node, skipping")
 				return
 			}
 
@@ -334,6 +363,15 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 	}
 
 	wg.Wait()
+
+	// If the context was cancelled or its deadline passed, some nodes may have
+	// been skipped — queued behind the fan-out limit, or their RPC aborted — so
+	// the response set is incomplete. Surface the cancellation rather than
+	// returning a partial result that a downstream merge would treat as complete.
+	// (Individual node failures with a live context remain best-effort skips.)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	zlog.Debug().Int("response_count", len(responses)).Int("node_count", len(nodes)).Msg("Fetched from nodes")
 	return responses, nil

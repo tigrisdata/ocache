@@ -31,6 +31,14 @@ func recordBytesTransferred(direction string, bytes int64) {
 	metrics.StreamBytesTransferred.WithLabelValues(direction).Add(float64(bytes))
 }
 
+// recordStreamError counts a cross-node Get that failed after streaming began,
+// i.e. after Operations.Get already returned (found resolved) so the failure
+// can't flow through its done(err). Keeps these failures visible in error
+// metrics (issue #162).
+func recordStreamError() {
+	metrics.Errors.WithLabelValues("operations", "getRemote").Inc()
+}
+
 // recordStreamActive increments the active streams counter and returns a function
 // to decrement it when the stream is done.
 func recordStreamActive() func() {
