@@ -57,6 +57,14 @@ func (o *Operations) GetLocal(ctx context.Context, key string, start, end int64)
 
 // getRemote fetches data from a remote node via gRPC.
 // Returns (reader, found, error) to be consistent with GetLocal.
+//
+// The returned reader streams chunks from the peer on demand rather than
+// buffering the whole object in memory, so a cross-node read of a large object
+// holds at most one chunk instead of the entire object (issue #162). The first
+// message is received eagerly so found/not-found can be resolved synchronously
+// (it is part of the return signature) without draining the rest of the stream.
+// Callers that stop reading early should Close the reader to tear down the
+// stream; GetBytes/GetStream/GetRange(Stream) already do.
 func (o *Operations) getRemote(ctx context.Context, key string, start, end int64) (io.Reader, bool, error) {
 	// Increment hop count for forwarding loop detection
 	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
@@ -77,8 +85,14 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 		End:   end,
 	}
 
-	stream, err := client.Get(ctx, req)
+	// Cancellable context so the returned reader can tear down the stream on
+	// Close (e.g. a partial/ranged read that never drains to EOF) rather than
+	// leaking it until the caller's context expires.
+	streamCtx, cancel := context.WithCancel(ctx)
+
+	stream, err := client.Get(streamCtx, req)
 	if err != nil {
+		cancel()
 		// Check for NotFound status - return (nil, false, nil) for consistency
 		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
 			return nil, false, nil
@@ -86,29 +100,76 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 		return nil, false, err
 	}
 
-	// Collect all data from the stream into a buffer
-	// Note: For very large objects, we might want to implement a streaming reader
-	// that reads from the gRPC stream on demand. For now, we buffer everything.
-	var buf bytes.Buffer
-	for {
-		resp, err := stream.Recv()
-		if err == io.EOF {
-			break
+	// Receive the first message eagerly to resolve found/not-found before
+	// returning, without buffering the rest of the object.
+	first, err := stream.Recv()
+	if err == io.EOF {
+		// Object exists but is empty.
+		cancel()
+		return bytes.NewReader(nil), true, nil
+	}
+	if err != nil {
+		cancel()
+		// Check for NotFound status during streaming
+		if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, false, nil
 		}
-		if err != nil {
-			// Check for NotFound status during streaming
-			if st, ok := status.FromError(err); ok && st.Code() == codes.NotFound {
-				return nil, false, nil
-			}
-			return nil, false, err
-		}
-		if len(resp.Data) > 0 {
-			buf.Write(resp.Data)
-			recordBytesTransferred("download", int64(len(resp.Data)))
-		}
+		return nil, false, err
 	}
 
-	return &buf, true, nil
+	r := &grpcStreamReader{stream: stream, cancel: cancel}
+	if len(first.Data) > 0 {
+		recordBytesTransferred("download", int64(len(first.Data)))
+		r.pending = first.Data
+	}
+	return r, true, nil
+}
+
+// grpcStreamReader adapts a server-streaming CacheService_GetClient into an
+// io.Reader that pulls chunks from the peer on demand, so a cross-node read
+// never holds more than one chunk of the object in memory (issue #162).
+type grpcStreamReader struct {
+	stream  pb.CacheService_GetClient
+	cancel  context.CancelFunc
+	pending []byte // bytes received but not yet consumed by Read
+	done    bool
+	err     error
+}
+
+// Read drains any pending bytes before pulling the next message from the stream.
+func (r *grpcStreamReader) Read(p []byte) (int, error) {
+	for len(r.pending) == 0 {
+		if r.done {
+			if r.err != nil {
+				return 0, r.err
+			}
+			return 0, io.EOF
+		}
+		resp, err := r.stream.Recv()
+		if err != nil {
+			r.done = true
+			if err != io.EOF {
+				r.err = err
+			}
+			continue
+		}
+		if len(resp.Data) > 0 {
+			recordBytesTransferred("download", int64(len(resp.Data)))
+			r.pending = resp.Data
+		}
+	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
+}
+
+// Close tears down the underlying stream. Safe to call multiple times and after
+// the stream has been fully consumed.
+func (r *grpcStreamReader) Close() error {
+	if r.cancel != nil {
+		r.cancel()
+	}
+	return nil
 }
 
 // GetBytes retrieves data as a byte slice with automatic routing.
