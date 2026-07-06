@@ -8,6 +8,10 @@ import (
 const (
 	// Default block cache size in bytes
 	DefaultRocksDBBlockCacheSize = 1 << 30 // 1GB
+
+	// DefaultRocksDBMaxBackgroundJobs is the default number of concurrent
+	// RocksDB background jobs (compactions + flushes) for the lifetime of the DB.
+	DefaultRocksDBMaxBackgroundJobs = 8
 )
 
 // RocksDBConfig holds all RocksDB-specific configuration parameters
@@ -52,10 +56,10 @@ func DefaultRocksDBConfig() *RocksDBConfig {
 		BloomBitsPerKey:                12,                // 12 bits for bloom filter
 		EnableStatistics:               true,              // Enable stats
 		TargetFileSizeBase:             64 * 1024 * 1024,  // 64MB files
-		MaxBackgroundJobs:              8,                 // 8 background jobs
-		Level0FileNumCompactionTrigger: 3,                 // Trigger at 3 L0 files
-		Level0SlowdownWritesTrigger:    10,                // Slowdown at 10 L0 files
-		Level0StopWritesTrigger:        20,                // Stop at 20 L0 files
+		MaxBackgroundJobs:              DefaultRocksDBMaxBackgroundJobs,
+		Level0FileNumCompactionTrigger: 3,  // Trigger at 3 L0 files
+		Level0SlowdownWritesTrigger:    10, // Slowdown at 10 L0 files
+		Level0StopWritesTrigger:        20, // Stop at 20 L0 files
 	}
 }
 

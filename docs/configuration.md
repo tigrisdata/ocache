@@ -34,6 +34,7 @@ OCache can be configured through command-line flags when starting the server.
 | `-ttl`                 | int   | 0          | Default TTL in seconds when no key-level TTL is set   |
 | `-fd-cache-size`       | int   | 10000      | Size of the file descriptor cache (number of entries) |
 | `-metadata-cache-size` | int64 | 1073741824 | Maximum size of the metadata cache in bytes (1GB)     |
+| `-metadata-background-jobs` | int | 8 | Max concurrent RocksDB background jobs (compactions + flushes) over the process lifetime |
 
 ### Compaction Configuration
 
@@ -237,7 +238,7 @@ OCache uses a dual-storage strategy:
 For workloads dominated by large objects (hundreds of MB, such as SlateDB SSTs cached whole), tune so large objects stay on the streamed raw-file path and never enter the compaction/segment machinery:
 
 - **Keep large objects as raw files.** Objects larger than `-compact-threshold` (default 64 MB) are stored as permanent raw files and never compacted — correct for large SSTs. Keep `-compact-threshold` below your object sizes so they take this path. It must also stay **below** `-segment-size` (default 256 MB); ocache clamps and warns if `compact-threshold >= segment-size`, since an object larger than a segment cannot be compacted into one.
-- **Size the block cache and boot parallelism to the container limit.** `-metadata-cache-size` bounds the RocksDB block cache; `-recovery-workers` bounds startup file-recovery parallelism (lower it under tight CPU/memory limits).
+- **Size the block cache and background CPU to the container limit.** `-metadata-cache-size` bounds the RocksDB block cache. `-recovery-workers` bounds the one-time startup file-recovery parallelism. `-metadata-background-jobs` caps RocksDB's background compaction/flush threads for the **whole process lifetime** (boot *and* steady state) — useful to bound background CPU on a container that does not set a CPU limit (a blanket CPU limit would also throttle request handling). Note that `GOMAXPROCS` governs only the Go scheduler, not RocksDB's own thread pools, so lowering it does not reduce this background CPU — use `-metadata-background-jobs`.
 - **Get/Put/range are streamed** and handle large objects without buffering the whole object. **List-with-values** is the exception: it caps returned values at 1 MiB per value — larger values are omitted from the response (key and size are still returned, `value_omitted=true`) so a List over large objects cannot buffer object-sized allocations or exceed the gRPC message limit. Use keys-only `List` when you only need keys.
 - **Readiness/boot:** a warm-cache boot over a large on-disk store can be slow; add a Kubernetes `startupProbe` so it is not liveness-killed mid-boot (see [Node lifecycle & readiness gating](cluster.md#readiness-gating)).
 
