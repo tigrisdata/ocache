@@ -142,6 +142,13 @@ jobs:
         with:
           node-version: 20
 
+      # Needed by the "Create per-module Go tags" step to rewrite intra-module
+      # require directives with `go mod edit`.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
         with:
@@ -217,6 +224,41 @@ jobs:
             "server"
             "embedded"
           )
+
+          # Pin intra-repo sibling require directives to the release version.
+          # The committed go.mod files keep their go.work-era requires (e.g.
+          # v1.1.0) because they resolve to local code via go.work during dev, and
+          # nothing updates them at release time. Without this, a consumer that
+          # bumps one module (say embedded) does NOT transitively get the matching
+          # sibling versions -- MVS leaves coordinator/server/common at whatever it
+          # already had, silently omitting fixes and sometimes failing to compile
+          # (issue #171). Rewrite each module's ocache-sibling requires to ${TAG}
+          # so a single `go get <module>@${TAG}` resolves the whole set.
+          echo "Pinning intra-module require directives to ${TAG}..."
+          for module in "${MODULES[@]}"; do
+            pushd "$module" >/dev/null
+            for sib in "${MODULES[@]}"; do
+              [ "$sib" = "$module" ] && continue
+              modpath="github.com/tigrisdata/ocache/${sib}"
+              # Only rewrite a require that already exists (exact-path match, so
+              # "coordinator" is not confused with "coordinator/proto").
+              if GOWORK=off go mod edit -json | jq -e --arg p "$modpath" '.Require[]? | select(.Path == $p)' >/dev/null; then
+                GOWORK=off go mod edit -require "${modpath}@${TAG}"
+                echo "  ${module}: require ${modpath}@${TAG}"
+              fi
+            done
+            popd >/dev/null
+          done
+
+          # Commit the rewritten go.mod files. This commit is referenced only by
+          # the per-module tags below (we push tags, not the branch), so the tags
+          # point at a self-consistent tree without moving the release branch.
+          # [skip ci] keeps this commit from re-triggering the release workflow.
+          if ! git diff --quiet; then
+            git commit -am "chore(release): pin intra-module requires to ${TAG} [skip ci]"
+          else
+            echo "No require rewrites were needed."
+          fi
 
           for module in "${MODULES[@]}"; do
             MODULE_TAG="${module}/${TAG}"
