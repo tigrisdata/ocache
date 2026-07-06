@@ -28,7 +28,8 @@ type Config struct {
 	DeleteBatchSize        int           // File deletions processed per deletion-queue batch
 	RequestLogging         bool          // Enable request logging
 	// RocksDB tuning parameters
-	MetadataCacheSize int64 // RocksDB block cache size in bytes
+	MetadataCacheSize      int64 // RocksDB block cache size in bytes
+	MetadataBackgroundJobs int   // Max concurrent RocksDB background jobs (compactions + flushes)
 
 	// Cluster configuration
 	ClusterEnabled bool     // Enable cluster mode
@@ -66,6 +67,7 @@ func LoadConfig() {
 		DeleteBatchSize:        *deleteBatchSize,
 		RequestLogging:         *requestLogging,
 		MetadataCacheSize:      *metadataCacheSize,
+		MetadataBackgroundJobs: *metadataBackgroundJobs,
 		ClusterEnabled:         *clusterEnabled,
 		NodeID:                 *nodeID,
 		ClusterAddr:            *clusterAddr,

@@ -80,7 +80,8 @@ const (
 	DefaultRecoveryWorkers = files.MaxWorkers
 
 	// Default RocksDB configuration
-	DefaultMetadataCacheSize = metadata.DefaultRocksDBBlockCacheSize
+	DefaultMetadataCacheSize      = metadata.DefaultRocksDBBlockCacheSize
+	DefaultMetadataBackgroundJobs = metadata.DefaultRocksDBMaxBackgroundJobs
 )
 
 // StorageConfig holds all configuration parameters for initializing storage
@@ -104,7 +105,8 @@ type StorageConfig struct {
 	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
 
 	// RocksDB-specific configuration
-	MetadataCacheSize int64 // RocksDB Block cache size in bytes (0 = use default)
+	MetadataCacheSize      int64 // RocksDB Block cache size in bytes (0 = use default)
+	MetadataBackgroundJobs int   // Max concurrent RocksDB background jobs, compactions+flushes (0 = use default)
 }
 
 // Storage wraps all RocksDB access and related logic
@@ -188,6 +190,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	rocksConfig := metadata.DefaultRocksDBConfig()
 	if config.MetadataCacheSize > 0 {
 		rocksConfig.BlockCacheSize = config.MetadataCacheSize
+	}
+	if config.MetadataBackgroundJobs > 0 {
+		rocksConfig.MaxBackgroundJobs = config.MetadataBackgroundJobs
 	}
 
 	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances
