@@ -361,8 +361,10 @@ func (c *Client) ListPageWithValues(ctx context.Context, prefix string, limit in
 	entries = make([]cacheclient.KeyValue, len(pbEntries))
 	for i, e := range pbEntries {
 		entries[i] = cacheclient.KeyValue{
-			Key:   e.Key,
-			Value: e.Value,
+			Key:          e.Key,
+			Value:        e.Value,
+			ValueLength:  e.ValueLength,
+			ValueOmitted: e.ValueOmitted,
 		}
 	}
 

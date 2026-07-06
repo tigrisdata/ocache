@@ -394,8 +394,10 @@ func (o *Operations) ListPageWithValues(ctx context.Context, prefix string, limi
 	entries := make([]KeyValue, len(resp.Entries))
 	for i, e := range resp.Entries {
 		entries[i] = KeyValue{
-			Key:   e.Key,
-			Value: e.Value,
+			Key:          e.Key,
+			Value:        e.Value,
+			ValueLength:  e.ValueLength,
+			ValueOmitted: e.ValueOmitted,
 		}
 	}
 

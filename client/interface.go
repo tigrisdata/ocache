@@ -9,6 +9,12 @@ import (
 type KeyValue struct {
 	Key   string
 	Value []byte
+	// ValueLength is the size of the value in bytes, set even when the value was
+	// omitted for exceeding the List-with-values per-value size cap.
+	ValueLength int64
+	// ValueOmitted is true when the value was omitted for exceeding that cap;
+	// Value is nil in that case.
+	ValueOmitted bool
 }
 
 // CacheClient is the common interface for both SimpleClient and ClusterClient
