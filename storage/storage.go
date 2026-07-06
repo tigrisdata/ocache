@@ -568,10 +568,14 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 			storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
 			valueLength = valueMsg.ValueLength
 
-			if MaxListValueSize > 0 && valueMsg.ValueLength > MaxListValueSize {
-				// Value exceeds the List cap: omit it rather than reading an
-				// object-sized buffer off disk (#165). INLINE values are always
-				// below the cap, so only SEGMENT/RAW_FILE reads are skipped here.
+			if valueMsg.ValueLength > MaxListValueSize {
+				// Value exceeds the List cap: omit it from the response (#165).
+				// For SEGMENT/RAW_FILE this skips the object-sized disk read below.
+				// With the default inline threshold (64 KB, well under the 1 MiB
+				// cap) INLINE values never reach here; if the inline threshold is
+				// configured above the cap, an INLINE value's bytes were already
+				// materialized by proto.Unmarshal above, so the cap still bounds
+				// the response but does not avoid that allocation.
 				valueOmitted = true
 				metrics.ListValuesOmitted.Inc()
 			} else {
