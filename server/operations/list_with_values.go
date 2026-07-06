@@ -70,8 +70,10 @@ func (o *Operations) ListLocalWithValues(ctx context.Context, prefix string, lim
 	entries := make([]*pb.KeyValue, len(storageEntries))
 	for i, e := range storageEntries {
 		entries[i] = &pb.KeyValue{
-			Key:   e.Key,
-			Value: e.Value,
+			Key:          e.Key,
+			Value:        e.Value,
+			ValueLength:  e.ValueLength,
+			ValueOmitted: e.ValueOmitted,
 		}
 	}
 

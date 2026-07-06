@@ -153,6 +153,22 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	if config.SegmentSize <= 0 {
 		config.SegmentSize = DefaultSegmentSize
 	}
+
+	// Guardrail: an object larger than a segment cannot be compacted into one, so
+	// CompactThreshold (the size at/below which objects are compaction-eligible)
+	// must stay below SegmentSize. Clamp + warn on a misconfiguration rather than
+	// failing to start; objects at/above SegmentSize then correctly remain
+	// permanent raw files (#165).
+	if config.CompactThreshold >= config.SegmentSize {
+		clamped := config.SegmentSize - 1
+		zlog.Warn().
+			Int64("compact_threshold", config.CompactThreshold).
+			Int64("segment_size", config.SegmentSize).
+			Int64("clamped_to", clamped).
+			Msg("storage: compact-threshold >= segment-size; clamping compact-threshold below segment-size so compaction-eligible objects always fit a segment")
+		config.CompactThreshold = clamped
+	}
+
 	if config.FdCacheSize <= 0 {
 		config.FdCacheSize = DefaultFdCacheSize
 	}
@@ -458,10 +474,22 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	return keyList, lastKey, hasMore, nil
 }
 
+// MaxListValueSize caps the per-value bytes returned by List-with-values. A
+// value larger than this is not read from disk; the entry is returned with the
+// value omitted (and its size reported) so a List over large objects cannot
+// buffer an object-sized allocation or exceed the gRPC message limit (#165).
+const MaxListValueSize int64 = 1 << 20 // 1 MiB
+
 // KeyValue holds a key and its associated value bytes.
 type KeyValue struct {
 	Key   string
 	Value []byte
+	// ValueLength is the size of the value in bytes, set even when the value was
+	// omitted for exceeding MaxListValueSize.
+	ValueLength int64
+	// ValueOmitted is true when the value was not read because it exceeds
+	// MaxListValueSize; Value is nil in that case.
+	ValueOmitted bool
 }
 
 // ListKeyValuesWithPagination returns paginated, sorted key-value pairs from RocksDB.
@@ -526,6 +554,8 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 		// If unmarshal fails, include the key with nil value to keep
 		// page boundaries consistent with ListKeysWithPagination.
 		var data []byte
+		var valueLength int64
+		var valueOmitted bool
 		valueMsg := &pb.ValueMessage{}
 		if err := proto.Unmarshal(v, valueMsg); err == nil {
 			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
@@ -536,38 +566,47 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 			}
 
 			storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
+			valueLength = valueMsg.ValueLength
 
-			switch valueMsg.ValueType {
-			case pb.ValueType_INLINE:
-				data = make([]byte, len(valueMsg.Data))
-				copy(data, valueMsg.Data)
-			case pb.ValueType_SEGMENT:
-				r, readErr := s.segmentManager.ReadEntry(keys.ExtractUserKey(k), valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
-				if readErr == nil && r != nil {
-					data, readErr = io.ReadAll(r)
-					if closer, ok := r.(io.Closer); ok {
-						closer.Close()
+			if MaxListValueSize > 0 && valueMsg.ValueLength > MaxListValueSize {
+				// Value exceeds the List cap: omit it rather than reading an
+				// object-sized buffer off disk (#165). INLINE values are always
+				// below the cap, so only SEGMENT/RAW_FILE reads are skipped here.
+				valueOmitted = true
+				metrics.ListValuesOmitted.Inc()
+			} else {
+				switch valueMsg.ValueType {
+				case pb.ValueType_INLINE:
+					data = make([]byte, len(valueMsg.Data))
+					copy(data, valueMsg.Data)
+				case pb.ValueType_SEGMENT:
+					r, readErr := s.segmentManager.ReadEntry(keys.ExtractUserKey(k), valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
+					if readErr == nil && r != nil {
+						data, readErr = io.ReadAll(r)
+						if closer, ok := r.(io.Closer); ok {
+							closer.Close()
+						}
+						if readErr != nil {
+							data = nil
+						}
 					}
-					if readErr != nil {
-						data = nil
-					}
-				}
-			case pb.ValueType_RAW_FILE:
-				r, readErr := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
-				if readErr == nil && r != nil {
-					data, readErr = io.ReadAll(r)
-					if closer, ok := r.(io.Closer); ok {
-						closer.Close()
-					}
-					if readErr != nil {
-						data = nil
+				case pb.ValueType_RAW_FILE:
+					r, readErr := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+					if readErr == nil && r != nil {
+						data, readErr = io.ReadAll(r)
+						if closer, ok := r.(io.Closer); ok {
+							closer.Close()
+						}
+						if readErr != nil {
+							data = nil
+						}
 					}
 				}
 			}
 		}
 
 		userKey := keys.ExtractUserKey(k)
-		entries = append(entries, KeyValue{Key: userKey, Value: data})
+		entries = append(entries, KeyValue{Key: userKey, Value: data, ValueLength: valueLength, ValueOmitted: valueOmitted})
 		lastKey = userKey
 
 		it.Key().Free()

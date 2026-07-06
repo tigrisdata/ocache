@@ -96,6 +96,8 @@ message ListResponse {
 message KeyValue {
   string key = 1;
   bytes value = 2;
+  int64 value_length = 3; // Size of the value in bytes (set even when value is omitted)
+  bool value_omitted = 4; // True if the value was omitted because it exceeds the List value-size cap
 }
 
 message ListWithValuesResponse {

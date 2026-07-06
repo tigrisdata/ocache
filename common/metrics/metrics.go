@@ -275,6 +275,15 @@ var (
 		},
 	)
 
+	// ListValuesOmitted counts values omitted from List-with-values responses
+	// because they exceeded the per-value size cap (keys/sizes are still returned).
+	ListValuesOmitted = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_list_values_omitted_total",
+			Help: "Number of values omitted from List-with-values responses for exceeding the per-value size cap",
+		},
+	)
+
 	StreamBytesTransferred = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "ocache_stream_bytes_transferred_total",
