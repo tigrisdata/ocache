@@ -128,20 +128,31 @@ Each node goes through a defined lifecycle managed by the dskit ring:
 
 ### Lifecycle States
 
-| State   | Description                                                         |
-| ------- | ------------------------------------------------------------------- |
-| JOINING | Node is registering with the ring and claiming tokens               |
-| ACTIVE  | Node is fully participating in the ring and serving requests        |
-| LEAVING | Node has announced departure and is waiting for gossip to propagate |
-| LEFT    | Node has left the ring completely                                   |
+| State   | Description                                                                                  |
+| ------- | ------------------------------------------------------------------------------------------- |
+| JOINING | Node has registered and is claiming tokens, but is **not yet routable** — peers send it no traffic. It stays here until it signals readiness (see [Readiness gating](#readiness-gating)). |
+| ACTIVE  | Node is fully participating in the ring and serving requests                                 |
+| LEAVING | Node has announced departure and is waiting for gossip to propagate                          |
+| LEFT    | Node has left the ring completely                                                            |
 
 ### Node Join Process
 
 1. Node starts and creates a memberlist gossip service
 2. Ring manager registers instance with JOINING state
 3. Tokens are generated (or loaded from persistence file)
-4. Node transitions to ACTIVE state after tokens stabilize
+4. Node **stays in JOINING** — present in the ring but not routable — until it can actually serve requests: its storage has finished booting and its gRPC server is listening. Only then does it signal readiness and transition to **ACTIVE**.
 5. Gossip propagates the new membership to other nodes
+
+### Readiness gating
+
+A (re)joining node does not advertise `ACTIVE` until it can serve — readiness is signaled once storage has booted and the gRPC server is listening (internally, via `Coordinator.MarkReady()`, which the server calls after binding the listener; embedded callers get this from `StartGRPCServer()`). This prevents peers from routing a key's traffic to a node that is still opening a large on-disk store, which would otherwise flood a cold node and stall its recovery.
+
+Operational implications:
+
+- The `/ready` (and `/readyz`) endpoint — and `IsReady()` — reflects the `ACTIVE` state, so a node is only marked ready once it can serve.
+- In Kubernetes, add a **`startupProbe`** (e.g. on `/health`) with a generous `failureThreshold`. During a warm-cache boot the HTTP server is not listening yet — storage opens before the server binds — so a plain liveness probe would kill the pod mid-boot and crash-loop it. The startupProbe tolerates the boot window and hands off to the liveness and readiness probes only once the server is up.
+- Use the **readiness** probe (`/ready`, gated on `ACTIVE`) to gate client and peer traffic, and the **liveness** probe (`/health`) to detect a hung process after startup.
+- A cluster-mode node that never starts its gRPC server never becomes routable — which is correct, since peers could not reach it anyway.
 
 ### Node Leave Process (Graceful Shutdown)
 

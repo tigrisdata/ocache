@@ -320,6 +320,8 @@ if cache.IsReady() {
 }
 ```
 
+> **Cluster mode:** `WaitReady()`/`IsReady()` report ready only once the node reaches the ring's `ACTIVE` state, and the node does not become `ACTIVE` until **`StartGRPCServer()`** has been called (readiness is gated on the peer listener binding). Call `StartGRPCServer()` **before** `WaitReady()` — a cluster-mode node that never starts its gRPC server stays `JOINING` indefinitely and `WaitReady()` blocks until the context expires. (In single-node mode there is no ring, so this gating does not apply.)
+
 ## Advanced Usage
 
 ### Accessing Underlying Layers
@@ -446,7 +448,7 @@ config := &embedded.Config{
 
 1. **Use stable node IDs**: In Kubernetes, use StatefulSet pod names
 2. **Include all nodes as seeds**: Ensures cluster formation
-3. **Wait for readiness**: Call `WaitReady()` before serving traffic
+3. **Start the gRPC server, then wait for readiness**: Call `StartGRPCServer()` before `WaitReady()` — the node stays `JOINING` (and `WaitReady()` blocks) until its gRPC server is listening
 4. **Advertise reachable addresses**: Ensure `AdvertiseAddr` is routable from other nodes
 
 ### Resource Management
