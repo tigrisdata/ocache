@@ -237,12 +237,20 @@ jobs:
           echo "Pinning intra-module require directives to ${TAG}..."
           for module in "${MODULES[@]}"; do
             pushd "$module" >/dev/null
+            # Capture go.mod as JSON once, with an explicit error check. A
+            # `go mod edit -json` failure (e.g. a malformed go.mod) must be a hard
+            # step error, not a silently-skipped pin. `set -e` does not reliably
+            # catch a failed command substitution in an assignment across bash
+            # versions, so check the exit status explicitly.
+            gomod_json="$(GOWORK=off go mod edit -json)" || {
+              echo "::error::failed to parse go.mod in ${module}"; exit 1;
+            }
             for sib in "${MODULES[@]}"; do
               [ "$sib" = "$module" ] && continue
               modpath="github.com/tigrisdata/ocache/${sib}"
               # Only rewrite a require that already exists (exact-path match, so
               # "coordinator" is not confused with "coordinator/proto").
-              if GOWORK=off go mod edit -json | jq -e --arg p "$modpath" '.Require[]? | select(.Path == $p)' >/dev/null; then
+              if echo "$gomod_json" | jq -e --arg p "$modpath" '.Require[]? | select(.Path == $p)' >/dev/null; then
                 GOWORK=off go mod edit -require "${modpath}@${TAG}"
                 echo "  ${module}: require ${modpath}@${TAG}"
               fi
