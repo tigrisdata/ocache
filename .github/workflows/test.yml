@@ -106,6 +106,9 @@ jobs:
       - name: Run linting
         run: STATIC_BUILD=true make lint
 
+      - name: Check dependency licenses
+        run: STATIC_BUILD=true make license-check
+
       - name: Run tests with race detector
         run: STATIC_BUILD=true make test-race
 

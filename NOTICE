@@ -1,0 +1,36 @@
+OCache
+Copyright (c) 2026 Tigris Data, Inc.
+
+This product includes software developed at Tigris Data, Inc.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This software depends on third-party open-source components. Their license texts
+are reproduced with the distributed source/binaries where required. Summary of
+the notable components and their licenses (see each project for full terms):
+
+RocksDB (C++), linked via cgo through github.com/linxGnu/grocksdb
+  RocksDB is dual-licensed under the Apache License, Version 2.0 and GPL v2.
+  This product uses RocksDB under the Apache License, Version 2.0.
+  grocksdb (the Go bindings) is licensed under the MIT License.
+
+HashiCorp libraries (via github.com/grafana/dskit), Mozilla Public License 2.0:
+  github.com/hashicorp/consul/api
+  github.com/hashicorp/errwrap
+  github.com/hashicorp/go-cleanhttp
+  github.com/hashicorp/go-immutable-radix
+  github.com/hashicorp/go-multierror
+  github.com/hashicorp/go-rootcerts
+  github.com/hashicorp/go-sockaddr
+  github.com/hashicorp/golang-lru (and /v2)
+  github.com/hashicorp/memberlist
+  github.com/hashicorp/serf
+  MPL-2.0 is a file-level copyleft license. These components are used unmodified;
+  their source and license notices are preserved. No MPL obligations extend to
+  OCache's own source.
+
+Other dependencies are licensed under permissive terms (Apache-2.0, MIT, BSD-2/3
+-Clause, ISC) or dedicated to the public domain (CC0-1.0). A machine-checkable
+inventory is enforced in CI (see scripts/check-licenses.sh).
