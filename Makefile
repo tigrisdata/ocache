@@ -424,6 +424,11 @@ lint:
 	@echo "Running gofmt..."
 	@gofmt -l -d $$(find . -name '*.go' -not -path './proto/*')
 
+.PHONY: license-check
+license-check:
+	@echo "Checking dependency licenses..."
+	@CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" bash scripts/check-licenses.sh
+
 .PHONY: tidy
 tidy:
 	@echo "Running go mod tidy..."
