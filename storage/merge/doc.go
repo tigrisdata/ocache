@@ -1,3 +1,6 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package merge implements a multiplexing merge operator for RocksDB that supports
 // different merge strategies based on key types.
 //

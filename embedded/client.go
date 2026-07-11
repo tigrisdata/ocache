@@ -1,3 +1,6 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package embedded provides an embedded ocache client for use in other services.
 // This allows services like TAG to embed ocache and get full cluster-aware
 // caching with metrics, routing, and cluster-wide list operations.
