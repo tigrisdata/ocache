@@ -1,6 +1,6 @@
 # Code of Conduct
 
-This project adopts the Tigris Data organization-wide Code of Conduct.
+This project adopts Tigris organization-wide Code of Conduct.
 
 Please read it here:
 https://github.com/tigrisdata/.github/blob/main/CODE_OF_CONDUCT.md

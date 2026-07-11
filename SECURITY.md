@@ -23,5 +23,5 @@ remediate before any public disclosure.
 ## Supported Versions
 
 Security fixes are provided on a best-effort basis for the latest released
-version. Please reproduce on, and upgrade to, the latest release before
-reporting.
+version. Please include the affected version(s), and reproduce on the latest
+release when possible.
