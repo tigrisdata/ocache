@@ -15,6 +15,13 @@ High-performance cache service with dual-storage architecture, supporting both g
 
 ## Quick Start
 
+**Prerequisites:** Go 1.24+, `protoc`, and RocksDB (with a C++ toolchain, since
+OCache links RocksDB via cgo). `make install-deps` installs `protoc` and the Go
+plugins; `make install-rocksdb` installs RocksDB. See the
+[Installation Guide](docs/installation.md) for platform details and static-build
+options. Always build and test through the `make` targets — they set the
+required CGO flags.
+
 ### Single Node
 
 ```bash
@@ -22,6 +29,7 @@ High-performance cache service with dual-storage architecture, supporting both g
 git clone https://github.com/tigrisdata/ocache.git
 cd ocache
 make install-deps
+make install-rocksdb   # or see docs/installation.md for a static build
 make all
 
 # Run the server
@@ -144,3 +152,19 @@ make test-integration TESTRUN=Compaction
 ```
 
 See [Testing Guide](docs/testing.md) for comprehensive testing documentation.
+
+## Contributing
+
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md). We use
+the [Developer Certificate of Origin](DCO) — sign off your commits with
+`git commit -s`. This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+To report a security vulnerability, please follow [SECURITY.md](SECURITY.md).
+Do not open public issues for security reports.
+
+## License
+
+OCache is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
+for third-party attributions.
