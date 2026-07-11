@@ -1,3 +1,6 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package logsample provides a shared, rate-limited logger for high-frequency
 // failure-path log lines.
 //
