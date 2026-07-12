@@ -8,7 +8,7 @@ require (
 	github.com/linxGnu/grocksdb v1.10.1
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/common v1.1.0
+	github.com/tigrisdata/ocache/common v1.7.0
 	golang.org/x/sys v0.35.0
 	google.golang.org/protobuf v1.36.8
 )
