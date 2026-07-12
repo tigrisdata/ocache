@@ -1,3 +1,6 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package metrics
 
 import (
@@ -272,6 +275,15 @@ var (
 		prometheus.GaugeOpts{
 			Name: "ocache_streams_active",
 			Help: "Number of active streaming operations",
+		},
+	)
+
+	// ListValuesOmitted counts values omitted from List-with-values responses
+	// because they exceeded the per-value size cap (keys/sizes are still returned).
+	ListValuesOmitted = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_list_values_omitted_total",
+			Help: "Number of values omitted from List-with-values responses for exceeding the per-value size cap",
 		},
 	)
 

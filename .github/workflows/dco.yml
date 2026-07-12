@@ -1,0 +1,48 @@
+name: DCO
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Signed-off-by on all commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          fail=0
+          # Every non-merge commit introduced by this PR must carry a
+          # Signed-off-by trailer matching its author (see CONTRIBUTING.md / DCO).
+          commits=$(git rev-list --no-merges "$BASE".."$HEAD")
+          if [ -z "$commits" ]; then
+            echo "No commits to check."
+            exit 0
+          fi
+          for sha in $commits; do
+            author="$(git show -s --format='%an <%ae>' "$sha")"
+            signoffs="$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")"
+            if printf '%s\n' "$signoffs" | grep -qxF "$author"; then
+              echo "ok    ${sha:0:12}  $author"
+            else
+              echo "::error::commit ${sha:0:12} is missing 'Signed-off-by: $author'"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "DCO check failed. Add a sign-off with 'git commit -s' (or"
+            echo "'git rebase --signoff <base>') and force-push. See CONTRIBUTING.md."
+            exit 1
+          fi
+          echo "All commits are signed off."

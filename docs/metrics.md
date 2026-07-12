@@ -6,6 +6,10 @@ This document provides a comprehensive reference for all Prometheus metrics expo
 
 OCache exposes Prometheus metrics at the `/metrics` endpoint on the configured HTTP port (default: 9001).
 
+## Rely on Metrics, Not Log Counts, During a Degraded Ring
+
+When the ring is degraded (a node down), the high-frequency failure-path log lines — e.g. `Failed to route key`, `Circuit breaker open for node`, `Node not found in ring` — are **rate-limited/sampled** to keep a single-node loss from producing millions of identical lines. Every one of those sites still increments an exact Prometheus counter, so use the metrics below (e.g. `ocache_errors_total`, `ocache_cluster_routing_errors_total`) for accurate failure rates rather than counting log lines.
+
 ## Metric Categories
 
 ### API Metrics

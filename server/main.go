@@ -1,3 +1,6 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package main
 
 import (
@@ -37,7 +40,8 @@ var (
 	recoveryWorkers = flag.Int("recovery-workers", stor.DefaultRecoveryWorkers, "Number of parallel workers for startup file recovery")
 	deleteBatchSize = flag.Int("delete-batch-size", stor.DefaultDeleteBatchSize, "Number of file deletions processed per deletion-queue batch")
 
-	metadataCacheSize = flag.Int64("metadata-cache-size", stor.DefaultMetadataCacheSize, "Metadata cache size in bytes (default: 1GB)")
+	metadataCacheSize      = flag.Int64("metadata-cache-size", stor.DefaultMetadataCacheSize, "Metadata cache size in bytes (default: 1GB)")
+	metadataBackgroundJobs = flag.Int("metadata-background-jobs", stor.DefaultMetadataBackgroundJobs, "Max concurrent RocksDB background jobs (compactions + flushes) over the process lifetime; caps background CPU without a container CPU limit")
 
 	listenAddr     = flag.String("listen-addr", ":9000", "Listen address for gRPC server")
 	listenHTTP     = flag.String("listen-http", ":9001", "Listen address for HTTP/grpc-gateway server")
@@ -107,22 +111,23 @@ func initializeCluster(ctx context.Context) *coordinator.Coordinator {
 // initializeStorage sets up the storage layer
 func initializeStorage() *stor.Storage {
 	storageConfig := &stor.StorageConfig{
-		DiskPath:            AppConfig.DiskPath,
-		TTL:                 AppConfig.TTL,
-		InlineThreshold:     AppConfig.InlineThreshold,
-		CompactThreshold:    AppConfig.CompactThreshold,
-		SegmentSize:         AppConfig.SegmentSize,
-		FdCacheSize:         AppConfig.FdCacheSize,
-		MaxDiskUsage:        AppConfig.MaxDiskUsage,
-		CompactionThreads:   AppConfig.CompactionThreads,
-		FragThreshold:       AppConfig.FragThreshold,
-		MinSegmentAge:       AppConfig.RecompactMinSegmentAge,
-		MinSegments:         AppConfig.RecompactMinSegments,
-		DisableRecompaction: AppConfig.RecompactDisable,
-		CleanupInterval:     AppConfig.TTLCleanupInterval,
-		MetadataCacheSize:   AppConfig.MetadataCacheSize,
-		RecoveryWorkers:     AppConfig.RecoveryWorkers,
-		DeleteBatchSize:     AppConfig.DeleteBatchSize,
+		DiskPath:               AppConfig.DiskPath,
+		TTL:                    AppConfig.TTL,
+		InlineThreshold:        AppConfig.InlineThreshold,
+		CompactThreshold:       AppConfig.CompactThreshold,
+		SegmentSize:            AppConfig.SegmentSize,
+		FdCacheSize:            AppConfig.FdCacheSize,
+		MaxDiskUsage:           AppConfig.MaxDiskUsage,
+		CompactionThreads:      AppConfig.CompactionThreads,
+		FragThreshold:          AppConfig.FragThreshold,
+		MinSegmentAge:          AppConfig.RecompactMinSegmentAge,
+		MinSegments:            AppConfig.RecompactMinSegments,
+		DisableRecompaction:    AppConfig.RecompactDisable,
+		CleanupInterval:        AppConfig.TTLCleanupInterval,
+		MetadataCacheSize:      AppConfig.MetadataCacheSize,
+		MetadataBackgroundJobs: AppConfig.MetadataBackgroundJobs,
+		RecoveryWorkers:        AppConfig.RecoveryWorkers,
+		DeleteBatchSize:        AppConfig.DeleteBatchSize,
 	}
 
 	s, err := stor.NewStorageWithConfig(storageConfig)

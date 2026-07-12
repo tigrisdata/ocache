@@ -1,3 +1,6 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // Package operations provides cache operations with automatic routing.
 // This package is used by both the gRPC service layer and the embedded client.
 package operations
