@@ -79,9 +79,19 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 		// Look up the key's metadata.
 		metaKey := keys.MakeMetadataKey(originalKey)
 		slice, err := c.storage.meta.Handle().Get(ro, metaKey)
-		if err != nil || !slice.Exists() {
+		if err != nil {
+			// Transient read error: skip this entry. Do NOT treat it as an orphan
+			// — deleting the entry would make a live key permanently invisible to
+			// FIFO eviction (reads never re-index it). Retry on the next pass.
+			zlog.Debug().Err(err).Str("key", originalKey).Msg("cleaner: fifo eviction metadata lookup failed; skipping")
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+		if !slice.Exists() {
 			// Orphan index entry (key deleted/expired, or superseded by a newer
 			// overwrite entry) — reclaim it.
+			slice.Free()
 			batch.Delete(keyBytes)
 			it.Key().Free()
 			it.Value().Free()
@@ -154,8 +164,8 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 	c.evictedKeys.Add(int64(evictedCount))
 	c.totalSize.Add(-evicted)
 
-	metrics.CleanerKeysDeleted.WithLabelValues("lru", "disk_limit").Add(float64(evictedCount))
-	metrics.CleanerBytesFreed.WithLabelValues("lru").Add(float64(evicted))
+	metrics.CleanerKeysDeleted.WithLabelValues("fifo", "disk_limit").Add(float64(evictedCount))
+	metrics.CleanerBytesFreed.WithLabelValues("fifo").Add(float64(evicted))
 
 	zlog.Info().
 		Int("count", evictedCount).

@@ -87,13 +87,14 @@ const (
 	DefaultMetadataBackgroundJobs = metadata.DefaultRocksDBMaxBackgroundJobs
 
 	// Eviction policies for StorageConfig.EvictionPolicy (only relevant when
-	// MaxDiskUsage > 0). Both walk the same time-bucketed access index oldest
-	// first; they differ only in whether a read refreshes an entry's timestamp.
+	// MaxDiskUsage > 0). Each policy maintains its own eviction index:
 	//
-	//   lru  - evict least-recently-accessed first; a read bumps the entry's
-	//          timestamp, protecting recently-read data.
-	//   fifo - evict oldest-written first; reads do not bump the timestamp, so
-	//          a rare read of old data does not protect it from eviction.
+	//   lru  - evict least-recently-accessed first, using the time-bucketed
+	//          access index; a read re-buckets the entry, protecting recently
+	//          -read data.
+	//   fifo - evict oldest-written first, using the dedicated !fifo/ index;
+	//          entries are written once at Put and never touched by reads, so a
+	//          read of old data does not protect it from eviction.
 	EvictionPolicyLRU  = "lru"
 	EvictionPolicyFIFO = "fifo"
 

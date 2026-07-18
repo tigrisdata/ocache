@@ -360,13 +360,14 @@ func (c *Cleaner) enforceDiskLimit() {
 
 	fifo := c.storage != nil && c.storage.evictionPolicy == EvictionPolicyFIFO
 
-	// Track eviction run
-	metrics.CleanerRuns.WithLabelValues("lru").Inc()
-
 	policy := EvictionPolicyLRU
 	if fifo {
 		policy = EvictionPolicyFIFO
 	}
+
+	// Track eviction run
+	metrics.CleanerRuns.WithLabelValues(policy).Inc()
+
 	zlog.Info().
 		Int64("current", currentSize).
 		Int64("max", c.maxDiskUsage).
@@ -383,7 +384,7 @@ func (c *Cleaner) enforceDiskLimit() {
 
 	// Record metrics
 	duration := time.Since(start)
-	metrics.CleanerDuration.WithLabelValues("lru").Observe(float64(duration.Milliseconds()))
+	metrics.CleanerDuration.WithLabelValues(policy).Observe(float64(duration.Milliseconds()))
 	metrics.LRUEvictions.Add(float64(evicted))
 }
 
