@@ -469,7 +469,11 @@ func (sm *Manager) RefreshMetrics() {
 	count := len(sm.segments)
 	var totalSize int64
 	for _, s := range sm.segments {
-		totalSize += s.size
+		// s.size is guarded by the segment's own mutex (writers update it
+		// under s.mu during compaction), so read it via GetSize() rather than
+		// touching the field directly. Lock order sm.mu -> seg.mu matches the
+		// rest of the manager, so this cannot deadlock.
+		totalSize += s.GetSize()
 	}
 	sm.mu.RUnlock()
 

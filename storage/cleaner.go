@@ -249,6 +249,16 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 	c.cleanedKeys.Add(int64(cleaned))
 
+	// TTL cleanup deletes entries directly via the batch above (bypassing
+	// DeleteKey, which is where explicit deletes decrement the total), so we
+	// must subtract the freed bytes here. Without this the live total stays
+	// inflated by expired-but-collected entries, which both inflates
+	// ocache_disk_usage_bytes and can trigger unnecessary LRU eviction in
+	// enforceDiskLimit.
+	if bytesFreed > 0 {
+		c.UpdateSize(-bytesFreed)
+	}
+
 	// Record metrics
 	duration := time.Since(start)
 	metrics.CleanerDuration.WithLabelValues("ttl").Observe(float64(duration.Milliseconds()))
