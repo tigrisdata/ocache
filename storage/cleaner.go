@@ -130,8 +130,16 @@ func (c *Cleaner) cleanupLoop() {
 // cleanupExpiredKeys scans for and removes expired keys
 func (c *Cleaner) cleanupExpiredKeys() {
 	start := time.Now()
-	cleaned := 0
-	var bytesFreed int64
+
+	// committed* accumulate only entries whose batch was written successfully.
+	// pending* hold the current batch's deletes until it commits, so a failed
+	// Write (which leaves those keys stored) does not drop their bytes from the
+	// live total — otherwise the next run would re-collect and re-subtract them,
+	// skewing TotalSize and disk-limit enforcement.
+	committedCleaned := 0
+	var committedBytes int64
+	pendingCleaned := 0
+	var pendingBytes int64
 
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
@@ -143,6 +151,25 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
+
+	// flush writes the current batch and, only on success, promotes the pending
+	// counts to committed. On failure the deletes did not persist, so the
+	// pending counts are discarded rather than committed.
+	flush := func(final bool) {
+		label := "deletion batch"
+		if final {
+			label = "final deletion batch"
+		}
+		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
+			zlog.Error().Err(err).Msgf("cleaner: failed to write %s", label)
+		} else {
+			committedCleaned += pendingCleaned
+			committedBytes += pendingBytes
+		}
+		pendingCleaned = 0
+		pendingBytes = 0
+		batch.Clear()
+	}
 
 	now := time.Now().Unix()
 
@@ -182,7 +209,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 				slice.Free()
 			}
 			batch.Delete(bucketIndexKey)
-			cleaned++
+			pendingCleaned++
 			it.Key().Free()
 			it.Value().Free()
 			continue
@@ -202,11 +229,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 				slice.Free()
 			}
 			batch.Delete(bucketIndexKey)
-			cleaned++
+			pendingCleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
 			// Track bytes freed
-			bytesFreed += valueMsg.ValueLength
+			pendingBytes += valueMsg.ValueLength
 
 			// Queue associated files for deletion
 			switch valueMsg.ValueType {
@@ -233,41 +260,36 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			default:
 			}
 
-			if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-				zlog.Error().Err(err).Msg("cleaner: failed to write deletion batch")
-			}
-			batch.Clear()
+			flush(false)
 		}
 	}
 
 	// Write final batch
 	if batch.Count() > 0 {
-		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("cleaner: failed to write final deletion batch")
-		}
+		flush(true)
 	}
 
-	c.cleanedKeys.Add(int64(cleaned))
+	c.cleanedKeys.Add(int64(committedCleaned))
 
 	// TTL cleanup deletes entries directly via the batch above (bypassing
 	// DeleteKey, which is where explicit deletes decrement the total), so we
 	// must subtract the freed bytes here. Without this the live total stays
 	// inflated by expired-but-collected entries, which both inflates
 	// ocache_disk_usage_bytes and can trigger unnecessary LRU eviction in
-	// enforceDiskLimit.
-	if bytesFreed > 0 {
-		c.UpdateSize(-bytesFreed)
+	// enforceDiskLimit. Only committed bytes are subtracted (see flush).
+	if committedBytes > 0 {
+		c.UpdateSize(-committedBytes)
 	}
 
 	// Record metrics
 	duration := time.Since(start)
 	metrics.CleanerDuration.WithLabelValues("ttl").Observe(float64(duration.Milliseconds()))
-	metrics.CleanerKeysDeleted.WithLabelValues("ttl", "expired").Add(float64(cleaned))
-	metrics.CleanerBytesFreed.WithLabelValues("ttl").Add(float64(bytesFreed))
+	metrics.CleanerKeysDeleted.WithLabelValues("ttl", "expired").Add(float64(committedCleaned))
+	metrics.CleanerBytesFreed.WithLabelValues("ttl").Add(float64(committedBytes))
 
 	zlog.Info().
-		Int("cleaned", cleaned).
-		Int64("bytes_freed", bytesFreed).
+		Int("cleaned", committedCleaned).
+		Int64("bytes_freed", committedBytes).
 		Dur("duration_ms", duration).
 		Msg("cleaner: TTL cleanup completed")
 }
