@@ -155,6 +155,15 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	// flush writes the current batch and, only on success, promotes the pending
 	// counts to committed. On failure the deletes did not persist, so the
 	// pending counts are discarded rather than committed.
+	//
+	// TTL cleanup deletes entries directly via this batch (bypassing DeleteKey,
+	// where explicit deletes decrement the total), so it must subtract the freed
+	// bytes itself. We do it here, per committed batch, rather than once at the
+	// end: that keeps the live total correct even if the scan returns early on
+	// shutdown after some batches have already persisted. Without it the total
+	// stays inflated by expired-but-collected entries, inflating
+	// ocache_disk_usage_bytes and risking unnecessary LRU eviction in
+	// enforceDiskLimit.
 	flush := func(final bool) {
 		label := "deletion batch"
 		if final {
@@ -165,6 +174,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		} else {
 			committedCleaned += pendingCleaned
 			committedBytes += pendingBytes
+			if pendingBytes > 0 {
+				c.UpdateSize(-pendingBytes)
+			}
 		}
 		pendingCleaned = 0
 		pendingBytes = 0
@@ -270,16 +282,6 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	}
 
 	c.cleanedKeys.Add(int64(committedCleaned))
-
-	// TTL cleanup deletes entries directly via the batch above (bypassing
-	// DeleteKey, which is where explicit deletes decrement the total), so we
-	// must subtract the freed bytes here. Without this the live total stays
-	// inflated by expired-but-collected entries, which both inflates
-	// ocache_disk_usage_bytes and can trigger unnecessary LRU eviction in
-	// enforceDiskLimit. Only committed bytes are subtracted (see flush).
-	if committedBytes > 0 {
-		c.UpdateSize(-committedBytes)
-	}
 
 	// Record metrics
 	duration := time.Since(start)
