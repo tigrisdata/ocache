@@ -21,6 +21,7 @@ type Config struct {
 	Verbose                bool          // Enable verbose/debug logging
 	FdCacheSize            int           // Size of the file descriptor cache
 	MaxDiskUsage           int64         // Maximum disk usage in bytes (0 = unlimited)
+	EvictionPolicy         string        // Eviction order when MaxDiskUsage > 0: "lru" (default) or "fifo"
 	CompactionThreads      int           // Number of compaction threads
 	FragThreshold          float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
 	RecompactMinSegmentAge time.Duration // Minimum age for segment recompaction
@@ -60,6 +61,7 @@ func LoadConfig() {
 		Verbose:                *verbose,
 		FdCacheSize:            *fdCacheSize,
 		MaxDiskUsage:           *maxDiskUsage,
+		EvictionPolicy:         *evictionPolicy,
 		CompactionThreads:      *compactionThreads,
 		FragThreshold:          *fragThreshold,
 		RecompactMinSegmentAge: *recompactMinSegmentAge,

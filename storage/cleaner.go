@@ -114,9 +114,16 @@ func (c *Cleaner) cleanupLoop() {
 				c.storage.segmentManager.RefreshMetrics()
 			}
 
-			// Periodically clean up old access buckets regardless of disk limits
-			// to prevent unbounded growth of the access index
-			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+			// Periodically clean up old access buckets to bound growth of the
+			// access index. Skip this under FIFO: there the access index doubles
+			// as the eviction order and entries are intentionally never
+			// re-bucketed, so pruning by bucket age would drop the eviction entry
+			// for still-live old keys (write-once workloads keep data well past
+			// the threshold) and make exactly the oldest data un-evictable. In
+			// FIFO the index holds one entry per live key, removed on delete/
+			// evict, so it stays bounded without age-based pruning.
+			if c.storage != nil && c.storage.evictionPolicy != EvictionPolicyFIFO &&
+				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
 			}

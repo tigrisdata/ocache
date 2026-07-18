@@ -85,6 +85,20 @@ const (
 	// Default RocksDB configuration
 	DefaultMetadataCacheSize      = metadata.DefaultRocksDBBlockCacheSize
 	DefaultMetadataBackgroundJobs = metadata.DefaultRocksDBMaxBackgroundJobs
+
+	// Eviction policies for StorageConfig.EvictionPolicy (only relevant when
+	// MaxDiskUsage > 0). Both walk the same time-bucketed access index oldest
+	// first; they differ only in whether a read refreshes an entry's timestamp.
+	//
+	//   lru  - evict least-recently-accessed first; a read bumps the entry's
+	//          timestamp, protecting recently-read data.
+	//   fifo - evict oldest-written first; reads do not bump the timestamp, so
+	//          a rare read of old data does not protect it from eviction.
+	EvictionPolicyLRU  = "lru"
+	EvictionPolicyFIFO = "fifo"
+
+	// DefaultEvictionPolicy preserves the historical behavior (LRU).
+	DefaultEvictionPolicy = EvictionPolicyLRU
 )
 
 // StorageConfig holds all configuration parameters for initializing storage
@@ -106,6 +120,7 @@ type StorageConfig struct {
 	AccessUpdateDelay    time.Duration // Access update delay
 	RecoveryWorkers      int           // Number of parallel workers for startup file recovery (<= 0 = default)
 	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
+	EvictionPolicy       string        // Eviction order when MaxDiskUsage > 0: "lru" (default) or "fifo"
 
 	// RocksDB-specific configuration
 	MetadataCacheSize      int64 // RocksDB Block cache size in bytes (0 = use default)
@@ -142,7 +157,8 @@ type Storage struct {
 	deletionQueue    *deletion.Queue       // Centralized file deletion queue
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
-	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
+	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
+	evictionPolicy   string                // "lru" or "fifo"; governs whether reads refresh access time
 	closed           atomic.Bool           // True when storage has been closed
 }
 
@@ -179,6 +195,18 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 	if config.DeleteBatchSize <= 0 {
 		config.DeleteBatchSize = DefaultDeleteBatchSize
+	}
+	switch config.EvictionPolicy {
+	case "":
+		config.EvictionPolicy = DefaultEvictionPolicy
+	case EvictionPolicyLRU, EvictionPolicyFIFO:
+		// valid
+	default:
+		zlog.Warn().
+			Str("eviction_policy", config.EvictionPolicy).
+			Str("fallback", DefaultEvictionPolicy).
+			Msg("storage: unknown eviction policy, falling back to default")
+		config.EvictionPolicy = DefaultEvictionPolicy
 	}
 
 	// Create the data directory if it doesn't exist
@@ -289,6 +317,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		fdCache:          fdCache,
 		deletionQueue:    deletionQueue,
 		compactor:        compactor,
+		evictionPolicy:   config.EvictionPolicy,
 	}
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
@@ -303,8 +332,13 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		Int64("max_disk_usage", config.MaxDiskUsage).
 		Msg("storage: started background cleaner with TTL cleanup and LRU eviction")
 
-	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
-	if config.MaxDiskUsage > 0 {
+	// Initialize and start the access updater for async LRU tracking. Only
+	// needed when eviction is active (MaxDiskUsage > 0) and the policy is LRU:
+	// its sole job is to refresh an entry's access time on reads. In FIFO mode
+	// reads must not refresh recency, so we leave it nil and the read path skips
+	// the bump — the access index then stays frozen at each entry's write time,
+	// which is exactly the FIFO eviction order.
+	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyLRU {
 		accessUpdateDelay := DefaultAccessUpdateDelay
 		if config.AccessUpdateDelay > 0 {
 			accessUpdateDelay = config.AccessUpdateDelay
@@ -783,7 +817,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		return nil, false, nil
 	}
 
-	// Update access time asynchronously for LRU tracking only if max disk usage is set
+	// Refresh access time for LRU tracking. The updater is only present when
+	// eviction is active and the policy is LRU; in FIFO mode it is nil, so reads
+	// deliberately do not bump recency and cannot protect old data from eviction.
 	if s.accessUpdater != nil {
 		s.accessUpdater.UpdateNow(key)
 	}

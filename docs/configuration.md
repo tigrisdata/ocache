@@ -25,7 +25,8 @@ OCache can be configured through command-line flags when starting the server.
 | `-threshold`         | int    | 65536        | Small object threshold in bytes (64KB). Objects smaller than this are stored in RocksDB          |
 | `-segment-size`      | int64  | 268435456    | Segment size in bytes (256MB) for large object storage                                           |
 | `-compact-threshold` | int64  | 16777216     | Compaction threshold in bytes (16MB). Objects less than this are eligible for segment compaction |
-| `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, uses LRU eviction                         |
+| `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, enables eviction                          |
+| `-eviction-policy`   | string | `lru`        | Eviction order when `-max-disk-usage` is set: `lru` (reads refresh recency) or `fifo` (evict oldest-written first; reads do not protect data) |
 
 ### Cache Configuration
 
