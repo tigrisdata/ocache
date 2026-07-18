@@ -392,6 +392,7 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	}()
 
 	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -522,6 +523,7 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	}()
 
 	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -747,6 +749,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
 	ro := metadata.CreateReadOptions(false, true)
+	defer ro.Destroy()
 	metaKey := keys.MakeMetadataKey(key)
 
 	slice, err := s.meta.Handle().Get(ro, metaKey)
@@ -1066,7 +1069,9 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
 
 	// If the value is larger than the inline threshold and smaller than the compact threshold,
 	// record it for compaction.
