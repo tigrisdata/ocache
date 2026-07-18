@@ -106,6 +106,14 @@ func (c *Cleaner) cleanupLoop() {
 				c.enforceDiskLimit()
 			}
 
+			// Mirror the live totals (maintained on every write/evict) back to the
+			// gauges, so ocache_disk_usage_bytes and the segment gauges track the
+			// current contents instead of reflecting only the value at startup.
+			c.refreshSizeMetrics()
+			if c.storage != nil && c.storage.segmentManager != nil {
+				c.storage.segmentManager.RefreshMetrics()
+			}
+
 			// Periodically clean up old access buckets regardless of disk limits
 			// to prevent unbounded growth of the access index
 			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
@@ -294,11 +302,8 @@ func (c *Cleaner) calculateTotalSize() {
 
 	c.totalSize.Store(totalSize)
 
-	// Update disk usage metrics
-	metrics.DiskUsageBytes.WithLabelValues("total").Set(float64(totalSize))
-	if c.maxDiskUsage > 0 {
-		metrics.DiskUsageRatio.Set(float64(totalSize) / float64(c.maxDiskUsage))
-	}
+	// Publish the freshly computed size to the gauges.
+	c.refreshSizeMetrics()
 
 	zlog.Info().
 		Int64("total_size", totalSize).
@@ -337,6 +342,22 @@ func (c *Cleaner) enforceDiskLimit() {
 // UpdateSize updates the tracked total size when keys are added/removed
 func (c *Cleaner) UpdateSize(delta int64) {
 	c.totalSize.Add(delta)
+}
+
+// refreshSizeMetrics publishes the current tracked total size to the disk-usage
+// gauges. Cheap (reads an atomic) and safe to call on every cleaner tick.
+func (c *Cleaner) refreshSizeMetrics() {
+	total := c.totalSize.Load()
+	metrics.DiskUsageBytes.WithLabelValues("total").Set(float64(total))
+	if c.maxDiskUsage > 0 {
+		metrics.DiskUsageRatio.Set(float64(total) / float64(c.maxDiskUsage))
+	}
+}
+
+// TotalSize returns the current tracked logical cache size in bytes (sum of
+// stored object lengths), maintained live on every write and eviction.
+func (c *Cleaner) TotalSize() int64 {
+	return c.totalSize.Load()
 }
 
 // WaitForInitialization waits until the cleaner has completed its initial size calculation

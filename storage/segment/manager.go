@@ -461,6 +461,22 @@ func (sm *Manager) GetSegmentCount() int {
 	return len(sm.segments)
 }
 
+// RefreshMetrics publishes the current segment count and total segment size to
+// the gauges. Called periodically (e.g. from the cleaner tick) so the segment
+// gauges track live contents rather than only the value at startup.
+func (sm *Manager) RefreshMetrics() {
+	sm.mu.RLock()
+	count := len(sm.segments)
+	var totalSize int64
+	for _, s := range sm.segments {
+		totalSize += s.size
+	}
+	sm.mu.RUnlock()
+
+	metrics.SegmentCount.Set(float64(count))
+	metrics.SegmentSize.Set(float64(totalSize))
+}
+
 // GetFragmentationRatio calculates the fragmentation ratio for a segment
 // Returns the ratio of dead space to total segment size (0.0 to 1.0)
 func (sm *Manager) GetFragmentationRatio(segmentPath string, deletedBytes int64) float64 {
