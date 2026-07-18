@@ -186,6 +186,47 @@ func TestPutOverwriteReplacesAccessEntry(t *testing.T) {
 	}
 }
 
+// TestFIFOBackfillsMissingAccessEntries verifies that keys written before a disk
+// cap existed (so they have no access-index entry) are backfilled on FIFO startup
+// and become evictable — otherwise the cap could never reclaim them.
+func TestFIFOBackfillsMissingAccessEntries(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fifo-backfill-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	// Phase 1: no disk cap → Put writes no access-index entries.
+	s1, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        dir,
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    0,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		require.NoError(t, s1.Put(fmt.Sprintf("k%d", i), bytes.NewReader([]byte("v")), 0))
+	}
+	require.Equal(t, 0, countAccessBucketEntries(t, s1), "no cap should mean no access entries")
+	s1.Close()
+
+	// Phase 2: reopen with a cap under FIFO → startup backfill makes every key
+	// visible to the eviction scan.
+	s2, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        dir,
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    1 << 20,
+		EvictionPolicy:  EvictionPolicyFIFO,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s2.Close()
+
+	assert.Equal(t, 5, countAccessBucketEntries(t, s2), "all pre-cap keys should be backfilled")
+	for i := 0; i < 5; i++ {
+		_, ok := readAccessIndex(t, s2, fmt.Sprintf("k%d", i))
+		assert.True(t, ok, "k%d should have an access-index entry after backfill", i)
+	}
+}
+
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:
 // under FIFO, reading the oldest-written keys does not save them — they are still
 // evicted first, while the newest-written keys survive.

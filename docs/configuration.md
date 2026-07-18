@@ -32,9 +32,13 @@ OCache can be configured through command-line flags when starting the server.
 > derived from a per-key access-time index. Under `lru` a read refreshes that
 > time; under `fifo` it never does. If you restart an existing `lru` cache as
 > `fifo`, entries that were read under `lru` carry their last *access* time (not
-> their write time) until they are next written or evicted, so eviction is not
-> strictly oldest-written-first during that transition. It converges to true FIFO
-> as those entries turn over. New writes are always ordered correctly.
+> their write time), so eviction is not strictly oldest-written-first during the
+> transition; it converges toward FIFO as those entries turn over. New writes are
+> always ordered correctly. On startup under `fifo`, any key lacking an access
+> entry (e.g. written before the cap was enabled, or pruned during a prior `lru`
+> run) is backfilled so it remains evictable — the disk cap is always enforced —
+> though such backfilled keys are ordered by startup time rather than their
+> original write time.
 
 ### Cache Configuration
 
