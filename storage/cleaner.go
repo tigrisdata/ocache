@@ -114,16 +114,11 @@ func (c *Cleaner) cleanupLoop() {
 				c.storage.segmentManager.RefreshMetrics()
 			}
 
-			// Periodically clean up old access buckets to bound growth of the
-			// access index. Skip this under FIFO: there the access index doubles
-			// as the eviction order and entries are intentionally never
-			// re-bucketed, so pruning by bucket age would drop the eviction entry
-			// for still-live old keys (write-once workloads keep data well past
-			// the threshold) and make exactly the oldest data un-evictable. In
-			// FIFO the index holds one entry per live key, removed on delete/
-			// evict, so it stays bounded without age-based pruning.
-			if c.storage != nil && c.storage.evictionPolicy != EvictionPolicyFIFO &&
-				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+			// Periodically clean up old access buckets regardless of disk limits
+			// to prevent unbounded growth of the access index. This only touches
+			// the LRU access-bucket index; the FIFO index (a separate keyspace) is
+			// never age-pruned — its entries are reclaimed by the eviction scan.
+			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
 			}
@@ -363,16 +358,28 @@ func (c *Cleaner) enforceDiskLimit() {
 	targetSize := int64(float64(c.maxDiskUsage) * 0.9) // Target 90% of max
 	needToEvict := currentSize - targetSize
 
-	// Track LRU eviction run
+	fifo := c.storage != nil && c.storage.evictionPolicy == EvictionPolicyFIFO
+
+	// Track eviction run
 	metrics.CleanerRuns.WithLabelValues("lru").Inc()
 
+	policy := EvictionPolicyLRU
+	if fifo {
+		policy = EvictionPolicyFIFO
+	}
 	zlog.Info().
 		Int64("current", currentSize).
 		Int64("max", c.maxDiskUsage).
 		Int64("need_to_evict", needToEvict).
-		Msg("cleaner: enforcing disk usage limit with LRU eviction")
+		Str("policy", policy).
+		Msg("cleaner: enforcing disk usage limit")
 
-	evicted := c.evictLRUKeys(needToEvict)
+	var evicted int
+	if fifo {
+		evicted = c.evictFIFOKeys(needToEvict)
+	} else {
+		evicted = c.evictLRUKeys(needToEvict)
+	}
 
 	// Record metrics
 	duration := time.Since(start)

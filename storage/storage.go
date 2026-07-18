@@ -326,18 +326,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		cleanupInterval = config.CleanupInterval
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
-
-	// Under FIFO, backfill access-index entries for any key that lacks one before
-	// the eviction loop starts. LRU repairs missing entries on read (via the
-	// access updater); FIFO never bumps on reads, so a key with no entry — one
-	// written before -max-disk-usage was enabled, or whose entry was pruned during
-	// a prior LRU run — would be invisible to the eviction scan and the disk cap
-	// could never reclaim it. This runs once at startup and is a no-op for a cache
-	// that has always run FIFO with the cap set.
-	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyFIFO {
-		s.backfillAccessIndex()
-	}
-
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
@@ -1128,114 +1116,26 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	metaKey := keys.MakeMetadataKey(key)
 	batch.Put(metaKey, val)
 
-	// Add an access-time index entry for eviction tracking only if a disk cap is
-	// set. The eviction scan walks these entries oldest-first.
+	// Index the key for eviction only if a disk cap is set. Each policy maintains
+	// its own index; the eviction scan walks whichever one applies oldest-first.
 	if s.cleaner.maxDiskUsage > 0 {
 		now := time.Now()
-		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-
-		// On overwrite, delete the previous access-bucket entry. Below we write a
-		// fresh entry and repoint the secondary index, but the old bucketed key
-		// is not otherwise removed; left behind it stays an orphan that still
-		// resolves to a live key. The eviction scan checks only that the key's
-		// metadata exists (not that the entry is current), so a stale entry makes
-		// a freshly rewritten key look old and get evicted out of order — and the
-		// index would grow with total writes rather than live keys. Deleting it
-		// keeps exactly one access entry per live key, for both LRU and FIFO.
-		ro := metadata.CreateReadOptions(false, false)
-		if prev, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil {
-			if prev.Exists() {
-				batch.Delete(prev.Data())
-			}
-			prev.Free()
+		switch s.evictionPolicy {
+		case EvictionPolicyFIFO:
+			// FIFO orders by write time, embedded in the index key. The entry is
+			// written once per Put and never bumped on reads. An overwrite simply
+			// adds a second entry at the new time; the older, now-stale one is
+			// reclaimed lazily by the eviction scan's metadata check, so no
+			// read-before-write is needed on the Put path.
+			batch.Put(keys.MakeFifoIndexKey(key, now), []byte{})
+		default: // LRU
+			accessKey := keys.MakeBucketedAccessKey(key, now)
+			batch.Put(accessKey, []byte{})
+			batch.Put(keys.MakeBucketedAccessIndexKey(key), accessKey)
 		}
-		ro.Destroy()
-
-		accessKey := keys.MakeBucketedAccessKey(key, now)
-		batch.Put(accessKey, []byte{})
-		batch.Put(bucketIndexKey, accessKey)
 	}
 
 	return s.meta.Handle().Write(wo, batch)
-}
-
-// backfillAccessIndex creates an access-index entry for every stored key that
-// lacks one, so the FIFO eviction scan can see (and reclaim) it. It exists only
-// for FIFO: LRU repairs a missing entry the next time the key is read, but FIFO
-// never bumps on reads, so keys written before -max-disk-usage was enabled — or
-// whose entries were pruned during a prior LRU run — would otherwise stay
-// invisible to eviction and defeat the disk cap. Missing entries are stamped at
-// the current time (we do not persist write time); such legacy keys therefore
-// sort ahead of everything written afterward and remain fully evictable. Runs
-// once at startup, before the eviction loop; a no-op when every key already has
-// an entry.
-func (s *Storage) backfillAccessIndex() {
-	start := time.Now()
-
-	ro := metadata.CreateReadOptions(false, false)
-	defer ro.Destroy()
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-
-	it := s.meta.Handle().NewIterator(ro)
-	defer it.Close()
-
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
-
-	now := time.Now()
-	backfilled := 0
-
-	flush := func() {
-		if batch.Count() == 0 {
-			return
-		}
-		if err := s.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("storage: failed to write access-index backfill batch")
-		}
-		batch.Clear()
-	}
-
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		keyBytes := it.Key().Data()
-		if !keys.IsMetadataKey(keyBytes) {
-			it.Key().Free()
-			it.Value().Free()
-			continue
-		}
-		key := keys.ExtractUserKey(keyBytes)
-		it.Key().Free()
-		it.Value().Free()
-
-		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-		existing, err := s.meta.Handle().Get(ro, bucketIndexKey)
-		if err != nil {
-			zlog.Error().Err(err).Str("key", key).Msg("storage: access-index backfill lookup failed")
-			continue
-		}
-		hasEntry := existing.Exists()
-		existing.Free()
-		if hasEntry {
-			continue
-		}
-
-		accessKey := keys.MakeBucketedAccessKey(key, now)
-		batch.Put(accessKey, []byte{})
-		batch.Put(bucketIndexKey, accessKey)
-		backfilled++
-
-		if batch.Count() >= 1000 {
-			flush()
-		}
-	}
-	flush()
-
-	if backfilled > 0 {
-		zlog.Info().
-			Int("backfilled", backfilled).
-			Dur("duration_ms", time.Since(start)).
-			Msg("storage: backfilled missing access-index entries for FIFO eviction")
-	}
 }
 
 // CleanerStats returns statistics from the background cleaner

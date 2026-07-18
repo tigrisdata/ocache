@@ -28,17 +28,21 @@ OCache can be configured through command-line flags when starting the server.
 | `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, enables eviction                          |
 | `-eviction-policy`   | string | `lru`        | Eviction order when `-max-disk-usage` is set: `lru` (reads refresh recency) or `fifo` (evict oldest-written first; reads do not protect data) |
 
-> **Switching `-eviction-policy` on an existing cache:** the eviction order is
-> derived from a per-key access-time index. Under `lru` a read refreshes that
-> time; under `fifo` it never does. If you restart an existing `lru` cache as
-> `fifo`, entries that were read under `lru` carry their last *access* time (not
-> their write time), so eviction is not strictly oldest-written-first during the
-> transition; it converges toward FIFO as those entries turn over. New writes are
-> always ordered correctly. On startup under `fifo`, any key lacking an access
-> entry (e.g. written before the cap was enabled, or pruned during a prior `lru`
-> run) is backfilled so it remains evictable — the disk cap is always enforced —
-> though such backfilled keys are ordered by startup time rather than their
-> original write time.
+> **Eviction policies.** With `-max-disk-usage` set, the cache evicts to stay
+> under the cap. `lru` evicts the least-recently-*accessed* key first — a read
+> refreshes an entry's position, protecting recently-read data. `fifo` evicts the
+> oldest-*written* key first and reads never change an entry's position, so a rare
+> read of old data cannot displace hotter data. `fifo` suits write-once workloads
+> (e.g. parquet, where the newest data is read most).
+>
+> Each policy maintains its own eviction index, written as keys are inserted, so
+> **enable the policy and the cap from the start of a deployment.** A key written
+> while `-max-disk-usage` was `0`, or (for `fifo`) before switching from `lru`, is
+> not in the active index and won't be considered for eviction until it is
+> rewritten — the same pre-existing limitation both policies share for un-indexed
+> keys. Under `fifo`, index entries for deleted or overwritten keys are reclaimed
+> lazily by the eviction scan rather than eagerly, so they cost a small amount of
+> extra space until the next eviction pass reaches them.
 
 ### Cache Configuration
 

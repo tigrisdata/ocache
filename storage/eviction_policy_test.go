@@ -17,15 +17,37 @@ import (
 	"github.com/tigrisdata/ocache/storage/metadata"
 )
 
-// readAccessIndex returns the current bucketed access key recorded for a user
-// key via the secondary index, or ("", false) if none exists. The bucketed key
-// encodes the access timestamp, so a change means the entry was re-bucketed.
+// countPrefix returns the number of RocksDB keys under the given prefix.
+func countPrefix(t *testing.T, s *Storage, prefix []byte) int {
+	t.Helper()
+	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
+	it := s.meta.Handle().NewIterator(ro)
+	defer it.Close()
+	n := 0
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		n++
+		it.Key().Free()
+		it.Value().Free()
+	}
+	return n
+}
+
+func countFifoEntries(t *testing.T, s *Storage) int {
+	return countPrefix(t, s, keys.GetFifoIndexPrefix())
+}
+
+func countAccessBucketEntries(t *testing.T, s *Storage) int {
+	return countPrefix(t, s, GetOldestAccessBucketPrefix())
+}
+
+// readAccessIndex returns the current bucketed access key recorded for a key via
+// the LRU secondary index, or ("", false) if none exists.
 func readAccessIndex(t *testing.T, s *Storage, key string) (string, bool) {
 	t.Helper()
 	ro := metadata.CreateReadOptions(false, false)
 	defer ro.Destroy()
-	idxKey := keys.MakeBucketedAccessIndexKey(key)
-	slice, err := s.meta.Handle().Get(ro, idxKey)
+	slice, err := s.meta.Handle().Get(ro, keys.MakeBucketedAccessIndexKey(key))
 	require.NoError(t, err)
 	defer slice.Free()
 	if !slice.Exists() {
@@ -35,8 +57,8 @@ func readAccessIndex(t *testing.T, s *Storage, key string) (string, bool) {
 }
 
 // TestEvictionPolicyNormalization checks that the policy is defaulted/validated
-// and that the access updater (which exists only to refresh recency on reads) is
-// created for LRU but not for FIFO.
+// and that the access updater (whose only job is to refresh recency on reads for
+// LRU) is created for LRU-with-cap but not for FIFO.
 func TestEvictionPolicyNormalization(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -64,167 +86,110 @@ func TestEvictionPolicyNormalization(t *testing.T) {
 			defer s.Close()
 
 			assert.Equal(t, tc.wantPolicy, s.evictionPolicy)
-			assert.Equal(t, tc.wantUpdater, s.accessUpdater != nil,
-				"accessUpdater presence should track LRU-with-cap")
+			assert.Equal(t, tc.wantUpdater, s.accessUpdater != nil)
 		})
 	}
 }
 
-// TestEvictionPolicyReadBumpBehavior verifies the core mechanism: in LRU a read
-// re-buckets the entry (refreshing recency), while in FIFO a read leaves the
-// entry frozen at its write-time bucket.
-func TestEvictionPolicyReadBumpBehavior(t *testing.T) {
-	newStore := func(policy string) *Storage {
-		s, err := NewStorageWithConfig(&StorageConfig{
-			DiskPath:          t.TempDir(),
-			InlineThreshold:   1 << 20,
-			MaxDiskUsage:      1 << 20, // enable eviction bookkeeping (access index)
-			EvictionPolicy:    policy,
-			AccessUpdateDelay: time.Millisecond, // don't time-gate the read bump
-			CleanupInterval:   time.Hour,
-		})
-		require.NoError(t, err)
-		return s
-	}
-
-	t.Run("lru bumps on read", func(t *testing.T) {
-		s := newStore(EvictionPolicyLRU)
-		defer s.Close()
-
-		require.NoError(t, s.Put("k", bytes.NewReader([]byte("value")), 0))
-		before, ok := readAccessIndex(t, s, "k")
-		require.True(t, ok)
-
-		_, _, err := s.Get("k", 0, 0)
-		require.NoError(t, err)
-		s.FlushAccessUpdates()
-
-		after, ok := readAccessIndex(t, s, "k")
-		require.True(t, ok)
-		assert.NotEqual(t, before, after, "LRU read should re-bucket the entry")
-	})
-
-	t.Run("fifo does not bump on read", func(t *testing.T) {
-		s := newStore(EvictionPolicyFIFO)
-		defer s.Close()
-
-		require.NoError(t, s.Put("k", bytes.NewReader([]byte("value")), 0))
-		before, ok := readAccessIndex(t, s, "k")
-		require.True(t, ok)
-
-		// Multiple reads must not change the entry's write-time bucket.
-		for i := 0; i < 3; i++ {
-			_, _, err := s.Get("k", 0, 0)
-			require.NoError(t, err)
-		}
-		s.FlushAccessUpdates() // no-op in FIFO (updater is nil); harmless
-
-		after, ok := readAccessIndex(t, s, "k")
-		require.True(t, ok)
-		assert.Equal(t, before, after, "FIFO read must leave the write-time bucket unchanged")
-	})
-}
-
-// countAccessBucketEntries returns the number of access-bucket entries currently
-// stored (one is expected per live key).
-func countAccessBucketEntries(t *testing.T, s *Storage) int {
-	t.Helper()
-	ro := metadata.CreateReadOptions(true, false)
-	defer ro.Destroy()
-	it := s.meta.Handle().NewIterator(ro)
-	defer it.Close()
-	prefix := GetOldestAccessBucketPrefix()
-	n := 0
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		n++
-		it.Key().Free()
-		it.Value().Free()
-	}
-	return n
-}
-
-// TestPutOverwriteReplacesAccessEntry verifies that overwriting a key does not
-// leave orphan access-bucket entries: each overwrite removes the previous entry
-// so exactly one remains per live key. Orphans would otherwise make a rewritten
-// key look old to the eviction scan and grow the index with total writes.
-func TestPutOverwriteReplacesAccessEntry(t *testing.T) {
-	for _, policy := range []string{EvictionPolicyLRU, EvictionPolicyFIFO} {
-		t.Run(policy, func(t *testing.T) {
-			s, err := NewStorageWithConfig(&StorageConfig{
-				DiskPath:        t.TempDir(),
-				InlineThreshold: 1 << 20,
-				MaxDiskUsage:    1 << 20,
-				EvictionPolicy:  policy,
-				CleanupInterval: time.Hour,
-			})
-			require.NoError(t, err)
-			defer s.Close()
-
-			require.NoError(t, s.Put("k", bytes.NewReader([]byte("v0")), 0))
-			require.Equal(t, 1, countAccessBucketEntries(t, s))
-
-			for i := 0; i < 5; i++ {
-				require.NoError(t, s.Put("k", bytes.NewReader([]byte(fmt.Sprintf("v%d", i+1))), 0))
-			}
-
-			assert.Equal(t, 1, countAccessBucketEntries(t, s),
-				"overwrites must not leave orphan access-bucket entries")
-
-			// The surviving entry is the current one (matches the secondary index).
-			idx, ok := readAccessIndex(t, s, "k")
-			require.True(t, ok)
-			ro := metadata.CreateReadOptions(true, false)
-			defer ro.Destroy()
-			it := s.meta.Handle().NewIterator(ro)
-			defer it.Close()
-			prefix := GetOldestAccessBucketPrefix()
-			it.Seek(prefix)
-			require.True(t, it.ValidForPrefix(prefix))
-			assert.Equal(t, idx, string(it.Key().Data()),
-				"the single access entry should be the one the secondary index points to")
-		})
-	}
-}
-
-// TestFIFOBackfillsMissingAccessEntries verifies that keys written before a disk
-// cap existed (so they have no access-index entry) are backfilled on FIFO startup
-// and become evictable — otherwise the cap could never reclaim them.
-func TestFIFOBackfillsMissingAccessEntries(t *testing.T) {
-	dir, err := os.MkdirTemp("", "fifo-backfill-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	// Phase 1: no disk cap → Put writes no access-index entries.
-	s1, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath:        dir,
-		InlineThreshold: 1 << 20,
-		MaxDiskUsage:    0,
-		CleanupInterval: time.Hour,
-	})
-	require.NoError(t, err)
-	for i := 0; i < 5; i++ {
-		require.NoError(t, s1.Put(fmt.Sprintf("k%d", i), bytes.NewReader([]byte("v")), 0))
-	}
-	require.Equal(t, 0, countAccessBucketEntries(t, s1), "no cap should mean no access entries")
-	s1.Close()
-
-	// Phase 2: reopen with a cap under FIFO → startup backfill makes every key
-	// visible to the eviction scan.
-	s2, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath:        dir,
+// TestFIFOIndexOnWriteNotOnRead verifies FIFO writes a single !fifo/ index entry
+// per Put, writes no LRU access-bucket entry, and does not touch the index on
+// reads (so a read cannot refresh an entry's write-time position).
+func TestFIFOIndexOnWriteNotOnRead(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
 		InlineThreshold: 1 << 20,
 		MaxDiskUsage:    1 << 20,
 		EvictionPolicy:  EvictionPolicyFIFO,
 		CleanupInterval: time.Hour,
 	})
 	require.NoError(t, err)
-	defer s2.Close()
+	defer s.Close()
 
-	assert.Equal(t, 5, countAccessBucketEntries(t, s2), "all pre-cap keys should be backfilled")
-	for i := 0; i < 5; i++ {
-		_, ok := readAccessIndex(t, s2, fmt.Sprintf("k%d", i))
-		assert.True(t, ok, "k%d should have an access-index entry after backfill", i)
+	require.NoError(t, s.Put("k", bytes.NewReader([]byte("v")), 0))
+	require.Equal(t, 1, countFifoEntries(t, s), "FIFO Put should write one index entry")
+	require.Equal(t, 0, countAccessBucketEntries(t, s), "FIFO must not use the LRU access index")
+
+	before := fifoEntryKey(t, s)
+	for i := 0; i < 3; i++ {
+		_, found, err := s.Get("k", 0, 0)
+		require.NoError(t, err)
+		require.True(t, found)
 	}
+	assert.Equal(t, 1, countFifoEntries(t, s), "reads must not add index entries")
+	assert.Equal(t, before, fifoEntryKey(t, s), "reads must not move the write-time entry")
+}
+
+// fifoEntryKey returns the (single) FIFO index key currently stored.
+func fifoEntryKey(t *testing.T, s *Storage) string {
+	t.Helper()
+	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
+	it := s.meta.Handle().NewIterator(ro)
+	defer it.Close()
+	prefix := keys.GetFifoIndexPrefix()
+	it.Seek(prefix)
+	require.True(t, it.ValidForPrefix(prefix))
+	return string(it.Key().Data())
+}
+
+// TestLRUReadRebucketsEntry is the LRU contrast: a read re-buckets the entry
+// (refreshing recency), which is exactly what FIFO avoids.
+func TestLRUReadRebucketsEntry(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:          t.TempDir(),
+		InlineThreshold:   1 << 20,
+		MaxDiskUsage:      1 << 20,
+		EvictionPolicy:    EvictionPolicyLRU,
+		AccessUpdateDelay: time.Millisecond,
+		CleanupInterval:   time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, s.Put("k", bytes.NewReader([]byte("v")), 0))
+	before, ok := readAccessIndex(t, s, "k")
+	require.True(t, ok)
+
+	_, _, err = s.Get("k", 0, 0)
+	require.NoError(t, err)
+	s.FlushAccessUpdates()
+
+	after, ok := readAccessIndex(t, s, "k")
+	require.True(t, ok)
+	assert.NotEqual(t, before, after, "LRU read should re-bucket the entry")
+	assert.Equal(t, 0, countFifoEntries(t, s), "LRU must not use the FIFO index")
+}
+
+// TestFIFOEvictionReclaimsOrphanIndexEntries verifies the self-cleaning property:
+// a FIFO index entry whose key no longer has metadata (deleted, or superseded by
+// an overwrite) is reclaimed by the eviction scan's existence check.
+func TestFIFOEvictionReclaimsOrphanIndexEntries(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    1 << 20,
+		EvictionPolicy:  EvictionPolicyFIFO,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Deleted key -> orphan entry, reclaimed on scan.
+	require.NoError(t, s.Put("gone", bytes.NewReader([]byte("v")), 0))
+	require.NoError(t, s.DeleteKey("gone"))
+	require.Equal(t, 1, countFifoEntries(t, s), "delete leaves the FIFO entry behind (lazy)")
+
+	// Overwritten key -> two entries; eviction evicts once and reclaims both.
+	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("x"), 100)), 0))
+	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("x"), 100)), 0))
+	require.Equal(t, 3, countFifoEntries(t, s), "orphan + two overwrite entries")
+
+	// A scan reclaims the orphan and evicts the live key (large target).
+	s.cleaner.evictFIFOKeys(1 << 30)
+	assert.Equal(t, 0, countFifoEntries(t, s), "eviction scan must reclaim all stale/live entries")
+	_, found, err := s.Get("k", 0, 0)
+	require.NoError(t, err)
+	assert.False(t, found, "the live key should have been evicted")
 }
 
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:
@@ -254,7 +219,6 @@ func TestFIFOEvictionReadDoesNotProtect(t *testing.T) {
 		require.NoError(t, s.Put(key, bytes.NewReader(bytes.Repeat([]byte("x"), 100)), 0))
 	}
 
-	// Let the initial size baseline settle.
 	time.Sleep(200 * time.Millisecond)
 
 	// Repeatedly read the three oldest keys. Under LRU this would protect them;
@@ -274,7 +238,6 @@ func TestFIFOEvictionReadDoesNotProtect(t *testing.T) {
 		require.NoError(t, s.Put(key, bytes.NewReader(bytes.Repeat([]byte("y"), 100)), 0))
 	}
 
-	// Wait for eviction to run.
 	require.Eventually(t, func() bool {
 		_, evicted := s.CleanerStats()
 		return evicted > 0
@@ -288,11 +251,9 @@ func TestFIFOEvictionReadDoesNotProtect(t *testing.T) {
 		remaining[k] = true
 	}
 
-	// The read oldest keys were NOT protected — they should be evicted.
 	for _, k := range readKeys {
 		assert.False(t, remaining[k], "%s was read but FIFO must still evict it (oldest-written)", k)
 	}
-	// The newest-written keys survive.
 	for i := 0; i < 5; i++ {
 		k := fmt.Sprintf("new-key-%d", i)
 		assert.True(t, remaining[k], "%s is newest-written and should survive FIFO eviction", k)
