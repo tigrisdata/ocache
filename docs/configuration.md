@@ -35,14 +35,13 @@ OCache can be configured through command-line flags when starting the server.
 > read of old data cannot displace hotter data. `fifo` suits write-once workloads
 > (e.g. parquet, where the newest data is read most).
 >
-> Each policy maintains its own eviction index, written as keys are inserted, so
-> **enable the policy and the cap from the start of a deployment.** A key written
-> while `-max-disk-usage` was `0`, or (for `fifo`) before switching from `lru`, is
-> not in the active index and won't be considered for eviction until it is
-> rewritten — the same pre-existing limitation both policies share for un-indexed
-> keys. Under `fifo`, index entries for deleted or overwritten keys are reclaimed
-> lazily by the eviction scan rather than eagerly, so they cost a small amount of
-> extra space until the next eviction pass reaches them.
+> Each policy maintains its own eviction index with a per-key back-reference, so
+> writes, overwrites, deletes, and TTL expiry keep exactly one entry per live key
+> (an overwrite re-indexes the key at its new write time). If you enable the cap
+> or switch to `fifo` on a data directory that already holds keys, those keys are
+> migrated into the `fifo` index once, on the next startup, so the cap is always
+> enforceable; migrated keys are ordered by migration time rather than their
+> original write time (which is not persisted).
 
 ### Cache Configuration
 

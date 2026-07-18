@@ -215,14 +215,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := proto.Unmarshal(value, valueMsg); err != nil {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
-			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-				bucketKey := slice.Data()
-				batch.Delete(bucketKey)
-				slice.Free()
-			}
-			batch.Delete(bucketIndexKey)
+			c.storage.stageEvictionIndexDeletes(batch, ro, key)
 			pendingCleaned++
 			it.Key().Free()
 			it.Value().Free()
@@ -235,14 +228,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
-			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-				bucketKey := slice.Data()
-				batch.Delete(bucketKey)
-				slice.Free()
-			}
-			batch.Delete(bucketIndexKey)
+			c.storage.stageEvictionIndexDeletes(batch, ro, key)
 			pendingCleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 

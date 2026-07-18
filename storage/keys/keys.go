@@ -49,6 +49,13 @@ const (
 	// bumped on reads.
 	// Format: !fifo/<write_time_nano>/<key>
 	FifoIndexPrefix = "!fifo/"
+
+	// FifoBackrefPrefix is the prefix for the FIFO secondary index that maps a
+	// cache key to its current FIFO entry, mirroring the LRU access index's
+	// secondary index. It lets Put/Delete/TTL locate and remove a key's previous
+	// FIFO entry so the index holds exactly one entry per live key.
+	// Format: !fifo_ref/<key> -> !fifo/<nano>/<key>
+	FifoBackrefPrefix = "!fifo_ref/"
 )
 
 // MakeMetadataKey creates a metadata key by adding the metadata prefix to the user key
@@ -238,6 +245,13 @@ func MakeFifoIndexKey(key string, writeTime time.Time) []byte {
 // (oldest first, since the write-time nanos sort lexicographically).
 func GetFifoIndexPrefix() []byte {
 	return []byte(FifoIndexPrefix)
+}
+
+// MakeFifoBackrefKey creates the FIFO secondary-index key mapping a cache key to
+// its current FIFO entry.
+// Format: !fifo_ref/<key>
+func MakeFifoBackrefKey(key string) []byte {
+	return fmt.Appendf(nil, "%s%s", FifoBackrefPrefix, key)
 }
 
 // ParseFifoIndexKey extracts the original user key from a FIFO index key.

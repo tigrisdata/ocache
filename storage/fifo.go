@@ -118,9 +118,10 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 			continue
 		}
 
-		// Evict the key and its index entry.
+		// Evict the key, its FIFO index entry, and its back-reference.
 		batch.Delete(metaKey)
 		batch.Delete(keyBytes)
+		batch.Delete(keys.MakeFifoBackrefKey(originalKey))
 
 		evicted += valueMsg.ValueLength
 		evictedCount++

@@ -160,10 +160,26 @@ func TestLRUReadRebucketsEntry(t *testing.T) {
 	assert.Equal(t, 0, countFifoEntries(t, s), "LRU must not use the FIFO index")
 }
 
-// TestFIFOEvictionReclaimsOrphanIndexEntries verifies the self-cleaning property:
-// a FIFO index entry whose key no longer has metadata (deleted, or superseded by
-// an overwrite) is reclaimed by the eviction scan's existence check.
-func TestFIFOEvictionReclaimsOrphanIndexEntries(t *testing.T) {
+// readFifoBackref returns the FIFO entry the secondary index points to for a
+// key, or ("", false) if none exists.
+func readFifoBackref(t *testing.T, s *Storage, key string) (string, bool) {
+	t.Helper()
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	slice, err := s.meta.Handle().Get(ro, keys.MakeFifoBackrefKey(key))
+	require.NoError(t, err)
+	defer slice.Free()
+	if !slice.Exists() {
+		return "", false
+	}
+	return string(slice.Data()), true
+}
+
+// TestFIFOOverwriteReplacesEntry verifies that overwriting a key deletes its
+// previous FIFO entry (via the back-reference), leaving exactly one entry at the
+// new write time — so a rewritten key is ordered by its latest write, not its
+// first.
+func TestFIFOOverwriteReplacesEntry(t *testing.T) {
 	s, err := NewStorageWithConfig(&StorageConfig{
 		DiskPath:        t.TempDir(),
 		InlineThreshold: 1 << 20,
@@ -174,22 +190,93 @@ func TestFIFOEvictionReclaimsOrphanIndexEntries(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	// Deleted key -> orphan entry, reclaimed on scan.
-	require.NoError(t, s.Put("gone", bytes.NewReader([]byte("v")), 0))
-	require.NoError(t, s.DeleteKey("gone"))
-	require.Equal(t, 1, countFifoEntries(t, s), "delete leaves the FIFO entry behind (lazy)")
+	require.NoError(t, s.Put("k", bytes.NewReader([]byte("v0")), 0))
+	require.Equal(t, 1, countFifoEntries(t, s))
+	e1 := fifoEntryKey(t, s)
+	ref1, ok := readFifoBackref(t, s, "k")
+	require.True(t, ok)
+	assert.Equal(t, e1, ref1, "back-reference should point to the current entry")
 
-	// Overwritten key -> two entries; eviction evicts once and reclaims both.
-	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("x"), 100)), 0))
-	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("x"), 100)), 0))
-	require.Equal(t, 3, countFifoEntries(t, s), "orphan + two overwrite entries")
+	require.NoError(t, s.Put("k", bytes.NewReader([]byte("v1")), 0))
+	assert.Equal(t, 1, countFifoEntries(t, s), "overwrite must not leave a stale entry")
+	e2 := fifoEntryKey(t, s)
+	assert.NotEqual(t, e1, e2, "overwrite should re-index at the new write time")
+	ref2, ok := readFifoBackref(t, s, "k")
+	require.True(t, ok)
+	assert.Equal(t, e2, ref2)
+}
 
-	// A scan reclaims the orphan and evicts the live key (large target).
-	s.cleaner.evictFIFOKeys(1 << 30)
-	assert.Equal(t, 0, countFifoEntries(t, s), "eviction scan must reclaim all stale/live entries")
-	_, found, err := s.Get("k", 0, 0)
+// TestFIFODeleteRemovesEntry verifies that deleting a key removes its FIFO entry
+// and back-reference, so removals don't leak index entries.
+func TestFIFODeleteRemovesEntry(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    1 << 20,
+		EvictionPolicy:  EvictionPolicyFIFO,
+		CleanupInterval: time.Hour,
+	})
 	require.NoError(t, err)
-	assert.False(t, found, "the live key should have been evicted")
+	defer s.Close()
+
+	require.NoError(t, s.Put("k", bytes.NewReader([]byte("v")), 0))
+	require.Equal(t, 1, countFifoEntries(t, s))
+	_, ok := readFifoBackref(t, s, "k")
+	require.True(t, ok)
+
+	require.NoError(t, s.DeleteKey("k"))
+	assert.Equal(t, 0, countFifoEntries(t, s), "delete must remove the FIFO entry")
+	_, ok = readFifoBackref(t, s, "k")
+	assert.False(t, ok, "delete must remove the back-reference")
+}
+
+// TestFIFOBackfillMigratesLegacyKeys verifies that keys written before the FIFO
+// index existed (no cap) are backfilled on the first FIFO+cap startup, once
+// (marker-gated), so they become evictable and the disk cap can be enforced.
+func TestFIFOBackfillMigratesLegacyKeys(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fifo-backfill-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	// Phase 1: no cap -> Put writes no index entries.
+	s1, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath: dir, InlineThreshold: 1 << 20, MaxDiskUsage: 0, CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		require.NoError(t, s1.Put(fmt.Sprintf("k%d", i), bytes.NewReader([]byte("v")), 0))
+	}
+	require.Equal(t, 0, countFifoEntries(t, s1))
+	s1.Close()
+
+	// Phase 2: reopen FIFO+cap -> one-time backfill makes every key evictable.
+	s2, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath: dir, InlineThreshold: 1 << 20, MaxDiskUsage: 1 << 20,
+		EvictionPolicy: EvictionPolicyFIFO, CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 5, countFifoEntries(t, s2), "all pre-cap keys should be backfilled")
+	for i := 0; i < 5; i++ {
+		_, ok := readFifoBackref(t, s2, fmt.Sprintf("k%d", i))
+		assert.True(t, ok, "k%d should have a back-reference after backfill", i)
+	}
+	// The completion marker should be recorded.
+	ro := metadata.CreateReadOptions(false, false)
+	m, err := s2.meta.Handle().Get(ro, []byte(fifoBackfillMarkerKey))
+	require.NoError(t, err)
+	assert.True(t, m.Exists(), "backfill marker should be set")
+	m.Free()
+	ro.Destroy()
+	s2.Close()
+
+	// Phase 3: reopen again -> marker present, no duplication.
+	s3, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath: dir, InlineThreshold: 1 << 20, MaxDiskUsage: 1 << 20,
+		EvictionPolicy: EvictionPolicyFIFO, CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s3.Close()
+	assert.Equal(t, 5, countFifoEntries(t, s3), "reopen must not duplicate entries")
 }
 
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:

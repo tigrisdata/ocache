@@ -327,6 +327,15 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		cleanupInterval = config.CleanupInterval
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
+
+	// Under FIFO, ensure keys that predate the index (written before the cap was
+	// enabled, or under LRU before switching) get an entry so they remain
+	// evictable. Runs at most once per data dir (marker-gated), before eviction
+	// starts; a no-op for a cache that has always run FIFO with the cap set.
+	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyFIFO {
+		s.backfillFifoIndex()
+	}
+
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
@@ -747,19 +756,9 @@ func (s *Storage) DeleteKey(key string) error {
 	wo := grocksdb.NewDefaultWriteOptions()
 	batch := grocksdb.NewWriteBatch()
 
-	// Delete key and its access index in a single batch
+	// Delete key and its eviction-index entries in a single batch
 	batch.Delete(metaKey)
-
-	// Use secondary index to find and delete the bucketed access entry
-	bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-	if slice, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-		// Delete the bucketed entry
-		bucketKey := slice.Data()
-		batch.Delete(bucketKey)
-		slice.Free()
-	}
-	// Delete the secondary index entry
-	batch.Delete(bucketIndexKey)
+	s.stageEvictionIndexDeletes(batch, ro, key)
 
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
@@ -1123,12 +1122,7 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		now := time.Now()
 		switch s.evictionPolicy {
 		case EvictionPolicyFIFO:
-			// FIFO orders by write time, embedded in the index key. The entry is
-			// written once per Put and never bumped on reads. An overwrite simply
-			// adds a second entry at the new time; the older, now-stale one is
-			// reclaimed lazily by the eviction scan's metadata check, so no
-			// read-before-write is needed on the Put path.
-			batch.Put(keys.MakeFifoIndexKey(key, now), []byte{})
+			s.writeFifoIndexEntry(batch, key, now)
 		default: // LRU
 			accessKey := keys.MakeBucketedAccessKey(key, now)
 			batch.Put(accessKey, []byte{})
@@ -1137,6 +1131,147 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	}
 
 	return s.meta.Handle().Write(wo, batch)
+}
+
+// writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
+// now, first deleting any previous entry (on overwrite) via the secondary index
+// so the index holds exactly one entry per live key. The writes are added to
+// batch.
+func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, now time.Time) {
+	backref := keys.MakeFifoBackrefKey(key)
+
+	ro := metadata.CreateReadOptions(false, false)
+	if prev, err := s.meta.Handle().Get(ro, backref); err == nil {
+		if prev.Exists() {
+			batch.Delete(prev.Data()) // previous !fifo/<oldnano>/<key>
+		}
+		prev.Free()
+	}
+	ro.Destroy()
+
+	fifoKey := keys.MakeFifoIndexKey(key, now)
+	batch.Put(fifoKey, []byte{})
+	batch.Put(backref, fifoKey)
+}
+
+// fifoBackfillMarkerKey records that the one-time FIFO index backfill has run for
+// this data directory. It is an internal key (not user metadata) and is skipped
+// by the metadata/eviction scans.
+const fifoBackfillMarkerKey = "!fifo_migrated"
+
+// backfillFifoIndex gives every stored key a FIFO index entry if it lacks one,
+// so a cache that accumulated data before FIFO+cap was enabled (or under LRU
+// before switching) is fully evictable and the disk cap can always be enforced.
+//
+// It runs at most once per data directory: a marker key records completion, so
+// later restarts skip the scan entirely and startup stays O(1) once migrated
+// (every subsequent Put maintains the index inline). Backfilled entries are
+// stamped at the current time — we do not persist original write time — so such
+// legacy keys sort ahead of everything written afterward and evict first.
+func (s *Storage) backfillFifoIndex() {
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+
+	marker := []byte(fifoBackfillMarkerKey)
+	if m, err := s.meta.Handle().Get(ro, marker); err == nil {
+		done := m.Exists()
+		m.Free()
+		if done {
+			return
+		}
+	}
+
+	start := time.Now()
+	it := s.meta.Handle().NewIterator(ro)
+	defer it.Close()
+
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	now := time.Now()
+	backfilled := 0
+
+	flush := func() {
+		if batch.Count() == 0 {
+			return
+		}
+		if err := s.meta.Handle().Write(wo, batch); err != nil {
+			zlog.Error().Err(err).Msg("storage: failed to write fifo backfill batch")
+		}
+		batch.Clear()
+	}
+
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		keyBytes := it.Key().Data()
+		if !keys.IsMetadataKey(keyBytes) {
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+		key := keys.ExtractUserKey(keyBytes)
+		it.Key().Free()
+		it.Value().Free()
+
+		backref := keys.MakeFifoBackrefKey(key)
+		existing, err := s.meta.Handle().Get(ro, backref)
+		if err != nil {
+			zlog.Error().Err(err).Str("key", key).Msg("storage: fifo backfill lookup failed")
+			continue
+		}
+		hasEntry := existing.Exists()
+		existing.Free()
+		if hasEntry {
+			continue
+		}
+
+		fifoKey := keys.MakeFifoIndexKey(key, now)
+		batch.Put(fifoKey, []byte{})
+		batch.Put(backref, fifoKey)
+		backfilled++
+
+		if batch.Count() >= 1000 {
+			flush()
+		}
+	}
+	flush()
+
+	// Record completion so future restarts skip the scan.
+	if err := s.meta.Handle().Put(wo, marker, []byte{1}); err != nil {
+		zlog.Error().Err(err).Msg("storage: failed to write fifo backfill marker")
+	}
+
+	if backfilled > 0 {
+		zlog.Info().
+			Int("backfilled", backfilled).
+			Dur("duration_ms", time.Since(start)).
+			Msg("storage: backfilled FIFO index entries for pre-existing keys")
+	}
+}
+
+// stageEvictionIndexDeletes adds deletes for key's eviction-index entries — the
+// ordered entry and its back-reference — to batch, based on the active policy.
+// ro resolves the current entry via the secondary index. A no-op when eviction
+// is disabled. Used by DeleteKey and the TTL cleaner so removals don't leave
+// stale index entries behind.
+func (s *Storage) stageEvictionIndexDeletes(batch *grocksdb.WriteBatch, ro *grocksdb.ReadOptions, key string) {
+	if s.cleaner == nil || s.cleaner.maxDiskUsage <= 0 {
+		return
+	}
+	var backref []byte
+	if s.evictionPolicy == EvictionPolicyFIFO {
+		backref = keys.MakeFifoBackrefKey(key)
+	} else {
+		backref = keys.MakeBucketedAccessIndexKey(key)
+	}
+	if prev, err := s.meta.Handle().Get(ro, backref); err == nil {
+		if prev.Exists() {
+			batch.Delete(prev.Data())
+		}
+		prev.Free()
+	}
+	batch.Delete(backref)
 }
 
 // CleanerStats returns statistics from the background cleaner
