@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -228,6 +229,48 @@ func TestFIFODeleteRemovesEntry(t *testing.T) {
 	assert.Equal(t, 0, countFifoEntries(t, s), "delete must remove the FIFO entry")
 	_, ok = readFifoBackref(t, s, "k")
 	assert.False(t, ok, "delete must remove the back-reference")
+}
+
+// TestFIFOEvictionSkipsSupersededDuplicateEntry proves the back-reference check:
+// a stale duplicate FIFO entry (as a concurrent overwrite could leave) must be
+// reclaimed rather than evicting its live key at the stale entry's old position.
+func TestFIFOEvictionSkipsSupersededDuplicateEntry(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    1 << 20,
+		EvictionPolicy:  EvictionPolicyFIFO,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	// "victim" is written first (oldest real write); "k" second (newest).
+	require.NoError(t, s.Put("victim", bytes.NewReader(bytes.Repeat([]byte("v"), 100)), 0))
+	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("k"), 100)), 0))
+
+	// Inject a stale duplicate entry for "k", older than everything, WITHOUT
+	// updating k's back-reference — exactly what a concurrent overwrite (or a
+	// failed back-ref lookup during Put) would leave behind.
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	staleEntry := keys.MakeFifoIndexKey("k", time.Now().Add(-time.Hour))
+	require.NoError(t, s.meta.Handle().Put(wo, staleEntry, []byte{}))
+	require.Equal(t, 3, countFifoEntries(t, s), "victim + k + stale-k")
+
+	// Evict ~one key's worth. Oldest-first, the scan hits k's stale entry first.
+	s.cleaner.evictFIFOKeys(50)
+
+	// The stale entry is reclaimed; "victim" (the real oldest write) is evicted;
+	// "k" survives — its stale entry must NOT have evicted it.
+	_, foundK, err := s.Get("k", 0, 0)
+	require.NoError(t, err)
+	assert.True(t, foundK, "k must survive: a stale duplicate entry must not evict the live key")
+	_, foundVictim, err := s.Get("victim", 0, 0)
+	require.NoError(t, err)
+	assert.False(t, foundVictim, "victim (oldest real write) should be evicted")
+
+	assert.Equal(t, 1, countFifoEntries(t, s), "stale + victim entries gone; only k's current entry remains")
 }
 
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:

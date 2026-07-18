@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"bytes"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -19,14 +20,18 @@ import (
 // freed. It walks the FIFO index (!fifo/<write_nano>/<key>), which sorts
 // oldest-first, and for each entry:
 //
-//   - metadata missing  -> the key was deleted, TTL-expired, or superseded by a
-//     later overwrite entry; the index entry is an orphan and is reclaimed here.
+//   - metadata missing -> the key was deleted or TTL-expired; the entry is an
+//     orphan and is reclaimed here.
 //   - metadata present, expired -> left for the TTL cleaner.
-//   - metadata present, live -> evicted (metadata + index entry + backing file).
+//   - metadata present but the back-reference points elsewhere -> this entry is
+//     a superseded duplicate (from a concurrent overwrite, or a Put whose
+//     back-reference lookup failed); reclaim just the entry, keep the key.
+//   - metadata present and the back-reference points here -> the current, live
+//     entry; evict (metadata + index entry + back-reference + backing file).
 //
-// The existence check also reclaims any orphan entries left by a rare race
-// (e.g. a concurrent overwrite). Under normal operation Put/Delete/TTL maintain
-// exactly one entry per live key via the secondary index (see
+// The back-reference check is what makes eviction correct without a per-key
+// lock: a stale duplicate never evicts the freshly-rewritten value. Under normal
+// operation Put/Delete/TTL keep exactly one entry per live key (see
 // writeFifoIndexEntry / stageEvictionIndexDeletes). Returns the number of keys
 // evicted.
 func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
@@ -143,10 +148,36 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 			continue
 		}
 
+		// Verify this entry is the key's current one before evicting. A
+		// concurrent overwrite (Put takes no per-key lock), or a Put whose
+		// back-reference lookup failed, can leave a stale duplicate entry while
+		// the key's metadata and back-reference point at the newer value.
+		// Evicting via the stale (older-timestamped) entry would discard the
+		// freshly-rewritten value at its old position, out of FIFO order. If the
+		// back-reference does not point at this entry, it is superseded: reclaim
+		// just the entry and keep the key.
+		backref := keys.MakeFifoBackrefKey(originalKey)
+		cur, err := c.storage.meta.Handle().Get(ro, backref)
+		if err != nil {
+			// Can't verify — skip rather than risk evicting a live key via a
+			// possibly-stale entry. Retry on the next pass.
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+		superseded := !cur.Exists() || !bytes.Equal(cur.Data(), keyBytes)
+		cur.Free()
+		if superseded {
+			batch.Delete(keyBytes)
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+
 		// Evict the key, its FIFO index entry, and its back-reference.
 		batch.Delete(metaKey)
 		batch.Delete(keyBytes)
-		batch.Delete(keys.MakeFifoBackrefKey(originalKey))
+		batch.Delete(backref)
 
 		evicted += valueMsg.ValueLength
 		evictedCount++
