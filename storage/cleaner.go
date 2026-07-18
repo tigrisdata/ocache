@@ -371,7 +371,11 @@ func (c *Cleaner) enforceDiskLimit() {
 	// Record metrics
 	duration := time.Since(start)
 	metrics.CleanerDuration.WithLabelValues(policy).Observe(float64(duration.Milliseconds()))
-	metrics.LRUEvictions.Add(float64(evicted))
+	// LRUEvictions is LRU-specific; FIFO eviction volume is tracked via the
+	// policy-labeled CleanerKeysDeleted{fifo,disk_limit} / CleanerBytesFreed{fifo}.
+	if !fifo {
+		metrics.LRUEvictions.Add(float64(evicted))
+	}
 }
 
 // UpdateSize updates the tracked total size when keys are added/removed

@@ -328,12 +328,12 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
 
-	// Under FIFO, ensure keys that predate the index (written before the cap was
-	// enabled, or under LRU before switching) get an entry so they remain
-	// evictable. Runs at most once per data dir (marker-gated), before eviction
-	// starts; a no-op for a cache that has always run FIFO with the cap set.
+	// FIFO indexes keys as they are written, so it only evicts keys written after
+	// it is enabled. Warn (cheaply) if this cache already holds keys but the FIFO
+	// index is empty — those keys are not evictable and the cap cannot reclaim
+	// them; FIFO should be enabled from a fresh deployment.
 	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyFIFO {
-		s.backfillFifoIndex()
+		s.warnIfUnindexedForFifo()
 	}
 
 	s.cleaner.Start()
@@ -1154,99 +1154,30 @@ func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, no
 	batch.Put(backref, fifoKey)
 }
 
-// fifoBackfillMarkerKey records that the one-time FIFO index backfill has run for
-// this data directory. It is an internal key (not user metadata) and is skipped
-// by the metadata/eviction scans.
-const fifoBackfillMarkerKey = "!fifo_migrated"
-
-// backfillFifoIndex gives every stored key a FIFO index entry if it lacks one,
-// so a cache that accumulated data before FIFO+cap was enabled (or under LRU
-// before switching) is fully evictable and the disk cap can always be enforced.
-//
-// It runs at most once per data directory: a marker key records completion, so
-// later restarts skip the scan entirely and startup stays O(1) once migrated
-// (every subsequent Put maintains the index inline). Backfilled entries are
-// stamped at the current time — we do not persist original write time — so such
-// legacy keys sort ahead of everything written afterward and evict first.
-func (s *Storage) backfillFifoIndex() {
+// warnIfUnindexedForFifo logs a warning when the data directory already holds
+// keys but the FIFO index is empty — i.e. FIFO+cap was enabled on a cache whose
+// keys predate the index (written before the cap, or under LRU). FIFO only
+// evicts keys written after it is enabled, so such pre-existing keys are not
+// evictable and the disk cap cannot reclaim them. This is an O(1) check (two
+// prefix seeks), not a scan: FIFO is meant to be enabled from a fresh deployment.
+func (s *Storage) warnIfUnindexedForFifo() {
 	ro := metadata.CreateReadOptions(false, false)
 	defer ro.Destroy()
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
 
-	marker := []byte(fifoBackfillMarkerKey)
-	if m, err := s.meta.Handle().Get(ro, marker); err == nil {
-		done := m.Exists()
-		m.Free()
-		if done {
-			return
+	hasAny := func(prefix []byte) bool {
+		it := s.meta.Handle().NewIterator(ro)
+		defer it.Close()
+		it.Seek(prefix)
+		if !it.ValidForPrefix(prefix) {
+			return false
 		}
-	}
-
-	start := time.Now()
-	it := s.meta.Handle().NewIterator(ro)
-	defer it.Close()
-
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
-
-	now := time.Now()
-	backfilled := 0
-
-	flush := func() {
-		if batch.Count() == 0 {
-			return
-		}
-		if err := s.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("storage: failed to write fifo backfill batch")
-		}
-		batch.Clear()
-	}
-
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		keyBytes := it.Key().Data()
-		if !keys.IsMetadataKey(keyBytes) {
-			it.Key().Free()
-			it.Value().Free()
-			continue
-		}
-		key := keys.ExtractUserKey(keyBytes)
 		it.Key().Free()
 		it.Value().Free()
-
-		backref := keys.MakeFifoBackrefKey(key)
-		existing, err := s.meta.Handle().Get(ro, backref)
-		if err != nil {
-			zlog.Error().Err(err).Str("key", key).Msg("storage: fifo backfill lookup failed")
-			continue
-		}
-		hasEntry := existing.Exists()
-		existing.Free()
-		if hasEntry {
-			continue
-		}
-
-		fifoKey := keys.MakeFifoIndexKey(key, now)
-		batch.Put(fifoKey, []byte{})
-		batch.Put(backref, fifoKey)
-		backfilled++
-
-		if batch.Count() >= 1000 {
-			flush()
-		}
-	}
-	flush()
-
-	// Record completion so future restarts skip the scan.
-	if err := s.meta.Handle().Put(wo, marker, []byte{1}); err != nil {
-		zlog.Error().Err(err).Msg("storage: failed to write fifo backfill marker")
+		return true
 	}
 
-	if backfilled > 0 {
-		zlog.Info().
-			Int("backfilled", backfilled).
-			Dur("duration_ms", time.Since(start)).
-			Msg("storage: backfilled FIFO index entries for pre-existing keys")
+	if hasAny([]byte(keys.MetadataPrefix)) && !hasAny(keys.GetFifoIndexPrefix()) {
+		zlog.Warn().Msg("storage: FIFO eviction enabled on a data directory that already holds keys but has an empty FIFO index; those pre-existing keys are not evictable and the disk cap cannot reclaim them. Enable FIFO from a fresh deployment.")
 	}
 }
 
@@ -1256,9 +1187,9 @@ func (s *Storage) backfillFifoIndex() {
 // is disabled. Used by DeleteKey and the TTL cleaner so removals don't leave
 // stale index entries behind.
 func (s *Storage) stageEvictionIndexDeletes(batch *grocksdb.WriteBatch, ro *grocksdb.ReadOptions, key string) {
-	if s.cleaner == nil || s.cleaner.maxDiskUsage <= 0 {
-		return
-	}
+	// Always attempt cleanup, even when the cap is currently disabled: entries may
+	// have been written under a prior capped run, and a stale-key Get simply
+	// misses (a no-op delete), so this never leaks index rows on removal.
 	var backref []byte
 	if s.evictionPolicy == EvictionPolicyFIFO {
 		backref = keys.MakeFifoBackrefKey(key)

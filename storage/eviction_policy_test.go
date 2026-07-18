@@ -230,55 +230,6 @@ func TestFIFODeleteRemovesEntry(t *testing.T) {
 	assert.False(t, ok, "delete must remove the back-reference")
 }
 
-// TestFIFOBackfillMigratesLegacyKeys verifies that keys written before the FIFO
-// index existed (no cap) are backfilled on the first FIFO+cap startup, once
-// (marker-gated), so they become evictable and the disk cap can be enforced.
-func TestFIFOBackfillMigratesLegacyKeys(t *testing.T) {
-	dir, err := os.MkdirTemp("", "fifo-backfill-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	// Phase 1: no cap -> Put writes no index entries.
-	s1, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath: dir, InlineThreshold: 1 << 20, MaxDiskUsage: 0, CleanupInterval: time.Hour,
-	})
-	require.NoError(t, err)
-	for i := 0; i < 5; i++ {
-		require.NoError(t, s1.Put(fmt.Sprintf("k%d", i), bytes.NewReader([]byte("v")), 0))
-	}
-	require.Equal(t, 0, countFifoEntries(t, s1))
-	s1.Close()
-
-	// Phase 2: reopen FIFO+cap -> one-time backfill makes every key evictable.
-	s2, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath: dir, InlineThreshold: 1 << 20, MaxDiskUsage: 1 << 20,
-		EvictionPolicy: EvictionPolicyFIFO, CleanupInterval: time.Hour,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, 5, countFifoEntries(t, s2), "all pre-cap keys should be backfilled")
-	for i := 0; i < 5; i++ {
-		_, ok := readFifoBackref(t, s2, fmt.Sprintf("k%d", i))
-		assert.True(t, ok, "k%d should have a back-reference after backfill", i)
-	}
-	// The completion marker should be recorded.
-	ro := metadata.CreateReadOptions(false, false)
-	m, err := s2.meta.Handle().Get(ro, []byte(fifoBackfillMarkerKey))
-	require.NoError(t, err)
-	assert.True(t, m.Exists(), "backfill marker should be set")
-	m.Free()
-	ro.Destroy()
-	s2.Close()
-
-	// Phase 3: reopen again -> marker present, no duplication.
-	s3, err := NewStorageWithConfig(&StorageConfig{
-		DiskPath: dir, InlineThreshold: 1 << 20, MaxDiskUsage: 1 << 20,
-		EvictionPolicy: EvictionPolicyFIFO, CleanupInterval: time.Hour,
-	})
-	require.NoError(t, err)
-	defer s3.Close()
-	assert.Equal(t, 5, countFifoEntries(t, s3), "reopen must not duplicate entries")
-}
-
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:
 // under FIFO, reading the oldest-written keys does not save them — they are still
 // evicted first, while the newest-written keys survive.

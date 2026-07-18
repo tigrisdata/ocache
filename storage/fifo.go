@@ -24,11 +24,11 @@ import (
 //   - metadata present, expired -> left for the TTL cleaner.
 //   - metadata present, live -> evicted (metadata + index entry + backing file).
 //
-// This existence check is what keeps the index self-cleaning: no separate GC and
-// no read-before-write on the Put path are needed. A key overwritten under FIFO
-// briefly has two index entries; it is evicted at the older position and the
-// newer entry is reclaimed as an orphan on a later pass (a no-op for write-once
-// workloads). Returns the number of keys evicted.
+// The existence check also reclaims any orphan entries left by a rare race
+// (e.g. a concurrent overwrite). Under normal operation Put/Delete/TTL maintain
+// exactly one entry per live key via the secondary index (see
+// writeFifoIndexEntry / stageEvictionIndexDeletes). Returns the number of keys
+// evicted.
 func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 	start := time.Now()
 
@@ -47,6 +47,21 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
+	// commit writes any staged deletes. It must run before every return path,
+	// including shutdown: evicted keys' raw files are queued for deletion
+	// immediately (deletionQueue.Add), so dropping the batched metadata deletes
+	// would leave live metadata pointing at deleted files (the dangling raw-file
+	// class reconciled by #150/#152).
+	commit := func() {
+		if batch.Count() == 0 {
+			return
+		}
+		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
+			zlog.Error().Err(err).Msg("cleaner: failed to write FIFO eviction batch")
+		}
+		batch.Clear()
+	}
+
 	prefix := keys.GetFifoIndexPrefix()
 	zlog.Info().
 		Int64("target_bytes", targetBytes).
@@ -57,6 +72,7 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 		select {
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: FIFO eviction interrupted by shutdown")
+			commit()
 			return evictedCount
 		default:
 		}
@@ -100,9 +116,11 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 
 		valueMsg := &pb.ValueMessage{}
 		if err := proto.Unmarshal(slice.Data(), valueMsg); err != nil {
-			// Corrupt metadata: drop both the metadata and the index entry.
+			// Corrupt metadata: drop the metadata, the index entry, and the
+			// back-reference (which would otherwise dangle).
 			batch.Delete(metaKey)
 			batch.Delete(keyBytes)
+			batch.Delete(keys.MakeFifoBackrefKey(originalKey))
 			slice.Free()
 			it.Key().Free()
 			it.Value().Free()
@@ -144,23 +162,16 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 			select {
 			case <-c.closeCh:
 				zlog.Info().Msg("cleaner: FIFO eviction interrupted by shutdown")
+				commit()
 				return evictedCount
 			default:
 			}
-
-			if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-				zlog.Error().Err(err).Msg("cleaner: failed to write FIFO eviction batch")
-			}
-			batch.Clear()
+			commit()
 		}
 	}
 
 	// Write final batch.
-	if batch.Count() > 0 {
-		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("cleaner: failed to write final FIFO eviction batch")
-		}
-	}
+	commit()
 
 	c.evictedKeys.Add(int64(evictedCount))
 	c.totalSize.Add(-evicted)
