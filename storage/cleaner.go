@@ -302,6 +302,7 @@ func (c *Cleaner) calculateTotalSize() {
 	var totalSize int64
 
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
