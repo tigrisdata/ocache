@@ -28,6 +28,14 @@ OCache can be configured through command-line flags when starting the server.
 | `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, enables eviction                          |
 | `-eviction-policy`   | string | `lru`        | Eviction order when `-max-disk-usage` is set: `lru` (reads refresh recency) or `fifo` (evict oldest-written first; reads do not protect data) |
 
+> **Switching `-eviction-policy` on an existing cache:** the eviction order is
+> derived from a per-key access-time index. Under `lru` a read refreshes that
+> time; under `fifo` it never does. If you restart an existing `lru` cache as
+> `fifo`, entries that were read under `lru` carry their last *access* time (not
+> their write time) until they are next written or evicted, so eviction is not
+> strictly oldest-written-first during that transition. It converges to true FIFO
+> as those entries turn over. New writes are always ordered correctly.
+
 ### Cache Configuration
 
 | Flag                   | Type  | Default    | Description                                           |

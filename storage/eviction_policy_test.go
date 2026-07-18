@@ -125,6 +125,67 @@ func TestEvictionPolicyReadBumpBehavior(t *testing.T) {
 	})
 }
 
+// countAccessBucketEntries returns the number of access-bucket entries currently
+// stored (one is expected per live key).
+func countAccessBucketEntries(t *testing.T, s *Storage) int {
+	t.Helper()
+	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
+	it := s.meta.Handle().NewIterator(ro)
+	defer it.Close()
+	prefix := GetOldestAccessBucketPrefix()
+	n := 0
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		n++
+		it.Key().Free()
+		it.Value().Free()
+	}
+	return n
+}
+
+// TestPutOverwriteReplacesAccessEntry verifies that overwriting a key does not
+// leave orphan access-bucket entries: each overwrite removes the previous entry
+// so exactly one remains per live key. Orphans would otherwise make a rewritten
+// key look old to the eviction scan and grow the index with total writes.
+func TestPutOverwriteReplacesAccessEntry(t *testing.T) {
+	for _, policy := range []string{EvictionPolicyLRU, EvictionPolicyFIFO} {
+		t.Run(policy, func(t *testing.T) {
+			s, err := NewStorageWithConfig(&StorageConfig{
+				DiskPath:        t.TempDir(),
+				InlineThreshold: 1 << 20,
+				MaxDiskUsage:    1 << 20,
+				EvictionPolicy:  policy,
+				CleanupInterval: time.Hour,
+			})
+			require.NoError(t, err)
+			defer s.Close()
+
+			require.NoError(t, s.Put("k", bytes.NewReader([]byte("v0")), 0))
+			require.Equal(t, 1, countAccessBucketEntries(t, s))
+
+			for i := 0; i < 5; i++ {
+				require.NoError(t, s.Put("k", bytes.NewReader([]byte(fmt.Sprintf("v%d", i+1))), 0))
+			}
+
+			assert.Equal(t, 1, countAccessBucketEntries(t, s),
+				"overwrites must not leave orphan access-bucket entries")
+
+			// The surviving entry is the current one (matches the secondary index).
+			idx, ok := readAccessIndex(t, s, "k")
+			require.True(t, ok)
+			ro := metadata.CreateReadOptions(true, false)
+			defer ro.Destroy()
+			it := s.meta.Handle().NewIterator(ro)
+			defer it.Close()
+			prefix := GetOldestAccessBucketPrefix()
+			it.Seek(prefix)
+			require.True(t, it.ValidForPrefix(prefix))
+			assert.Equal(t, idx, string(it.Key().Data()),
+				"the single access entry should be the one the secondary index points to")
+		})
+	}
+}
+
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:
 // under FIFO, reading the oldest-written keys does not save them — they are still
 // evicted first, while the newest-written keys survive.

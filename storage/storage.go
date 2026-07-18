@@ -1115,14 +1115,31 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	metaKey := keys.MakeMetadataKey(key)
 	batch.Put(metaKey, val)
 
-	// Add access time index entry for LRU tracking only if max disk usage is set
+	// Add an access-time index entry for eviction tracking only if a disk cap is
+	// set. The eviction scan walks these entries oldest-first.
 	if s.cleaner.maxDiskUsage > 0 {
 		now := time.Now()
+		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
+
+		// On overwrite, delete the previous access-bucket entry. Below we write a
+		// fresh entry and repoint the secondary index, but the old bucketed key
+		// is not otherwise removed; left behind it stays an orphan that still
+		// resolves to a live key. The eviction scan checks only that the key's
+		// metadata exists (not that the entry is current), so a stale entry makes
+		// a freshly rewritten key look old and get evicted out of order — and the
+		// index would grow with total writes rather than live keys. Deleting it
+		// keeps exactly one access entry per live key, for both LRU and FIFO.
+		ro := metadata.CreateReadOptions(false, false)
+		if prev, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil {
+			if prev.Exists() {
+				batch.Delete(prev.Data())
+			}
+			prev.Free()
+		}
+		ro.Destroy()
+
 		accessKey := keys.MakeBucketedAccessKey(key, now)
 		batch.Put(accessKey, []byte{})
-
-		// Add secondary index entry
-		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 		batch.Put(bucketIndexKey, accessKey)
 	}
 
