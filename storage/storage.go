@@ -352,6 +352,17 @@ func (s *Storage) Close() {
 	}
 }
 
+// TotalSize returns the current logical cache size in bytes: the sum of stored
+// object lengths across all keys. It is maintained live on every write and
+// eviction, so embedders can publish their own gauge without a full rescan.
+// Returns 0 if the cleaner is not initialized.
+func (s *Storage) TotalSize() int64 {
+	if s.cleaner == nil {
+		return 0
+	}
+	return s.cleaner.TotalSize()
+}
+
 // IsClosed returns true if this storage instance has been closed.
 // This can be used to check if it's safe to call other Storage methods.
 func (s *Storage) IsClosed() bool {
