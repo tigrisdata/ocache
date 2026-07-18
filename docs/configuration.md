@@ -38,11 +38,17 @@ OCache can be configured through command-line flags when starting the server.
 > Each policy maintains its own eviction index with a per-key back-reference, so
 > writes, overwrites, deletes, and TTL expiry keep exactly one entry per live key
 > (an overwrite re-indexes the key at its new write time). The index is built as
-> keys are written, so **`fifo` only evicts keys written after it was enabled** —
-> enable `fifo` (and the cap) from a fresh deployment. Enabling it on a data
-> directory that already holds keys, or switching from `lru` in place, leaves
-> those pre-existing keys unindexed and therefore not evictable (the cap cannot
-> reclaim them); ocache logs a warning at startup when it detects this.
+> keys are written, so **choose the policy and cap at deployment time and keep
+> them fixed for the life of the data directory.**
+>
+> - `fifo` only evicts keys written after it was enabled. Enabling it (or the cap)
+>   on a directory that already holds keys leaves those keys unindexed and not
+>   evictable, so the cap cannot reclaim them and eviction thrashes newer keys
+>   trying to reach a target it can never hit. ocache logs a warning at startup
+>   when it detects pre-existing keys with an empty FIFO index.
+> - Switching `-eviction-policy` in place (e.g. `lru`↔`fifo`) is not supported:
+>   each policy only maintains and prunes its own index, so the previous policy's
+>   index rows are never reclaimed. Recreate the data directory instead.
 
 ### Cache Configuration
 

@@ -77,6 +77,13 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 		default:
 		}
 
+		// Bound the in-memory batch. Checked here (not only after an eviction) so
+		// that runs of orphan/corrupt entries — which continue without evicting —
+		// still flush periodically instead of accumulating one giant batch.
+		if batch.Count() >= 1000 {
+			commit()
+		}
+
 		if evicted >= targetBytes {
 			break
 		}
@@ -156,18 +163,6 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 
 		it.Key().Free()
 		it.Value().Free()
-
-		// Write batch periodically to avoid large batches.
-		if batch.Count() >= 1000 {
-			select {
-			case <-c.closeCh:
-				zlog.Info().Msg("cleaner: FIFO eviction interrupted by shutdown")
-				commit()
-				return evictedCount
-			default:
-			}
-			commit()
-		}
 	}
 
 	// Write final batch.

@@ -114,11 +114,12 @@ func (c *Cleaner) cleanupLoop() {
 				c.storage.segmentManager.RefreshMetrics()
 			}
 
-			// Periodically clean up old access buckets regardless of disk limits
-			// to prevent unbounded growth of the access index. This only touches
-			// the LRU access-bucket index; the FIFO index (a separate keyspace) is
-			// never age-pruned — its entries are reclaimed by the eviction scan.
-			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+			// Periodically clean up old access buckets to bound growth of the LRU
+			// access index. Only under LRU: FIFO writes no access-bucket entries,
+			// so the scan would be pure waste, and the FIFO index (a separate
+			// keyspace) is reclaimed by its own eviction scan, not age-pruned.
+			if (c.storage == nil || c.storage.evictionPolicy != EvictionPolicyFIFO) &&
+				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
 			}
@@ -147,7 +148,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
 
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 

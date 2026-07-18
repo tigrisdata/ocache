@@ -717,6 +717,7 @@ func (s *Storage) DeleteKey(key string) error {
 
 	// Get the value to track size changes and file cleanup
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	metaKey := keys.MakeMetadataKey(key)
 	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil {
@@ -754,7 +755,9 @@ func (s *Storage) DeleteKey(key string) error {
 	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
 
 	// Delete key and its eviction-index entries in a single batch
 	batch.Delete(metaKey)
