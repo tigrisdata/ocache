@@ -85,6 +85,21 @@ const (
 	// Default RocksDB configuration
 	DefaultMetadataCacheSize      = metadata.DefaultRocksDBBlockCacheSize
 	DefaultMetadataBackgroundJobs = metadata.DefaultRocksDBMaxBackgroundJobs
+
+	// Eviction policies for StorageConfig.EvictionPolicy (only relevant when
+	// MaxDiskUsage > 0). Each policy maintains its own eviction index:
+	//
+	//   lru  - evict least-recently-accessed first, using the time-bucketed
+	//          access index; a read re-buckets the entry, protecting recently
+	//          -read data.
+	//   fifo - evict oldest-written first, using the dedicated !fifo/ index;
+	//          entries are written once at Put and never touched by reads, so a
+	//          read of old data does not protect it from eviction.
+	EvictionPolicyLRU  = "lru"
+	EvictionPolicyFIFO = "fifo"
+
+	// DefaultEvictionPolicy preserves the historical behavior (LRU).
+	DefaultEvictionPolicy = EvictionPolicyLRU
 )
 
 // StorageConfig holds all configuration parameters for initializing storage
@@ -106,6 +121,7 @@ type StorageConfig struct {
 	AccessUpdateDelay    time.Duration // Access update delay
 	RecoveryWorkers      int           // Number of parallel workers for startup file recovery (<= 0 = default)
 	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
+	EvictionPolicy       string        // Eviction order when MaxDiskUsage > 0: "lru" (default) or "fifo"
 
 	// RocksDB-specific configuration
 	MetadataCacheSize      int64 // RocksDB Block cache size in bytes (0 = use default)
@@ -142,7 +158,8 @@ type Storage struct {
 	deletionQueue    *deletion.Queue       // Centralized file deletion queue
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
-	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking
+	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
+	evictionPolicy   string                // "lru" or "fifo"; governs whether reads refresh access time
 	closed           atomic.Bool           // True when storage has been closed
 }
 
@@ -179,6 +196,18 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 	if config.DeleteBatchSize <= 0 {
 		config.DeleteBatchSize = DefaultDeleteBatchSize
+	}
+	switch config.EvictionPolicy {
+	case "":
+		config.EvictionPolicy = DefaultEvictionPolicy
+	case EvictionPolicyLRU, EvictionPolicyFIFO:
+		// valid
+	default:
+		zlog.Warn().
+			Str("eviction_policy", config.EvictionPolicy).
+			Str("fallback", DefaultEvictionPolicy).
+			Msg("storage: unknown eviction policy, falling back to default")
+		config.EvictionPolicy = DefaultEvictionPolicy
 	}
 
 	// Create the data directory if it doesn't exist
@@ -289,6 +318,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		fdCache:          fdCache,
 		deletionQueue:    deletionQueue,
 		compactor:        compactor,
+		evictionPolicy:   config.EvictionPolicy,
 	}
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
@@ -297,14 +327,29 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		cleanupInterval = config.CleanupInterval
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
+
+	// FIFO indexes keys as they are written, so it only evicts keys written after
+	// it is enabled. Warn (cheaply) if this cache already holds keys but the FIFO
+	// index is empty — those keys are not evictable and the cap cannot reclaim
+	// them; FIFO should be enabled from a fresh deployment.
+	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyFIFO {
+		s.warnIfUnindexedForFifo()
+	}
+
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
 		Int64("max_disk_usage", config.MaxDiskUsage).
-		Msg("storage: started background cleaner with TTL cleanup and LRU eviction")
+		Str("eviction_policy", config.EvictionPolicy).
+		Msg("storage: started background cleaner with TTL cleanup and eviction")
 
-	// Initialize and start the access updater for async LRU tracking only if max disk usage is set
-	if config.MaxDiskUsage > 0 {
+	// Initialize and start the access updater for async LRU tracking. Only
+	// needed when eviction is active (MaxDiskUsage > 0) and the policy is LRU:
+	// its sole job is to refresh an entry's access time on reads. In FIFO mode
+	// reads must not refresh recency, so we leave it nil and the read path skips
+	// the bump — the access index then stays frozen at each entry's write time,
+	// which is exactly the FIFO eviction order.
+	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyLRU {
 		accessUpdateDelay := DefaultAccessUpdateDelay
 		if config.AccessUpdateDelay > 0 {
 			accessUpdateDelay = config.AccessUpdateDelay
@@ -352,6 +397,17 @@ func (s *Storage) Close() {
 	}
 }
 
+// TotalSize returns the current logical cache size in bytes: the sum of stored
+// object lengths across all keys. It is maintained live on every write and
+// eviction, so embedders can publish their own gauge without a full rescan.
+// Returns 0 if the cleaner is not initialized.
+func (s *Storage) TotalSize() int64 {
+	if s.cleaner == nil {
+		return 0
+	}
+	return s.cleaner.TotalSize()
+}
+
 // IsClosed returns true if this storage instance has been closed.
 // This can be used to check if it's safe to call other Storage methods.
 func (s *Storage) IsClosed() bool {
@@ -381,6 +437,7 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	}()
 
 	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -511,6 +568,7 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	}()
 
 	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
 	it := s.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -651,6 +709,26 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	return entries, lastKey, hasMore, nil
 }
 
+// stageFileDeletion reclaims the backing file(s) for a value that is being
+// evicted or deleted. Raw files are queued for asynchronous deletion rather than
+// removed inline: fileManager.Remove's non-blocking TryLock skips a file being
+// read, and callers drop the metadata in the same batch, so a skipped file would
+// be orphaned permanently (no metadata, no compaction entry, no queue entry);
+// the queue retries until the reader releases the lock. Segment references are
+// recorded in the delete index for the segment GC. Inline values have no backing
+// file. Shared by DeleteKey, the TTL cleaner, and disk-limit eviction so all four
+// reclaim paths stay in lockstep.
+func (s *Storage) stageFileDeletion(valueMsg *pb.ValueMessage) {
+	switch valueMsg.ValueType {
+	case pb.ValueType_RAW_FILE:
+		if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
+			zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("storage: failed to queue raw file for deletion")
+		}
+	case pb.ValueType_SEGMENT:
+		s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
+	}
+}
+
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) error {
 	storageType := "unknown"
@@ -661,6 +739,7 @@ func (s *Storage) DeleteKey(key string) error {
 
 	// Get the value to track size changes and file cleanup
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	metaKey := keys.MakeMetadataKey(key)
 	slice, err := s.meta.Handle().Get(ro, metaKey)
 	if err != nil {
@@ -684,35 +763,18 @@ func (s *Storage) DeleteKey(key string) error {
 		// Notify cleaner about size reduction
 		s.notifyDelete(valueMsg.ValueLength)
 
-		// Clean up files if necessary
-		switch valueMsg.ValueType {
-		case pb.ValueType_RAW_FILE:
-			if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-				zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).
-					Msg("storage.DeleteKey: failed to add raw file to deletion queue")
-			}
-		case pb.ValueType_SEGMENT:
-			// Update delete index to track this deletion for future garbage collection
-			s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
-		}
+		// Clean up backing files if necessary
+		s.stageFileDeletion(valueMsg)
 	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
 
-	// Delete key and its access index in a single batch
+	// Delete key and its eviction-index entries in a single batch
 	batch.Delete(metaKey)
-
-	// Use secondary index to find and delete the bucketed access entry
-	bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-	if slice, err := s.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-		// Delete the bucketed entry
-		bucketKey := slice.Data()
-		batch.Delete(bucketKey)
-		slice.Free()
-	}
-	// Delete the secondary index entry
-	batch.Delete(bucketIndexKey)
+	s.stageEvictionIndexDeletes(batch, ro, key)
 
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
@@ -736,6 +798,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
 	ro := metadata.CreateReadOptions(false, true)
+	defer ro.Destroy()
 	metaKey := keys.MakeMetadataKey(key)
 
 	slice, err := s.meta.Handle().Get(ro, metaKey)
@@ -772,7 +835,9 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		return nil, false, nil
 	}
 
-	// Update access time asynchronously for LRU tracking only if max disk usage is set
+	// Refresh access time for LRU tracking. The updater is only present when
+	// eviction is active and the policy is LRU; in FIFO mode it is nil, so reads
+	// deliberately do not bump recency and cannot protect old data from eviction.
 	if s.accessUpdater != nil {
 		s.accessUpdater.UpdateNow(key)
 	}
@@ -1055,7 +1120,9 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
 
 	// If the value is larger than the inline threshold and smaller than the compact threshold,
 	// record it for compaction.
@@ -1068,18 +1135,102 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	metaKey := keys.MakeMetadataKey(key)
 	batch.Put(metaKey, val)
 
-	// Add access time index entry for LRU tracking only if max disk usage is set
+	// Index the key for eviction only if a disk cap is set. Each policy maintains
+	// its own index; the eviction scan walks whichever one applies oldest-first.
 	if s.cleaner.maxDiskUsage > 0 {
 		now := time.Now()
-		accessKey := keys.MakeBucketedAccessKey(key, now)
-		batch.Put(accessKey, []byte{})
-
-		// Add secondary index entry
-		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-		batch.Put(bucketIndexKey, accessKey)
+		switch s.evictionPolicy {
+		case EvictionPolicyFIFO:
+			s.writeFifoIndexEntry(batch, key, now)
+		default: // LRU
+			accessKey := keys.MakeBucketedAccessKey(key, now)
+			batch.Put(accessKey, []byte{})
+			batch.Put(keys.MakeBucketedAccessIndexKey(key), accessKey)
+		}
 	}
 
 	return s.meta.Handle().Write(wo, batch)
+}
+
+// fifoBackrefReadOpts is a shared, read-only ReadOptions for the FIFO
+// back-reference lookup writeFifoIndexEntry performs on every Put. It is created
+// once (fill-cache disabled, matching the other metadata point lookups) and
+// never mutated, so it is safe to share across concurrent Puts and avoids a
+// native malloc/free per write on the FIFO hot path. It intentionally lives for
+// the process lifetime (a single fixed allocation, never Destroy'd).
+var fifoBackrefReadOpts = metadata.CreateReadOptions(false, false)
+
+// writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
+// now, first deleting any previous entry (on overwrite) via the secondary index
+// so the index holds exactly one entry per live key. The writes are added to
+// batch.
+func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, now time.Time) {
+	backref := keys.MakeFifoBackrefKey(key)
+
+	if prev, err := s.meta.Handle().Get(fifoBackrefReadOpts, backref); err == nil {
+		if prev.Exists() {
+			batch.Delete(prev.Data()) // previous !fifo/<oldnano>/<key>
+		}
+		prev.Free()
+	}
+
+	fifoKey := keys.MakeFifoIndexKey(key, now)
+	batch.Put(fifoKey, []byte{})
+	batch.Put(backref, fifoKey)
+}
+
+// warnIfUnindexedForFifo logs a warning when the data directory already holds
+// keys but the FIFO index is empty — i.e. FIFO+cap was enabled on a cache whose
+// keys predate the index (written before the cap, or under LRU). FIFO only
+// evicts keys written after it is enabled, so such pre-existing keys are not
+// evictable and the disk cap cannot reclaim them. This is an O(1) check (two
+// prefix seeks), not a scan: FIFO is meant to be enabled from a fresh deployment.
+//
+// #189 tracks hardening this warning into a refuse-to-start guard, along with
+// the related stale-access-index leak on an LRU->FIFO switch.
+func (s *Storage) warnIfUnindexedForFifo() {
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+
+	hasAny := func(prefix []byte) bool {
+		it := s.meta.Handle().NewIterator(ro)
+		defer it.Close()
+		it.Seek(prefix)
+		if !it.ValidForPrefix(prefix) {
+			return false
+		}
+		it.Key().Free()
+		it.Value().Free()
+		return true
+	}
+
+	if hasAny([]byte(keys.MetadataPrefix)) && !hasAny(keys.GetFifoIndexPrefix()) {
+		zlog.Warn().Msg("storage: FIFO eviction enabled on a data directory that already holds keys but has an empty FIFO index; those pre-existing keys are not evictable and the disk cap cannot reclaim them. Enable FIFO from a fresh deployment.")
+	}
+}
+
+// stageEvictionIndexDeletes adds deletes for key's eviction-index entries — the
+// ordered entry and its back-reference — to batch, based on the active policy.
+// ro resolves the current entry via the secondary index. A no-op when eviction
+// is disabled. Used by DeleteKey and the TTL cleaner so removals don't leave
+// stale index entries behind.
+func (s *Storage) stageEvictionIndexDeletes(batch *grocksdb.WriteBatch, ro *grocksdb.ReadOptions, key string) {
+	// Always attempt cleanup, even when the cap is currently disabled: entries may
+	// have been written under a prior capped run, and a stale-key Get simply
+	// misses (a no-op delete), so this never leaks index rows on removal.
+	var backref []byte
+	if s.evictionPolicy == EvictionPolicyFIFO {
+		backref = keys.MakeFifoBackrefKey(key)
+	} else {
+		backref = keys.MakeBucketedAccessIndexKey(key)
+	}
+	if prev, err := s.meta.Handle().Get(ro, backref); err == nil {
+		if prev.Exists() {
+			batch.Delete(prev.Data())
+		}
+		prev.Free()
+	}
+	batch.Delete(backref)
 }
 
 // CleanerStats returns statistics from the background cleaner

@@ -25,7 +25,43 @@ OCache can be configured through command-line flags when starting the server.
 | `-threshold`         | int    | 65536        | Small object threshold in bytes (64KB). Objects smaller than this are stored in RocksDB          |
 | `-segment-size`      | int64  | 268435456    | Segment size in bytes (256MB) for large object storage                                           |
 | `-compact-threshold` | int64  | 16777216     | Compaction threshold in bytes (16MB). Objects less than this are eligible for segment compaction |
-| `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, uses LRU eviction                         |
+| `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, enables eviction                          |
+| `-eviction-policy`   | string | `lru`        | Eviction order when `-max-disk-usage` is set: `lru` (reads refresh recency) or `fifo` (evict oldest-written first; reads do not protect data) |
+
+> **Eviction policies.** With `-max-disk-usage` set, the cache evicts to stay
+> under the cap. `lru` evicts the least-recently-*accessed* key first — a read
+> refreshes an entry's position, protecting recently-read data. `fifo` evicts the
+> oldest-*written* key first and reads never change an entry's position, so a rare
+> read of old data cannot displace hotter data. `fifo` suits write-once workloads
+> (e.g. parquet, where the newest data is read most).
+>
+> Each policy maintains its own eviction index. Deletes and TTL expiry remove a
+> key's index entry under both. On overwrite they differ: `fifo` deletes the
+> previous entry at write time (via a per-key back-reference), so the index holds
+> exactly one entry per live key; `lru` leaves the previous access-bucket entry as
+> an orphan, reclaimed later by re-access or the periodic bucket prune. In both
+> cases the eviction scan validates each entry against the key's back-reference
+> before acting, so a superseded entry is reclaimed rather than evicting a
+> rewritten key out of order. The index is built as keys are written, so for the
+> cap to cover **all** data, **choose the policy and cap at deployment time.**
+> Changing them later is allowed but only takes effect for data written afterward
+> (see below).
+>
+> - `fifo` only evicts keys written after it was enabled. Keys already present when
+>   `fifo` (or the cap) is enabled are not in the FIFO index, so the disk cap
+>   cannot reclaim them — they remain until rewritten or deleted. If that
+>   pre-existing set already exceeds the cap, eviction cannot bring usage back
+>   under it. ocache logs a warning at startup when it detects pre-existing keys
+>   with an empty FIFO index.
+> - Switching `-eviction-policy` in place (e.g. `lru`↔`fifo`) is supported — reads
+>   and writes stay correct — but each policy maintains only its own index, so data
+>   written under the previous policy is not tracked by the new one. After
+>   switching to `fifo`, keys written before the switch are **not evictable by the
+>   cap** until they are rewritten, and leftover `lru` access-index rows are not
+>   pruned while `fifo` is active (a bounded, one-time metadata overhead). Size the
+>   cap so the untracked set fits under it, or start `fifo` from a fresh deployment
+>   if the cap must cover all data. See
+>   [#189](https://github.com/tigrisdata/ocache/issues/189).
 
 ### Cache Configuration
 

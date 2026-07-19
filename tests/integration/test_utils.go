@@ -29,7 +29,8 @@ type IntegrationTestConfig struct {
 	RecompactionInterval   time.Duration // How often compaction runs
 	CleanupInterval        time.Duration // How often cleanup runs
 	AccessUpdateDelay      time.Duration // How often access time is updated
-	MaxDiskUsage           int64         // Maximum disk usage for LRU eviction
+	MaxDiskUsage           int64         // Maximum disk usage for eviction
+	EvictionPolicy         string        // Eviction policy when MaxDiskUsage > 0: "lru" (default) or "fifo"
 	FDCacheSize            int           // File descriptor cache size
 }
 
@@ -46,6 +47,7 @@ func DefaultIntegrationTestConfig() IntegrationTestConfig {
 		CleanupInterval:        1 * time.Second,        // Fast for testing
 		AccessUpdateDelay:      200 * time.Millisecond, // Default to 200ms for testing
 		MaxDiskUsage:           0,                      // No limit by default
+		EvictionPolicy:         "",                     // Empty => LRU (storage default)
 		FDCacheSize:            100,
 	}
 }
@@ -93,6 +95,7 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 		SegmentSize:          config.SegmentSize,
 		FdCacheSize:          config.FDCacheSize,
 		MaxDiskUsage:         config.MaxDiskUsage,
+		EvictionPolicy:       config.EvictionPolicy,
 		CompactionThreads:    config.CompactionThreads,
 		MinSegmentAge:        config.RecompactMinSegmentAge,
 		MinSegments:          config.RecompactMinSegments,

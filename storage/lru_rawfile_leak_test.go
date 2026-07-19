@@ -17,7 +17,7 @@ import (
 // lands as a *large* raw file (> inlineThreshold makes it a RAW_FILE, >
 // compactThreshold makes it "large": never compacted, so it is reclaimed only
 // by LRU eviction). The background cleaner is disabled so the test drives
-// eviction deterministically via evictLRUKeys.
+// eviction deterministically via evictByIndex(lruEvictionIndex()).
 func leakTestStorage(t *testing.T) (*Storage, func()) {
 	dir := t.TempDir()
 	config := &StorageConfig{
@@ -27,7 +27,7 @@ func leakTestStorage(t *testing.T) (*Storage, func()) {
 		CompactThreshold: 4 * 1024, // > 4KB  → large (never compacted)
 		SegmentSize:      256 * 1024 * 1024,
 		// Disable the periodic TTL/LRU cleaner so the test drives eviction via
-		// evictLRUKeys directly. (0 would mean "use default" — a 1-min interval.)
+		// evictByIndex directly. (0 would mean "use default" — a 1-min interval.)
 		// The deletion queue's own background ProcessBatch still runs; the read
 		// lock the test holds is what gates it, which is exactly what we assert.
 		CleanupInterval: 24 * time.Hour,
@@ -61,7 +61,7 @@ func TestLRUEviction_LockedRawFile_QueuedNotOrphaned(t *testing.T) {
 	// Evict everything. The metadata entry is removed; the still-locked file
 	// must NOT be silently dropped — it must be handed to the deletion queue.
 	cleaner := NewCleaner(s, time.Hour, 1)
-	evicted := cleaner.evictLRUKeys(1 << 30)
+	evicted := cleaner.evictByIndex(lruEvictionIndex(), 1<<30)
 	require.Greater(t, evicted, 0, "the large raw-file key should have been evicted")
 
 	// File survives (it was read-locked) but is now tracked for retry, not lost.

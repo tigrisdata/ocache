@@ -30,13 +30,15 @@ The e2e test suite covers all major functionality of OCache:
 - Validates TTL update on key overwrite
 - Tests concurrent operations with TTL
 
-### 4. LRU Eviction Test (`lru_eviction_test.sh`)
+### 4. Eviction Test (`eviction_test.sh`)
 
-- Tests LRU eviction when disk usage limit is reached
-- Verifies recently accessed keys are retained
-- Tests eviction with mixed object sizes
-- Validates LRU behavior under continuous load
-- Tests interaction between LRU and TTL
+Runs the eviction suite against **both** eviction policies (`lru` and `fifo`):
+
+- Tests eviction when the disk usage limit is reached
+- Protection semantics: under `lru` a read protects a key; under `fifo` a read
+  does not (oldest-written keys evict even after being read)
+- Tests interaction between eviction and TTL expiry
+- Validates data persistence across a restart
 
 ### 5. Compaction Test (`compaction_test.sh`)
 
@@ -63,7 +65,7 @@ make test-e2e
 make test-e2e-concurrent      # Concurrent operations test
 make test-e2e-storage-layers  # Storage layers test
 make test-e2e-ttl             # TTL functionality test
-make test-e2e-lru             # LRU eviction test
+make test-e2e-eviction        # Eviction test (LRU + FIFO)
 make test-e2e-compaction      # Compaction test
 make test-e2e-recompaction    # Recompaction test
 make test-e2e-legacy          # Legacy TTL/LRU test
@@ -72,7 +74,7 @@ make test-e2e-legacy          # Legacy TTL/LRU test
 ./tests/e2e/concurrent_ops_test.sh
 ./tests/e2e/storage_layers_test.sh
 ./tests/e2e/ttl_cleaner_test.sh
-./tests/e2e/lru_eviction_test.sh
+./tests/e2e/eviction_test.sh
 ./tests/e2e/compaction_test.sh
 ./tests/e2e/recompaction_test.sh
 ```

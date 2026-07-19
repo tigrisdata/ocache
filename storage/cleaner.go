@@ -106,9 +106,20 @@ func (c *Cleaner) cleanupLoop() {
 				c.enforceDiskLimit()
 			}
 
-			// Periodically clean up old access buckets regardless of disk limits
-			// to prevent unbounded growth of the access index
-			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+			// Mirror the live totals (maintained on every write/evict) back to the
+			// gauges, so ocache_disk_usage_bytes and the segment gauges track the
+			// current contents instead of reflecting only the value at startup.
+			c.refreshSizeMetrics()
+			if c.storage != nil && c.storage.segmentManager != nil {
+				c.storage.segmentManager.RefreshMetrics()
+			}
+
+			// Periodically clean up old access buckets to bound growth of the LRU
+			// access index. Only under LRU: FIFO writes no access-bucket entries,
+			// so the scan would be pure waste, and the FIFO index (a separate
+			// keyspace) is reclaimed by its own eviction scan, not age-pruned.
+			if c.storage != nil && c.storage.evictionPolicy != EvictionPolicyFIFO &&
+				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
 			}
@@ -122,19 +133,72 @@ func (c *Cleaner) cleanupLoop() {
 // cleanupExpiredKeys scans for and removes expired keys
 func (c *Cleaner) cleanupExpiredKeys() {
 	start := time.Now()
-	cleaned := 0
-	var bytesFreed int64
+
+	// committed* accumulate only entries whose batch was written successfully.
+	// pending* hold the current batch's deletes until it commits, so a failed
+	// Write (which leaves those keys stored) does not drop their bytes from the
+	// live total — otherwise the next run would re-collect and re-subtract them,
+	// skewing TotalSize and disk-limit enforcement.
+	committedCleaned := 0
+	var committedBytes int64
+	pendingCleaned := 0
+	var pendingBytes int64
+	// pendingFiles holds the value metadata of expired keys deleted in the current
+	// batch, so their backing files are reclaimed only after the batch's write
+	// succeeds. Staging file deletion earlier would strand the file (metadata still
+	// live) if the write failed — the dangling raw-file class reconciled by
+	// #150/#152.
+	var pendingFiles []*pb.ValueMessage
 
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
 
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
+
+	// flush writes the current batch and, only on success, promotes the pending
+	// counts to committed. On failure the deletes did not persist, so the
+	// pending counts are discarded rather than committed.
+	//
+	// TTL cleanup deletes entries directly via this batch (bypassing DeleteKey,
+	// where explicit deletes decrement the total), so it must subtract the freed
+	// bytes itself. We do it here, per committed batch, rather than once at the
+	// end: that keeps the live total correct even if the scan returns early on
+	// shutdown after some batches have already persisted. Without it the total
+	// stays inflated by expired-but-collected entries, inflating
+	// ocache_disk_usage_bytes and risking unnecessary LRU eviction in
+	// enforceDiskLimit.
+	flush := func(final bool) {
+		label := "deletion batch"
+		if final {
+			label = "final deletion batch"
+		}
+		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
+			zlog.Error().Err(err).Msgf("cleaner: failed to write %s", label)
+		} else {
+			// Metadata deletes are durable; only now is it safe to reclaim the
+			// backing files.
+			for _, vm := range pendingFiles {
+				c.storage.stageFileDeletion(vm)
+			}
+			committedCleaned += pendingCleaned
+			committedBytes += pendingBytes
+			if pendingBytes > 0 {
+				c.UpdateSize(-pendingBytes)
+			}
+		}
+		pendingCleaned = 0
+		pendingBytes = 0
+		pendingFiles = pendingFiles[:0]
+		batch.Clear()
+	}
 
 	now := time.Now().Unix()
 
@@ -166,15 +230,8 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := proto.Unmarshal(value, valueMsg); err != nil {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
-			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-				bucketKey := slice.Data()
-				batch.Delete(bucketKey)
-				slice.Free()
-			}
-			batch.Delete(bucketIndexKey)
-			cleaned++
+			c.storage.stageEvictionIndexDeletes(batch, ro, key)
+			pendingCleaned++
 			it.Key().Free()
 			it.Value().Free()
 			continue
@@ -186,30 +243,16 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
-			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-				bucketKey := slice.Data()
-				batch.Delete(bucketKey)
-				slice.Free()
-			}
-			batch.Delete(bucketIndexKey)
-			cleaned++
+			c.storage.stageEvictionIndexDeletes(batch, ro, key)
+			pendingCleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
 			// Track bytes freed
-			bytesFreed += valueMsg.ValueLength
+			pendingBytes += valueMsg.ValueLength
 
-			// Queue associated files for deletion
-			switch valueMsg.ValueType {
-			case pb.ValueType_RAW_FILE:
-				if err := c.storage.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-					zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to queue raw file for deletion")
-				}
-			case pb.ValueType_SEGMENT:
-				// Update delete index to track this deletion for future garbage collection
-				c.storage.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
-			}
+			// Defer file reclaim to flush(): the backing file is freed only once
+			// this batch's write succeeds (see pendingFiles), never before.
+			pendingFiles = append(pendingFiles, valueMsg)
 		}
 
 		it.Key().Free()
@@ -225,31 +268,26 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			default:
 			}
 
-			if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-				zlog.Error().Err(err).Msg("cleaner: failed to write deletion batch")
-			}
-			batch.Clear()
+			flush(false)
 		}
 	}
 
 	// Write final batch
 	if batch.Count() > 0 {
-		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("cleaner: failed to write final deletion batch")
-		}
+		flush(true)
 	}
 
-	c.cleanedKeys.Add(int64(cleaned))
+	c.cleanedKeys.Add(int64(committedCleaned))
 
 	// Record metrics
 	duration := time.Since(start)
 	metrics.CleanerDuration.WithLabelValues("ttl").Observe(float64(duration.Milliseconds()))
-	metrics.CleanerKeysDeleted.WithLabelValues("ttl", "expired").Add(float64(cleaned))
-	metrics.CleanerBytesFreed.WithLabelValues("ttl").Add(float64(bytesFreed))
+	metrics.CleanerKeysDeleted.WithLabelValues("ttl", "expired").Add(float64(committedCleaned))
+	metrics.CleanerBytesFreed.WithLabelValues("ttl").Add(float64(committedBytes))
 
 	zlog.Info().
-		Int("cleaned", cleaned).
-		Int64("bytes_freed", bytesFreed).
+		Int("cleaned", committedCleaned).
+		Int64("bytes_freed", committedBytes).
 		Dur("duration_ms", duration).
 		Msg("cleaner: TTL cleanup completed")
 }
@@ -260,6 +298,7 @@ func (c *Cleaner) calculateTotalSize() {
 	var totalSize int64
 
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -294,11 +333,8 @@ func (c *Cleaner) calculateTotalSize() {
 
 	c.totalSize.Store(totalSize)
 
-	// Update disk usage metrics
-	metrics.DiskUsageBytes.WithLabelValues("total").Set(float64(totalSize))
-	if c.maxDiskUsage > 0 {
-		metrics.DiskUsageRatio.Set(float64(totalSize) / float64(c.maxDiskUsage))
-	}
+	// Publish the freshly computed size to the gauges.
+	c.refreshSizeMetrics()
 
 	zlog.Info().
 		Int64("total_size", totalSize).
@@ -317,26 +353,55 @@ func (c *Cleaner) enforceDiskLimit() {
 	targetSize := int64(float64(c.maxDiskUsage) * 0.9) // Target 90% of max
 	needToEvict := currentSize - targetSize
 
-	// Track LRU eviction run
-	metrics.CleanerRuns.WithLabelValues("lru").Inc()
+	fifo := c.storage != nil && c.storage.evictionPolicy == EvictionPolicyFIFO
+
+	idx := lruEvictionIndex()
+	if fifo {
+		idx = fifoEvictionIndex()
+	}
+	policy := idx.policy
+
+	// Track eviction run
+	metrics.CleanerRuns.WithLabelValues(policy).Inc()
 
 	zlog.Info().
 		Int64("current", currentSize).
 		Int64("max", c.maxDiskUsage).
 		Int64("need_to_evict", needToEvict).
-		Msg("cleaner: enforcing disk usage limit with LRU eviction")
+		Str("policy", policy).
+		Msg("cleaner: enforcing disk usage limit")
 
-	evicted := c.evictLRUKeys(needToEvict)
+	evicted := c.evictByIndex(idx, needToEvict)
 
 	// Record metrics
 	duration := time.Since(start)
-	metrics.CleanerDuration.WithLabelValues("lru").Observe(float64(duration.Milliseconds()))
-	metrics.LRUEvictions.Add(float64(evicted))
+	metrics.CleanerDuration.WithLabelValues(policy).Observe(float64(duration.Milliseconds()))
+	// LRUEvictions is LRU-specific; FIFO eviction volume is tracked via the
+	// policy-labeled CleanerKeysDeleted{fifo,disk_limit} / CleanerBytesFreed{fifo}.
+	if !fifo {
+		metrics.LRUEvictions.Add(float64(evicted))
+	}
 }
 
 // UpdateSize updates the tracked total size when keys are added/removed
 func (c *Cleaner) UpdateSize(delta int64) {
 	c.totalSize.Add(delta)
+}
+
+// refreshSizeMetrics publishes the current tracked total size to the disk-usage
+// gauges. Cheap (reads an atomic) and safe to call on every cleaner tick.
+func (c *Cleaner) refreshSizeMetrics() {
+	total := c.totalSize.Load()
+	metrics.DiskUsageBytes.WithLabelValues("total").Set(float64(total))
+	if c.maxDiskUsage > 0 {
+		metrics.DiskUsageRatio.Set(float64(total) / float64(c.maxDiskUsage))
+	}
+}
+
+// TotalSize returns the current tracked logical cache size in bytes (sum of
+// stored object lengths), maintained live on every write and eviction.
+func (c *Cleaner) TotalSize() int64 {
+	return c.totalSize.Load()
 }
 
 // WaitForInitialization waits until the cleaner has completed its initial size calculation

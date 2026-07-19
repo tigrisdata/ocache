@@ -184,6 +184,78 @@ func (s *CleanerSuite) Test_CleanerLoop_LRUEviction() {
 	require.LessOrEqual(t, oldKeysFound, 2, "Most old keys should be evicted")
 }
 
+// Test_CleanerLoop_FIFOEviction tests FIFO eviction when disk usage exceeds the
+// limit: the oldest-WRITTEN objects are evicted first, and — unlike LRU — reading
+// an old object does NOT protect it from eviction.
+func (s *CleanerSuite) Test_CleanerLoop_FIFOEviction() {
+	t := s.T()
+
+	// Re-create harness with a low disk limit and the FIFO policy.
+	s.Harness.Cleanup()
+	config := DefaultIntegrationTestConfig()
+	config.CleanupInterval = 200 * time.Millisecond
+	config.MaxDiskUsage = 100 * 1024 // 100KB limit
+	config.EvictionPolicy = storage.EvictionPolicyFIFO
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(t, config)
+
+	// Store objects in order; write order == FIFO order (oldest-written first).
+	numObjects := 50
+	keys := make([]string, numObjects)
+	objectSize := int64(5 * 1024) // 5KB each, total 250KB (exceeds 100KB limit)
+
+	t.Log("Storing 50 objects (5KB each) in order to trigger FIFO eviction")
+	for i := 0; i < numObjects; i++ {
+		key := fmt.Sprintf("fifo-evict-%d", i)
+		keys[i] = key
+		data := GenerateRandomData(objectSize)
+		err := s.Harness.PutObject(key, data, 0) // No TTL
+		require.NoError(t, err, "Failed to store object %d", i)
+	}
+
+	// Repeatedly read the oldest-written keys. Under LRU this would protect them;
+	// under FIFO it must NOT — they are still the oldest-written and evict first.
+	t.Log("Reading the oldest-written keys (must not protect them under FIFO)")
+	for r := 0; r < 3; r++ {
+		for i := 0; i < 10; i++ {
+			_, _ = s.Harness.GetObject(keys[i])
+		}
+	}
+
+	// Wait for FIFO eviction to trigger.
+	t.Log("Waiting for FIFO eviction to reduce disk usage...")
+	time.Sleep(3 * time.Second)
+
+	finalStats := s.Harness.GetStorageStats()
+	t.Logf("Final storage - Keys: %d, Evicted: %d, Disk usage: %d bytes",
+		finalStats.TotalKeys, finalStats.EvictedKeys, finalStats.DiskUsage)
+	require.Greater(t, finalStats.EvictedKeys, int64(0),
+		"Expected keys to be evicted due to disk limit")
+
+	// The oldest-written keys (which we also read) should be evicted.
+	oldEvicted := 0
+	for i := 0; i < 10; i++ {
+		if _, err := s.Harness.GetObject(keys[i]); err != nil {
+			oldEvicted++
+		}
+	}
+	require.GreaterOrEqual(t, oldEvicted, 8,
+		"Oldest-written keys should be evicted even though they were read (FIFO ignores reads)")
+
+	// The newest-written keys should be retained.
+	recentRetained := 0
+	for i := 40; i < 50; i++ {
+		if _, err := s.Harness.GetObject(keys[i]); err == nil {
+			recentRetained++
+		}
+	}
+	require.GreaterOrEqual(t, recentRetained, 8,
+		"Newest-written keys should be retained under FIFO")
+
+	t.Logf("FIFO eviction - oldest (also read) evicted: %d/10, newest retained: %d/10",
+		oldEvicted, recentRetained)
+}
+
 // Test_CleanerLoop_MixedWorkload tests cleaner with mixed TTL/LRU workload
 func (s *CleanerSuite) Test_CleanerLoop_MixedWorkload() {
 	t := s.T()

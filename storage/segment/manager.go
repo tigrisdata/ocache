@@ -461,6 +461,30 @@ func (sm *Manager) GetSegmentCount() int {
 	return len(sm.segments)
 }
 
+// RefreshMetrics publishes the current segment count and total segment size to
+// the gauges. Called periodically (e.g. from the cleaner tick) so the segment
+// gauges track live contents rather than only the value at startup.
+func (sm *Manager) RefreshMetrics() {
+	// Snapshot the segment set under sm.mu, then release it before reading each
+	// segment's size. s.size is guarded by the segment's own mutex (writers
+	// update it under s.mu during compaction), so we read it via GetSize().
+	// Taking sm.mu and seg.mu at the same time would nest the two locks; the
+	// snapshot avoids holding sm.mu across GetSize() entirely, so there is no
+	// lock-ordering coupling with segment finalization to reason about.
+	sm.mu.RLock()
+	segs := make([]*Segment, len(sm.segments))
+	copy(segs, sm.segments)
+	sm.mu.RUnlock()
+
+	var totalSize int64
+	for _, s := range segs {
+		totalSize += s.GetSize()
+	}
+
+	metrics.SegmentCount.Set(float64(len(segs)))
+	metrics.SegmentSize.Set(float64(totalSize))
+}
+
 // GetFragmentationRatio calculates the fragmentation ratio for a segment
 // Returns the ratio of dead space to total segment size (0.0 to 1.0)
 func (sm *Manager) GetFragmentationRatio(segmentPath string, deletedBytes int64) float64 {
