@@ -118,7 +118,7 @@ func (c *Cleaner) cleanupLoop() {
 			// access index. Only under LRU: FIFO writes no access-bucket entries,
 			// so the scan would be pure waste, and the FIFO index (a separate
 			// keyspace) is reclaimed by its own eviction scan, not age-pruned.
-			if (c.storage == nil || c.storage.evictionPolicy != EvictionPolicyFIFO) &&
+			if c.storage != nil && c.storage.evictionPolicy != EvictionPolicyFIFO &&
 				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
