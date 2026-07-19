@@ -150,8 +150,8 @@ jobs:
       - name: Run TTL functionality E2E test
         run: STATIC_BUILD=true make test-e2e-ttl
 
-      - name: Run LRU eviction E2E test
-        run: STATIC_BUILD=true make test-e2e-lru
+      - name: Run eviction E2E test (LRU + FIFO)
+        run: STATIC_BUILD=true make test-e2e-eviction
 
       - name: Run compaction E2E test
         run: STATIC_BUILD=true make test-e2e-compaction

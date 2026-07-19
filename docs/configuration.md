@@ -35,11 +35,15 @@ OCache can be configured through command-line flags when starting the server.
 > read of old data cannot displace hotter data. `fifo` suits write-once workloads
 > (e.g. parquet, where the newest data is read most).
 >
-> Each policy maintains its own eviction index with a per-key back-reference, so
-> writes, overwrites, deletes, and TTL expiry keep exactly one entry per live key
-> (an overwrite re-indexes the key at its new write time). The index is built as
-> keys are written, so **choose the policy and cap at deployment time and keep
-> them fixed for the life of the data directory.**
+> Each policy maintains its own eviction index. Deletes and TTL expiry remove a
+> key's index entry under both policies. On overwrite they differ: under `fifo`
+> the previous entry is deleted (via a per-key back-reference) so the index holds
+> exactly one entry per live key and a rewritten key is ordered by its latest
+> write; under `lru` an overwrite leaves the previous access-bucket entry behind
+> (reclaimed later by re-access or the periodic bucket prune), unchanged from the
+> behavior without this flag. The index is built as keys are written, so **choose
+> the policy and cap at deployment time and keep them fixed for the life of the
+> data directory.**
 >
 > - `fifo` only evicts keys written after it was enabled. Enabling it (or the cap)
 >   on a directory that already holds keys leaves those keys unindexed and not
