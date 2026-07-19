@@ -238,16 +238,8 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			// Track bytes freed
 			pendingBytes += valueMsg.ValueLength
 
-			// Queue associated files for deletion
-			switch valueMsg.ValueType {
-			case pb.ValueType_RAW_FILE:
-				if err := c.storage.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-					zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to queue raw file for deletion")
-				}
-			case pb.ValueType_SEGMENT:
-				// Update delete index to track this deletion for future garbage collection
-				c.storage.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
-			}
+			// Reclaim the backing file(s).
+			c.storage.stageFileDeletion(valueMsg)
 		}
 
 		it.Key().Free()
@@ -350,10 +342,11 @@ func (c *Cleaner) enforceDiskLimit() {
 
 	fifo := c.storage != nil && c.storage.evictionPolicy == EvictionPolicyFIFO
 
-	policy := EvictionPolicyLRU
+	idx := lruEvictionIndex()
 	if fifo {
-		policy = EvictionPolicyFIFO
+		idx = fifoEvictionIndex()
 	}
+	policy := idx.policy
 
 	// Track eviction run
 	metrics.CleanerRuns.WithLabelValues(policy).Inc()
@@ -365,12 +358,7 @@ func (c *Cleaner) enforceDiskLimit() {
 		Str("policy", policy).
 		Msg("cleaner: enforcing disk usage limit")
 
-	var evicted int
-	if fifo {
-		evicted = c.evictFIFOKeys(needToEvict)
-	} else {
-		evicted = c.evictLRUKeys(needToEvict)
-	}
+	evicted := c.evictByIndex(idx, needToEvict)
 
 	// Record metrics
 	duration := time.Since(start)

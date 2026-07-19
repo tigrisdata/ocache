@@ -709,6 +709,26 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	return entries, lastKey, hasMore, nil
 }
 
+// stageFileDeletion reclaims the backing file(s) for a value that is being
+// evicted or deleted. Raw files are queued for asynchronous deletion rather than
+// removed inline: fileManager.Remove's non-blocking TryLock skips a file being
+// read, and callers drop the metadata in the same batch, so a skipped file would
+// be orphaned permanently (no metadata, no compaction entry, no queue entry);
+// the queue retries until the reader releases the lock. Segment references are
+// recorded in the delete index for the segment GC. Inline values have no backing
+// file. Shared by DeleteKey, the TTL cleaner, and disk-limit eviction so all four
+// reclaim paths stay in lockstep.
+func (s *Storage) stageFileDeletion(valueMsg *pb.ValueMessage) {
+	switch valueMsg.ValueType {
+	case pb.ValueType_RAW_FILE:
+		if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
+			zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("storage: failed to queue raw file for deletion")
+		}
+	case pb.ValueType_SEGMENT:
+		s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
+	}
+}
+
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) error {
 	storageType := "unknown"
@@ -743,17 +763,8 @@ func (s *Storage) DeleteKey(key string) error {
 		// Notify cleaner about size reduction
 		s.notifyDelete(valueMsg.ValueLength)
 
-		// Clean up files if necessary
-		switch valueMsg.ValueType {
-		case pb.ValueType_RAW_FILE:
-			if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-				zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).
-					Msg("storage.DeleteKey: failed to add raw file to deletion queue")
-			}
-		case pb.ValueType_SEGMENT:
-			// Update delete index to track this deletion for future garbage collection
-			s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
-		}
+		// Clean up backing files if necessary
+		s.stageFileDeletion(valueMsg)
 	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -1141,6 +1152,14 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	return s.meta.Handle().Write(wo, batch)
 }
 
+// fifoBackrefReadOpts is a shared, read-only ReadOptions for the FIFO
+// back-reference lookup writeFifoIndexEntry performs on every Put. It is created
+// once (fill-cache disabled, matching the other metadata point lookups) and
+// never mutated, so it is safe to share across concurrent Puts and avoids a
+// native malloc/free per write on the FIFO hot path. It intentionally lives for
+// the process lifetime (a single fixed allocation, never Destroy'd).
+var fifoBackrefReadOpts = metadata.CreateReadOptions(false, false)
+
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
 // now, first deleting any previous entry (on overwrite) via the secondary index
 // so the index holds exactly one entry per live key. The writes are added to
@@ -1148,14 +1167,12 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, now time.Time) {
 	backref := keys.MakeFifoBackrefKey(key)
 
-	ro := metadata.CreateReadOptions(false, false)
-	if prev, err := s.meta.Handle().Get(ro, backref); err == nil {
+	if prev, err := s.meta.Handle().Get(fifoBackrefReadOpts, backref); err == nil {
 		if prev.Exists() {
 			batch.Delete(prev.Data()) // previous !fifo/<oldnano>/<key>
 		}
 		prev.Free()
 	}
-	ro.Destroy()
 
 	fifoKey := keys.MakeFifoIndexKey(key, now)
 	batch.Put(fifoKey, []byte{})
@@ -1168,6 +1185,9 @@ func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, no
 // evicts keys written after it is enabled, so such pre-existing keys are not
 // evictable and the disk cap cannot reclaim them. This is an O(1) check (two
 // prefix seeks), not a scan: FIFO is meant to be enabled from a fresh deployment.
+//
+// #189 tracks hardening this warning into a refuse-to-start guard, along with
+// the related stale-access-index leak on an LRU->FIFO switch.
 func (s *Storage) warnIfUnindexedForFifo() {
 	ro := metadata.CreateReadOptions(false, false)
 	defer ro.Destroy()

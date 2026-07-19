@@ -259,7 +259,7 @@ func TestFIFOEvictionSkipsSupersededDuplicateEntry(t *testing.T) {
 	require.Equal(t, 3, countFifoEntries(t, s), "victim + k + stale-k")
 
 	// Evict ~one key's worth. Oldest-first, the scan hits k's stale entry first.
-	s.cleaner.evictFIFOKeys(50)
+	s.cleaner.evictByIndex(fifoEvictionIndex(), 50)
 
 	// The stale entry is reclaimed; "victim" (the real oldest write) is evicted;
 	// "k" survives — its stale entry must NOT have evicted it.
@@ -299,7 +299,7 @@ func TestFIFOEvictionEvictsWhenBackrefAbsent(t *testing.T) {
 	_, ok := readFifoBackref(t, s, "k")
 	require.False(t, ok, "back-reference should be absent")
 
-	s.cleaner.evictFIFOKeys(1 << 30)
+	s.cleaner.evictByIndex(fifoEvictionIndex(), 1<<30)
 
 	_, found, err := s.Get("k", 0, 0)
 	require.NoError(t, err)
@@ -335,7 +335,7 @@ func TestLRUEvictionSkipsSupersededDuplicateEntry(t *testing.T) {
 	require.Equal(t, 3, countAccessBucketEntries(t, s), "victim + k + stale-k")
 
 	// Evict ~one key's worth. Oldest-first, the scan hits k's stale entry first.
-	s.cleaner.evictLRUKeys(50)
+	s.cleaner.evictByIndex(lruEvictionIndex(), 50)
 
 	_, foundK, err := s.Get("k", 0, 0)
 	require.NoError(t, err)
