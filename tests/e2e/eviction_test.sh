@@ -85,16 +85,30 @@ run_eviction_suite() {
 
     # Read the OLDEST keys (1-5) under both policies. Under LRU this refreshes
     # them so they survive; under FIFO it must NOT protect them.
-    echo "Reading oldest keys (1-5)..."
+    #
+    # The read MUST succeed for LRU to bump the key's recency: access buckets are
+    # hourly, so eviction order within the bucket is purely by nanosecond, and an
+    # un-bumped key stays at its (oldest) write position and is evicted first.
+    # A silently-failed read (busy CI runner, cold CLI) therefore leaves the key
+    # unprotected and flakes this check. Retry each read until it actually
+    # succeeds so the bump is genuinely triggered.
+    echo "Reading oldest keys (1-5) to refresh their LRU recency..."
     for i in $(seq 1 5); do
-        ./ocachecli get "order-key-${i}" >/dev/null 2>&1 || true
+        for attempt in $(seq 1 10); do
+            if ./ocachecli get "order-key-${i}" >/dev/null 2>&1; then
+                break
+            fi
+            [ "$attempt" -eq 10 ] && echo "WARN: read of order-key-${i} never succeeded"
+            sleep 0.5
+        done
     done
 
-    # LRU updates access time asynchronously (buffered, flushed ~every second),
-    # so wait for the read-bumps to persist before triggering eviction —
-    # otherwise eviction may run against stale access times and this check races.
+    # LRU updates access time asynchronously (buffered, flushed ~every second via
+    # DefaultAccessUpdateInterval), so wait for the read-bumps to persist before
+    # triggering eviction — otherwise eviction may run against stale access times
+    # and this check races. Wait several flush intervals for CI headroom.
     echo "Waiting for access-time updates to flush..."
-    sleep 5
+    sleep 8
 
     # Phase 2: push well over the cap (10 more keys -> 60KB total) to force
     # eviction of ~8 keys. There are 15 un-read keys (6-20) to absorb that, so
