@@ -76,81 +76,103 @@ run_eviction_suite() {
     echo "=== [${policy}] Test 2: Protection semantics ==="
     # Phase 1: fill UNDER the 50KB cap (20 keys x 2KB = 40KB) so nothing is
     # evicted yet — otherwise eviction would fire before we read the oldest keys.
+    # Writes are retried until they succeed: a silently-dropped setup write would
+    # leave a key absent, skewing both the eviction dynamics and the survivor
+    # count below.
     echo "Adding 20 keys in order (order-key-1 oldest .. order-key-20 newest), under the cap..."
+    setup_ok=true
     for i in $(seq 1 20); do
         VALUE=$(generate_random_data 2000)
-        ./ocachecli put "order-key-${i}" "$VALUE" >/dev/null 2>&1 || true
+        wrote=false
+        for attempt in $(seq 1 5); do
+            if ./ocachecli put "order-key-${i}" "$VALUE" >/dev/null 2>&1; then
+                wrote=true
+                break
+            fi
+            sleep 0.3
+        done
+        [ "$wrote" = true ] || { setup_ok=false; echo "WARN: write of order-key-${i} failed"; }
         sleep 0.05
     done
 
     # Read the OLDEST keys (1-5) under both policies. Under LRU this refreshes
     # them so they survive; under FIFO it must NOT protect them.
     #
-    # The read MUST succeed for LRU to bump the key's recency: access buckets are
-    # hourly, so eviction order within the bucket is purely by nanosecond, and an
-    # un-bumped key stays at its (oldest) write position and is evicted first.
-    # A silently-failed read (busy CI runner, cold CLI) therefore leaves the key
-    # unprotected and flakes this check. Retry each read until it actually
-    # succeeds so the bump is genuinely triggered.
+    # The read must return DATA for LRU to bump recency: the server refreshes
+    # access time only AFTER the key is found, access buckets are hourly, and
+    # eviction order within a bucket is purely by nanosecond — so an un-bumped key
+    # stays at its (oldest) write position and is evicted first. `ocachecli get`
+    # exits non-zero and prints nothing on a miss, so retry until it both succeeds
+    # AND returns a non-empty value; that proves the key was actually read (bump
+    # triggered), not a silent miss counting as success.
     echo "Reading oldest keys (1-5) to refresh their LRU recency..."
     for i in $(seq 1 5); do
+        read_ok=false
         for attempt in $(seq 1 10); do
-            if ./ocachecli get "order-key-${i}" >/dev/null 2>&1; then
+            if val=$(./ocachecli get "order-key-${i}" 2>/dev/null) && [ -n "$val" ]; then
+                read_ok=true
                 break
             fi
-            [ "$attempt" -eq 10 ] && echo "WARN: read of order-key-${i} never succeeded"
             sleep 0.5
         done
+        [ "$read_ok" = true ] || { setup_ok=false; echo "WARN: read of order-key-${i} never returned data"; }
     done
 
-    # LRU updates access time asynchronously (buffered, flushed ~every second via
-    # DefaultAccessUpdateInterval), so wait for the read-bumps to persist before
-    # triggering eviction — otherwise eviction may run against stale access times
-    # and this check races. Wait several flush intervals for CI headroom.
-    echo "Waiting for access-time updates to flush..."
-    sleep 8
-
-    # Phase 2: push well over the cap (10 more keys -> 60KB total) to force
-    # eviction of ~8 keys. There are 15 un-read keys (6-20) to absorb that, so
-    # under LRU the read keys (1-5) are safe; under FIFO the oldest-written (1-5)
-    # go regardless of the read.
-    echo "Adding 10 more keys (21-30) to trigger eviction..."
-    for i in $(seq 21 30); do
-        VALUE=$(generate_random_data 2000)
-        ./ocachecli put "order-key-${i}" "$VALUE" >/dev/null 2>&1 || true
-    done
-
-    echo "Waiting for eviction..."
-    sleep 10
-
-    # Newest-written keys (26-30) survive under both policies.
-    NEWEST_EXISTS=0
-    for i in $(seq 26 30); do
-        ./ocachecli get "order-key-${i}" >/dev/null 2>&1 && NEWEST_EXISTS=$((NEWEST_EXISTS + 1)) || true
-    done
-    # The oldest keys we READ (1-5).
-    READ_OLD_EXISTS=0
-    for i in $(seq 1 5); do
-        ./ocachecli get "order-key-${i}" >/dev/null 2>&1 && READ_OLD_EXISTS=$((READ_OLD_EXISTS + 1)) || true
-    done
-
-    echo "Newest keys (26-30) surviving: $NEWEST_EXISTS/5"
-    echo "Read-oldest keys (1-5) surviving: $READ_OLD_EXISTS/5"
-
-    if [ "$policy" = "lru" ]; then
-        # LRU: the oldest keys we read should be protected (mostly survive).
-        if [ "$NEWEST_EXISTS" -ge 3 ] && [ "$READ_OLD_EXISTS" -ge 3 ]; then
-            pass_test "RESULT_${policy}_protection" "[lru] Reads protected the accessed keys"
-        else
-            fail_test "RESULT_${policy}_protection" "[lru] Reads did not protect accessed keys (read-old survived=$READ_OLD_EXISTS)"
-        fi
+    if [ "$setup_ok" != true ]; then
+        # A failed setup write/read makes the protection assertion meaningless (the
+        # key is absent or was never really read, so it cannot be protected). Fail
+        # with a clear cause instead of misattributing it to an eviction bug.
+        fail_test "RESULT_${policy}_protection" "[${policy}] setup could not reliably write/read the order keys; protection check inconclusive"
     else
-        # FIFO: the oldest keys we read must NOT be protected (mostly evicted),
-        # while the newest-written survive.
-        if [ "$NEWEST_EXISTS" -ge 3 ] && [ "$READ_OLD_EXISTS" -le 2 ]; then
-            pass_test "RESULT_${policy}_protection" "[fifo] Reads did not protect oldest-written keys (evicted despite being read)"
+        # LRU updates access time asynchronously (buffered, flushed ~every second
+        # via DefaultAccessUpdateInterval), so wait for the read-bumps to persist
+        # before triggering eviction — otherwise eviction runs against stale access
+        # times and this races. Wait several flush intervals for CI headroom.
+        echo "Waiting for access-time updates to flush..."
+        sleep 8
+
+        # Phase 2: push well over the cap (10 more keys -> 60KB total) to force
+        # eviction of ~8 keys. There are 15 un-read keys (6-20) to absorb that, so
+        # under LRU the read keys (1-5) are safe; under FIFO the oldest-written
+        # (1-5) go regardless of the read.
+        echo "Adding 10 more keys (21-30) to trigger eviction..."
+        for i in $(seq 21 30); do
+            VALUE=$(generate_random_data 2000)
+            ./ocachecli put "order-key-${i}" "$VALUE" >/dev/null 2>&1 || true
+        done
+
+        echo "Waiting for eviction..."
+        sleep 10
+
+        # Newest-written keys (26-30) survive under both policies.
+        NEWEST_EXISTS=0
+        for i in $(seq 26 30); do
+            ./ocachecli get "order-key-${i}" >/dev/null 2>&1 && NEWEST_EXISTS=$((NEWEST_EXISTS + 1)) || true
+        done
+        # The oldest keys we READ (1-5).
+        READ_OLD_EXISTS=0
+        for i in $(seq 1 5); do
+            ./ocachecli get "order-key-${i}" >/dev/null 2>&1 && READ_OLD_EXISTS=$((READ_OLD_EXISTS + 1)) || true
+        done
+
+        echo "Newest keys (26-30) surviving: $NEWEST_EXISTS/5"
+        echo "Read-oldest keys (1-5) surviving: $READ_OLD_EXISTS/5"
+
+        if [ "$policy" = "lru" ]; then
+            # LRU: the oldest keys we read should be protected (mostly survive).
+            if [ "$NEWEST_EXISTS" -ge 3 ] && [ "$READ_OLD_EXISTS" -ge 3 ]; then
+                pass_test "RESULT_${policy}_protection" "[lru] Reads protected the accessed keys"
+            else
+                fail_test "RESULT_${policy}_protection" "[lru] Reads did not protect accessed keys (read-old survived=$READ_OLD_EXISTS)"
+            fi
         else
-            fail_test "RESULT_${policy}_protection" "[fifo] Oldest-written keys were not evicted (read-old survived=$READ_OLD_EXISTS)"
+            # FIFO: the oldest keys we read must NOT be protected (mostly evicted),
+            # while the newest-written survive.
+            if [ "$NEWEST_EXISTS" -ge 3 ] && [ "$READ_OLD_EXISTS" -le 2 ]; then
+                pass_test "RESULT_${policy}_protection" "[fifo] Reads did not protect oldest-written keys (evicted despite being read)"
+            else
+                fail_test "RESULT_${policy}_protection" "[fifo] Oldest-written keys were not evicted (read-old survived=$READ_OLD_EXISTS)"
+            fi
         fi
     fi
 
