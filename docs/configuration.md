@@ -36,12 +36,13 @@ OCache can be configured through command-line flags when starting the server.
 > (e.g. parquet, where the newest data is read most).
 >
 > Each policy maintains its own eviction index. Deletes and TTL expiry remove a
-> key's index entry under both policies. On overwrite they differ: under `fifo`
-> the previous entry is deleted (via a per-key back-reference) so the index holds
-> exactly one entry per live key and a rewritten key is ordered by its latest
-> write; under `lru` an overwrite leaves the previous access-bucket entry behind
-> (reclaimed later by re-access or the periodic bucket prune), unchanged from the
-> behavior without this flag. The index is built as keys are written, so **choose
+> key's index entry under both. On overwrite they differ: `fifo` deletes the
+> previous entry at write time (via a per-key back-reference), so the index holds
+> exactly one entry per live key; `lru` leaves the previous access-bucket entry as
+> an orphan, reclaimed later by re-access or the periodic bucket prune. In both
+> cases the eviction scan validates each entry against the key's back-reference
+> before acting, so a superseded entry is reclaimed rather than evicting a
+> rewritten key out of order. The index is built as keys are written, so **choose
 > the policy and cap at deployment time and keep them fixed for the life of the
 > data directory.**
 >

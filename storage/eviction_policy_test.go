@@ -273,6 +273,46 @@ func TestFIFOEvictionSkipsSupersededDuplicateEntry(t *testing.T) {
 	assert.Equal(t, 1, countFifoEntries(t, s), "stale + victim entries gone; only k's current entry remains")
 }
 
+// TestLRUEvictionSkipsSupersededDuplicateEntry is the LRU counterpart to the FIFO
+// test above: an overwrite leaves an orphan access-bucket entry (putLow does not
+// delete the previous one), and the eviction scan must not evict the live key via
+// that stale entry.
+func TestLRUEvictionSkipsSupersededDuplicateEntry(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    1 << 20,
+		EvictionPolicy:  EvictionPolicyLRU,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	// "victim" written first, "k" second (both current entries + secondary index).
+	require.NoError(t, s.Put("victim", bytes.NewReader(bytes.Repeat([]byte("v"), 100)), 0))
+	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("k"), 100)), 0))
+
+	// Inject a stale duplicate access-bucket entry for "k", older than everything,
+	// WITHOUT repointing k's secondary index — what an overwrite leaves behind.
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	staleEntry := keys.MakeBucketedAccessKey("k", time.Now().Add(-time.Hour))
+	require.NoError(t, s.meta.Handle().Put(wo, staleEntry, []byte{}))
+	require.Equal(t, 3, countAccessBucketEntries(t, s), "victim + k + stale-k")
+
+	// Evict ~one key's worth. Oldest-first, the scan hits k's stale entry first.
+	s.cleaner.evictLRUKeys(50)
+
+	_, foundK, err := s.Get("k", 0, 0)
+	require.NoError(t, err)
+	assert.True(t, foundK, "k must survive: a stale duplicate access entry must not evict the live key")
+	_, foundVictim, err := s.Get("victim", 0, 0)
+	require.NoError(t, err)
+	assert.False(t, foundVictim, "victim (the genuinely oldest current entry) should be evicted")
+
+	assert.Equal(t, 1, countAccessBucketEntries(t, s), "stale + victim entries gone; only k's current entry remains")
+}
+
 // TestFIFOEvictionReadDoesNotProtect is the end-to-end contrast to TestLRUEviction:
 // under FIFO, reading the oldest-written keys does not save them — they are still
 // evicted first, while the newest-written keys survive.

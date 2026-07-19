@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"bytes"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -121,12 +122,33 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 			continue
 		}
 
-		// Delete the key and its access entry
+		// Verify this bucket entry is the key's current one before evicting. An
+		// overwrite writes a new bucket entry and repoints the secondary index but
+		// does not delete the old entry; evicting via that stale entry would drop
+		// the freshly-rewritten value at its old position, out of LRU order. If the
+		// secondary index does not point at this entry, it is superseded — reclaim
+		// just the entry and keep the key. (Mirrors evictFIFOKeys.)
+		bucketIndexKey := keys.MakeBucketedAccessIndexKey(originalKey)
+		cur, err := c.storage.meta.Handle().Get(ro, bucketIndexKey)
+		if err != nil {
+			// Can't verify — skip and retry next pass rather than risk evicting a
+			// live key via a possibly-stale entry.
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+		superseded := !cur.Exists() || !bytes.Equal(cur.Data(), keyBytes)
+		cur.Free()
+		if superseded {
+			batch.Delete(keyBytes)
+			it.Key().Free()
+			it.Value().Free()
+			continue
+		}
+
+		// Delete the key and its access entries.
 		batch.Delete(metaKey)
 		batch.Delete(keyBytes)
-
-		// Delete secondary index entry
-		bucketIndexKey := keys.MakeBucketedAccessIndexKey(originalKey)
 		batch.Delete(bucketIndexKey)
 
 		evicted += valueMsg.ValueLength
