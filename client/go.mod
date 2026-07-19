@@ -6,10 +6,10 @@ require (
 	github.com/pterm/pterm v0.12.81
 	github.com/spf13/cobra v1.9.1
 	github.com/stretchr/testify v1.11.1
-	github.com/tigrisdata/ocache/common v1.1.0
-	github.com/tigrisdata/ocache/coordinator v1.1.0
-	github.com/tigrisdata/ocache/coordinator/proto v1.1.0
-	github.com/tigrisdata/ocache/proto v1.1.0
+	github.com/tigrisdata/ocache/common v1.8.0
+	github.com/tigrisdata/ocache/coordinator v1.8.0
+	github.com/tigrisdata/ocache/coordinator/proto v1.8.0
+	github.com/tigrisdata/ocache/proto v1.8.0
 	google.golang.org/grpc v1.72.2
 	google.golang.org/protobuf v1.36.8
 )
