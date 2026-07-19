@@ -56,12 +56,25 @@ type evictionIndex struct {
 //   - metadata present, back-reference points here or is absent -> the current,
 //     live (or only) entry; evict metadata + entry + back-reference + backing
 //     file.
-func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
+func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCount int) {
 	start := time.Now()
 
-	var evicted int64
-	var evictedCount int
 	var processedKeys int
+
+	// committed*/pending* separate durable evictions from in-flight ones, so the
+	// two side effects that assume a key was actually removed — reclaiming its
+	// backing file and subtracting its bytes from the live total — happen only for
+	// batches that committed. The batch write is atomic, so a failed Write removes
+	// nothing; staging file deletions or decrementing the total for it would leave
+	// live metadata pointing at deleted files and undercount the disk total (which
+	// could wrongly stall further eviction). evictedCount (the named return) counts
+	// only committed evictions.
+	var committedBytes int64
+	var pendingBytes int64
+	var pendingCount int
+	// pendingFiles holds the value metadata of keys deleted in the current batch,
+	// so their backing files are reclaimed only after the batch's write succeeds.
+	var pendingFiles []*pb.ValueMessage
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
@@ -74,40 +87,49 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	// commit writes any staged deletes. Called for the periodic in-loop flush and
-	// by the finalize defer below. Evicted keys' backing files are queued for
-	// deletion immediately (stageFileDeletion), so dropping the batched metadata
-	// deletes would leave live metadata pointing at deleted files (the dangling
-	// raw-file class reconciled by #150/#152).
+	// commit writes the staged batch (periodic in-loop flush and the finalize
+	// defer). Only on a successful write does it reclaim the batch's backing files
+	// and promote the pending counts; on failure the keys were not removed, so it
+	// discards the pending state and they are retried on the next pass. Reclaiming
+	// files before the write would strand them (metadata still live) if the write
+	// failed — the dangling raw-file class reconciled by #150/#152.
 	commit := func() {
 		if batch.Count() == 0 {
 			return
 		}
 		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Str("policy", idx.policy).Msg("cleaner: failed to write eviction batch")
+			zlog.Error().Err(err).Str("policy", idx.policy).Msg("cleaner: failed to write eviction batch; keys not evicted, will retry next pass")
+		} else {
+			for _, vm := range pendingFiles {
+				c.storage.stageFileDeletion(vm)
+			}
+			committedBytes += pendingBytes
+			evictedCount += pendingCount
 		}
+		pendingBytes = 0
+		pendingCount = 0
+		pendingFiles = pendingFiles[:0]
 		batch.Clear()
 	}
 
 	// finalize flushes the last batch and then reconciles the size/stat accounting
-	// for everything evicted this run. It is deferred (registered after the
-	// resource defers, so it runs before they release) so that the commit and its
+	// for everything committed this run. It is deferred (registered after the
+	// resource defers, so it runs before they release) so the commit and its
 	// accounting stay together on EVERY return path — including the shutdown
-	// early-return. Splitting them (commit inline, accounting after the loop) let a
-	// shutdown mid-eviction flush the deletes while leaving totalSize inflated
-	// until the next startup recalculation.
+	// early-return. Splitting them let a shutdown mid-eviction flush the deletes
+	// while leaving totalSize inflated until the next startup recalculation.
 	defer func() {
 		commit()
 
 		c.evictedKeys.Add(int64(evictedCount))
-		c.totalSize.Add(-evicted)
+		c.totalSize.Add(-committedBytes)
 
 		metrics.CleanerKeysDeleted.WithLabelValues(idx.policy, "disk_limit").Add(float64(evictedCount))
-		metrics.CleanerBytesFreed.WithLabelValues(idx.policy).Add(float64(evicted))
+		metrics.CleanerBytesFreed.WithLabelValues(idx.policy).Add(float64(committedBytes))
 
 		zlog.Info().
 			Int("count", evictedCount).
-			Int64("bytes", evicted).
+			Int64("bytes", committedBytes).
 			Int64("target", targetBytes).
 			Int("processed", processedKeys).
 			Str("policy", idx.policy).
@@ -126,7 +148,7 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 		case <-c.closeCh:
 			zlog.Info().Str("policy", idx.policy).Msg("cleaner: eviction interrupted by shutdown")
 			// The finalize defer flushes the batch and reconciles accounting.
-			return evictedCount
+			return
 		default:
 		}
 
@@ -138,7 +160,7 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 			commit()
 		}
 
-		if evicted >= targetBytes {
+		if committedBytes+pendingBytes >= targetBytes {
 			break
 		}
 
@@ -227,21 +249,22 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 			continue
 		}
 
-		// Evict the key, its ordered index entry, and its back-reference.
+		// Evict the key, its ordered index entry, and its back-reference. The
+		// backing file is reclaimed by commit() only once this batch's write
+		// succeeds (see pendingFiles), never before.
 		batch.Delete(metaKey)
 		batch.Delete(keyBytes)
 		batch.Delete(backref)
 
-		evicted += valueMsg.ValueLength
-		evictedCount++
-
-		// Reclaim the backing file(s).
-		c.storage.stageFileDeletion(valueMsg)
+		pendingBytes += valueMsg.ValueLength
+		pendingCount++
+		pendingFiles = append(pendingFiles, valueMsg)
 
 		it.Key().Free()
 		it.Value().Free()
 	}
 
-	// The finalize defer flushes the last batch and reconciles accounting.
-	return evictedCount
+	// The finalize defer flushes the last batch and reconciles accounting;
+	// evictedCount (named return) is promoted there for the committed batch.
+	return
 }
