@@ -37,6 +37,7 @@ run_eviction_suite() {
     start_server "${policy}-eviction" "true" \
       -disk "$dir" \
       -threshold 1000 \
+      -compact-threshold 1500 \
       -max-disk-usage 51200 \
       -eviction-policy "$policy" \
       -ttl-cleanup-interval 5s \
@@ -73,11 +74,13 @@ run_eviction_suite() {
     # ---------------------------------------------------------------------------
     echo
     echo "=== [${policy}] Test 2: Protection semantics ==="
-    echo "Adding 15 keys in order (order-key-1 oldest .. order-key-15 newest)..."
-    for i in $(seq 1 15); do
-        VALUE=$(generate_random_data 3500)
+    # Phase 1: fill UNDER the 50KB cap (20 keys x 2KB = 40KB) so nothing is
+    # evicted yet — otherwise eviction would fire before we read the oldest keys.
+    echo "Adding 20 keys in order (order-key-1 oldest .. order-key-20 newest), under the cap..."
+    for i in $(seq 1 20); do
+        VALUE=$(generate_random_data 2000)
         ./ocachecli put "order-key-${i}" "$VALUE" >/dev/null 2>&1 || true
-        sleep 0.1
+        sleep 0.05
     done
 
     # Read the OLDEST keys (1-5) under both policies. Under LRU this refreshes
@@ -87,18 +90,28 @@ run_eviction_suite() {
         ./ocachecli get "order-key-${i}" >/dev/null 2>&1 || true
     done
 
-    echo "Adding 5 more keys (16-20) to push over the limit and trigger eviction..."
-    for i in $(seq 16 20); do
-        VALUE=$(generate_random_data 3500)
+    # LRU updates access time asynchronously (buffered, flushed ~every second),
+    # so wait for the read-bumps to persist before triggering eviction —
+    # otherwise eviction may run against stale access times and this check races.
+    echo "Waiting for access-time updates to flush..."
+    sleep 5
+
+    # Phase 2: push well over the cap (10 more keys -> 60KB total) to force
+    # eviction of ~8 keys. There are 15 un-read keys (6-20) to absorb that, so
+    # under LRU the read keys (1-5) are safe; under FIFO the oldest-written (1-5)
+    # go regardless of the read.
+    echo "Adding 10 more keys (21-30) to trigger eviction..."
+    for i in $(seq 21 30); do
+        VALUE=$(generate_random_data 2000)
         ./ocachecli put "order-key-${i}" "$VALUE" >/dev/null 2>&1 || true
     done
 
     echo "Waiting for eviction..."
     sleep 10
 
-    # Newest-written keys (16-20) survive under both policies.
+    # Newest-written keys (26-30) survive under both policies.
     NEWEST_EXISTS=0
-    for i in $(seq 16 20); do
+    for i in $(seq 26 30); do
         ./ocachecli get "order-key-${i}" >/dev/null 2>&1 && NEWEST_EXISTS=$((NEWEST_EXISTS + 1)) || true
     done
     # The oldest keys we READ (1-5).
@@ -107,7 +120,7 @@ run_eviction_suite() {
         ./ocachecli get "order-key-${i}" >/dev/null 2>&1 && READ_OLD_EXISTS=$((READ_OLD_EXISTS + 1)) || true
     done
 
-    echo "Newest keys (16-20) surviving: $NEWEST_EXISTS/5"
+    echo "Newest keys (26-30) surviving: $NEWEST_EXISTS/5"
     echo "Read-oldest keys (1-5) surviving: $READ_OLD_EXISTS/5"
 
     if [ "$policy" = "lru" ]; then
@@ -177,6 +190,7 @@ run_eviction_suite() {
     start_server "${policy}-eviction" "false" \
       -disk "$dir" \
       -threshold 1000 \
+      -compact-threshold 1500 \
       -max-disk-usage 51200 \
       -eviction-policy "$policy" \
       -ttl-cleanup-interval 5s \
