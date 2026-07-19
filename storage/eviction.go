@@ -74,11 +74,11 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
-	// commit writes any staged deletes. It must run before every return path,
-	// including shutdown: evicted keys' backing files are queued for deletion
-	// immediately (stageFileDeletion), so dropping the batched metadata deletes
-	// would leave live metadata pointing at deleted files (the dangling raw-file
-	// class reconciled by #150/#152).
+	// commit writes any staged deletes. Called for the periodic in-loop flush and
+	// by the finalize defer below. Evicted keys' backing files are queued for
+	// deletion immediately (stageFileDeletion), so dropping the batched metadata
+	// deletes would leave live metadata pointing at deleted files (the dangling
+	// raw-file class reconciled by #150/#152).
 	commit := func() {
 		if batch.Count() == 0 {
 			return
@@ -88,6 +88,32 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 		}
 		batch.Clear()
 	}
+
+	// finalize flushes the last batch and then reconciles the size/stat accounting
+	// for everything evicted this run. It is deferred (registered after the
+	// resource defers, so it runs before they release) so that the commit and its
+	// accounting stay together on EVERY return path — including the shutdown
+	// early-return. Splitting them (commit inline, accounting after the loop) let a
+	// shutdown mid-eviction flush the deletes while leaving totalSize inflated
+	// until the next startup recalculation.
+	defer func() {
+		commit()
+
+		c.evictedKeys.Add(int64(evictedCount))
+		c.totalSize.Add(-evicted)
+
+		metrics.CleanerKeysDeleted.WithLabelValues(idx.policy, "disk_limit").Add(float64(evictedCount))
+		metrics.CleanerBytesFreed.WithLabelValues(idx.policy).Add(float64(evicted))
+
+		zlog.Info().
+			Int("count", evictedCount).
+			Int64("bytes", evicted).
+			Int64("target", targetBytes).
+			Int("processed", processedKeys).
+			Str("policy", idx.policy).
+			Dur("duration_ms", time.Since(start)).
+			Msg("cleaner: eviction complete")
+	}()
 
 	zlog.Info().
 		Int64("target_bytes", targetBytes).
@@ -99,7 +125,7 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 		select {
 		case <-c.closeCh:
 			zlog.Info().Str("policy", idx.policy).Msg("cleaner: eviction interrupted by shutdown")
-			commit()
+			// The finalize defer flushes the batch and reconciles accounting.
 			return evictedCount
 		default:
 		}
@@ -216,23 +242,6 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) int {
 		it.Value().Free()
 	}
 
-	// Write final batch.
-	commit()
-
-	c.evictedKeys.Add(int64(evictedCount))
-	c.totalSize.Add(-evicted)
-
-	metrics.CleanerKeysDeleted.WithLabelValues(idx.policy, "disk_limit").Add(float64(evictedCount))
-	metrics.CleanerBytesFreed.WithLabelValues(idx.policy).Add(float64(evicted))
-
-	zlog.Info().
-		Int("count", evictedCount).
-		Int64("bytes", evicted).
-		Int64("target", targetBytes).
-		Int("processed", processedKeys).
-		Str("policy", idx.policy).
-		Dur("duration_ms", time.Since(start)).
-		Msg("cleaner: eviction complete")
-
+	// The finalize defer flushes the last batch and reconciles accounting.
 	return evictedCount
 }
