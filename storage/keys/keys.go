@@ -42,6 +42,20 @@ const (
 
 	// DeleteIndexPrefix is the prefix for segment deletion tracking entries in RocksDB
 	DeleteIndexPrefix = "!delete:segment/"
+
+	// FifoIndexPrefix is the prefix for the FIFO eviction index. Entries embed the
+	// write time in the key so the eviction scan can walk them oldest-written
+	// first. Unlike the access index, entries are written once at Put and never
+	// bumped on reads.
+	// Format: !fifo/<write_time_nano>/<key>
+	FifoIndexPrefix = "!fifo/"
+
+	// FifoBackrefPrefix is the prefix for the FIFO secondary index that maps a
+	// cache key to its current FIFO entry, mirroring the LRU access index's
+	// secondary index. It lets Put/Delete/TTL locate and remove a key's previous
+	// FIFO entry so the index holds exactly one entry per live key.
+	// Format: !fifo_ref/<key> -> !fifo/<nano>/<key>
+	FifoBackrefPrefix = "!fifo_ref/"
 )
 
 // MakeMetadataKey creates a metadata key by adding the metadata prefix to the user key
@@ -218,6 +232,41 @@ func MakeBucketedAccessIndexKey(key string) []byte {
 func IsBucketedAccessKey(key []byte) bool {
 	return len(key) >= len(AccessBucketPrefix) &&
 		string(key[:len(AccessBucketPrefix)]) == AccessBucketPrefix
+}
+
+// MakeFifoIndexKey creates a FIFO eviction index key that embeds the write time
+// so entries sort oldest-written first.
+// Format: !fifo/<write_time_nano>/<key>
+func MakeFifoIndexKey(key string, writeTime time.Time) []byte {
+	return fmt.Appendf(nil, "%s%019d/%s", FifoIndexPrefix, writeTime.UnixNano(), key)
+}
+
+// GetFifoIndexPrefix returns the prefix used to iterate FIFO index entries
+// (oldest first, since the write-time nanos sort lexicographically).
+func GetFifoIndexPrefix() []byte {
+	return []byte(FifoIndexPrefix)
+}
+
+// MakeFifoBackrefKey creates the FIFO secondary-index key mapping a cache key to
+// its current FIFO entry.
+// Format: !fifo_ref/<key>
+func MakeFifoBackrefKey(key string) []byte {
+	return fmt.Appendf(nil, "%s%s", FifoBackrefPrefix, key)
+}
+
+// ParseFifoIndexKey extracts the original user key from a FIFO index key.
+// Format: !fifo/<19-digit nano>/<key>
+func ParseFifoIndexKey(fifoKey []byte) (string, error) {
+	s := string(fifoKey)
+	if len(s) < len(FifoIndexPrefix) || s[:len(FifoIndexPrefix)] != FifoIndexPrefix {
+		return "", fmt.Errorf("invalid fifo index key: bad prefix")
+	}
+	rest := s[len(FifoIndexPrefix):] // "<19 digits>/<key>"
+	// 19 nanos digits followed by '/'
+	if len(rest) < 20 || rest[19] != '/' {
+		return "", fmt.Errorf("invalid fifo index key: missing timestamp separator")
+	}
+	return rest[20:], nil
 }
 
 // ParseBucketedAccessKey extracts components from a bucketed access key

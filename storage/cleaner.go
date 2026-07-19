@@ -114,9 +114,12 @@ func (c *Cleaner) cleanupLoop() {
 				c.storage.segmentManager.RefreshMetrics()
 			}
 
-			// Periodically clean up old access buckets regardless of disk limits
-			// to prevent unbounded growth of the access index
-			if time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
+			// Periodically clean up old access buckets to bound growth of the LRU
+			// access index. Only under LRU: FIFO writes no access-bucket entries,
+			// so the scan would be pure waste, and the FIFO index (a separate
+			// keyspace) is reclaimed by its own eviction scan, not age-pruned.
+			if c.storage != nil && c.storage.evictionPolicy != EvictionPolicyFIFO &&
+				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
 			}
@@ -140,12 +143,20 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	var committedBytes int64
 	pendingCleaned := 0
 	var pendingBytes int64
+	// pendingFiles holds the value metadata of expired keys deleted in the current
+	// batch, so their backing files are reclaimed only after the batch's write
+	// succeeds. Staging file deletion earlier would strand the file (metadata still
+	// live) if the write failed — the dangling raw-file class reconciled by
+	// #150/#152.
+	var pendingFiles []*pb.ValueMessage
 
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
 
 	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
 	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -172,6 +183,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
 			zlog.Error().Err(err).Msgf("cleaner: failed to write %s", label)
 		} else {
+			// Metadata deletes are durable; only now is it safe to reclaim the
+			// backing files.
+			for _, vm := range pendingFiles {
+				c.storage.stageFileDeletion(vm)
+			}
 			committedCleaned += pendingCleaned
 			committedBytes += pendingBytes
 			if pendingBytes > 0 {
@@ -180,6 +196,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		pendingCleaned = 0
 		pendingBytes = 0
+		pendingFiles = pendingFiles[:0]
 		batch.Clear()
 	}
 
@@ -213,14 +230,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := proto.Unmarshal(value, valueMsg); err != nil {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
-			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-				bucketKey := slice.Data()
-				batch.Delete(bucketKey)
-				slice.Free()
-			}
-			batch.Delete(bucketIndexKey)
+			c.storage.stageEvictionIndexDeletes(batch, ro, key)
 			pendingCleaned++
 			it.Key().Free()
 			it.Value().Free()
@@ -233,30 +243,16 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
 			batch.Delete(keyBytes)
-			// Use secondary index to delete bucketed access entry
-			bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
-			if slice, err := c.storage.meta.Handle().Get(ro, bucketIndexKey); err == nil && slice.Exists() {
-				bucketKey := slice.Data()
-				batch.Delete(bucketKey)
-				slice.Free()
-			}
-			batch.Delete(bucketIndexKey)
+			c.storage.stageEvictionIndexDeletes(batch, ro, key)
 			pendingCleaned++
 			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
 
 			// Track bytes freed
 			pendingBytes += valueMsg.ValueLength
 
-			// Queue associated files for deletion
-			switch valueMsg.ValueType {
-			case pb.ValueType_RAW_FILE:
-				if err := c.storage.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-					zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("cleaner: failed to queue raw file for deletion")
-				}
-			case pb.ValueType_SEGMENT:
-				// Update delete index to track this deletion for future garbage collection
-				c.storage.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
-			}
+			// Defer file reclaim to flush(): the backing file is freed only once
+			// this batch's write succeeds (see pendingFiles), never before.
+			pendingFiles = append(pendingFiles, valueMsg)
 		}
 
 		it.Key().Free()
@@ -357,21 +353,34 @@ func (c *Cleaner) enforceDiskLimit() {
 	targetSize := int64(float64(c.maxDiskUsage) * 0.9) // Target 90% of max
 	needToEvict := currentSize - targetSize
 
-	// Track LRU eviction run
-	metrics.CleanerRuns.WithLabelValues("lru").Inc()
+	fifo := c.storage != nil && c.storage.evictionPolicy == EvictionPolicyFIFO
+
+	idx := lruEvictionIndex()
+	if fifo {
+		idx = fifoEvictionIndex()
+	}
+	policy := idx.policy
+
+	// Track eviction run
+	metrics.CleanerRuns.WithLabelValues(policy).Inc()
 
 	zlog.Info().
 		Int64("current", currentSize).
 		Int64("max", c.maxDiskUsage).
 		Int64("need_to_evict", needToEvict).
-		Msg("cleaner: enforcing disk usage limit with LRU eviction")
+		Str("policy", policy).
+		Msg("cleaner: enforcing disk usage limit")
 
-	evicted := c.evictLRUKeys(needToEvict)
+	evicted := c.evictByIndex(idx, needToEvict)
 
 	// Record metrics
 	duration := time.Since(start)
-	metrics.CleanerDuration.WithLabelValues("lru").Observe(float64(duration.Milliseconds()))
-	metrics.LRUEvictions.Add(float64(evicted))
+	metrics.CleanerDuration.WithLabelValues(policy).Observe(float64(duration.Milliseconds()))
+	// LRUEvictions is LRU-specific; FIFO eviction volume is tracked via the
+	// policy-labeled CleanerKeysDeleted{fifo,disk_limit} / CleanerBytesFreed{fifo}.
+	if !fifo {
+		metrics.LRUEvictions.Add(float64(evicted))
+	}
 }
 
 // UpdateSize updates the tracked total size when keys are added/removed

@@ -34,8 +34,9 @@ var (
 	recompactDisable       = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
 	ttlCleanupInterval     = flag.Duration("ttl-cleanup-interval", stor.DefaultTTLCleanupInterval, "Interval at which TTL keys are cleaned up")
 
-	maxDiskUsage = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited, uses LRU eviction)")
-	fdCacheSize  = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
+	maxDiskUsage   = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited)")
+	evictionPolicy = flag.String("eviction-policy", stor.DefaultEvictionPolicy, "Eviction order when max-disk-usage is set: 'lru' (reads refresh recency) or 'fifo' (evict oldest-written first; reads do not protect data)")
+	fdCacheSize    = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
 
 	recoveryWorkers = flag.Int("recovery-workers", stor.DefaultRecoveryWorkers, "Number of parallel workers for startup file recovery")
 	deleteBatchSize = flag.Int("delete-batch-size", stor.DefaultDeleteBatchSize, "Number of file deletions processed per deletion-queue batch")
@@ -128,6 +129,7 @@ func initializeStorage() *stor.Storage {
 		MetadataBackgroundJobs: AppConfig.MetadataBackgroundJobs,
 		RecoveryWorkers:        AppConfig.RecoveryWorkers,
 		DeleteBatchSize:        AppConfig.DeleteBatchSize,
+		EvictionPolicy:         AppConfig.EvictionPolicy,
 	}
 
 	s, err := stor.NewStorageWithConfig(storageConfig)

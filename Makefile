@@ -306,7 +306,7 @@ test-e2e: build build-cli
 	@$(MAKE) test-e2e-concurrent
 	@$(MAKE) test-e2e-storage-layers
 	@$(MAKE) test-e2e-ttl
-	@$(MAKE) test-e2e-lru
+	@$(MAKE) test-e2e-eviction
 	@$(MAKE) test-e2e-compaction
 	@$(MAKE) test-e2e-recompaction
 	@$(MAKE) test-e2e-data-validation
@@ -327,10 +327,10 @@ test-e2e-ttl: build build-cli
 	@echo "Running TTL functionality E2E test..."
 	./tests/e2e/ttl_cleaner_test.sh
 
-.PHONY: test-e2e-lru
-test-e2e-lru: build build-cli
-	@echo "Running LRU eviction E2E test..."
-	./tests/e2e/lru_eviction_test.sh
+.PHONY: test-e2e-eviction
+test-e2e-eviction: build build-cli
+	@echo "Running eviction E2E test (LRU + FIFO)..."
+	./tests/e2e/eviction_test.sh
 
 .PHONY: test-e2e-compaction
 test-e2e-compaction: build build-cli
