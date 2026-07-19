@@ -187,6 +187,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 		SegmentSize:          h.Config.SegmentSize,
 		FdCacheSize:          h.Config.FDCacheSize,
 		MaxDiskUsage:         h.Config.MaxDiskUsage,
+		EvictionPolicy:       h.Config.EvictionPolicy,
 		CompactionThreads:    h.Config.CompactionThreads,
 		MinSegmentAge:        h.Config.RecompactMinSegmentAge,
 		MinSegments:          h.Config.RecompactMinSegments,
