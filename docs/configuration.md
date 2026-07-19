@@ -42,18 +42,26 @@ OCache can be configured through command-line flags when starting the server.
 > an orphan, reclaimed later by re-access or the periodic bucket prune. In both
 > cases the eviction scan validates each entry against the key's back-reference
 > before acting, so a superseded entry is reclaimed rather than evicting a
-> rewritten key out of order. The index is built as keys are written, so **choose
-> the policy and cap at deployment time and keep them fixed for the life of the
-> data directory.**
+> rewritten key out of order. The index is built as keys are written, so for the
+> cap to cover **all** data, **choose the policy and cap at deployment time.**
+> Changing them later is allowed but only takes effect for data written afterward
+> (see below).
 >
-> - `fifo` only evicts keys written after it was enabled. Enabling it (or the cap)
->   on a directory that already holds keys leaves those keys unindexed and not
->   evictable, so the cap cannot reclaim them and eviction thrashes newer keys
->   trying to reach a target it can never hit. ocache logs a warning at startup
->   when it detects pre-existing keys with an empty FIFO index.
-> - Switching `-eviction-policy` in place (e.g. `lru`↔`fifo`) is not supported:
->   each policy only maintains and prunes its own index, so the previous policy's
->   index rows are never reclaimed. Recreate the data directory instead.
+> - `fifo` only evicts keys written after it was enabled. Keys already present when
+>   `fifo` (or the cap) is enabled are not in the FIFO index, so the disk cap
+>   cannot reclaim them — they remain until rewritten or deleted. If that
+>   pre-existing set already exceeds the cap, eviction cannot bring usage back
+>   under it. ocache logs a warning at startup when it detects pre-existing keys
+>   with an empty FIFO index.
+> - Switching `-eviction-policy` in place (e.g. `lru`↔`fifo`) is supported — reads
+>   and writes stay correct — but each policy maintains only its own index, so data
+>   written under the previous policy is not tracked by the new one. After
+>   switching to `fifo`, keys written before the switch are **not evictable by the
+>   cap** until they are rewritten, and leftover `lru` access-index rows are not
+>   pruned while `fifo` is active (a bounded, one-time metadata overhead). Size the
+>   cap so the untracked set fits under it, or start `fifo` from a fresh deployment
+>   if the cap must cover all data. See
+>   [#189](https://github.com/tigrisdata/ocache/issues/189).
 
 ### Cache Configuration
 
