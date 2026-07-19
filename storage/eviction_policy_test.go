@@ -273,6 +273,40 @@ func TestFIFOEvictionSkipsSupersededDuplicateEntry(t *testing.T) {
 	assert.Equal(t, 1, countFifoEntries(t, s), "stale + victim entries gone; only k's current entry remains")
 }
 
+// TestFIFOEvictionEvictsWhenBackrefAbsent verifies that if a live key's FIFO
+// entry has no back-reference at all, eviction evicts the key via that entry
+// rather than deleting the entry and stranding the key (which would make it
+// permanently un-evictable and defeat the disk cap).
+func TestFIFOEvictionEvictsWhenBackrefAbsent(t *testing.T) {
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    1 << 20,
+		EvictionPolicy:  EvictionPolicyFIFO,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("k"), 100)), 0))
+	require.Equal(t, 1, countFifoEntries(t, s))
+
+	// Remove the back-reference, leaving a live key with a FIFO entry but no
+	// back-reference.
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, s.meta.Handle().Delete(wo, keys.MakeFifoBackrefKey("k")))
+	_, ok := readFifoBackref(t, s, "k")
+	require.False(t, ok, "back-reference should be absent")
+
+	s.cleaner.evictFIFOKeys(1 << 30)
+
+	_, found, err := s.Get("k", 0, 0)
+	require.NoError(t, err)
+	assert.False(t, found, "key with a live FIFO entry but no back-reference must be evicted, not stranded")
+	assert.Equal(t, 0, countFifoEntries(t, s), "the entry should be reclaimed on eviction")
+}
+
 // TestLRUEvictionSkipsSupersededDuplicateEntry is the LRU counterpart to the FIFO
 // test above: an overwrite leaves an orphan access-bucket entry (putLow does not
 // delete the previous one), and the eviction scan must not evict the live key via

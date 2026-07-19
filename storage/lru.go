@@ -122,12 +122,15 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 			continue
 		}
 
-		// Verify this bucket entry is the key's current one before evicting. An
-		// overwrite writes a new bucket entry and repoints the secondary index but
-		// does not delete the old entry; evicting via that stale entry would drop
-		// the freshly-rewritten value at its old position, out of LRU order. If the
-		// secondary index does not point at this entry, it is superseded — reclaim
-		// just the entry and keep the key. (Mirrors evictFIFOKeys.)
+		// Verify this bucket entry against the key's secondary index before
+		// evicting. An overwrite writes a new bucket entry and repoints the
+		// secondary index but does not delete the old entry; evicting via that
+		// stale entry would drop the freshly-rewritten value at its old position,
+		// out of LRU order. Only treat the entry as superseded when the secondary
+		// index EXISTS and points elsewhere — then reclaim just the entry and keep
+		// the key. If it is absent, this is the key's authoritative (or only)
+		// entry: evict via it rather than stranding a live key. (Mirrors
+		// evictFIFOKeys.)
 		bucketIndexKey := keys.MakeBucketedAccessIndexKey(originalKey)
 		cur, err := c.storage.meta.Handle().Get(ro, bucketIndexKey)
 		if err != nil {
@@ -137,7 +140,7 @@ func (c *Cleaner) evictLRUKeys(targetBytes int64) int {
 			it.Value().Free()
 			continue
 		}
-		superseded := !cur.Exists() || !bytes.Equal(cur.Data(), keyBytes)
+		superseded := cur.Exists() && !bytes.Equal(cur.Data(), keyBytes)
 		cur.Free()
 		if superseded {
 			batch.Delete(keyBytes)

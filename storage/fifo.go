@@ -148,14 +148,18 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 			continue
 		}
 
-		// Verify this entry is the key's current one before evicting. A
+		// Verify this entry against the key's back-reference before evicting. A
 		// concurrent overwrite (Put takes no per-key lock), or a Put whose
 		// back-reference lookup failed, can leave a stale duplicate entry while
-		// the key's metadata and back-reference point at the newer value.
-		// Evicting via the stale (older-timestamped) entry would discard the
-		// freshly-rewritten value at its old position, out of FIFO order. If the
-		// back-reference does not point at this entry, it is superseded: reclaim
-		// just the entry and keep the key.
+		// the back-reference points at the newer value. Evicting via the stale
+		// (older-timestamped) entry would discard the freshly-rewritten value at
+		// its old position, out of FIFO order.
+		//
+		// Only treat this entry as superseded when the back-reference EXISTS and
+		// points somewhere else — then reclaim just the entry and keep the key. If
+		// the back-reference is absent, this entry is the key's authoritative (or
+		// only) index entry: fall through and evict via it, rather than deleting
+		// it and stranding a live key with no eviction entry.
 		backref := keys.MakeFifoBackrefKey(originalKey)
 		cur, err := c.storage.meta.Handle().Get(ro, backref)
 		if err != nil {
@@ -165,7 +169,7 @@ func (c *Cleaner) evictFIFOKeys(targetBytes int64) int {
 			it.Value().Free()
 			continue
 		}
-		superseded := !cur.Exists() || !bytes.Equal(cur.Data(), keyBytes)
+		superseded := cur.Exists() && !bytes.Equal(cur.Data(), keyBytes)
 		cur.Free()
 		if superseded {
 			batch.Delete(keyBytes)
