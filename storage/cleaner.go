@@ -143,6 +143,12 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	var committedBytes int64
 	pendingCleaned := 0
 	var pendingBytes int64
+	// pendingFiles holds the value metadata of expired keys deleted in the current
+	// batch, so their backing files are reclaimed only after the batch's write
+	// succeeds. Staging file deletion earlier would strand the file (metadata still
+	// live) if the write failed — the dangling raw-file class reconciled by
+	// #150/#152.
+	var pendingFiles []*pb.ValueMessage
 
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
@@ -177,6 +183,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
 			zlog.Error().Err(err).Msgf("cleaner: failed to write %s", label)
 		} else {
+			// Metadata deletes are durable; only now is it safe to reclaim the
+			// backing files.
+			for _, vm := range pendingFiles {
+				c.storage.stageFileDeletion(vm)
+			}
 			committedCleaned += pendingCleaned
 			committedBytes += pendingBytes
 			if pendingBytes > 0 {
@@ -185,6 +196,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		}
 		pendingCleaned = 0
 		pendingBytes = 0
+		pendingFiles = pendingFiles[:0]
 		batch.Clear()
 	}
 
@@ -238,8 +250,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			// Track bytes freed
 			pendingBytes += valueMsg.ValueLength
 
-			// Reclaim the backing file(s).
-			c.storage.stageFileDeletion(valueMsg)
+			// Defer file reclaim to flush(): the backing file is freed only once
+			// this batch's write succeeds (see pendingFiles), never before.
+			pendingFiles = append(pendingFiles, valueMsg)
 		}
 
 		it.Key().Free()
