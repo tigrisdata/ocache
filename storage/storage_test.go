@@ -240,6 +240,53 @@ func TestStorage_ListKeys_WithPrefix(t *testing.T) {
 }
 
 // TestStorage_Get_ByteRange_SmallObject tests byte-range requests for inline (small) objects
+// countingReadSeeker wraps a seekable reader and counts how many bytes are read
+// via Read, so a test can detect prefix-scan read amplification.
+type countingReadSeeker struct {
+	r     *bytes.Reader
+	readN int64
+}
+
+func (c *countingReadSeeker) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.readN += int64(n)
+	return n, err
+}
+
+func (c *countingReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return c.r.Seek(offset, whence)
+}
+
+// TestByteRangeReader_SeekableReaderDoesNotScanPrefix pins the behavior that
+// makes the storage-layer wrappers' seekability matter: given a seekable reader,
+// byteRangeReader must Seek to the range start, not read-and-discard the prefix.
+// A deep range into a multi-MiB object must touch only ~the range, never the
+// megabytes before it. (The wrappers embed io.ReadSeeker so this seekable path is
+// actually reached in production — see TestReadCloserWithOnClose_ExposesSeek and
+// TestFileReadCloser_ExposesSeek.)
+func TestByteRangeReader_SeekableReaderDoesNotScanPrefix(t *testing.T) {
+	const size = 4 << 20 // 4 MiB
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	crs := &countingReadSeeker{r: bytes.NewReader(data)}
+
+	var s Storage // applyByteRange does not touch Storage state
+	start, end := int64(size-100), int64(size-1)
+	br := s.applyByteRange(crs, start, end)
+
+	got, err := io.ReadAll(br)
+	assert.NoError(t, err)
+	assert.Equal(t, data[start:end+1], got, "wrong range bytes returned")
+
+	// The whole point: a seekable reader must be seeked to `start`, so the ~4 MiB
+	// prefix is never read. Allow generous slack for buffering; the bug read the
+	// full prefix (millions of bytes).
+	assert.Less(t, crs.readN, int64(64*1024),
+		"prefix was scanned (read amplification): read %d bytes to serve %d", crs.readN, end-start+1)
+}
+
 func TestStorage_Get_ByteRange_SmallObject(t *testing.T) {
 	s, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1024*1024)
 	defer cleanup()
