@@ -491,6 +491,17 @@ func (c *Client) Coordinator() *coordinator.Coordinator {
 	return c.coordinator
 }
 
+// IsLocal reports whether key is owned by this node — i.e. a read for it is
+// served from local storage rather than routed to a peer over gRPC. In
+// single-node (non-cluster) mode every key is local. Callers use this to
+// observe cross-node serve ratios without reaching into the coordinator.
+func (c *Client) IsLocal(key string) bool {
+	if c.coordinator == nil {
+		return true
+	}
+	return c.coordinator.IsLocal(key)
+}
+
 // Service returns the gRPC service.
 // This is useful for registering additional handlers or middleware.
 func (c *Client) Service() *service.CacheService {
