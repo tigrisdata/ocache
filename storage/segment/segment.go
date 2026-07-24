@@ -247,7 +247,7 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 
 	reader := io.NewSectionReader(entry.File(), offset, length)
 	return &readCloserWithOnClose{
-		Reader: reader,
+		ReadSeeker: reader,
 		onClose: func() {
 			// Release lock & cached FD when caller is done.
 			entry.RUnlock()
@@ -443,8 +443,15 @@ func (it *Iterator) LastError() error {
 }
 
 // readCloserWithOnClose wraps a reader and calls the provided function when closed.
+//
+// It embeds io.ReadSeeker (not io.Reader) on purpose: the wrapped value is an
+// *io.SectionReader, which is seekable, and the range-read path
+// (storage.byteRangeReader) type-asserts its reader for io.Seeker to jump to a
+// range's start offset. Embedding the plain io.Reader interface would hide Seek,
+// forcing that path to read and discard every byte before the range — turning a
+// deep ranged read of a large object into a full-prefix scan.
 type readCloserWithOnClose struct {
-	io.Reader
+	io.ReadSeeker
 	onClose func()
 }
 

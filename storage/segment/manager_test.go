@@ -544,7 +544,7 @@ func TestManager_MultipleOpenSegments(t *testing.T) {
 func TestReadCloserWithOnClose(t *testing.T) {
 	called := false
 	rc := &readCloserWithOnClose{
-		Reader: bytes.NewReader([]byte("test")),
+		ReadSeeker: bytes.NewReader([]byte("test")),
 		onClose: func() {
 			called = true
 		},
@@ -569,10 +569,34 @@ func TestReadCloserWithOnClose(t *testing.T) {
 	}
 }
 
+// TestReadCloserWithOnClose_ExposesSeek is a regression guard for the ranged-read
+// amplification bug: the wrapper must embed io.ReadSeeker (not io.Reader) so that
+// storage.byteRangeReader can Seek to a range's start offset instead of reading
+// and discarding every byte before it. Reverting to io.Reader breaks the
+// compile-time assertion below.
+func TestReadCloserWithOnClose_ExposesSeek(t *testing.T) {
+	var _ io.Seeker = (*readCloserWithOnClose)(nil) // compile-time: Seek must be promoted
+
+	sr := io.NewSectionReader(bytes.NewReader([]byte("0123456789")), 0, 10)
+	rc := &readCloserWithOnClose{ReadSeeker: sr}
+
+	pos, err := rc.Seek(5, io.SeekStart)
+	if err != nil || pos != 5 {
+		t.Fatalf("Seek(5, SeekStart) = (%d, %v), want (5, nil)", pos, err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "56789" {
+		t.Errorf("after Seek(5), read %q, want %q", string(got), "56789")
+	}
+}
+
 func TestReadCloserWithOnClose_NilCallback(t *testing.T) {
 	rc := &readCloserWithOnClose{
-		Reader:  bytes.NewReader([]byte("test")),
-		onClose: nil,
+		ReadSeeker: bytes.NewReader([]byte("test")),
+		onClose:    nil,
 	}
 
 	err := rc.Close()
