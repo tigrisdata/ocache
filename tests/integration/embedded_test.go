@@ -289,6 +289,22 @@ func TestEmbeddedClient_GetConnectedNodes(t *testing.T) {
 	assert.NotNil(t, nodes)
 }
 
+func TestEmbeddedClient_IsLocal(t *testing.T) {
+	client, err := embedded.New(&embedded.Config{
+		DiskPath: t.TempDir(),
+		TTL:      time.Hour,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	// Single-node (non-cluster) mode: every key is owned locally, regardless
+	// of the key. This is the branch consumers rely on to report local vs
+	// remote serve locality.
+	assert.True(t, client.IsLocal("any-key"))
+	assert.True(t, client.IsLocal("body|bucket|object|etag"))
+	assert.True(t, client.IsLocal(""))
+}
+
 // TestEmbeddedClient_AdvancedConfig exercises the Storage and Registerer
 // plumbing to confirm advanced options flow through without breaking the
 // client end-to-end. The specific tuning values here are chosen to be safe

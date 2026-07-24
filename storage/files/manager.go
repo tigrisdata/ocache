@@ -24,8 +24,15 @@ var ErrFileLocked = errors.New("file is locked for reading")
 
 // fileReadCloser wraps a Reader and closes the underlying file while
 // releasing the per-file read lock when Close is invoked.
+//
+// It embeds io.ReadSeeker (not io.Reader) on purpose: the wrapped value is an
+// *io.SectionReader, which is seekable, and the range-read path
+// (storage.byteRangeReader) type-asserts its reader for io.Seeker to jump to a
+// range's start offset. Embedding the plain io.Reader interface would hide Seek,
+// forcing that path to read and discard every byte before the range — turning a
+// deep ranged read of a large raw file into a full-prefix scan.
 type fileReadCloser struct {
-	io.Reader
+	io.ReadSeeker
 	onClose func()
 }
 
@@ -146,7 +153,7 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 	reader := io.NewSectionReader(e.File(), 0, length)
 
 	return &fileReadCloser{
-		Reader: reader,
+		ReadSeeker: reader,
 		onClose: func() {
 			// Release lock & cached FD when caller is done.
 			e.RUnlock()
