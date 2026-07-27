@@ -22,19 +22,25 @@ jobs:
     needs: [test]
     strategy:
       matrix:
+        # Linux binaries link jemalloc as the process allocator to cap RocksDB
+        # off-heap RSS (issue #176); macOS ships the plain variant (no bundled
+        # jemalloc, no fully-static link).
         include:
           - os: namespace-profile-ubuntu-2404
             arch: x86_64
             goos: linux
             goarch: amd64
+            with_jemalloc: "true"
           - os: namespace-profile-ubuntu-2404-arm
             arch: aarch64
             goos: linux
             goarch: arm64
+            with_jemalloc: "true"
           - os: namespace-profile-macos-1561-arm
             arch: arm64
             goos: darwin
             goarch: arm64
+            with_jemalloc: "false"
     runs-on: ${{ matrix.os }}
 
     permissions:
@@ -58,6 +64,10 @@ jobs:
         run: |
           OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+          # Select the rocksdb-static variant: jemalloc on Linux, plain elsewhere.
+          SUFFIX=""
+          if [ "${{ matrix.with_jemalloc }}" = "true" ]; then SUFFIX="-jemalloc"; fi
+          echo "art_name=rocksdb-static-${{ env.ROCKSDB_VERSION }}${SUFFIX}-${OS_NAME}-${{ matrix.arch }}.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
@@ -75,23 +85,25 @@ jobs:
         uses: actions/cache@v4
         id: cache-rocksdb-static
         with:
-          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
-          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+          path: ${{ steps.os-name.outputs.art_name }}
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-jemalloc-${{ matrix.with_jemalloc }}-v6
 
       - name: Download pre-built RocksDB artifact
         if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
         run: |
           # Try to download from GitHub releases first
-          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          ARTIFACT_NAME="${{ steps.os-name.outputs.art_name }}"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
 
           if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
             echo "Downloaded pre-built artifact from release"
           else
             echo "Pre-built artifact not found, building from source..."
+            VARIANT=$([ "${{ matrix.with_jemalloc }}" = "true" ] && echo jemalloc || echo plain)
             ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
             OS=${{ steps.os-name.outputs.os_name }} \
             ARCH=${{ matrix.arch }} \
+            VARIANT=${VARIANT} \
             make build-rocksdb-static
             mv rocksdb-static/rocksdb-static-*.tar.gz .
           fi
@@ -99,7 +111,7 @@ jobs:
       - name: Extract RocksDB static artifact
         run: |
           mkdir -p rocksdb-static/artifact
-          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          tar xzf "${{ steps.os-name.outputs.art_name }}" -C rocksdb-static/artifact
           ls -la rocksdb-static/artifact/
 
       - name: Install dependencies
@@ -110,13 +122,33 @@ jobs:
 
       - name: Build binaries
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} STATIC_BUILD=true make all
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          STATIC_BUILD=true WITH_JEMALLOC=${{ matrix.with_jemalloc }} make all
 
       - name: Rename binaries with platform suffix
         run: |
           mkdir -p dist
           mv ocache dist/ocache-${{ matrix.goos }}-${{ matrix.goarch }}
           mv ocachecli dist/ocachecli-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      # Fail the build if a jemalloc binary didn't actually link/activate jemalloc
+      # (empty prefix must interpose, RocksDB WITH_JEMALLOC must resolve). Runs
+      # natively — each Linux arch is built on its own-arch runner. See issue #176.
+      - name: Verify jemalloc linkage
+        if: matrix.with_jemalloc == 'true'
+        run: |
+          BIN="dist/ocache-${{ matrix.goos }}-${{ matrix.goarch }}"
+          echo "jemalloc symbols in binary: $(nm "$BIN" | grep -c -i jemalloc)"
+          # jemalloc's malloc must be the process malloc (empty prefix, defined T).
+          nm "$BIN" | grep -qE ' T malloc$' || { echo "ERROR: jemalloc malloc not linked as the process allocator"; exit 1; }
+          nm "$BIN" | grep -qE ' T mallctl$' || { echo "ERROR: jemalloc integration (mallctl) not present"; exit 1; }
+          # Runtime: an invalid MALLOC_CONF makes jemalloc warn at init; glibc's
+          # allocator ignores MALLOC_CONF entirely, so this proves jemalloc is live.
+          if MALLOC_CONF=verify_jemalloc_is_active:1 "$BIN" -version 2>&1 | grep -q '<jemalloc>'; then
+            echo "OK: jemalloc is the runtime allocator"
+          else
+            echo "ERROR: jemalloc is not the active runtime allocator"; exit 1
+          fi
 
       - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
