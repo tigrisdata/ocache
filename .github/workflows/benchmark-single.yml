@@ -131,6 +131,13 @@ jobs:
             sleep 1
           done
 
+      - name: Start RSS sampler
+        run: |
+          # Record the server's RSS (VmRSS/RssAnon/VmData) across all benchmarks
+          # so plain vs jemalloc allocator footprint can be compared (issue #176).
+          nohup bash scripts/rss-sample.sh rss-samples.csv 1 "${SERVER_PID}" >/dev/null 2>&1 &
+          echo "RSS_SAMPLER_PID=$!" >> $GITHUB_ENV
+
       - name: Run read-heavy benchmark - 100 bytes
         run: |
           echo "=== Running benchmark with 100 byte objects ==="
@@ -165,6 +172,14 @@ jobs:
           # and serves as a performance-regression guard on the compactor commit path.
           ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee 256kb-compaction-churn.log
 
+      - name: Stop RSS sampler and summarize
+        if: always()
+        run: |
+          kill "${RSS_SAMPLER_PID}" 2>/dev/null || true
+          sleep 1
+          echo "=== RSS summary (variant: ${{ matrix.variant }}) ==="
+          bash scripts/rss-summary.sh rss-samples.csv | tee rss-summary.txt
+
       - name: Stop server
         if: always()
         run: |
@@ -179,3 +194,5 @@ jobs:
           path: |
             *.log
             *.out
+            rss-samples.csv
+            rss-summary.txt
