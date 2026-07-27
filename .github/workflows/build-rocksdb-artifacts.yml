@@ -15,13 +15,24 @@ jobs:
   build-artifacts:
     strategy:
       matrix:
+        # Two variants on Linux (plain + jemalloc, see issue #176); jemalloc is
+        # Linux-only, so macOS builds the plain variant only.
         include:
           - os: namespace-profile-ubuntu-2404
             arch: x86_64
+            variant: plain
+          - os: namespace-profile-ubuntu-2404
+            arch: x86_64
+            variant: jemalloc
           - os: namespace-profile-ubuntu-2404-arm
             arch: aarch64
+            variant: plain
+          - os: namespace-profile-ubuntu-2404-arm
+            arch: aarch64
+            variant: jemalloc
           - os: namespace-profile-macos-1561-arm
             arch: arm64
+            variant: plain
     runs-on: ${{ matrix.os }}
     
     steps:
@@ -31,25 +42,27 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libsnappy-dev \
+          # bzip2 is needed to extract the jemalloc release tarball (.tar.bz2).
+          sudo apt-get install -y build-essential cmake bzip2 libsnappy-dev \
             liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
-      
+
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install cmake snappy lz4 zstd
-      
+
       - name: Build RocksDB static library
         run: |
           ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
           ARCH=${{ matrix.arch }} \
           OS=${{ runner.os }} \
+          VARIANT=${{ matrix.variant }} \
           make build-rocksdb-static
-      
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ runner.os }}-${{ matrix.arch }}
+          name: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.variant }}-${{ runner.os }}-${{ matrix.arch }}
           path: rocksdb-static/rocksdb-static-*.tar.gz
           retention-days: 90
 
@@ -78,17 +91,28 @@ jobs:
             Pre-built static RocksDB libraries for various platforms.
 
             ## Supported Platforms
-            - Linux x86_64
-            - Linux aarch64
-            - macOS arm64
-            
+            - Linux x86_64 (plain, jemalloc)
+            - Linux aarch64 (plain, jemalloc)
+            - macOS arm64 (plain)
+
+            ## Variants
+            - **plain** — `rocksdb-static-<ver>-<os>-<arch>.tar.gz`: RocksDB only.
+            - **jemalloc** — `rocksdb-static-<ver>-jemalloc-<os>-<arch>.tar.gz`
+              (Linux only): RocksDB built `WITH_JEMALLOC=ON`, with a static
+              `libjemalloc.a` (empty prefix) bundled in `lib/` so the final binary
+              can link jemalloc as the process allocator to cap RocksDB off-heap
+              RSS. See issue #176.
+
             ## Usage
-            1. Download the appropriate artifact for your platform
+            1. Download the appropriate artifact for your platform and variant
             2. Extract to your project directory
             3. Set build flags:
                ```
                export CGO_CFLAGS="-I/path/to/extracted/include"
+               # plain:
                export CGO_LDFLAGS="-L/path/to/extracted/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread"
+               # jemalloc (add -ljemalloc to make jemalloc the process allocator):
+               export CGO_LDFLAGS="-L/path/to/extracted/lib -lrocksdb -ljemalloc -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread"
                ```
           draft: false
           prerelease: false
