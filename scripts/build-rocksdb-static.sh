@@ -68,11 +68,22 @@ if [ "${VARIANT}" = "jemalloc" ]; then
     if [ ! -f "${JEMALLOC_PREFIX}/lib/libjemalloc.a" ]; then
         # The release tarball ships a pre-generated ./configure (the GitHub source
         # archive does not — it would need autoconf), so fetch the release asset.
+        # This tarball's configure + generated Makefile are executed below, so its
+        # integrity is verified against a pinned digest before extraction to keep
+        # tampered upstream content out of the published artifact. If you bump
+        # JEMALLOC_VERSION, update JEMALLOC_SHA256 to the new release's checksum.
+        JEMALLOC_SHA256="${JEMALLOC_SHA256:-2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aecfeaa}"
         JEMALLOC_TARBALL="jemalloc-${JEMALLOC_VERSION}.tar.bz2"
         if [ ! -f "${JEMALLOC_TARBALL}" ]; then
             echo "Downloading jemalloc ${JEMALLOC_VERSION}..."
-            curl -L -o "${JEMALLOC_TARBALL}" \
+            curl -fL -o "${JEMALLOC_TARBALL}" \
                 "https://github.com/jemalloc/jemalloc/releases/download/${JEMALLOC_VERSION}/${JEMALLOC_TARBALL}"
+        fi
+        echo "Verifying jemalloc tarball checksum..."
+        if command -v sha256sum >/dev/null 2>&1; then
+            echo "${JEMALLOC_SHA256}  ${JEMALLOC_TARBALL}" | sha256sum -c -
+        else
+            echo "${JEMALLOC_SHA256}  ${JEMALLOC_TARBALL}" | shasum -a 256 -c -
         fi
         rm -rf "jemalloc-${JEMALLOC_VERSION}"
         tar xjf "${JEMALLOC_TARBALL}"
