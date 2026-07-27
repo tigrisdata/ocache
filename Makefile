@@ -55,22 +55,36 @@ VERSION_LDFLAGS := -X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.B
 
 # Static build configuration
 STATIC_BUILD ?= false
+# WITH_JEMALLOC links jemalloc (bundled in the jemalloc rocksdb-static artifact)
+# as the process allocator to cap RocksDB off-heap RSS (issue #176). Linux static
+# builds only — jemalloc is not bundled for macOS and the RSS problem is a
+# glibc-arena/static-link concern. Requires the `jemalloc` rocksdb-static artifact
+# (contains lib/libjemalloc.a).
+WITH_JEMALLOC ?= false
 ifeq ($(STATIC_BUILD),true)
     # Use static RocksDB from artifact
     ROCKSDB_STATIC_DIR ?= $(shell pwd)/rocksdb-static/artifact
     CGO_CFLAGS := -I$(ROCKSDB_STATIC_DIR)/include
     ifeq ($(UNAME_S),Darwin)
-        # On macOS, also include Homebrew paths for compression libraries
+        # On macOS, also include Homebrew paths for compression libraries.
+        # macOS doesn't support fully static binaries (only RocksDB is static) and
+        # bundles no jemalloc, so WITH_JEMALLOC is ignored here.
         BREW_PREFIX := $(shell brew --prefix 2>/dev/null || echo "/usr/local")
         CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -L$(BREW_PREFIX)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
-    else
-        CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
-    endif
-    # macOS doesn't support fully static binaries, so we only statically link RocksDB
-    ifeq ($(UNAME_S),Darwin)
         LDFLAGS := -ldflags "-s -w $(VERSION_LDFLAGS)"
     else
+      ifeq ($(WITH_JEMALLOC),true)
+        # -ljemalloc is placed AFTER -lrocksdb so jemalloc's malloc resolves
+        # RocksDB's allocations, making jemalloc the process allocator. In a fully
+        # static glibc binary the linker may also pull glibc's malloc.o (for its
+        # internal aliases); --allow-multiple-definition keeps the first (jemalloc)
+        # definition instead of erroring. See issue #176.
+        CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -ljemalloc -ldl -pthread
+        LDFLAGS := -ldflags "-linkmode external -extldflags '-static -Wl,--allow-multiple-definition' $(VERSION_LDFLAGS)"
+      else
+        CGO_LDFLAGS := -L$(ROCKSDB_STATIC_DIR)/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread
         LDFLAGS := -ldflags "-linkmode external -extldflags '-static' $(VERSION_LDFLAGS)"
+      endif
     endif
 else
     # Non-static builds still get version info
