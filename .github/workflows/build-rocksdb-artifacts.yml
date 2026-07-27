@@ -79,44 +79,26 @@ jobs:
         with:
           path: artifacts
       
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      # Create the release only if it doesn't already exist. actions/create-release
+      # hard-fails with "already_exists" when re-running for a version whose
+      # release was published by an earlier run (e.g. adding the jemalloc variant
+      # to an existing version), which then skips the asset upload below. The
+      # upload step uses --clobber, so on a re-run we skip creation and just
+      # add/refresh assets.
+      - name: Create release if absent
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: rocksdb-v${{ env.ROCKSDB_VERSION }}
-          release_name: RocksDB ${{ env.ROCKSDB_VERSION }} Static Libraries
-          body: |
-            Pre-built static RocksDB libraries for various platforms.
+        run: |
+          TAG="rocksdb-v${{ env.ROCKSDB_VERSION }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; the upload step will add/refresh its assets."
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "RocksDB ${{ env.ROCKSDB_VERSION }} Static Libraries" \
+              --notes "Pre-built static RocksDB libraries. Variants: plain (\`rocksdb-static-<ver>-<os>-<arch>.tar.gz\`) and Linux-only jemalloc (\`...-jemalloc-...\`; RocksDB WITH_JEMALLOC=ON with a bundled empty-prefix libjemalloc.a — add \`-ljemalloc\` when linking). See scripts/build-rocksdb-static.sh and issue #176."
+          fi
 
-            ## Supported Platforms
-            - Linux x86_64 (plain, jemalloc)
-            - Linux aarch64 (plain, jemalloc)
-            - macOS arm64 (plain)
-
-            ## Variants
-            - **plain** — `rocksdb-static-<ver>-<os>-<arch>.tar.gz`: RocksDB only.
-            - **jemalloc** — `rocksdb-static-<ver>-jemalloc-<os>-<arch>.tar.gz`
-              (Linux only): RocksDB built `WITH_JEMALLOC=ON`, with a static
-              `libjemalloc.a` (empty prefix) bundled in `lib/` so the final binary
-              can link jemalloc as the process allocator to cap RocksDB off-heap
-              RSS. See issue #176.
-
-            ## Usage
-            1. Download the appropriate artifact for your platform and variant
-            2. Extract to your project directory
-            3. Set build flags:
-               ```
-               export CGO_CFLAGS="-I/path/to/extracted/include"
-               # plain:
-               export CGO_LDFLAGS="-L/path/to/extracted/lib -lrocksdb -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread"
-               # jemalloc (add -ljemalloc to make jemalloc the process allocator):
-               export CGO_LDFLAGS="-L/path/to/extracted/lib -lrocksdb -ljemalloc -lstdc++ -lm -lz -lbz2 -lsnappy -llz4 -lzstd -pthread"
-               ```
-          draft: false
-          prerelease: false
-      
       - name: Upload Release Assets
         run: |
           for artifact in artifacts/*/rocksdb-static-*.tar.gz; do
