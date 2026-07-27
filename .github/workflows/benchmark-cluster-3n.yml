@@ -204,6 +204,14 @@ jobs:
 
           echo "Cluster is fully converged and ready for benchmarks"
 
+      - name: Start RSS sampler
+        run: |
+          # Record aggregate node RSS across all benchmarks so plain vs jemalloc
+          # allocator footprint can be compared (issue #176).
+          nohup bash scripts/rss-sample.sh rss-samples.csv 1 \
+            "$(cat node1.pid)" "$(cat node2.pid)" "$(cat node3.pid)" >/dev/null 2>&1 &
+          echo "RSS_SAMPLER_PID=$!" >> $GITHUB_ENV
+
       - name: Run cluster read-heavy benchmark - 100 bytes
         run: |
           echo "=== Running cluster benchmark with 100 byte objects ==="
@@ -238,6 +246,14 @@ jobs:
           # and serves as a performance-regression guard on the compactor commit path.
           ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee cluster-256kb-compaction-churn.log
 
+      - name: Stop RSS sampler and summarize
+        if: always()
+        run: |
+          kill "${RSS_SAMPLER_PID}" 2>/dev/null || true
+          sleep 1
+          echo "=== RSS summary — aggregate of 3 nodes (variant: ${{ matrix.variant }}) ==="
+          bash scripts/rss-summary.sh rss-samples.csv | tee rss-summary.txt
+
       - name: Stop cluster nodes
         if: always()
         run: |
@@ -263,3 +279,5 @@ jobs:
           path: |
             cluster-*.log
             *.out
+            rss-samples.csv
+            rss-summary.txt
