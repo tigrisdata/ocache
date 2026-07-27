@@ -65,15 +65,20 @@ jobs:
           OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
           # Select the rocksdb-static variant: jemalloc on Linux, plain elsewhere.
+          # Use runner.os casing (Linux/macOS) to match the names published by
+          # build-rocksdb-artifacts.yml (which passes OS=${{ runner.os }}), so the
+          # download actually hits the release asset instead of the source fallback.
           SUFFIX=""
           if [ "${{ matrix.with_jemalloc }}" = "true" ]; then SUFFIX="-jemalloc"; fi
-          echo "art_name=rocksdb-static-${{ env.ROCKSDB_VERSION }}${SUFFIX}-${OS_NAME}-${{ matrix.arch }}.tar.gz" >> $GITHUB_OUTPUT
+          echo "art_name=rocksdb-static-${{ env.ROCKSDB_VERSION }}${SUFFIX}-${{ runner.os }}-${{ matrix.arch }}.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgflags-dev \
+          # bzip2 extracts jemalloc's .tar.bz2 if the rocksdb-static source-build
+          # fallback runs (jemalloc variant); libbz2-dev only covers linking.
+          sudo apt-get install -y build-essential cmake bzip2 libgflags-dev \
             libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
 
       - name: Install system dependencies (macOS)
@@ -101,7 +106,7 @@ jobs:
             echo "Pre-built artifact not found, building from source..."
             VARIANT=$([ "${{ matrix.with_jemalloc }}" = "true" ] && echo jemalloc || echo plain)
             ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
-            OS=${{ steps.os-name.outputs.os_name }} \
+            OS=${{ runner.os }} \
             ARCH=${{ matrix.arch }} \
             VARIANT=${VARIANT} \
             make build-rocksdb-static
@@ -138,16 +143,22 @@ jobs:
         if: matrix.with_jemalloc == 'true'
         run: |
           BIN="dist/ocache-${{ matrix.goos }}-${{ matrix.goarch }}"
-          echo "jemalloc symbols in binary: $(nm "$BIN" | grep -c -i jemalloc)"
+          # Dump symbols to a file and grep the file — piping nm into `grep -q`
+          # lets grep close the pipe early, killing nm with SIGPIPE, which fails
+          # the step under the runner's `bash -eo pipefail` even on a good binary.
+          nm "$BIN" > nm.txt
+          echo "jemalloc symbols in binary: $(grep -c -i jemalloc nm.txt || true)"
           # jemalloc's malloc must be the process malloc (empty prefix, defined T).
-          nm "$BIN" | grep -qE ' T malloc$' || { echo "ERROR: jemalloc malloc not linked as the process allocator"; exit 1; }
-          nm "$BIN" | grep -qE ' T mallctl$' || { echo "ERROR: jemalloc integration (mallctl) not present"; exit 1; }
+          grep -qE ' T malloc$' nm.txt || { echo "ERROR: jemalloc malloc not linked as the process allocator"; exit 1; }
+          grep -qE ' T mallctl$' nm.txt || { echo "ERROR: jemalloc integration (mallctl) not present"; exit 1; }
           # Runtime: an invalid MALLOC_CONF makes jemalloc warn at init; glibc's
           # allocator ignores MALLOC_CONF entirely, so this proves jemalloc is live.
-          if MALLOC_CONF=verify_jemalloc_is_active:1 "$BIN" -version 2>&1 | grep -q '<jemalloc>'; then
+          # Capture to a file first (same SIGPIPE/pipefail reason as above).
+          MALLOC_CONF=verify_jemalloc_is_active:1 "$BIN" -version > probe.txt 2>&1 || true
+          if grep -q '<jemalloc>' probe.txt; then
             echo "OK: jemalloc is the runtime allocator"
           else
-            echo "ERROR: jemalloc is not the active runtime allocator"; exit 1
+            echo "ERROR: jemalloc is not the active runtime allocator"; cat probe.txt; exit 1
           fi
 
       - name: Upload binary artifacts
