@@ -86,6 +86,56 @@ func TestValueMessageValueLength_MalformedIsNotOK(t *testing.T) {
 	require.False(t, ok)
 }
 
+// valueMessageExpiry must agree with a full decode's Expiry field across shapes.
+func TestValueMessageExpiry_MatchesFullDecode(t *testing.T) {
+	msgs := []*pb.ValueMessage{
+		{},
+		{ValueType: pb.ValueType_INLINE, Data: []byte("hi"), ValueLength: 2}, // no expiry
+		{ValueType: pb.ValueType_INLINE, Data: bytes.Repeat([]byte("x"), 64*1024), ValueLength: 64 * 1024, Expiry: 1786728207},
+		{ValueType: pb.ValueType_RAW_FILE, RawFilePath: "/r", ValueLength: 1 << 20, Expiry: 42},
+	}
+	for _, m := range msgs {
+		buf, err := proto.Marshal(m)
+		require.NoError(t, err)
+		got, ok := valueMessageExpiry(buf)
+		require.True(t, ok)
+		require.Equal(t, m.Expiry, got)
+	}
+}
+
+// unmarshalValueMessageSkippingData must reproduce a full proto.Unmarshal on
+// every field except Data, which it must drop.
+func TestUnmarshalValueMessageSkippingData_MatchesFullDecodeExceptData(t *testing.T) {
+	msgs := map[string]*pb.ValueMessage{
+		"empty":   {},
+		"inline":  {ValueType: pb.ValueType_INLINE, Data: bytes.Repeat([]byte("x"), 64*1024), ValueLength: 64 * 1024, Expiry: 9},
+		"rawfile": {ValueType: pb.ValueType_RAW_FILE, RawFilePath: "/disk/files/abc.dat", ValueLength: 8 << 20, Checksum: 0xabcd},
+		"segment": {ValueType: pb.ValueType_SEGMENT, SegmentPath: "/disk/segments/seg_1.seg", SegmentOffset: 4096, ValueLength: 262144},
+	}
+	for name, m := range msgs {
+		t.Run(name, func(t *testing.T) {
+			buf, err := proto.Marshal(m)
+			require.NoError(t, err)
+
+			var got pb.ValueMessage
+			require.True(t, unmarshalValueMessageSkippingData(buf, &got))
+
+			require.Empty(t, got.Data, "Data must be dropped")
+			require.Equal(t, m.ValueType, got.ValueType)
+			require.Equal(t, m.Expiry, got.Expiry)
+			require.Equal(t, m.RawFilePath, got.RawFilePath)
+			require.Equal(t, m.SegmentPath, got.SegmentPath)
+			require.Equal(t, m.SegmentOffset, got.SegmentOffset)
+			require.Equal(t, m.ValueLength, got.ValueLength)
+			require.Equal(t, m.Checksum, got.Checksum)
+		})
+	}
+
+	// Malformed input is rejected, matching the callers' proto.Unmarshal-error path.
+	var msg pb.ValueMessage
+	require.False(t, unmarshalValueMessageSkippingData([]byte{0x80}, &msg))
+}
+
 // Benchmarks the allocation/CPU delta the size-accounting paths gain by
 // extracting value_length off the wire instead of a full decode of an inline
 // row at the 64 KiB threshold.

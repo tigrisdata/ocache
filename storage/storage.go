@@ -489,10 +489,12 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 		k := it.Key().Data()
 		v := it.Value().Data()
 
-		// Try to decode as proto ValueMessage to check expiry
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(v, valueMsg); err == nil {
-			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
+		// Only expiry is needed to decide whether to skip an expired row, so read
+		// it off the wire rather than decoding the whole message (and its inline
+		// Data payload) for every scanned key. A malformed row (ok=false) is
+		// treated as non-expired and included, matching the prior behavior.
+		if expiry, ok := valueMessageExpiry(v); ok {
+			if expiry > 0 && time.Now().Unix() >= expiry {
 				// Expired, skip but don't delete - let the cleaner handle it
 				it.Key().Free()
 				it.Value().Free()
@@ -754,10 +756,12 @@ func (s *Storage) DeleteKey(key string) error {
 	}
 	defer slice.Free()
 
-	// Parse value to get size and file info
+	// Parse value to get size and file info. Only the control fields (type,
+	// length, backing paths) are needed, so decode skipping the inline Data
+	// payload to avoid copying it (up to 64 KiB) on every delete of an inline key.
 	dataSize := int64(0)
 	valueMsg := &pb.ValueMessage{}
-	if err := proto.Unmarshal(slice.Data(), valueMsg); err == nil {
+	if unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
 		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
 		dataSize = valueMsg.ValueLength
 		// Notify cleaner about size reduction
