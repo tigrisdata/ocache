@@ -4,10 +4,13 @@
 package storage
 
 import (
+	"bytes"
+	"io"
 	"testing"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -147,7 +150,7 @@ func TestAccessUpdater_ExplicitFlush(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Explicitly flush without waiting for interval
-	updater.Flush()
+	require.Equal(t, 2, updater.Flush())
 
 	// Verify updates were written immediately
 	ro := grocksdb.NewDefaultReadOptions()
@@ -326,4 +329,79 @@ func TestAccessUpdater_StopFlushesRemaining(t *testing.T) {
 		require.True(t, slice.Exists(), "Key %s should exist after stop", key)
 		slice.Free()
 	}
+}
+
+func benchmarkStorageGet(b *testing.B, storage *Storage, key string) {
+	b.Helper()
+
+	reader, found, err := storage.Get(key, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if !found {
+		b.Fatalf("key %q was not found", key)
+	}
+
+	value, err := io.ReadAll(reader)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if string(value) != key {
+		b.Fatalf("key %q returned %q", key, value)
+	}
+}
+
+// BenchmarkAccessUpdater_CapacityPressure drives Storage.Get through the
+// updater worker and flushes each access group to include access-index work.
+func BenchmarkAccessUpdater_CapacityPressure(b *testing.B) {
+	originalLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.Disabled)
+	b.Cleanup(func() { zerolog.SetGlobalLevel(originalLevel) })
+
+	storage, cleanup := createTestStorage(b, 3600, 1024, 4096, 16*1024*1024, 1000, 1<<30)
+	b.Cleanup(cleanup)
+
+	storage.accessUpdater.Stop()
+	updater := newAccessUpdater(storage, 2, time.Hour, time.Hour)
+	// Keep the capacity-two LRU while allowing the full access group to queue.
+	updater.updates = make(chan accessUpdate, 16)
+	storage.accessUpdater = updater
+	updater.Start()
+
+	for _, key := range []string{"hot", "cold-a", "cold-b"} {
+		if err := storage.Put(key, bytes.NewReader([]byte(key)), 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	runAccessGroup := func() int {
+		for _, key := range []string{"hot", "cold-a", "hot", "cold-b", "hot"} {
+			benchmarkStorageGet(b, storage, key)
+		}
+		return updater.Flush()
+	}
+
+	// Establish the same steady-state LRU contents before timing either side.
+	if flushed := runAccessGroup(); flushed != 3 {
+		b.Fatalf("warm-up flushed %d updates, want 3", flushed)
+	}
+	for b.Loop() {
+		runAccessGroup()
+	}
+
+	// Each entry flushed here performs one secondary-index read. The three
+	// preloaded keys already have index entries, so each entry also rewrites
+	// its old bucket, new bucket, and secondary index.
+	flushed := runAccessGroup()
+	if flushed < 2 {
+		b.Fatalf("access group flushed %d updates, want at least 2", flushed)
+	}
+	b.ReportMetric(float64(flushed), "access-index-reads/op")
+	b.ReportMetric(float64(flushed*3), "access-index-key-writes/op")
+	b.ReportMetric(float64(flushed-2), "hot-key-readmissions/op")
 }
