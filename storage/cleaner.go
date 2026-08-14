@@ -41,6 +41,13 @@ type Cleaner struct {
 	maxDiskUsage int64
 	initialized  atomic.Bool
 
+	// backfillPending is set when a reconcile could not fully backfill eviction-
+	// index coverage (a failed batch write or a truncated scan). While set, the
+	// cleanup loop re-runs the reconcile every tick — instead of waiting for the
+	// hourly recalc — so uncovered keys become evictable within a tick rather than
+	// up to an hour, bounding the window in which the cap cannot reclaim them.
+	backfillPending atomic.Bool
+
 	// stats
 	totalSize   atomic.Int64
 	cleanedKeys atomic.Int64
@@ -65,8 +72,11 @@ func NewCleaner(storage *Storage, interval time.Duration, maxDiskUsage int64) *C
 // It performs an initial size calculation synchronously to establish accurate baseline
 // before any concurrent operations can modify the size
 func (c *Cleaner) Start() {
-	// Calculate initial size synchronously to avoid race with concurrent puts
-	c.calculateTotalSize()
+	// Initial pass, synchronous (before any concurrent puts and before the loop):
+	// recompute size and, when a cap is set, backfill eviction-index coverage for
+	// keys written uncapped or under a prior policy (#189), so the first
+	// enforcement tick sees a complete index.
+	c.reconcileFromMetadata()
 	c.initialized.Store(true)
 
 	c.wg.Add(1)
@@ -113,7 +123,10 @@ func (c *Cleaner) cleanupLoop() {
 		select {
 		case <-ticker.C:
 			// Correct any accumulated drift before enforcement acts on the total.
-			if time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
+			// Also re-run promptly (every tick) while a prior backfill was left
+			// incomplete, so uncovered keys become evictable within a tick rather
+			// than waiting for the hourly recalc.
+			if c.backfillPending.Load() || time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
 				c.calculateTotalSize()
 				lastSizeRecalc = time.Now()
 			}
@@ -309,15 +322,41 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		Msg("cleaner: TTL cleanup completed")
 }
 
-// calculateTotalSize re-derives the total size of stored data from the metadata.
-//
-// The scan is pinned to a RocksDB snapshot and its result is applied as a
-// correction relative to the value the counter held when that snapshot was taken
-// (never as a plain store), so a write that commits while the scan runs keeps its
-// incremental delta instead of being stomped by a scan that could not see it.
+// calculateTotalSize re-derives the tracked total from the metadata. Thin wrapper
+// retained for the hourly reconciliation caller and tests; see reconcileFromMetadata.
 func (c *Cleaner) calculateTotalSize() {
+	c.reconcileFromMetadata()
+}
+
+// reconcileFromMetadata scans every metadata row once, on a pinned RocksDB
+// snapshot, to recompute the total size and apply it as a correction relative to
+// the value the counter held when the snapshot was taken (never a plain store),
+// so a write that commits during the scan keeps its incremental delta instead of
+// being stomped by a scan that could not see it (#205).
+//
+// Whenever a cap is set it ALSO guarantees eviction-index coverage during the
+// same scan. putLow indexes a key only when a cap is set at write time and only
+// for the policy active then, so keys written uncapped — or under a prior policy
+// before an lru<->fifo switch — have no index entry and are invisible to
+// eviction: the cap can never reclaim them (#189, the state that fills the disk
+// into the terminal ENOSPC of #204). Rather than a per-key lookup, this
+// merge-joins the metadata rows against the active policy's back-reference rows
+// — both stored sorted by the same key suffix — advancing a second iterator in
+// lockstep, so coverage is checked in O(1) memory with no random reads. Any live
+// key with no back-reference is given a fresh entry.
+//
+// Running on every reconcile (not just startup) makes coverage self-healing: a
+// backfill left incomplete by a write or iterator error is finished on a later
+// pass, and the merge is cheap when coverage is already complete. A concurrent
+// put during an hourly pass can momentarily produce a duplicate/orphan index
+// entry, which the eviction scan already validates against the back-reference
+// and reclaims. Orphan back-references (no metadata row) are skipped. Backfilled
+// keys are stamped at scan time, so the order among them is arbitrary but they
+// become evictable.
+func (c *Cleaner) reconcileFromMetadata() {
 	start := time.Now()
 	var totalSize int64
+	backfill := c.maxDiskUsage > 0
 
 	// Pin the scan before reading the counter: a write the scan cannot see then
 	// also has its delta applied after tracked was read, so it survives.
@@ -331,11 +370,50 @@ func (c *Cleaner) calculateTotalSize() {
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
+	// Backfill state: a second iterator over the active policy's back-reference
+	// rows on the same snapshot, advanced in lockstep with the metadata rows.
+	var (
+		backrefIt     *grocksdb.Iterator
+		backrefPrefix []byte
+		wo            *grocksdb.WriteOptions
+		batch         *grocksdb.WriteBatch
+		now           time.Time
+		backfilled    int
+		writeErrs     int
+		backrefBroken bool
+	)
+	if backfill {
+		now = time.Now()
+		if c.storage.evictionPolicy == EvictionPolicyFIFO {
+			backrefPrefix = []byte(keys.FifoBackrefPrefix)
+		} else {
+			backrefPrefix = []byte(keys.AccessBucketIndexPrefix)
+		}
+		backrefIt = c.storage.meta.Handle().NewIterator(ro)
+		defer backrefIt.Close()
+		backrefIt.Seek(backrefPrefix)
+		wo = grocksdb.NewDefaultWriteOptions()
+		defer wo.Destroy()
+		batch = grocksdb.NewWriteBatch()
+		defer batch.Destroy()
+	}
+	flush := func() {
+		if batch == nil || batch.Count() == 0 {
+			return
+		}
+		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
+			writeErrs++
+			zlog.Error().Err(err).Msg("cleaner: eviction-index backfill batch write failed")
+		}
+		batch.Clear()
+	}
+
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// Check if we're shutting down
 		select {
 		case <-c.closeCh:
-			zlog.Info().Msg("cleaner: size calculation interrupted by shutdown")
+			zlog.Info().Msg("cleaner: metadata reconciliation interrupted by shutdown")
+			flush()
 			return
 		default:
 		}
@@ -349,18 +427,64 @@ func (c *Cleaner) calculateTotalSize() {
 			continue
 		}
 
-		value := it.Value().Data()
-
 		// This scan sums only value_length across every metadata row, so read
 		// it directly off the wire rather than fully decoding each message —
 		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
 		// threshold) on both the startup scan and the hourly reconciliation.
-		if length, ok := valueMessageValueLength(value); ok {
+		if length, ok := valueMessageValueLength(it.Value().Data()); ok {
 			totalSize += length
+		}
+
+		if backfill && !backrefBroken {
+			userKey := keys.ExtractUserKey(keyBytes)
+			covered, ok := advanceBackrefTo(backrefIt, backrefPrefix, userKey)
+			switch {
+			case !ok:
+				// The back-reference scan errored: coverage is now unknown, so stop
+				// backfilling for the rest of this pass. Treating errored-out keys as
+				// uncovered would re-stamp already-indexed keys (rewriting their
+				// eviction order). backfillPending triggers a full retry next tick.
+				backrefBroken = true
+			case !covered:
+				c.stageBackfillEntry(batch, userKey, now)
+				backfilled++
+				if batch.Count() >= 1000 {
+					flush()
+				}
+			}
 		}
 
 		it.Key().Free()
 		it.Value().Free()
+	}
+	flush()
+
+	// A truncated scan yields a partial sum; applying it would corrupt the counter
+	// (under-sizing the cap and weakening the very eviction this protects). Skip
+	// the correction and let the next reconcile retry the full scan.
+	if err := it.Err(); err != nil {
+		// The scan was truncated, so coverage may be incomplete — flag a fast retry.
+		if backfill {
+			c.backfillPending.Store(true)
+		}
+		zlog.Error().Err(err).Int("backfilled", backfilled).
+			Msg("cleaner: metadata scan truncated by iterator error; skipped size correction, will retry next tick")
+		return
+	}
+	if backfill {
+		incomplete := writeErrs > 0 || backrefBroken
+		if err := backrefIt.Err(); err != nil {
+			incomplete = true
+			zlog.Warn().Err(err).
+				Msg("cleaner: back-reference scan errored; stopped backfill to avoid re-stamping indexed keys, will retry next tick")
+		}
+		if writeErrs > 0 {
+			zlog.Warn().Int("failed_batches", writeErrs).Int("backfilled", backfilled).
+				Msg("cleaner: eviction-index backfill incomplete; will retry next tick")
+		}
+		// While set, the cleanup loop re-runs this reconcile every tick until a
+		// pass completes cleanly, so uncovered keys are reclaimable within a tick.
+		c.backfillPending.Store(incomplete)
 	}
 
 	c.totalSize.Add(totalSize - tracked)
@@ -368,11 +492,63 @@ func (c *Cleaner) calculateTotalSize() {
 	// Publish the freshly computed size to the gauges.
 	c.refreshSizeMetrics()
 
-	zlog.Info().
+	event := zlog.Info().
 		Int64("total_size", totalSize).
 		Int64("drift", tracked-totalSize).
-		Dur("duration_ms", time.Since(start)).
-		Msg("cleaner: calculated total storage size")
+		Dur("duration_ms", time.Since(start))
+	if backfill {
+		event = event.Int("backfilled", backfilled).Str("policy", c.storage.evictionPolicy)
+	}
+	event.Msg("cleaner: reconciled total storage size from metadata")
+}
+
+// advanceBackrefTo advances the sorted back-reference iterator to userKey and
+// reports whether an entry for it exists (covered). ok is false only when the
+// iterator is in an error state — coverage is then unknown, and the caller must
+// NOT treat the key as uncovered (re-stamping an already-indexed key would
+// rewrite its eviction order). Orphan back-references (a key that sorts before
+// userKey, i.e. has no metadata row) are skipped. The iterator only moves
+// forward, matching the ascending metadata scan, so the whole coverage check
+// across a reconcile is a single linear merge — O(1) memory, no lookups.
+func advanceBackrefTo(it *grocksdb.Iterator, prefix []byte, userKey string) (covered, ok bool) {
+	for it.ValidForPrefix(prefix) {
+		suffix := string(it.Key().Data()[len(prefix):])
+		it.Key().Free()
+		it.Value().Free()
+		switch {
+		case suffix < userKey:
+			it.Next() // orphan back-reference with no metadata row; skip past it
+		case suffix == userKey:
+			it.Next() // consume it — each key matches at most one metadata row
+			return true, true
+		default: // suffix > userKey: no entry for this key; keep it for a later row
+			return false, true
+		}
+	}
+	// The prefix range ended: distinguish a genuine "no more entries" from an
+	// iterator error, so a transient read failure does not masquerade as
+	// "uncovered" and trigger re-stamping of the remaining keys.
+	if it.Err() != nil {
+		return false, false
+	}
+	return false, true
+}
+
+// stageBackfillEntry adds a fresh eviction-index entry for userKey to batch,
+// stamped at now, for the active policy — mirroring putLow's index writes. FIFO
+// goes through writeFifoIndexEntry so that if a concurrent put indexed this key
+// after our snapshot (only possible on a live hourly pass), the stale entry is
+// deleted via the back-reference rather than left as a duplicate. The LRU path
+// leaves any superseded access-bucket entry as an orphan for later reclamation,
+// exactly as putLow's LRU branch does.
+func (c *Cleaner) stageBackfillEntry(batch *grocksdb.WriteBatch, userKey string, now time.Time) {
+	if c.storage.evictionPolicy == EvictionPolicyFIFO {
+		c.storage.writeFifoIndexEntry(batch, userKey, now)
+		return
+	}
+	accessKey := keys.MakeBucketedAccessKey(userKey, now)
+	batch.Put(accessKey, []byte{})
+	batch.Put(keys.MakeBucketedAccessIndexKey(userKey), accessKey)
 }
 
 // enforceDiskLimit evicts keys if disk usage exceeds the limit

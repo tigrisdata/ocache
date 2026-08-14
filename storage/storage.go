@@ -328,14 +328,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
 
-	// FIFO indexes keys as they are written, so it only evicts keys written after
-	// it is enabled. Warn (cheaply) if this cache already holds keys but the FIFO
-	// index is empty — those keys are not evictable and the cap cannot reclaim
-	// them; FIFO should be enabled from a fresh deployment.
-	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyFIFO {
-		s.warnIfUnindexedForFifo()
-	}
-
+	// The cleaner's initial pass recomputes size and, when a cap is set, backfills
+	// eviction-index coverage for keys written uncapped or under a prior policy so
+	// the cap can reclaim them (#189, which feeds #204).
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
@@ -1216,36 +1211,6 @@ func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, no
 	fifoKey := keys.MakeFifoIndexKey(key, now)
 	batch.Put(fifoKey, []byte{})
 	batch.Put(backref, fifoKey)
-}
-
-// warnIfUnindexedForFifo logs a warning when the data directory already holds
-// keys but the FIFO index is empty — i.e. FIFO+cap was enabled on a cache whose
-// keys predate the index (written before the cap, or under LRU). FIFO only
-// evicts keys written after it is enabled, so such pre-existing keys are not
-// evictable and the disk cap cannot reclaim them. This is an O(1) check (two
-// prefix seeks), not a scan: FIFO is meant to be enabled from a fresh deployment.
-//
-// #189 tracks hardening this warning into a refuse-to-start guard, along with
-// the related stale-access-index leak on an LRU->FIFO switch.
-func (s *Storage) warnIfUnindexedForFifo() {
-	ro := metadata.CreateReadOptions(false, false)
-	defer ro.Destroy()
-
-	hasAny := func(prefix []byte) bool {
-		it := s.meta.Handle().NewIterator(ro)
-		defer it.Close()
-		it.Seek(prefix)
-		if !it.ValidForPrefix(prefix) {
-			return false
-		}
-		it.Key().Free()
-		it.Value().Free()
-		return true
-	}
-
-	if hasAny([]byte(keys.MetadataPrefix)) && !hasAny(keys.GetFifoIndexPrefix()) {
-		zlog.Warn().Msg("storage: FIFO eviction enabled on a data directory that already holds keys but has an empty FIFO index; those pre-existing keys are not evictable and the disk cap cannot reclaim them. Enable FIFO from a fresh deployment.")
-	}
 }
 
 // stageEvictionIndexDeletes adds deletes for key's eviction-index entries — the
