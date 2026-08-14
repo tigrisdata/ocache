@@ -35,6 +35,15 @@ OCache can be configured through command-line flags when starting the server.
 > read of old data cannot displace hotter data. `fifo` suits write-once workloads
 > (e.g. parquet, where the newest data is read most).
 >
+> **ENOSPC backstop.** `-max-disk-usage` bounds the *logical* size (the sum of
+> stored object lengths). Physical usage can legitimately run higher — segment
+> preallocation slack, not-yet-recompacted dead space, orphaned raw files — so a
+> logical-only cap cannot by itself prevent the volume filling to 100%, which is
+> terminal (RocksDB can no longer open). As a safety net, whenever a cap is set
+> the cleaner also evicts if the volume's *actual* free space (measured via
+> `statfs`, exported as `ocache_filesystem_free_bytes`) falls below a fixed 2 GiB
+> reserve, independent of the logical total. This is not configurable.
+>
 > Each policy maintains its own eviction index. Deletes and TTL expiry remove a
 > key's index entry under both. On overwrite they differ: `fifo` deletes the
 > previous entry at write time (via a per-key back-reference), so the index holds
