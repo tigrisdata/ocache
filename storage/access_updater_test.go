@@ -331,6 +331,28 @@ func TestAccessUpdater_StopFlushesRemaining(t *testing.T) {
 	}
 }
 
+// TestAccessUpdater_TimeGatingRefreshesLRURecency verifies that a gated read
+// keeps a hot key resident when distinct keys create capacity pressure.
+func TestAccessUpdater_TimeGatingRefreshesLRURecency(t *testing.T) {
+	const initialAccessTime = int64(1_000_000)
+
+	updater := newAccessUpdater(nil, 2, time.Hour, time.Hour)
+	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime})
+	updater.timeGateUpdate(accessUpdate{key: "other", time: initialAccessTime + 1})
+	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime + 2})
+	updater.timeGateUpdate(accessUpdate{key: "new", time: initialAccessTime + 3})
+
+	_, ok := updater.accessTimeLRU.Peek("hot")
+	assert.True(t, ok, "a gated hot-key read must refresh LRU recency")
+
+	firstHotUpdate := updater.batch["hot"].time
+	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime + 4})
+	hotUpdate, ok := updater.batch["hot"]
+	require.True(t, ok)
+	assert.Equal(t, firstHotUpdate, hotUpdate.time,
+		"a hot key within the delay must not be readmitted to the batch")
+}
+
 func benchmarkStorageGet(b *testing.B, storage *Storage, key string) {
 	b.Helper()
 

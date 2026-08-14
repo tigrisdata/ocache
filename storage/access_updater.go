@@ -160,12 +160,12 @@ func (a *accessUpdater) collectUpdates() {
 	}
 }
 
-// timeGateUpdate adds an update to the batch if it is stale
-// and adds the key to the LRU cache so that it is marked as most recently used
+// timeGateUpdate adds an update to the batch if it is stale and refreshes the
+// key's recency in the access-time LRU.
 func (a *accessUpdater) timeGateUpdate(update accessUpdate) {
-	// Only add to the batch if the key in LRU cache is more than delay old
-	// or if the key is not in the LRU cache
-	accessTime, ok := a.accessTimeLRU.Peek(update.key)
+	// Get marks a gated hit as recently used without changing its timestamp.
+	accessTime, ok := a.accessTimeLRU.Get(update.key)
+	// Only add to the batch when the timestamp is stale or the cache misses.
 	if (ok && time.Unix(update.time, 0).Sub(time.Unix(accessTime, 0)) > a.delay) || !ok {
 		a.addToBatch(update)
 
