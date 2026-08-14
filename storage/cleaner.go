@@ -23,6 +23,15 @@ const (
 
 	// accessBucketCleanupThreshold is the threshold at which we clean up old access buckets
 	accessBucketCleanupThreshold = 30 * 24 * time.Hour
+
+	// totalSizeRecalcInterval is how often the tracked total is re-derived from a
+	// full metadata scan. The running total is maintained incrementally on every
+	// write and delete, which is exact in the common case but can still drift: a
+	// crash between the metadata write and the accounting update, or two
+	// concurrent Puts of the same key both reading the same previous row. Redoing
+	// the startup scan keeps any such drift bounded instead of letting it
+	// accumulate for the process lifetime; it is a metadata-only scan.
+	totalSizeRecalcInterval = 1 * time.Hour
 )
 
 // Cleaner is responsible for background TTL cleanup and LRU eviction
@@ -97,10 +106,18 @@ func (c *Cleaner) cleanupLoop() {
 
 	// Track when we last cleaned up old buckets
 	lastBucketCleanup := time.Now()
+	// Track when we last re-derived the total size from the metadata
+	lastSizeRecalc := time.Now()
 
 	for {
 		select {
 		case <-ticker.C:
+			// Correct any accumulated drift before enforcement acts on the total.
+			if time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
+				c.calculateTotalSize()
+				lastSizeRecalc = time.Now()
+			}
+
 			c.cleanupExpiredKeys()
 			if c.maxDiskUsage > 0 {
 				c.enforceDiskLimit()
