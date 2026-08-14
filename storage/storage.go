@@ -1063,12 +1063,12 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 			return storageErrors.NewInternalError("Put", err)
 		}
-		err = s.putLow(key, val, filePath, bytesWritten)
+		prevSize, err := s.putLow(key, val, filePath, bytesWritten)
 		if err == nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 			metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(bytesWritten))
 			metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
-			s.notifyPut(bytesWritten)
+			s.notifyPut(bytesWritten - prevSize)
 		} else {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
@@ -1097,12 +1097,12 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 		return storageErrors.NewInternalError("Put", err)
 	}
-	err = s.putLow(key, val, "", int64(n))
+	prevSize, err := s.putLow(key, val, "", int64(n))
 	if err == nil {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 		metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(n))
 		metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
-		s.notifyPut(int64(n))
+		s.notifyPut(int64(n) - prevSize)
 	} else {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
@@ -1116,7 +1116,9 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 
 // putLow stores the key-value pair in the database
 // If the value is larger than the compact threshold, record it for compaction.
-func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten int64) error {
+// It returns the ValueLength of the metadata row this write replaced (0 when the
+// key is new) so the caller can apply the net size delta to the cleaner.
+func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten int64) (int64, error) {
 	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -1133,6 +1135,10 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 
 	// Store the metadata in the database with the metadata prefix
 	metaKey := keys.MakeMetadataKey(key)
+	// The row is overwritten in place, so the replaced value's bytes have to leave
+	// the cleaner's accounting here — otherwise repeated Puts of the same key
+	// inflate totalSize forever and eviction starts chasing bytes that don't exist.
+	prevSize := s.existingValueLength(key, metaKey)
 	batch.Put(metaKey, val)
 
 	// Index the key for eviction only if a disk cap is set. Each policy maintains
@@ -1149,16 +1155,41 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		}
 	}
 
-	return s.meta.Handle().Write(wo, batch)
+	if err := s.meta.Handle().Write(wo, batch); err != nil {
+		return 0, err
+	}
+	return prevSize, nil
 }
 
-// fifoBackrefReadOpts is a shared, read-only ReadOptions for the FIFO
-// back-reference lookup writeFifoIndexEntry performs on every Put. It is created
-// once (fill-cache disabled, matching the other metadata point lookups) and
-// never mutated, so it is safe to share across concurrent Puts and avoids a
-// native malloc/free per write on the FIFO hot path. It intentionally lives for
-// the process lifetime (a single fixed allocation, never Destroy'd).
-var fifoBackrefReadOpts = metadata.CreateReadOptions(false, false)
+// putPointReadOpts is a shared, read-only ReadOptions for the point lookups Put
+// performs on every write (the previous metadata row, and the FIFO
+// back-reference). It is created once (fill-cache disabled, matching the other
+// metadata point lookups) and never mutated, so it is safe to share across
+// concurrent Puts and avoids a native malloc/free per write on the hot path. It
+// intentionally lives for the process lifetime (a single fixed allocation, never
+// Destroy'd).
+var putPointReadOpts = metadata.CreateReadOptions(false, false)
+
+// existingValueLength returns the ValueLength of the metadata row currently
+// stored under metaKey, or 0 when the key is absent or its row cannot be read.
+func (s *Storage) existingValueLength(key string, metaKey []byte) int64 {
+	slice, err := s.meta.Handle().Get(putPointReadOpts, metaKey)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValueLength: db.Get error, size accounting may drift")
+		return 0
+	}
+	defer slice.Free()
+	if !slice.Exists() {
+		return 0
+	}
+
+	valueMsg := &pb.ValueMessage{}
+	if err := proto.Unmarshal(slice.Data(), valueMsg); err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValueLength: failed to unmarshal previous value message")
+		return 0
+	}
+	return valueMsg.ValueLength
+}
 
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
 // now, first deleting any previous entry (on overwrite) via the secondary index
@@ -1167,7 +1198,7 @@ var fifoBackrefReadOpts = metadata.CreateReadOptions(false, false)
 func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, now time.Time) {
 	backref := keys.MakeFifoBackrefKey(key)
 
-	if prev, err := s.meta.Handle().Get(fifoBackrefReadOpts, backref); err == nil {
+	if prev, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
 		if prev.Exists() {
 			batch.Delete(prev.Data()) // previous !fifo/<oldnano>/<key>
 		}

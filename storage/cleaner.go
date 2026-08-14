@@ -23,6 +23,15 @@ const (
 
 	// accessBucketCleanupThreshold is the threshold at which we clean up old access buckets
 	accessBucketCleanupThreshold = 30 * 24 * time.Hour
+
+	// totalSizeRecalcInterval is how often the tracked total is re-derived from a
+	// full metadata scan. The running total is maintained incrementally on every
+	// write and delete, which is exact in the common case but can still drift: a
+	// crash between the metadata write and the accounting update, or two
+	// concurrent Puts of the same key both reading the same previous row. Redoing
+	// the startup scan keeps any such drift bounded instead of letting it
+	// accumulate for the process lifetime; it is a metadata-only scan.
+	totalSizeRecalcInterval = 1 * time.Hour
 )
 
 // Cleaner is responsible for background TTL cleanup and LRU eviction
@@ -97,10 +106,18 @@ func (c *Cleaner) cleanupLoop() {
 
 	// Track when we last cleaned up old buckets
 	lastBucketCleanup := time.Now()
+	// Track when we last re-derived the total size from the metadata
+	lastSizeRecalc := time.Now()
 
 	for {
 		select {
 		case <-ticker.C:
+			// Correct any accumulated drift before enforcement acts on the total.
+			if time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
+				c.calculateTotalSize()
+				lastSizeRecalc = time.Now()
+			}
+
 			c.cleanupExpiredKeys()
 			if c.maxDiskUsage > 0 {
 				c.enforceDiskLimit()
@@ -292,13 +309,25 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		Msg("cleaner: TTL cleanup completed")
 }
 
-// calculateTotalSize calculates the total size of stored data
+// calculateTotalSize re-derives the total size of stored data from the metadata.
+//
+// The scan is pinned to a RocksDB snapshot and its result is applied as a
+// correction relative to the value the counter held when that snapshot was taken
+// (never as a plain store), so a write that commits while the scan runs keeps its
+// incremental delta instead of being stomped by a scan that could not see it.
 func (c *Cleaner) calculateTotalSize() {
 	start := time.Now()
 	var totalSize int64
 
+	// Pin the scan before reading the counter: a write the scan cannot see then
+	// also has its delta applied after tracked was read, so it survives.
+	snapshot := c.storage.meta.Handle().NewSnapshot()
+	defer c.storage.meta.Handle().ReleaseSnapshot(snapshot)
+	tracked := c.totalSize.Load()
+
 	ro := metadata.CreateReadOptions(false, false)
 	defer ro.Destroy()
+	ro.SetSnapshot(snapshot)
 	it := c.storage.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
@@ -331,13 +360,14 @@ func (c *Cleaner) calculateTotalSize() {
 		it.Value().Free()
 	}
 
-	c.totalSize.Store(totalSize)
+	c.totalSize.Add(totalSize - tracked)
 
 	// Publish the freshly computed size to the gauges.
 	c.refreshSizeMetrics()
 
 	zlog.Info().
 		Int64("total_size", totalSize).
+		Int64("drift", tracked-totalSize).
 		Dur("duration_ms", time.Since(start)).
 		Msg("cleaner: calculated total storage size")
 }
