@@ -33,4 +33,10 @@ func TestPut_Overwrite_TotalSizeStaysExact(t *testing.T) {
 	// the running total must be a fixpoint against it.
 	s.cleaner.calculateTotalSize()
 	require.Equal(t, want, s.cleaner.totalSize.Load(), "running total must agree with a full rescan")
+
+	// Drift the counter the way a crash between the metadata write and the
+	// accounting update would: the periodic rescan must absorb it, not keep it.
+	s.cleaner.UpdateSize(50 * 1024)
+	s.cleaner.calculateTotalSize()
+	require.Equal(t, want, s.cleaner.totalSize.Load(), "rescan must correct accumulated drift")
 }
