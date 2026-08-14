@@ -351,9 +351,12 @@ func (c *Cleaner) calculateTotalSize() {
 
 		value := it.Value().Data()
 
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(value, valueMsg); err == nil {
-			totalSize += valueMsg.ValueLength
+		// This scan sums only value_length across every metadata row, so read
+		// it directly off the wire rather than fully decoding each message —
+		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
+		// threshold) on both the startup scan and the hourly reconciliation.
+		if length, ok := valueMessageValueLength(value); ok {
+			totalSize += length
 		}
 
 		it.Key().Free()

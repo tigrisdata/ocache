@@ -1183,12 +1183,16 @@ func (s *Storage) existingValueLength(key string, metaKey []byte) int64 {
 		return 0
 	}
 
-	valueMsg := &pb.ValueMessage{}
-	if err := proto.Unmarshal(slice.Data(), valueMsg); err != nil {
-		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValueLength: failed to unmarshal previous value message")
+	// Only value_length is needed here, so extract it straight off the wire
+	// instead of a full proto.Unmarshal — that avoids copying the previous
+	// inline Data payload (up to the inline threshold, 64 KiB) on every
+	// overwrite of an inline key.
+	length, ok := valueMessageValueLength(slice.Data())
+	if !ok {
+		zlog.Error().Str("key", key).Msg("storage.existingValueLength: failed to decode previous value message")
 		return 0
 	}
-	return valueMsg.ValueLength
+	return length
 }
 
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
