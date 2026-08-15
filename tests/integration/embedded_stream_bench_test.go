@@ -170,6 +170,16 @@ func TestEmbeddedClient_GetRangeStreamRemote(t *testing.T) {
 		t.Fatal("GetRangeStream output did not preserve peer byte order")
 	}
 
+	// io.Copy's Reader fallback supplies 32 KiB writes. A writer with that
+	// limit must keep working when the remote reader takes its WriteTo path.
+	limitedOutput := &remoteRangeStreamLimitedWriter{limit: remoteRangeStreamWriteLimit}
+	if err := fixture.client.GetRangeStream(ctx, key, 0, int64(2*remoteRangeStreamWriteLimit-1), limitedOutput); err != nil {
+		t.Fatalf("GetRangeStream with limited writer: %v", err)
+	}
+	if !bytes.Equal(limitedOutput.Bytes(), data[:2*remoteRangeStreamWriteLimit]) {
+		t.Fatal("GetRangeStream limited-writer output did not preserve peer byte order")
+	}
+
 	missingKey := fixture.remoteKey(t, "missing-remote-range-stream")
 	reader, found, err = fixture.client.Operations().Get(ctx, missingKey, 0, 0)
 	if err != nil {
@@ -186,6 +196,20 @@ func TestEmbeddedClient_GetRangeStreamRemote(t *testing.T) {
 	if output.Len() != 0 {
 		t.Fatalf("missing GetRangeStream wrote %d bytes", output.Len())
 	}
+}
+
+const remoteRangeStreamWriteLimit = 32 * 1024
+
+type remoteRangeStreamLimitedWriter struct {
+	bytes.Buffer
+	limit int
+}
+
+func (w *remoteRangeStreamLimitedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return 0, fmt.Errorf("write of %d bytes exceeds %d-byte limit", len(p), w.limit)
+	}
+	return w.Buffer.Write(p)
 }
 
 type remoteRangeStreamDiscardWriter struct{}
