@@ -328,14 +328,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
 
-	// FIFO indexes keys as they are written, so it only evicts keys written after
-	// it is enabled. Warn (cheaply) if this cache already holds keys but the FIFO
-	// index is empty — those keys are not evictable and the cap cannot reclaim
-	// them; FIFO should be enabled from a fresh deployment.
-	if config.MaxDiskUsage > 0 && config.EvictionPolicy == EvictionPolicyFIFO {
-		s.warnIfUnindexedForFifo()
-	}
-
+	// The cleaner's initial pass recomputes size and, when a cap is set, backfills
+	// eviction-index coverage for keys written uncapped or under a prior policy so
+	// the cap can reclaim them (#189, which feeds #204).
 	s.cleaner.Start()
 	zlog.Info().
 		Dur("ttl_cleanup_interval", cleanupInterval).
@@ -489,10 +484,12 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 		k := it.Key().Data()
 		v := it.Value().Data()
 
-		// Try to decode as proto ValueMessage to check expiry
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(v, valueMsg); err == nil {
-			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
+		// Only expiry is needed to decide whether to skip an expired row, so read
+		// it off the wire rather than decoding the whole message (and its inline
+		// Data payload) for every scanned key. A malformed row (ok=false) is
+		// treated as non-expired and included, matching the prior behavior.
+		if expiry, ok := valueMessageExpiry(v); ok {
+			if expiry > 0 && time.Now().Unix() >= expiry {
 				// Expired, skip but don't delete - let the cleaner handle it
 				it.Key().Free()
 				it.Value().Free()
@@ -754,10 +751,12 @@ func (s *Storage) DeleteKey(key string) error {
 	}
 	defer slice.Free()
 
-	// Parse value to get size and file info
+	// Parse value to get size and file info. Only the control fields (type,
+	// length, backing paths) are needed, so decode skipping the inline Data
+	// payload to avoid copying it (up to 64 KiB) on every delete of an inline key.
 	dataSize := int64(0)
 	valueMsg := &pb.ValueMessage{}
-	if err := proto.Unmarshal(slice.Data(), valueMsg); err == nil {
+	if unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
 		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
 		dataSize = valueMsg.ValueLength
 		// Notify cleaner about size reduction
@@ -1063,12 +1062,12 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 			return storageErrors.NewInternalError("Put", err)
 		}
-		err = s.putLow(key, val, filePath, bytesWritten)
+		prevSize, err := s.putLow(key, val, filePath, bytesWritten)
 		if err == nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 			metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(bytesWritten))
 			metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
-			s.notifyPut(bytesWritten)
+			s.notifyPut(bytesWritten - prevSize)
 		} else {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
@@ -1097,12 +1096,12 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
 		return storageErrors.NewInternalError("Put", err)
 	}
-	err = s.putLow(key, val, "", int64(n))
+	prevSize, err := s.putLow(key, val, "", int64(n))
 	if err == nil {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "success").Inc()
 		metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(n))
 		metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
-		s.notifyPut(int64(n))
+		s.notifyPut(int64(n) - prevSize)
 	} else {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
@@ -1116,7 +1115,9 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 
 // putLow stores the key-value pair in the database
 // If the value is larger than the compact threshold, record it for compaction.
-func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten int64) error {
+// It returns the ValueLength of the metadata row this write replaced (0 when the
+// key is new) so the caller can apply the net size delta to the cleaner.
+func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten int64) (int64, error) {
 	zlog.Debug().Str("key", key).Msg("storage.putLow: storing in RocksDB")
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -1133,6 +1134,10 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 
 	// Store the metadata in the database with the metadata prefix
 	metaKey := keys.MakeMetadataKey(key)
+	// The row is overwritten in place, so the replaced value's bytes have to leave
+	// the cleaner's accounting here — otherwise repeated Puts of the same key
+	// inflate totalSize forever and eviction starts chasing bytes that don't exist.
+	prevSize := s.existingValueLength(key, metaKey)
 	batch.Put(metaKey, val)
 
 	// Index the key for eviction only if a disk cap is set. Each policy maintains
@@ -1149,16 +1154,45 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		}
 	}
 
-	return s.meta.Handle().Write(wo, batch)
+	if err := s.meta.Handle().Write(wo, batch); err != nil {
+		return 0, err
+	}
+	return prevSize, nil
 }
 
-// fifoBackrefReadOpts is a shared, read-only ReadOptions for the FIFO
-// back-reference lookup writeFifoIndexEntry performs on every Put. It is created
-// once (fill-cache disabled, matching the other metadata point lookups) and
-// never mutated, so it is safe to share across concurrent Puts and avoids a
-// native malloc/free per write on the FIFO hot path. It intentionally lives for
-// the process lifetime (a single fixed allocation, never Destroy'd).
-var fifoBackrefReadOpts = metadata.CreateReadOptions(false, false)
+// putPointReadOpts is a shared, read-only ReadOptions for the point lookups Put
+// performs on every write (the previous metadata row, and the FIFO
+// back-reference). It is created once (fill-cache disabled, matching the other
+// metadata point lookups) and never mutated, so it is safe to share across
+// concurrent Puts and avoids a native malloc/free per write on the hot path. It
+// intentionally lives for the process lifetime (a single fixed allocation, never
+// Destroy'd).
+var putPointReadOpts = metadata.CreateReadOptions(false, false)
+
+// existingValueLength returns the ValueLength of the metadata row currently
+// stored under metaKey, or 0 when the key is absent or its row cannot be read.
+func (s *Storage) existingValueLength(key string, metaKey []byte) int64 {
+	slice, err := s.meta.Handle().Get(putPointReadOpts, metaKey)
+	if err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValueLength: db.Get error, size accounting may drift")
+		return 0
+	}
+	defer slice.Free()
+	if !slice.Exists() {
+		return 0
+	}
+
+	// Only value_length is needed here, so extract it straight off the wire
+	// instead of a full proto.Unmarshal — that avoids copying the previous
+	// inline Data payload (up to the inline threshold, 64 KiB) on every
+	// overwrite of an inline key.
+	length, ok := valueMessageValueLength(slice.Data())
+	if !ok {
+		zlog.Error().Str("key", key).Msg("storage.existingValueLength: failed to decode previous value message")
+		return 0
+	}
+	return length
+}
 
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
 // now, first deleting any previous entry (on overwrite) via the secondary index
@@ -1167,7 +1201,7 @@ var fifoBackrefReadOpts = metadata.CreateReadOptions(false, false)
 func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, now time.Time) {
 	backref := keys.MakeFifoBackrefKey(key)
 
-	if prev, err := s.meta.Handle().Get(fifoBackrefReadOpts, backref); err == nil {
+	if prev, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
 		if prev.Exists() {
 			batch.Delete(prev.Data()) // previous !fifo/<oldnano>/<key>
 		}
@@ -1177,36 +1211,6 @@ func (s *Storage) writeFifoIndexEntry(batch *grocksdb.WriteBatch, key string, no
 	fifoKey := keys.MakeFifoIndexKey(key, now)
 	batch.Put(fifoKey, []byte{})
 	batch.Put(backref, fifoKey)
-}
-
-// warnIfUnindexedForFifo logs a warning when the data directory already holds
-// keys but the FIFO index is empty — i.e. FIFO+cap was enabled on a cache whose
-// keys predate the index (written before the cap, or under LRU). FIFO only
-// evicts keys written after it is enabled, so such pre-existing keys are not
-// evictable and the disk cap cannot reclaim them. This is an O(1) check (two
-// prefix seeks), not a scan: FIFO is meant to be enabled from a fresh deployment.
-//
-// #189 tracks hardening this warning into a refuse-to-start guard, along with
-// the related stale-access-index leak on an LRU->FIFO switch.
-func (s *Storage) warnIfUnindexedForFifo() {
-	ro := metadata.CreateReadOptions(false, false)
-	defer ro.Destroy()
-
-	hasAny := func(prefix []byte) bool {
-		it := s.meta.Handle().NewIterator(ro)
-		defer it.Close()
-		it.Seek(prefix)
-		if !it.ValidForPrefix(prefix) {
-			return false
-		}
-		it.Key().Free()
-		it.Value().Free()
-		return true
-	}
-
-	if hasAny([]byte(keys.MetadataPrefix)) && !hasAny(keys.GetFifoIndexPrefix()) {
-		zlog.Warn().Msg("storage: FIFO eviction enabled on a data directory that already holds keys but has an empty FIFO index; those pre-existing keys are not evictable and the disk cap cannot reclaim them. Enable FIFO from a fresh deployment.")
-	}
 }
 
 // stageEvictionIndexDeletes adds deletes for key's eviction-index entries — the

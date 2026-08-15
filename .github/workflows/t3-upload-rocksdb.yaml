@@ -73,11 +73,16 @@ jobs:
           TAG="rocksdb-v$VERSION"
           mkdir -p artifacts
 
-          # Define all expected artifacts
+          # Define all expected artifacts. Both build variants (plain + the
+          # Linux-only jemalloc variant, see issue #176) must be mirrored so T3
+          # consumers can fetch either. Keep this in sync with the matrix in
+          # build-rocksdb-artifacts.yml.
           ARTIFACTS=(
             "rocksdb-static-$VERSION-Linux-aarch64.tar.gz"
             "rocksdb-static-$VERSION-Linux-x86_64.tar.gz"
             "rocksdb-static-$VERSION-macOS-arm64.tar.gz"
+            "rocksdb-static-$VERSION-jemalloc-Linux-aarch64.tar.gz"
+            "rocksdb-static-$VERSION-jemalloc-Linux-x86_64.tar.gz"
           )
 
           # Download each artifact

@@ -250,12 +250,18 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 	// Track compaction run
 	metrics.CompactionRuns.Inc()
 
-	// RocksDB iterator setup
+	// RocksDB iterator setup. Destroy ro after the iterator that uses it is
+	// closed (defers run LIFO), so its native handle is not leaked per run.
 	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
 	it := c.meta.Handle().NewIterator(ro)
 	defer it.Close()
 
+	// CompactFiles is called in a tight loop by fileCompactionLoop; without this
+	// the batch's native rocksdb_writebatch handle leaks on every run (normal,
+	// cancellation, and error returns alike). Write() does not consume the batch.
 	wb := grocksdb.NewWriteBatch()
+	defer wb.Destroy()
 	var (
 		processed   int
 		bytesCopied int64
@@ -666,7 +672,9 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 		return err
 	}
 
-	if err := c.meta.Handle().Write(grocksdb.NewDefaultWriteOptions(), wb); err != nil {
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	if err := c.meta.Handle().Write(wo, wb); err != nil {
 		return err
 	}
 

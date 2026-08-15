@@ -35,6 +35,15 @@ OCache can be configured through command-line flags when starting the server.
 > read of old data cannot displace hotter data. `fifo` suits write-once workloads
 > (e.g. parquet, where the newest data is read most).
 >
+> **ENOSPC backstop.** `-max-disk-usage` bounds the *logical* size (the sum of
+> stored object lengths). Physical usage can legitimately run higher — segment
+> preallocation slack, not-yet-recompacted dead space, orphaned raw files — so a
+> logical-only cap cannot by itself prevent the volume filling to 100%, which is
+> terminal (RocksDB can no longer open). As a safety net, whenever a cap is set
+> the cleaner also evicts if the volume's *actual* free space (measured via
+> `statfs`, exported as `ocache_filesystem_free_bytes`) falls below a fixed 2 GiB
+> reserve, independent of the logical total. This is not configurable.
+>
 > Each policy maintains its own eviction index. Deletes and TTL expiry remove a
 > key's index entry under both. On overwrite they differ: `fifo` deletes the
 > previous entry at write time (via a per-key back-reference), so the index holds
@@ -42,25 +51,20 @@ OCache can be configured through command-line flags when starting the server.
 > an orphan, reclaimed later by re-access or the periodic bucket prune. In both
 > cases the eviction scan validates each entry against the key's back-reference
 > before acting, so a superseded entry is reclaimed rather than evicting a
-> rewritten key out of order. The index is built as keys are written, so for the
-> cap to cover **all** data, **choose the policy and cap at deployment time.**
-> Changing them later is allowed but only takes effect for data written afterward
-> (see below).
+> rewritten key out of order. The index is normally built as keys are written; at
+> startup, when a cap is set, ocache also backfills an index entry for any live
+> key that lacks one — so keys written while uncapped, or under a prior policy, are
+> brought under the cap instead of remaining permanently unevictable.
 >
-> - `fifo` only evicts keys written after it was enabled. Keys already present when
->   `fifo` (or the cap) is enabled are not in the FIFO index, so the disk cap
->   cannot reclaim them — they remain until rewritten or deleted. If that
->   pre-existing set already exceeds the cap, eviction cannot bring usage back
->   under it. ocache logs a warning at startup when it detects pre-existing keys
->   with an empty FIFO index.
+> - Enabling or changing `-eviction-policy` or the cap on an existing data
+>   directory is supported: the startup backfill indexes the pre-existing keys for
+>   the active policy, so the cap can reclaim them. Those keys carry no recorded
+>   write/access time, so they are stamped at startup and evicted in an arbitrary
+>   (but bounded) order among themselves; keys written afterward are ordered
+>   normally, and under `lru` a subsequent read restores a key's true recency.
 > - Switching `-eviction-policy` in place (e.g. `lru`↔`fifo`) is supported — reads
->   and writes stay correct — but each policy maintains only its own index, so data
->   written under the previous policy is not tracked by the new one. After
->   switching to `fifo`, keys written before the switch are **not evictable by the
->   cap** until they are rewritten, and leftover `lru` access-index rows are not
->   pruned while `fifo` is active (a bounded, one-time metadata overhead). Size the
->   cap so the untracked set fits under it, or start `fifo` from a fresh deployment
->   if the cap must cover all data. See
+>   and writes stay correct. One residual: leftover `lru` access-index rows are not
+>   pruned while `fifo` is active (a bounded, one-time metadata overhead). See
 >   [#189](https://github.com/tigrisdata/ocache/issues/189).
 
 ### Cache Configuration

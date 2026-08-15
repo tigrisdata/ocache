@@ -25,11 +25,17 @@ env:
 jobs:
   benchmark-single:
     strategy:
+      # Run both allocator variants so their throughput/latency can be compared
+      # (A/B for issue #176); don't cancel one variant if the other fails.
+      fail-fast: false
       matrix:
-        os: [namespace-profile-ubuntu-2404-medium]
         include:
           - os: namespace-profile-ubuntu-2404-medium
             arch: x86_64
+            variant: plain
+          - os: namespace-profile-ubuntu-2404-medium
+            arch: x86_64
+            variant: jemalloc
     runs-on: ${{ matrix.os }}
 
     permissions:
@@ -53,7 +59,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgflags-dev \
+          # bzip2 extracts jemalloc's .tar.bz2 if the source-build fallback runs.
+          sudo apt-get install -y build-essential cmake bzip2 libgflags-dev \
             libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev netcat-openbsd
 
       - name: Set OS name
@@ -61,19 +68,24 @@ jobs:
         run: |
           OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+          # Pick the rocksdb-static variant (plain vs jemalloc) for this A/B leg.
+          # runner.os casing (Linux) matches the published asset names.
+          SUFFIX=""
+          if [ "${{ matrix.variant }}" = "jemalloc" ]; then SUFFIX="-jemalloc"; fi
+          echo "art_name=rocksdb-static-${{ env.ROCKSDB_VERSION }}${SUFFIX}-${{ runner.os }}-${{ matrix.arch }}.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Cache RocksDB static artifact
         uses: actions/cache@v4
         id: cache-rocksdb-static
         with:
-          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
-          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+          path: ${{ steps.os-name.outputs.art_name }}
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-${{ matrix.variant }}-v6
 
       - name: Download pre-built RocksDB artifact
         if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
         run: |
           # Try to download from GitHub releases first
-          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          ARTIFACT_NAME="${{ steps.os-name.outputs.art_name }}"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
 
           if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
@@ -81,8 +93,9 @@ jobs:
           else
             echo "Pre-built artifact not found, building from source..."
             ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
-            OS=${{ steps.os-name.outputs.os_name }} \
+            OS=${{ runner.os }} \
             ARCH=${{ matrix.arch }} \
+            VARIANT=${{ matrix.variant }} \
             make build-rocksdb-static
             mv rocksdb-static/rocksdb-static-*.tar.gz .
           fi
@@ -90,7 +103,7 @@ jobs:
       - name: Extract RocksDB static artifact
         run: |
           mkdir -p rocksdb-static/artifact
-          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          tar xzf "${{ steps.os-name.outputs.art_name }}" -C rocksdb-static/artifact
           ls -la rocksdb-static/artifact/
 
       - name: Install dependencies
@@ -100,7 +113,7 @@ jobs:
         run: make proto
 
       - name: Build server and CLI
-        run: STATIC_BUILD=true make all
+        run: STATIC_BUILD=true WITH_JEMALLOC=${{ matrix.variant == 'jemalloc' }} make all
 
       - name: Start OCache server
         run: |
@@ -117,6 +130,13 @@ jobs:
             echo "Waiting for server to start..."
             sleep 1
           done
+
+      - name: Start RSS sampler
+        run: |
+          # Record the server's RSS (VmRSS/RssAnon/VmData) across all benchmarks
+          # so plain vs jemalloc allocator footprint can be compared (issue #176).
+          nohup bash scripts/rss-sample.sh rss-samples.csv 1 "${SERVER_PID}" >/dev/null 2>&1 &
+          echo "RSS_SAMPLER_PID=$!" >> $GITHUB_ENV
 
       - name: Run read-heavy benchmark - 100 bytes
         run: |
@@ -152,6 +172,14 @@ jobs:
           # and serves as a performance-regression guard on the compactor commit path.
           ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee 256kb-compaction-churn.log
 
+      - name: Stop RSS sampler and summarize
+        if: always()
+        run: |
+          kill "${RSS_SAMPLER_PID}" 2>/dev/null || true
+          sleep 1
+          echo "=== RSS summary (variant: ${{ matrix.variant }}) ==="
+          bash scripts/rss-summary.sh rss-samples.csv | tee rss-summary.txt
+
       - name: Stop server
         if: always()
         run: |
@@ -162,7 +190,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: single-node-benchmark-results-${{ matrix.os }}
+          name: single-node-benchmark-results-${{ matrix.os }}-${{ matrix.variant }}
           path: |
             *.log
             *.out
+            rss-samples.csv
+            rss-summary.txt

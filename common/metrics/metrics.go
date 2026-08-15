@@ -219,6 +219,17 @@ var (
 		},
 	)
 
+	// FilesystemFreeBytes is the actual free space on the cache volume (statfs),
+	// as opposed to the logical DiskUsageBytes. The cleaner evicts to keep this
+	// above a reserved floor so physical usage cannot reach ENOSPC even when it
+	// exceeds the logical cap (segment dead space, orphaned raw files).
+	FilesystemFreeBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_filesystem_free_bytes",
+			Help: "Free space on the cache volume in bytes (statfs)",
+		},
+	)
+
 	// LRU Metrics
 	LRUEvictions = promauto.NewCounter(
 		prometheus.CounterOpts{

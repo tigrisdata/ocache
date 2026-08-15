@@ -54,7 +54,9 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgflags-dev \
+          # bzip2 extracts jemalloc's .tar.bz2 if the rocksdb-static source-build
+          # fallback runs; libbz2-dev only covers linking.
+          sudo apt-get install -y build-essential cmake bzip2 libgflags-dev \
             libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
 
       - name: Set OS name
@@ -62,19 +64,22 @@ jobs:
         run: |
           OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
+          # Use the jemalloc rocksdb-static variant so the e2e suite links jemalloc
+          # (issue #176). runner.os casing (Linux) matches the published asset names.
+          echo "art_name=rocksdb-static-${{ env.ROCKSDB_VERSION }}-jemalloc-${{ runner.os }}-${{ matrix.arch }}.tar.gz" >> $GITHUB_OUTPUT
 
       - name: Cache RocksDB static artifact
         uses: actions/cache@v4
         id: cache-rocksdb-static
         with:
-          path: rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz
-          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-v5
+          path: ${{ steps.os-name.outputs.art_name }}
+          key: ${{ runner.os }}-rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ matrix.arch }}-jemalloc-v6
 
       - name: Download pre-built RocksDB artifact
         if: steps.cache-rocksdb-static.outputs.cache-hit != 'true'
         run: |
           # Try to download from GitHub releases first
-          ARTIFACT_NAME="rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz"
+          ARTIFACT_NAME="${{ steps.os-name.outputs.art_name }}"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/rocksdb-v${{ env.ROCKSDB_VERSION }}/${ARTIFACT_NAME}"
 
           if curl -fsSL -o "${ARTIFACT_NAME}" "${RELEASE_URL}"; then
@@ -82,8 +87,9 @@ jobs:
           else
             echo "Pre-built artifact not found, building from source..."
             ROCKSDB_VERSION=${{ env.ROCKSDB_VERSION }} \
-            OS=${{ steps.os-name.outputs.os_name }} \
+            OS=${{ runner.os }} \
             ARCH=${{ matrix.arch }} \
+            VARIANT=jemalloc \
             make build-rocksdb-static
             mv rocksdb-static/rocksdb-static-*.tar.gz .
           fi
@@ -91,7 +97,7 @@ jobs:
       - name: Extract RocksDB static artifact
         run: |
           mkdir -p rocksdb-static/artifact
-          tar xzf rocksdb-static-${{ env.ROCKSDB_VERSION }}-${{ steps.os-name.outputs.os_name }}-${{ matrix.arch }}.tar.gz -C rocksdb-static/artifact
+          tar xzf "${{ steps.os-name.outputs.art_name }}" -C rocksdb-static/artifact
           ls -la rocksdb-static/artifact/
 
       - name: Install dependencies
@@ -142,22 +148,22 @@ jobs:
         run: STATIC_BUILD=true make test-integration-cluster
 
       - name: Run concurrent operations E2E test
-        run: STATIC_BUILD=true make test-e2e-concurrent
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-concurrent
 
       - name: Run storage layers E2E test
-        run: STATIC_BUILD=true make test-e2e-storage-layers
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-storage-layers
 
       - name: Run TTL functionality E2E test
-        run: STATIC_BUILD=true make test-e2e-ttl
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-ttl
 
       - name: Run eviction E2E test (LRU + FIFO)
-        run: STATIC_BUILD=true make test-e2e-eviction
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-eviction
 
       - name: Run compaction E2E test
-        run: STATIC_BUILD=true make test-e2e-compaction
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-compaction
 
       - name: Run recompaction E2E test
-        run: STATIC_BUILD=true make test-e2e-recompaction
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-recompaction
 
       - name: Run cluster mode concurrent operations E2E test
-        run: STATIC_BUILD=true make test-e2e-cluster
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-cluster
