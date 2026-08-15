@@ -219,6 +219,15 @@ bench: build build-cli run-background
 	./ocachecli --addr localhost:9000 bench
 	@$(MAKE) stop
 
+# Compile integration benchmarks once so they can be sampled without rebuilding.
+# Set INTEGRATION_BENCH_BINARY to the desired output path.
+INTEGRATION_BENCH_BINARY ?=
+.PHONY: bench-integration
+bench-integration:
+	@test -n "$(INTEGRATION_BENCH_BINARY)" || { echo "INTEGRATION_BENCH_BINARY is required"; exit 1; }
+	@mkdir -p "$(dir $(INTEGRATION_BENCH_BINARY))"
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(INTEGRATION_BENCH_BINARY)" .
+
 .PHONY: run-background
 run-background:
 	@echo "Starting ocache in background..."
@@ -535,6 +544,7 @@ help:
 	@echo "  test-integration-race       - Run integration tests with race detector"
 	@echo "  test-integration-coverage   - Run integration tests with coverage"
 	@echo "  bench                       - Run benchmarks"
+	@echo "  bench-integration           - Compile integration benchmarks (set INTEGRATION_BENCH_BINARY)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"

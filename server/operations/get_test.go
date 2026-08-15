@@ -4,6 +4,7 @@
 package operations
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"testing"
