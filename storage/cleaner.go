@@ -32,6 +32,32 @@ const (
 	// the startup scan keeps any such drift bounded instead of letting it
 	// accumulate for the process lifetime; it is a metadata-only scan.
 	totalSizeRecalcInterval = 1 * time.Hour
+
+	// defaultDiskReserveBytes is the free space the cleaner keeps on the cache
+	// volume as an ENOSPC backstop. The logical cap (MaxDiskUsage) bounds the sum
+	// of stored object lengths, but physical usage can legitimately exceed it —
+	// not-yet-recompacted segment dead space, orphaned raw files, RocksDB SST
+	// amplification — so a logical-only cap cannot prevent the disk filling to
+	// 100%, which is terminal (RocksDB can no longer open; #204). When actual free
+	// space falls below this floor the cleaner evicts regardless of the logical
+	// total. Sized to absorb a burst of in-flight large-object writes (segments
+	// are 256 MiB) between cleaner ticks; eviction frees raw-file bytes promptly
+	// for the large-object workload this protects.
+	defaultDiskReserveBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+
+	// reserveVolumeFraction caps the effective reserve at 1/N of the volume's
+	// total capacity, so the fixed 2 GiB floor cannot exceed a sane share of a
+	// small volume (where a 2 GiB reserve might be unachievable and would evict
+	// continuously). On production-sized volumes the 2 GiB floor is the binding
+	// value.
+	reserveVolumeFraction int64 = 10 // 10%
+
+	// reserveEvictSliceFraction bounds a single reserve pass to at most 1/N of the
+	// current cache, so one low statfs reading can't evict everything at once; the
+	// next tick re-measures and continues if free is still low. Large caches evict
+	// the whole (reserve-bounded) deficit in one pass; only a small cache relative
+	// to the reserve is throttled across ticks.
+	reserveEvictSliceFraction int64 = 4 // 25%
 )
 
 // Cleaner is responsible for background TTL cleanup and LRU eviction
@@ -39,7 +65,14 @@ type Cleaner struct {
 	storage      *Storage
 	interval     time.Duration
 	maxDiskUsage int64
-	initialized  atomic.Bool
+	// diskReserveBytes is the free-space ceiling for the ENOSPC backstop; the
+	// effective reserve is min(diskReserveBytes, volume/reserveVolumeFraction).
+	// A field (not a flag) defaulted from the const. diskUsageFn is the (injectable,
+	// for tests) statfs source. The backstop is deliberately stateless — see
+	// enforceFilesystemReserve.
+	diskReserveBytes int64
+	diskUsageFn      func(path string) (free, total int64, ok bool)
+	initialized      atomic.Bool
 
 	// backfillPending is set when a reconcile could not fully backfill eviction-
 	// index coverage (a failed batch write or a truncated scan). While set, the
@@ -61,10 +94,12 @@ type Cleaner struct {
 // NewCleaner creates a new Cleaner for background TTL cleanup and LRU eviction
 func NewCleaner(storage *Storage, interval time.Duration, maxDiskUsage int64) *Cleaner {
 	return &Cleaner{
-		storage:      storage,
-		interval:     interval,
-		maxDiskUsage: maxDiskUsage,
-		closeCh:      make(chan struct{}),
+		storage:          storage,
+		interval:         interval,
+		maxDiskUsage:     maxDiskUsage,
+		diskReserveBytes: defaultDiskReserveBytes,
+		diskUsageFn:      diskUsage,
+		closeCh:          make(chan struct{}),
 	}
 }
 
@@ -134,6 +169,9 @@ func (c *Cleaner) cleanupLoop() {
 			c.cleanupExpiredKeys()
 			if c.maxDiskUsage > 0 {
 				c.enforceDiskLimit()
+				// ENOSPC backstop: evict on actual free space, independent of the
+				// logical cap, so physical usage can't reach 100% (#204).
+				c.enforceFilesystemReserve()
 			}
 
 			// Mirror the live totals (maintained on every write/evict) back to the
@@ -587,6 +625,76 @@ func (c *Cleaner) enforceDiskLimit() {
 	metrics.CleanerDuration.WithLabelValues(policy).Observe(float64(duration.Milliseconds()))
 	// LRUEvictions is LRU-specific; FIFO eviction volume is tracked via the
 	// policy-labeled CleanerKeysDeleted{fifo,disk_limit} / CleanerBytesFreed{fifo}.
+	if !fifo {
+		metrics.LRUEvictions.Add(float64(evicted))
+	}
+}
+
+// enforceFilesystemReserve is the ENOSPC backstop: when the cache volume's
+// *actual* free space (statfs) is below the reserve it evicts by the active
+// policy's index, independent of the logical total. enforceDiskLimit only bounds
+// the logical sum of object lengths, but physical usage can legitimately exceed
+// the cap (segment dead space, orphaned raw files, SST amplification), so without
+// this the disk can still fill to the terminal 100% state (#204).
+//
+// It evicts at most a bounded slice per tick and re-measures on the next tick,
+// converging over several ticks rather than acting on the whole deficit at once.
+// It deliberately keeps NO in-flight state. Freed space lags eviction (raw-file
+// deletion queue, segment recompaction), but re-evicting while reclamation is
+// pending is self-limiting — evicting segment entries raises their fragmentation,
+// which triggers the recompaction that frees their space — and, crucially, the
+// backstop can never stall on stale bookkeeping. Under-eviction risks the
+// terminal ENOSPC this exists to prevent; over-eviction only costs recoverable
+// cache warmth, so when in doubt it evicts.
+func (c *Cleaner) enforceFilesystemReserve() {
+	// The eviction indexes only exist when a cap is set, so there is nothing to
+	// evict from otherwise.
+	if c.maxDiskUsage <= 0 || c.storage == nil {
+		return
+	}
+
+	free, total, ok := c.diskUsageFn(c.storage.diskPath)
+	if !ok {
+		return // statfs unavailable; treat the backstop as inactive this tick
+	}
+	metrics.FilesystemFreeBytes.Set(float64(free))
+
+	// Cap the fixed reserve at a fraction of the volume so it stays achievable on
+	// small volumes (otherwise free could be permanently below a 2 GiB reserve).
+	reserve := c.diskReserveBytes
+	if volCap := total / reserveVolumeFraction; total > 0 && volCap < reserve {
+		reserve = volCap
+	}
+	if free >= reserve {
+		return
+	}
+
+	// Bound the per-tick blast radius to a fraction of the cache so a single low
+	// reading can't evict everything at once; the next tick re-measures and
+	// continues if free is still low. A large cache's slice covers the whole
+	// (reserve-bounded) deficit; only a small cache is throttled.
+	slice := reserve - free
+	if maxSlice := c.totalSize.Load() / reserveEvictSliceFraction; maxSlice > 0 && maxSlice < slice {
+		slice = maxSlice
+	}
+
+	fifo := c.storage.evictionPolicy == EvictionPolicyFIFO
+	idx := lruEvictionIndex()
+	if fifo {
+		idx = fifoEvictionIndex()
+	}
+
+	metrics.CleanerRuns.WithLabelValues(idx.policy).Inc()
+	zlog.Warn().
+		Int64("free", free).
+		Int64("reserve", reserve).
+		Int64("evict_target", slice).
+		Str("policy", idx.policy).
+		Msg("cleaner: filesystem free space below reserve; evicting to reclaim disk (ENOSPC backstop)")
+
+	start := time.Now()
+	evicted := c.evictByIndex(idx, slice)
+	metrics.CleanerDuration.WithLabelValues(idx.policy).Observe(float64(time.Since(start).Milliseconds()))
 	if !fifo {
 		metrics.LRUEvictions.Add(float64(evicted))
 	}
