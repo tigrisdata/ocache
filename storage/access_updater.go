@@ -24,7 +24,7 @@ type accessUpdate struct {
 type accessUpdater struct {
 	updates       chan accessUpdate
 	done          chan struct{}
-	flush         chan chan struct{} // Channel to request flush with completion notification
+	flush         chan chan int // Channel to request flush with the number of flushed entries
 	storage       *Storage
 	interval      time.Duration
 	delay         time.Duration // The delay after which an access time update is considered stale and should be updated
@@ -44,7 +44,7 @@ func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration, delay 
 	return &accessUpdater{
 		updates:       make(chan accessUpdate, bufferSize),
 		done:          make(chan struct{}),
-		flush:         make(chan chan struct{}),
+		flush:         make(chan chan int),
 		storage:       s,
 		interval:      interval,
 		delay:         delay,
@@ -95,21 +95,23 @@ func (a *accessUpdater) UpdateNow(key string) {
 // single, consistent batch. This avoids any races between the caller and the
 // background `run` goroutine both trying to drain the `updates` channel.
 //
-// Flush is mainly useful for tests to ensure deterministic behaviour.
-func (a *accessUpdater) Flush() {
+// Flush is mainly useful for tests to ensure deterministic behaviour. It
+// returns the number of distinct access updates flushed.
+func (a *accessUpdater) Flush() int {
 	zlog.Debug().Msg("accessUpdater: flushing (external request)")
 
 	// Channel used to signal completion of the flush request.
-	done := make(chan struct{})
+	done := make(chan int)
 
 	// Attempt to send the flush request. If the updater has already been
 	// stopped (i.e. `done` is closed), return immediately.
 	select {
 	case a.flush <- done:
 		// Wait until the background goroutine signals completion.
-		<-done
+		return <-done
 	case <-a.done:
 		// The updater is shutting down; nothing to flush.
+		return 0
 	}
 }
 
@@ -138,7 +140,7 @@ func (a *accessUpdater) run() {
 		case doneCh := <-a.flush:
 			// Synchronously handle external flush request.
 			a.collectUpdates()
-			a.flushBatch()
+			doneCh <- a.flushBatch()
 			close(doneCh)
 		}
 	}
@@ -158,12 +160,12 @@ func (a *accessUpdater) collectUpdates() {
 	}
 }
 
-// timeGateUpdate adds an update to the batch if it is stale
-// and adds the key to the LRU cache so that it is marked as most recently used
+// timeGateUpdate adds an update to the batch if it is stale and refreshes the
+// key's recency in the access-time LRU.
 func (a *accessUpdater) timeGateUpdate(update accessUpdate) {
-	// Only add to the batch if the key in LRU cache is more than delay old
-	// or if the key is not in the LRU cache
-	accessTime, ok := a.accessTimeLRU.Peek(update.key)
+	// Get marks a gated hit as recently used without changing its timestamp.
+	accessTime, ok := a.accessTimeLRU.Get(update.key)
+	// Only add to the batch when the timestamp is stale or the cache misses.
 	if (ok && time.Unix(update.time, 0).Sub(time.Unix(accessTime, 0)) > a.delay) || !ok {
 		a.addToBatch(update)
 
@@ -172,14 +174,16 @@ func (a *accessUpdater) timeGateUpdate(update accessUpdate) {
 	}
 }
 
-// flushBatch writes a batch of access updates to RocksDB
-func (a *accessUpdater) flushBatch() {
+// flushBatch writes a batch of access updates to RocksDB and returns its size.
+func (a *accessUpdater) flushBatch() int {
 	a.batchMutex.Lock()
 	defer a.batchMutex.Unlock()
 
 	if len(a.batch) == 0 {
-		return
+		return 0
 	}
+
+	batchSize := len(a.batch)
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -236,6 +240,7 @@ func (a *accessUpdater) flushBatch() {
 
 	// Clear the batch
 	a.batch = make(map[string]accessUpdate)
+	return batchSize
 }
 
 func (a *accessUpdater) addToBatch(update accessUpdate) {
