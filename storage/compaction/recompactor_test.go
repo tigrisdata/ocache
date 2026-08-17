@@ -6,6 +6,7 @@ package compaction
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/deletion"
+	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
@@ -30,6 +32,9 @@ func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, 
 	mergeOp := merge.NewMultiplexOperator()
 	meta, err := metadata.NewMetaDB(tmpDir, 0, mergeOp, nil)
 	require.NoError(t, err)
+
+	// Segment removal reaches the process-wide descriptor cache.
+	_ = fd.NewFdCache(100)
 
 	// Initialize segment manager
 	sm, err := segment.NewManager(tmpDir, 1024*1024) // 1MB segments for testing
@@ -184,7 +189,8 @@ func TestSegmentRecompaction_WithFragmentation(t *testing.T) {
 	err = meta.Handle().Put(wo, deleteIndexKey, deleteBytes)
 	require.NoError(t, err)
 
-	// Lower the fragmentation threshold to trigger recompaction
+	// Allow this one fragmented segment to be selected by the test.
+	recompactor.minSegments = 1
 	recompactor.fragThreshold = 0.1
 
 	// Run recompaction
@@ -192,9 +198,10 @@ func TestSegmentRecompaction_WithFragmentation(t *testing.T) {
 	err = recompactor.RecompactFragmentedSegments(ctx)
 	assert.NoError(t, err)
 
-	// Verify a new segment was created
+	// Verify the fragmented segment was replaced.
 	segments := sm.GetSegments()
-	assert.GreaterOrEqual(t, len(segments), 1)
+	require.Len(t, segments, 1)
+	assert.NotEqual(t, seg.Path(), segments[0].Path())
 
 	// Verify key1 and key3 still exist in metadata with correct segment references
 	ro := grocksdb.NewDefaultReadOptions()
@@ -211,6 +218,14 @@ func TestSegmentRecompaction_WithFragmentation(t *testing.T) {
 		err = proto.Unmarshal(slice.Data(), &vm)
 		require.NoError(t, err)
 		assert.Equal(t, pb.ValueType_SEGMENT, vm.ValueType)
+		assert.Equal(t, segments[0].Path(), vm.SegmentPath)
+
+		reader, err := sm.ReadEntry(key, vm.SegmentPath, vm.SegmentOffset, vm.ValueLength)
+		require.NoError(t, err)
+		value, err := io.ReadAll(reader)
+		require.NoError(t, err)
+		require.NoError(t, reader.Close())
+		assert.Equal(t, entries[key], value)
 	}
 
 	// Verify key2 is still deleted

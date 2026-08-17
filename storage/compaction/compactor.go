@@ -266,6 +266,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 		processed   int
 		bytesCopied int64
 	)
+	advice := newCacheAdvice()
 
 	// Create a unique caller ID for this worker
 	workerCallerID := fmt.Sprintf("%s-%d", compactorCallerID, workerID)
@@ -383,7 +384,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 		}
 
 		// Compact the entry
-		if err := c.compactEntry(ctx, entry, &seg, workerCallerID, wb); err != nil {
+		if err := c.compactEntry(ctx, entry, &seg, workerCallerID, wb, advice); err != nil {
 			if err == context.Canceled {
 				zlog.Debug().Msg("compactor: compaction cancelled")
 				return processed, bytesCopied
@@ -427,7 +428,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 	}
 
 	// Final commit.
-	if err := c.commit(ctx, seg, wb); err != nil {
+	if err := c.commit(ctx, seg, wb, advice); err != nil {
 		if err != context.Canceled {
 			zlog.Error().Err(err).Msg("compactor: commit failed")
 		}
@@ -553,7 +554,7 @@ func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath
 }
 
 // compactEntry performs the actual compaction of a single entry
-func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch) error {
+func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch, advice *cacheAdvice) error {
 	// Validate file size matches metadata
 	if entry.fileInfo.Size() != entry.metadata.ValueLength {
 		zlog.Error().
@@ -576,7 +577,7 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 	totalNeeded := headerSize + entry.metadata.ValueLength
 
 	// Ensure we have space in the current segment
-	if err := c.ensureCapacity(ctx, seg, callerID, totalNeeded); err != nil {
+	if err := c.ensureCapacity(ctx, seg, callerID, totalNeeded, advice); err != nil {
 		return err
 	}
 
@@ -605,6 +606,7 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 		zlog.Error().Err(err).Str("key", entry.userKey).Msg("compactor: copy failed")
 		return err
 	}
+	advice.addOutput(*seg, entry.metadata.SegmentOffset, totalNeeded)
 
 	zlog.Debug().
 		Str("key", entry.userKey).
@@ -640,6 +642,10 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 		return err
 	}
 
+	// Raw files are one-pass compaction input. Discard their clean cache pages
+	// after copying; unsupported kernels and filesystems retain buffered I/O.
+	dropFileCache(f, 0, vm.ValueLength)
+
 	// NOTE: vm.RawFilePath is deliberately NOT cleared here. The caller
 	// marshals vm as the operand bytes for a conditional-merge write
 	// (see compactEntry and merge.mergeMetadataCAS), and that merge needs
@@ -655,7 +661,7 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 }
 
 // commit commits pending RocksDB mutations.
-func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocksdb.WriteBatch) error {
+func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocksdb.WriteBatch, advice *cacheAdvice) error {
 	if wb.Count() == 0 {
 		return nil // nothing to do
 	}
@@ -671,6 +677,7 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 	if err := seg.Sync(); err != nil {
 		return err
 	}
+	advice.dropSyncedOutput(seg)
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -683,7 +690,7 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 
 // ensureCapacity ensures that the segment has at least the needed bytes
 // available, finalising and acquiring a fresh segment when necessary.
-func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64) error {
+func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64, advice *cacheAdvice) error {
 	if (*seg).Remaining() >= needed {
 		return nil
 	}
@@ -698,6 +705,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 	if err := c.sm.FinalizeSegment(*seg); err != nil {
 		return err
 	}
+	advice.dropSyncedOutput(*seg)
 
 	// Now safe to release since it's finalized
 	if err := (*seg).Release(callerID); err != nil {
