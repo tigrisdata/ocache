@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -36,7 +37,7 @@ func defaultDeletionQueueConfig() deletion.Config {
 	}
 }
 
-func setupTestEnvironment(t *testing.T) (string, *metadata.MetaDB, *files.FileManager, *segment.Manager, func()) {
+func setupTestEnvironment(t testing.TB) (string, *metadata.MetaDB, *files.FileManager, *segment.Manager, func()) {
 	tmpDir, err := os.MkdirTemp("", "compactor-test-*")
 	require.NoError(t, err)
 
@@ -191,12 +192,12 @@ func TestEnsureCapacity(t *testing.T) {
 
 	// Test 1: When segment has enough capacity
 	ctx := context.Background()
-	err = c.ensureCapacity(ctx, &seg, "test", 100)
+	err = c.ensureCapacity(ctx, &seg, "test", 100, newCacheAdvice())
 	assert.NoError(t, err)
 	assert.Equal(t, initialPath, seg.Path()) // Same segment
 
 	// Test 2: When segment needs rotation
-	err = c.ensureCapacity(ctx, &seg, "test", initialRemaining+1)
+	err = c.ensureCapacity(ctx, &seg, "test", initialRemaining+1, newCacheAdvice())
 	assert.NoError(t, err)
 	assert.NotEqual(t, initialPath, seg.Path()) // New segment
 }
@@ -283,7 +284,7 @@ func TestCommit(t *testing.T) {
 
 	// Test commit with non-empty batch
 	ctx := context.Background()
-	err = c.commit(ctx, seg, wb)
+	err = c.commit(ctx, seg, wb, newCacheAdvice())
 	assert.NoError(t, err)
 
 	// Files should still exist (queued for deletion, not immediately deleted)
@@ -294,7 +295,7 @@ func TestCommit(t *testing.T) {
 
 	// Test commit with empty batch
 	emptyWb := grocksdb.NewWriteBatch()
-	err = c.commit(ctx, seg, emptyWb)
+	err = c.commit(ctx, seg, emptyWb, newCacheAdvice())
 	assert.NoError(t, err)
 }
 
@@ -370,16 +371,21 @@ func TestCompactFiles(t *testing.T) {
 	// Verify metadata was updated
 	metaKey1 = keys.MakeMetadataKey("key1")
 	slice3, _ := meta.Handle().Get(ro, metaKey1)
-	assert.True(t, slice3.Exists())
-	if slice3.Exists() {
-		updatedVm := &pb.ValueMessage{}
-		err = proto.Unmarshal(slice3.Data(), updatedVm)
-		assert.NoError(t, err)
-		assert.Equal(t, pb.ValueType_SEGMENT, updatedVm.ValueType)
-		assert.Empty(t, updatedVm.RawFilePath)
-		assert.NotEmpty(t, updatedVm.SegmentPath)
-	}
+	require.True(t, slice3.Exists())
+	updatedVm := &pb.ValueMessage{}
+	err = proto.Unmarshal(slice3.Data(), updatedVm)
+	assert.NoError(t, err)
+	assert.Equal(t, pb.ValueType_SEGMENT, updatedVm.ValueType)
+	assert.Empty(t, updatedVm.RawFilePath)
+	assert.NotEmpty(t, updatedVm.SegmentPath)
 	slice3.Free()
+
+	reader, err := sm.ReadEntry("key1", updatedVm.SegmentPath, updatedVm.SegmentOffset, updatedVm.ValueLength)
+	require.NoError(t, err)
+	copiedData, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	assert.Equal(t, testData1, copiedData)
 
 	// Files should still exist (queued for deletion, not immediately deleted)
 	_, err = os.Stat(testFile1)
