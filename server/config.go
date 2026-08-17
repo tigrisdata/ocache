@@ -31,6 +31,9 @@ type Config struct {
 	RecoveryWorkers        int           // Number of parallel workers for startup file recovery
 	DeleteBatchSize        int           // File deletions processed per deletion-queue batch
 	RequestLogging         bool          // Enable request logging
+
+	CompactionBytesPerSecond int64 // Shared file/recompaction payload-byte limit
+
 	// RocksDB tuning parameters
 	MetadataCacheSize      int64 // RocksDB block cache size in bytes
 	MetadataBackgroundJobs int   // Max concurrent RocksDB background jobs (compactions + flushes)
@@ -78,6 +81,8 @@ func LoadConfig() {
 		ClusterAddr:            *clusterAddr,
 		Seeds:                  seeds,
 		AdvertiseAddr:          resolveAdvertiseAddr(*listenAddr, *advertiseAddr),
+
+		CompactionBytesPerSecond: *compactionBytesPerSecond,
 	}
 }
 

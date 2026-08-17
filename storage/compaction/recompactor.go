@@ -20,6 +20,7 @@ import (
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
 	"github.com/tigrisdata/ocache/storage/utils"
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 
 	zlog "github.com/rs/zerolog/log"
@@ -38,10 +39,17 @@ type SegmentRecompactor struct {
 	fragThreshold float64
 	minSegmentAge time.Duration
 	minSegments   int
+	rateLimiter   *rate.Limiter
 }
 
-// NewSegmentRecompactor creates a new segment recompactor
+// NewSegmentRecompactor creates a new segment recompactor without a rate limit.
+// NewCompactorWithConfig uses the internal constructor to share its limiter
+// with file compaction workers.
 func NewSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int) *SegmentRecompactor {
+	return newSegmentRecompactor(meta, sm, deletionQueue, fragThreshold, minSegmentAge, minSegments, nil)
+}
+
+func newSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int, rateLimiter *rate.Limiter) *SegmentRecompactor {
 	return &SegmentRecompactor{
 		sm:            sm,
 		meta:          meta,
@@ -49,6 +57,7 @@ func NewSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQ
 		fragThreshold: fragThreshold,
 		minSegmentAge: minSegmentAge,
 		minSegments:   minSegments,
+		rateLimiter:   rateLimiter,
 	}
 }
 
@@ -343,8 +352,13 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		Checksum:    entry.Checksum,
 	}
 
+	var reader io.Reader = dataReader
+	if sr.rateLimiter != nil {
+		reader = newRateLimitedReader(ctx, reader, entry.ValueLength, sr.rateLimiter)
+	}
+
 	// Use segment's WriteEntry function
-	newOffset, err := (*newSeg).WriteEntry(entry.Key, dataReader, vm)
+	newOffset, err := (*newSeg).WriteEntry(entry.Key, reader, vm)
 	if err != nil {
 		return fmt.Errorf("failed to write entry: %w", err)
 	}

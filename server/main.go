@@ -34,6 +34,8 @@ var (
 	recompactDisable       = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
 	ttlCleanupInterval     = flag.Duration("ttl-cleanup-interval", stor.DefaultTTLCleanupInterval, "Interval at which TTL keys are cleaned up")
 
+	compactionBytesPerSecond = flag.Int64("compaction-bytes-per-second", stor.DefaultCompactionBytesPerSecond, "Maximum shared compaction payload bytes per second")
+
 	maxDiskUsage   = flag.Int64("max-disk-usage", stor.DefaultMaxDiskUsage, "Maximum disk usage in bytes (0 = unlimited)")
 	evictionPolicy = flag.String("eviction-policy", stor.DefaultEvictionPolicy, "Eviction order when max-disk-usage is set: 'lru' (reads refresh recency) or 'fifo' (evict oldest-written first; reads do not protect data)")
 	fdCacheSize    = flag.Int("fd-cache-size", stor.DefaultFdCacheSize, "Size of the file descriptor cache (entries)")
@@ -130,6 +132,8 @@ func initializeStorage() *stor.Storage {
 		RecoveryWorkers:        AppConfig.RecoveryWorkers,
 		DeleteBatchSize:        AppConfig.DeleteBatchSize,
 		EvictionPolicy:         AppConfig.EvictionPolicy,
+
+		CompactionBytesPerSecond: AppConfig.CompactionBytesPerSecond,
 	}
 
 	s, err := stor.NewStorageWithConfig(storageConfig)

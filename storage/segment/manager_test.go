@@ -5,6 +5,7 @@ package segment
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -239,6 +240,115 @@ func TestManager_AcquireOpenSegment(t *testing.T) {
 
 	if !hasFile {
 		t.Error("Acquired segment should have an open file")
+	}
+}
+
+type errorAfterReader struct {
+	reader    io.Reader
+	remaining int
+	err       error
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, r.err
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.remaining -= n
+	return n, err
+}
+
+func TestManager_WriteEntryRollsBackInterruptedPayload(t *testing.T) {
+	basePath := t.TempDir()
+	_ = fd.NewFdCache(100)
+	manager, err := NewManager(basePath, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	seg, err := manager.AcquireOpenSegmentWithReservation("rollback", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prefix := []byte("retained payload")
+	prefixOffset, err := seg.WriteEntry("retained", bytes.NewReader(prefix), &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		ValueLength: int64(len(prefix)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefixOffset != 0 {
+		t.Fatalf("prefix offset = %d, want 0", prefixOffset)
+	}
+	sizeBeforeFailure := seg.GetSize()
+
+	payload := bytes.Repeat([]byte("x"), 2*64*1024)
+	_, err = seg.WriteEntry("interrupted", &errorAfterReader{
+		reader:    bytes.NewReader(payload),
+		remaining: 64 * 1024,
+		err:       errors.New("interrupted source read"),
+	}, &pb.ValueMessage{ValueType: pb.ValueType_RAW_FILE, ValueLength: int64(len(payload))})
+	if err == nil {
+		t.Fatal("WriteEntry succeeded after the source reader failed")
+	}
+	if got := seg.GetSize(); got != sizeBeforeFailure {
+		t.Fatalf("segment size after interrupted write = %d, want %d", got, sizeBeforeFailure)
+	}
+	if got := seg.GetNumEntries(); got != 1 {
+		t.Fatalf("segment entries after interrupted write = %d, want 1", got)
+	}
+
+	want := []byte("replacement payload")
+	offset, err := seg.WriteEntry("replacement", bytes.NewReader(want), &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		ValueLength: int64(len(want)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset != sizeBeforeFailure {
+		t.Fatalf("replacement offset = %d, want %d", offset, sizeBeforeFailure)
+	}
+	if err := manager.FinalizeSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := manager.ReadEntry("replacement", seg.Path(), offset, int64(len(want)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("replacement payload = %q, want %q", got, want)
+	}
+
+	reader, err = manager.ReadEntry("retained", seg.Path(), prefixOffset, int64(len(prefix)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = io.ReadAll(reader)
+	closeErr = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !bytes.Equal(got, prefix) {
+		t.Fatalf("retained payload = %q, want %q", got, prefix)
 	}
 }
 

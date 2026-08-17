@@ -867,6 +867,8 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 	s.Harness.Cleanup()
 	config := DefaultIntegrationTestConfig()
 	config.RecompactionInterval = 500 * time.Millisecond
+	// Keep this threshold test independent of the production I/O budget.
+	config.CompactionBytesPerSecond = 1 << 30
 	config.SegmentSize = 2 * 1024 * 1024
 	config.RecompactMinSegmentAge = 100 * time.Millisecond
 	config.RecompactMinSegments = 1
@@ -1026,26 +1028,37 @@ func (s *CompactionSuite) Test_SegmentRecompaction_ThresholdBehavior() {
 
 	t.Logf("Pushed segments over threshold (Seg0: 60%%, Seg1: 60%%, Seg2: already recompacted)")
 
-	// Now all segments should be recompacted as they're all >50% fragmentation
+	// Now all segments should be recompacted as they're all >50% fragmentation.
+	// Background work completes asynchronously, so wait for the state we assert
+	// instead of assuming a fixed delay.
 	t.Log("Waiting for recompaction of remaining segments...")
-	time.Sleep(5 * time.Second)
-
-	// Check if recompaction occurred
-	segmentsAfter, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
-	totalSizeAfter := int64(0)
-	for _, seg := range segmentsAfter {
-		info, _ := os.Stat(seg)
-		totalSizeAfter += info.Size()
+	expectedMaxSize := baselineSize * 52 / 100
+	segmentSize := func() int64 {
+		segments, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+		totalSize := int64(0)
+		for _, seg := range segments {
+			info, err := os.Stat(seg)
+			if err == nil {
+				totalSize += info.Size()
+			}
+		}
+		return totalSize
 	}
+	require.Eventually(t, func() bool {
+		return segmentSize() < expectedMaxSize
+	}, 20*time.Second, 100*time.Millisecond, "remaining segments were not fully recompacted")
+
+	// Check if recompaction occurred.
+	segmentsAfter, _ := filepath.Glob(filepath.Join(segmentDir, "segment_*.seg"))
+	totalSizeAfter := segmentSize()
 
 	t.Logf("Final state: %d segments, size: %d bytes", len(segmentsAfter), totalSizeAfter)
 	t.Logf("Size progression - Baseline: %d bytes, After 40%%: %d bytes, After 60%%+recompaction: %d bytes",
 		baselineSize, totalSizeBefore, totalSizeAfter)
 
-	// Size should be significantly reduced after all recompactions
-	// We have about 40% of data remaining
-	// Allow up to 52% of baseline to account for segment overhead and metadata
-	expectedMaxSize := baselineSize * 52 / 100
+	// Size should be significantly reduced after all recompactions.
+	// We have about 40% of data remaining. Allow up to 52% of baseline to
+	// account for segment overhead and metadata.
 	require.Less(t, totalSizeAfter, expectedMaxSize,
 		fmt.Sprintf("Segment size should be significantly reduced after full recompaction (baseline: %d, after: %d, max expected: %d)",
 			baselineSize, totalSizeAfter, expectedMaxSize))

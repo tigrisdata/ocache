@@ -9,6 +9,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestNewStorageWithConfig_CompactionBytesPerSecond verifies that background
+// compaction gets a conservative default while preserving an explicit limit.
+func TestNewStorageWithConfig_CompactionBytesPerSecond(t *testing.T) {
+	t.Run("default applied when unset", func(t *testing.T) {
+		config := &StorageConfig{DiskPath: t.TempDir(), DisableRecompaction: true}
+		s, err := NewStorageWithConfig(config)
+		require.NoError(t, err)
+		defer s.Close()
+
+		require.Equal(t, DefaultCompactionBytesPerSecond, config.CompactionBytesPerSecond)
+	})
+
+	t.Run("explicit value preserved", func(t *testing.T) {
+		const limit = int64(2 * 1024 * 1024)
+		config := &StorageConfig{
+			DiskPath:                 t.TempDir(),
+			DisableRecompaction:      true,
+			CompactionBytesPerSecond: limit,
+		}
+		s, err := NewStorageWithConfig(config)
+		require.NoError(t, err)
+		defer s.Close()
+
+		require.Equal(t, limit, config.CompactionBytesPerSecond)
+	})
+}
+
 // TestNewStorageWithConfig_DeleteBatchSize verifies the deletion-queue batch
 // size is configurable: an unset value falls back to DefaultDeleteBatchSize,
 // and an explicit value is preserved. NewStorageWithConfig applies the default
