@@ -177,6 +177,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 	// Track metadata updates
 	wb := grocksdb.NewWriteBatch()
 	defer wb.Destroy()
+	advice := newCacheAdvice()
 
 	// Create an iterator to scan the old segment
 	iter, err := oldSeg.NewIterator(oldFile)
@@ -222,7 +223,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 		}
 
 		// This is a live entry, copy it to the new segment
-		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, entry, meta, wb); err != nil {
+		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, entry, meta, wb, advice); err != nil {
 			zlog.Error().Err(err).Str("key", entry.Key).
 				Msg("recompactor: failed to copy entry")
 			continue
@@ -242,8 +243,14 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 			Msg("recompactor: no live entries found")
 	}
 
-	// Now commit metadata updates - readers will only see the new segment
+	// Persist the copied range before publishing metadata that references it.
 	if wb.Count() > 0 {
+		if err := newSeg.Sync(); err != nil {
+			return fmt.Errorf("failed to sync new segment: %w", err)
+		}
+		advice.dropSyncedOutput(newSeg)
+
+		// Now commit metadata updates - readers will only see the new segment.
 		wo := grocksdb.NewDefaultWriteOptions()
 		defer wo.Destroy()
 		if err := sr.meta.Handle().Write(wo, wb); err != nil {
@@ -297,7 +304,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 
 // copyEntry copies a single entry from old segment to new segment
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
-	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch,
+	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch, advice *cacheAdvice,
 ) error {
 	// Create a section reader for the value data (no checksum verification per review)
 	valueOffset := entry.Offset + entry.HeaderSize
@@ -313,6 +320,7 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
+		advice.dropSyncedOutput(*newSeg)
 
 		// Now safe to release since it's finalized
 		if err := (*newSeg).Release(callerID); err != nil {
@@ -337,6 +345,10 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	if err != nil {
 		return fmt.Errorf("failed to write entry: %w", err)
 	}
+	advice.addOutput(*newSeg, newOffset, totalNeeded)
+
+	// Old segment values are one-pass recompaction input.
+	dropFileCache(oldFile, entry.Offset, totalNeeded)
 
 	// Update metadata to point to new location
 	meta.SegmentPath = (*newSeg).Path()
