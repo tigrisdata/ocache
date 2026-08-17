@@ -14,6 +14,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/storage/benchio"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
@@ -637,7 +638,9 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 		return err
 	}
 
-	segOff, err := seg.WriteEntry(userKey, f, vm)
+	// Charge direct raw-file payload reads to the benchmark-only shared lane.
+	reader := benchio.WrapPayloadReaderForBenchmark(f)
+	segOff, err := seg.WriteEntry(userKey, reader, vm)
 	if err != nil {
 		return err
 	}

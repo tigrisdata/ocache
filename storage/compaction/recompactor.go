@@ -13,6 +13,7 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/storage/benchio"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
@@ -306,9 +307,11 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
 	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch, advice *cacheAdvice,
 ) error {
-	// Create a section reader for the value data (no checksum verification per review)
+	// Create a section reader for the value data (no checksum verification per review).
+	// The wrapper charges the direct payload reads to the benchmark-only shared lane.
 	valueOffset := entry.Offset + entry.HeaderSize
-	dataReader := io.NewSectionReader(oldFile, valueOffset, entry.ValueLength)
+	payloadReader := benchio.WrapPayloadReaderAtForBenchmark(oldFile)
+	dataReader := io.NewSectionReader(payloadReader, valueOffset, entry.ValueLength)
 
 	// Check if we need a new segment
 	// NOTE: FinalizeSegment and AcquireOpenSegmentWithReservation are thread-safe - the segment

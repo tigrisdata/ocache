@@ -95,7 +95,11 @@ func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int6
 		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
-	return seg.ReadEntry(userKey, offset, length, sm.fdCache)
+	reader, err := seg.ReadEntry(userKey, offset, length, sm.fdCache)
+	if err != nil {
+		return nil, err
+	}
+	return wrapReadForBenchmark(reader), nil
 }
 
 // AcquireOpenSegmentWithReservation returns an open segment reserved for the caller

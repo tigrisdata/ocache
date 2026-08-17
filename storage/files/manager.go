@@ -152,14 +152,14 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 	// and reads up to length bytes.
 	reader := io.NewSectionReader(e.File(), 0, length)
 
-	return &fileReadCloser{
+	return wrapReadForBenchmark(&fileReadCloser{
 		ReadSeeker: reader,
 		onClose: func() {
 			// Release lock & cached FD when caller is done.
 			e.RUnlock()
 			fm.fdCache.Release(filePath, e)
 		},
-	}, nil
+	}), nil
 }
 
 // Remove removes a file for the given key without blocking if it's being read
