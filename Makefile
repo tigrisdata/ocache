@@ -221,9 +221,14 @@ bench: build build-cli run-background
 
 # Compile integration benchmarks once so they can be sampled without rebuilding.
 # Set INTEGRATION_BENCH_BINARY to the desired output path.
+#
+# NOTE: -timeout is a run-time flag, so it cannot be baked in here; a compiled
+# test binary has NO default timeout (go test's 10m default is injected at run
+# time). Whoever runs the binary must pass -test.timeout (e.g. -test.timeout=300s,
+# matching test-integration) or a hung benchmark blocks forever.
 INTEGRATION_BENCH_BINARY ?=
 .PHONY: bench-integration
-bench-integration:
+bench-integration: proto
 	@test -n "$(INTEGRATION_BENCH_BINARY)" || { echo "INTEGRATION_BENCH_BINARY is required"; exit 1; }
 	@mkdir -p "$(dir $(INTEGRATION_BENCH_BINARY))"
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(INTEGRATION_BENCH_BINARY)" .
