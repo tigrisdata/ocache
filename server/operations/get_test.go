@@ -4,6 +4,7 @@
 package operations
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"testing"
@@ -142,5 +143,144 @@ func TestGrpcStreamReader_CloseCancels(t *testing.T) {
 	// Close must be safe to call again (e.g. after full consumption).
 	if err := r.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// peerChunkWriter retains the slices it receives so tests can verify that
+// WriteTo passes peer response data directly to the destination.
+type peerChunkWriter struct {
+	chunks [][]byte
+}
+
+func (w *peerChunkWriter) Write(p []byte) (int, error) {
+	w.chunks = append(w.chunks, p)
+	return len(p), nil
+}
+
+func TestGrpcStreamReader_WriteToWritesPeerChunksDirectly(t *testing.T) {
+	chunks := [][]byte{[]byte("first"), []byte("second"), []byte("third")}
+	released := false
+	r := &grpcStreamReader{
+		stream:  &mockGetClient{chunks: chunks[1:]},
+		pending: chunks[0],
+		cancel:  func() { released = true },
+	}
+	w := &peerChunkWriter{}
+
+	written, err := io.Copy(w, r)
+	if err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if want := int64(len("firstsecondthird")); written != want {
+		t.Fatalf("written = %d, want %d", written, want)
+	}
+	if len(w.chunks) != len(chunks) {
+		t.Fatalf("writes = %d, want %d", len(w.chunks), len(chunks))
+	}
+	for i, chunk := range chunks {
+		if !bytes.Equal(w.chunks[i], chunk) {
+			t.Errorf("chunk %d = %q, want %q", i, w.chunks[i], chunk)
+		}
+		if &w.chunks[i][0] != &chunk[0] {
+			t.Errorf("chunk %d was copied before Write", i)
+		}
+	}
+	if !released {
+		t.Fatal("stream not released on EOF")
+	}
+}
+
+type maxChunkWriter struct {
+	limit  int
+	chunks [][]byte
+}
+
+func (w *maxChunkWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return 0, errors.New("write exceeds limit")
+	}
+	w.chunks = append(w.chunks, p)
+	return len(p), nil
+}
+
+func TestGrpcStreamReader_WriteToMatchesCopyWriteSize(t *testing.T) {
+	chunk := bytes.Repeat([]byte("x"), 2*grpcStreamReaderWriteChunkSize)
+	r := &grpcStreamReader{pending: chunk, stream: &mockGetClient{}}
+	w := &maxChunkWriter{limit: grpcStreamReaderWriteChunkSize}
+
+	written, err := io.Copy(w, r)
+	if err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if written != int64(len(chunk)) {
+		t.Fatalf("written = %d, want %d", written, len(chunk))
+	}
+	if len(w.chunks) != 2 {
+		t.Fatalf("writes = %d, want 2", len(w.chunks))
+	}
+	for i, got := range w.chunks {
+		if len(got) != grpcStreamReaderWriteChunkSize {
+			t.Errorf("write %d length = %d, want %d", i, len(got), grpcStreamReaderWriteChunkSize)
+		}
+		if &got[0] != &chunk[i*grpcStreamReaderWriteChunkSize] {
+			t.Errorf("write %d was copied before Write", i)
+		}
+	}
+}
+
+func TestGrpcStreamReader_WriteToPropagatesError(t *testing.T) {
+	wantErr := errors.New("boom")
+	r := &grpcStreamReader{
+		stream:  &mockGetClient{chunks: [][]byte{[]byte("second")}, tailErr: wantErr},
+		pending: []byte("first"),
+	}
+	var out bytes.Buffer
+
+	written, err := io.Copy(&out, r)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Copy error = %v, want %v", err, wantErr)
+	}
+	if written != int64(len("firstsecond")) {
+		t.Fatalf("written = %d, want %d", written, len("firstsecond"))
+	}
+	if got := out.String(); got != "firstsecond" {
+		t.Fatalf("output = %q, want %q", got, "firstsecond")
+	}
+}
+
+type shortWriter struct {
+	limit int
+}
+
+func (w shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return w.limit, nil
+	}
+	return len(p), nil
+}
+
+func TestGrpcStreamReader_WriteToPreservesShortWriteRemainder(t *testing.T) {
+	r := &grpcStreamReader{
+		stream:  &mockGetClient{chunks: [][]byte{[]byte("ef")}},
+		pending: []byte("abcd"),
+	}
+
+	written, err := r.WriteTo(shortWriter{limit: 2})
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("WriteTo error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if written != 2 {
+		t.Fatalf("written = %d, want 2", written)
+	}
+	if got := string(r.pending); got != "cd" {
+		t.Fatalf("pending = %q, want %q", got, "cd")
+	}
+
+	var out bytes.Buffer
+	if _, err := io.Copy(&out, r); err != nil {
+		t.Fatalf("Copy remainder: %v", err)
+	}
+	if got := out.String(); got != "cdef" {
+		t.Fatalf("remainder = %q, want %q", got, "cdef")
 	}
 }

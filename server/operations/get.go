@@ -182,6 +182,64 @@ func (r *grpcStreamReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// grpcStreamReaderWriteChunkSize matches io.Copy's buffered Reader fallback.
+// WriteTo uses subslices at this boundary to retain the prior Write-size
+// behavior without allocating a relay buffer.
+const grpcStreamReaderWriteChunkSize = 32 * 1024
+
+// WriteTo streams pending and subsequent peer chunks directly to w. io.Copy
+// prefers WriterTo over its buffered Reader fallback, avoiding a relay copy of
+// each peer response while retaining Read for other callers.
+func (r *grpcStreamReader) WriteTo(w io.Writer) (int64, error) {
+	var written int64
+
+	for {
+		for len(r.pending) == 0 {
+			if r.done {
+				r.release()
+				return written, r.err
+			}
+
+			resp, err := r.stream.Recv()
+			if err != nil {
+				r.done = true
+				if err != io.EOF {
+					// A failure after the first chunk can no longer be reported via
+					// Operations.Get's return value (found was already resolved), so
+					// count it here to keep cross-node read errors visible (#162).
+					r.err = err
+					recordStreamError()
+				}
+				continue
+			}
+			if len(resp.Data) > 0 {
+				recordBytesTransferred("download", int64(len(resp.Data)))
+				r.pending = resp.Data
+			}
+		}
+
+		chunk := r.pending
+		if len(chunk) > grpcStreamReaderWriteChunkSize {
+			chunk = chunk[:grpcStreamReaderWriteChunkSize]
+		}
+		n, err := w.Write(chunk)
+		if n < 0 || n > len(chunk) {
+			n = 0
+			if err == nil {
+				err = io.ErrShortWrite
+			}
+		}
+		written += int64(n)
+		r.pending = r.pending[n:]
+		if err != nil {
+			return written, err
+		}
+		if n != len(chunk) {
+			return written, io.ErrShortWrite
+		}
+	}
+}
+
 // release tears down the underlying stream/context. Idempotent.
 func (r *grpcStreamReader) release() {
 	if r.cancel != nil {

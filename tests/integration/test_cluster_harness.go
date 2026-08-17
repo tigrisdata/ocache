@@ -114,7 +114,7 @@ func (n *ClusterServerNode) IsRunning() bool {
 
 // ClusterTestHarness provides a test harness for multi-node cluster testing with full servers
 type ClusterTestHarness struct {
-	T               *testing.T
+	T               testing.TB
 	Nodes           map[string]*ClusterServerNode
 	Client          cacheclient.CacheClient
 	NodeCount       int
@@ -130,7 +130,7 @@ type ClusterTestHarness struct {
 }
 
 // NewClusterTestHarness creates a new cluster test harness with full cache servers
-func NewClusterTestHarness(t *testing.T, nodeCount int, config IntegrationTestConfig) *ClusterTestHarness {
+func NewClusterTestHarness(t testing.TB, nodeCount int, config IntegrationTestConfig) *ClusterTestHarness {
 	// Get free ports dynamically: nodeCount for gRPC + nodeCount for memberlist
 	ports, err := getFreePorts(nodeCount * 2)
 	if err != nil {
@@ -162,7 +162,7 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	listenPort := h.grpcPorts[nodeIndex]           // gRPC service port (cache + cluster RPCs)
 	memberlistPort := h.memberlistPorts[nodeIndex] // Memberlist gossip port
 	listenAddr := fmt.Sprintf("localhost:%d", listenPort)
-	clusterAddr := fmt.Sprintf("0.0.0.0:%d", memberlistPort) // Memberlist requires IP, not hostname
+	clusterAddr := fmt.Sprintf("127.0.0.1:%d", memberlistPort) // Loopback avoids private-interface discovery in isolated test runners
 
 	// Create temporary directory for this node
 	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("ocache-cluster-test-node-%d-*", nodeIndex))
