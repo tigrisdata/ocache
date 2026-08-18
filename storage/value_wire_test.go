@@ -136,6 +136,34 @@ func TestUnmarshalValueMessageSkippingData_MatchesFullDecodeExceptData(t *testin
 	require.False(t, unmarshalValueMessageSkippingData([]byte{0x80}, &msg))
 }
 
+// valueMessageSegmentRef must agree with a full decode on both fields it reads,
+// for every stored-value shape — the reconciliation scan derives the total size
+// from its value_length for EVERY row, so a mis-parse would skew the cap.
+func TestValueMessageSegmentRef_MatchesFullDecode(t *testing.T) {
+	msgs := map[string]*pb.ValueMessage{
+		"empty":       {},
+		"inline":      {ValueType: pb.ValueType_INLINE, Data: bytes.Repeat([]byte("x"), 64*1024), ValueLength: 64 * 1024, Expiry: 9},
+		"rawfile":     {ValueType: pb.ValueType_RAW_FILE, RawFilePath: "/disk/files/abc.dat", ValueLength: 8 << 20, Checksum: 0xabcd},
+		"segment":     {ValueType: pb.ValueType_SEGMENT, SegmentPath: "/disk/segments/seg_1.seg", SegmentOffset: 4096, ValueLength: 262144},
+		"segment_ttl": {ValueType: pb.ValueType_SEGMENT, SegmentPath: "/d/s/seg_2.seg", SegmentOffset: 1 << 30, ValueLength: 1, Expiry: 1786728207, Checksum: 7},
+	}
+	for name, m := range msgs {
+		t.Run(name, func(t *testing.T) {
+			buf, err := proto.Marshal(m)
+			require.NoError(t, err)
+
+			segPath, length, ok := valueMessageSegmentRef(buf)
+			require.True(t, ok)
+			require.Equal(t, m.SegmentPath, segPath)
+			require.Equal(t, m.ValueLength, length)
+		})
+	}
+
+	// Malformed input is rejected rather than silently contributing 0.
+	_, _, ok := valueMessageSegmentRef([]byte{0x80})
+	require.False(t, ok)
+}
+
 // Benchmarks the allocation/CPU delta the size-accounting paths gain by
 // extracting value_length off the wire instead of a full decode of an inline
 // row at the 64 KiB threshold.
