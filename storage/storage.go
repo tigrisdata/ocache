@@ -227,8 +227,15 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		rocksConfig.MaxBackgroundJobs = config.MetadataBackgroundJobs
 	}
 
-	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances
-	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp, rocksConfig)
+	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances.
+	// The DB is opened WITHOUT engine-level TTL (0): RocksDB's TTL compaction filter drops EVERY
+	// key not rewritten within the window — including per-segment delete-index records, the FIFO
+	// eviction index, and bucketed access keys — silently erasing the recompactor's only
+	// fragmentation signal and orphaning dead segment bytes forever. Entry expiry is owned by the
+	// cleaner, which scans metadata and stages reclamation; the engine TTL was redundant for that.
+	// OpenDbWithTTL(…, 0) keeps the on-disk value format (timestamp suffixes) so existing DBs
+	// remain readable; 0 means "never expire".
+	meta, err := metadata.NewMetaDB(config.DiskPath, 0, mergeOp, rocksConfig)
 	if err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to open metadata DB")
 		return nil, storageErrors.NewInternalError("Init", err)
