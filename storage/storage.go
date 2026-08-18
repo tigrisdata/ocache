@@ -331,6 +331,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	compactor := compaction.NewCompactorWithConfig(compactorConfig)
+	compactor.Start()
 
 	s := &Storage{
 		meta:             meta,
@@ -345,13 +346,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		compactor:        compactor,
 		evictionPolicy:   config.EvictionPolicy,
 	}
-
-	// Reconcile segment dead-byte credit from metadata BEFORE any background
-	// worker starts: this is the only single-threaded window in the process
-	// lifetime, which is what makes the absolute index rewrite safe (see the
-	// method comment). Only then start the compactor.
-	s.reconcileSegmentDeleteIndexAtStartup()
-	compactor.Start()
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
 	cleanupInterval := DefaultTTLCleanupInterval
@@ -1330,190 +1324,6 @@ func (s *Storage) notifyPut(size int64) {
 // notifyDelete updates the cleaner's size tracking when a key is deleted
 func (s *Storage) notifyDelete(size int64) {
 	s.cleaner.UpdateSize(-size)
-}
-
-// segmentLiveness is the live-entry tally a metadata scan accumulates for one
-// segment: entries still referenced, and their payload bytes.
-type segmentLiveness struct {
-	entries int64
-	bytes   int64
-}
-
-// reconcileSegmentDeleteIndexAtStartup re-derives every finalized segment's
-// dead-byte credit from a full metadata scan and REPLACES the
-// `!delete:segment/` index rows with the derived values. It is the
-// self-healing half of dead-byte accounting: the incremental credit
-// (DeleteKey, eviction, Put-overwrite) can drift — overlapping same-key Puts
-// can double-credit or skip the intermediate value — and credit lost before
-// the incremental path existed is otherwise invisible forever, since a
-// segment holding nothing but dead bytes looks identical to a live one.
-//
-// It runs exactly once, synchronously, during NewStorageWithConfig — after
-// segments and metadata are loaded, BEFORE the compactor, recompactor, or
-// cleaner start, and before the storage is reachable by requests. That
-// single-threaded window is what makes an absolute rewrite safe:
-//
-//   - No compaction run is mid-flight, so there is no finalized segment whose
-//     metadata publication is still pending in an uncommitted batch (copies in
-//     such a segment after a crash are genuinely dead: their rows still
-//     reference the raw files, which still exist because the deletion queue
-//     only ran after the commit that never happened).
-//   - No concurrent Put/Delete/eviction can race the read-derive-write cycle,
-//     so over-credit can be withdrawn, not just under-credit filled in.
-//   - No recompactor is running, so a delete-index row is never resurrected
-//     for a segment that was concurrently rewritten.
-//
-// Steady-state drift between restarts (e.g. transient over-credit from two
-// overlapping Puts of one hot key) is bounded — the recompactor re-verifies
-// every entry against metadata before copying, so the worst case is an early
-// recompaction — and is corrected at the next restart by this pass.
-//
-// Index rows for segments no longer present on disk are removed. Memory is
-// O(segments), not O(keys).
-func (s *Storage) reconcileSegmentDeleteIndexAtStartup() {
-	if s.segmentManager == nil {
-		return
-	}
-	start := time.Now()
-
-	// Full metadata scan: per-segment live tally, read straight off the wire so
-	// inline payloads (up to the inline threshold) are never copied.
-	live := make(map[string]segmentLiveness)
-	ro := metadata.CreateReadOptions(false, false)
-	defer ro.Destroy()
-	it := s.meta.Handle().NewIterator(ro)
-	defer it.Close()
-	metaPrefix := []byte(keys.MetadataPrefix)
-	for it.Seek(metaPrefix); it.ValidForPrefix(metaPrefix); it.Next() {
-		if segPath, length, ok := valueMessageSegmentRef(it.Value().Data()); ok && segPath != "" {
-			l := live[segPath]
-			l.entries++
-			l.bytes += length
-			live[segPath] = l
-		}
-	}
-	// A truncated scan means an incomplete live tally, and an absolute rewrite
-	// from partial knowledge would mark unseen live entries dead. Abort the
-	// whole pass: doing nothing is safe (the index just keeps yesterday's
-	// state), rewriting from a short scan is not.
-	if err := it.Err(); err != nil {
-		zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: metadata scan failed; skipping reconciliation")
-		return
-	}
-
-	known := make(map[string]struct{})
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
-	corrected := 0
-
-	// Each batch holds whole per-segment corrections (Delete+Merge pairs), so a
-	// committed batch is individually consistent; on a write failure we stop
-	// issuing further corrections rather than continue with unknown state.
-	flush := func() error {
-		if batch.Count() == 0 {
-			return nil
-		}
-		if err := s.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: batch write failed; aborting reconciliation")
-			return err
-		}
-		batch.Clear()
-		return nil
-	}
-
-	for _, seg := range s.segmentManager.GetSegments() {
-		if seg == nil {
-			continue
-		}
-		known[seg.Path()] = struct{}{}
-		if seg.HasOpenFile() {
-			// Still writable: entry count and payload total are not final.
-			continue
-		}
-		entries, dataBytes := int64(seg.GetNumEntries()), seg.GetDataBytes()
-		if entries <= 0 || dataBytes <= 0 {
-			// No footer totals to derive from (pre-footer segment, or empty).
-			continue
-		}
-
-		l := live[seg.Path()]
-		deadEntries, deadBytes := entries-l.entries, dataBytes-l.bytes
-		if deadEntries < 0 {
-			deadEntries = 0
-		}
-		if deadBytes < 0 {
-			deadBytes = 0
-		}
-
-		key := keys.MakeDeleteIndexKey(seg.Path())
-		creditedEntries, creditedBytes, err := s.deleteIndexStatsWithOptions(ro, key)
-		if err != nil {
-			zlog.Error().Err(err).Str("segment", seg.Path()).
-				Msg("storage.reconcileSegmentDeleteIndexAtStartup: failed to read delete index")
-			continue
-		}
-		if creditedEntries == deadEntries && creditedBytes == deadBytes {
-			continue
-		}
-
-		// Absolute rewrite: Delete then Merge in one batch replaces the row with
-		// exactly the derived value (the merge applies onto an empty base).
-		batch.Delete(key)
-		if deadEntries > 0 && deadBytes > 0 {
-			batch.Merge(key, merge.MakeDeleteIndexOperand(deadEntries, deadBytes))
-		}
-		corrected++
-		if batch.Count() >= 1000 {
-			if flush() != nil {
-				return
-			}
-		}
-	}
-
-	// Commit the per-segment corrections before starting the orphan-row scan:
-	// they are complete and correct on their own, and must not be discarded if
-	// the second scan fails.
-	if flush() != nil {
-		return
-	}
-
-	// Remove index rows for segments that no longer exist: they can only
-	// mislead (and would otherwise persist forever, since segment paths embed
-	// creation timestamps and are never reused).
-	removed := 0
-	dit := s.meta.Handle().NewIterator(ro)
-	defer dit.Close()
-	delPrefix := []byte(keys.DeleteIndexPrefix)
-	for dit.Seek(delPrefix); dit.ValidForPrefix(delPrefix); dit.Next() {
-		segPath := keys.ExtractSegmentPath(dit.Key().Data())
-		if _, ok := known[segPath]; !ok {
-			batch.Delete(append([]byte(nil), dit.Key().Data()...))
-			removed++
-			if batch.Count() >= 1000 {
-				if flush() != nil {
-					return
-				}
-			}
-		}
-	}
-	// A short index scan can only make orphan-row removal incomplete — rows we
-	// did not see are simply kept — but skip the final write so we do not act
-	// on it either.
-	if err := dit.Err(); err != nil {
-		zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: delete-index scan failed; skipping remaining cleanup")
-		return
-	}
-	if flush() != nil {
-		return
-	}
-
-	if corrected > 0 || removed > 0 {
-		zlog.Info().Int("corrected", corrected).Int("removed_orphan_rows", removed).
-			Dur("took", time.Since(start)).
-			Msg("storage: reconciled segment delete index from metadata at startup")
-	}
 }
 
 // purgeDanglingRawFile tombstones a metadata entry whose backing raw file no
