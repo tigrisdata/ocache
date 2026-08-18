@@ -95,7 +95,11 @@ func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int6
 		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
-	return seg.ReadEntry(userKey, offset, length, sm.fdCache)
+	reader, err := seg.ReadEntry(userKey, offset, length, sm.fdCache)
+	if err != nil {
+		return nil, err
+	}
+	return wrapReadForBenchmark(reader), nil
 }
 
 // AcquireOpenSegmentWithReservation returns an open segment reserved for the caller
@@ -113,7 +117,17 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 
 	// Look for an existing segment with enough space
 	for _, seg := range sm.openSegments {
-		seg.mu.RLock()
+		// Never block on a busy segment while holding the manager-wide sm.mu:
+		// WriteEntry holds seg.mu exclusively for the whole payload copy, which
+		// under the compaction I/O budget can take seconds per entry. Blocking
+		// here would hold sm.mu for that entire copy and stall every
+		// Manager.ReadEntry (the foreground GET path for all segment-resident
+		// objects) behind it. An exclusively-locked segment is necessarily
+		// mid-copy by its reserving owner, so it could not be handed to this
+		// caller anyway — skip it.
+		if !seg.mu.TryRLock() {
+			continue
+		}
 		if seg.file != nil && seg.Remaining() >= needed {
 			// Check reservation status
 			if seg.reservedBy == "" || seg.reservedBy == callerID {
@@ -140,16 +154,23 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 	return newSeg, nil
 }
 
-// ReleaseAllSegments releases all segments reserved by the given caller
+// ReleaseAllSegments releases all segments reserved by the given caller.
+// Snapshot the open set under sm.mu and release it BEFORE calling seg.Release
+// (which takes seg.mu): holding sm.mu while acquiring a segment lock would
+// block for the duration of a rate-limited WriteEntry copy and — via Go's
+// writer-preferring RWMutex — convoy Manager.ReadEntry behind it, the same
+// hazard fixed in AcquireOpenSegmentWithReservation.
 func (sm *Manager) ReleaseAllSegments(callerID string) error {
 	if callerID == "" {
 		return fmt.Errorf("callerID cannot be empty")
 	}
 
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	open := make([]*Segment, len(sm.openSegments))
+	copy(open, sm.openSegments)
+	sm.mu.RUnlock()
 
-	for _, seg := range sm.openSegments {
+	for _, seg := range open {
 		seg.Release(callerID)
 	}
 	return nil

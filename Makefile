@@ -219,6 +219,29 @@ bench: build build-cli run-background
 	./ocachecli --addr localhost:9000 bench
 	@$(MAKE) stop
 
+# Compile integration benchmarks once so they can be sampled without rebuilding.
+# Set INTEGRATION_BENCH_BINARY to the desired output path.
+#
+# NOTE: -timeout is a run-time flag, so it cannot be baked in here; a compiled
+# test binary has NO default timeout (go test's 10m default is injected at run
+# time). Whoever runs the binary must pass -test.timeout (e.g. -test.timeout=300s,
+# matching test-integration) or a hung benchmark blocks forever.
+INTEGRATION_BENCH_BINARY ?=
+.PHONY: bench-integration
+bench-integration: proto
+	@test -n "$(INTEGRATION_BENCH_BINARY)" || { echo "INTEGRATION_BENCH_BINARY is required"; exit 1; }
+	@mkdir -p "$(dir $(INTEGRATION_BENCH_BINARY))"
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(INTEGRATION_BENCH_BINARY)" .
+
+# Compile the compaction/serving benchmark once so paired runs do not include
+# Go compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+PERFLOOP_BUILD_OUTPUT_DIR ?=
+.PHONY: build-bench-compaction-serving-reads
+build-bench-compaction-serving-reads: proto
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/compaction-serving-reads.test" .
+
 .PHONY: run-background
 run-background:
 	@echo "Starting ocache in background..."
@@ -535,6 +558,8 @@ help:
 	@echo "  test-integration-race       - Run integration tests with race detector"
 	@echo "  test-integration-coverage   - Run integration tests with coverage"
 	@echo "  bench                       - Run benchmarks"
+	@echo "  bench-integration           - Compile integration benchmarks (set INTEGRATION_BENCH_BINARY)"
+	@echo "  build-bench-compaction-serving-reads - Compile the compaction/serving benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"

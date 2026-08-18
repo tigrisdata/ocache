@@ -20,18 +20,19 @@ import (
 
 // IntegrationTestConfig holds configuration for Integration tests
 type IntegrationTestConfig struct {
-	InlineThreshold        int64         // Threshold for inline storage (default 64KB)
-	CompactThreshold       int64         // Threshold for compaction (default 16MB)
-	SegmentSize            int64         // Maximum segment size (default 256MB)
-	CompactionThreads      int           // Number of compaction threads
-	RecompactMinSegmentAge time.Duration // Minimum age for segment recompaction
-	RecompactMinSegments   int           // Minimum number of segments for recompaction
-	RecompactionInterval   time.Duration // How often compaction runs
-	CleanupInterval        time.Duration // How often cleanup runs
-	AccessUpdateDelay      time.Duration // How often access time is updated
-	MaxDiskUsage           int64         // Maximum disk usage for eviction
-	EvictionPolicy         string        // Eviction policy when MaxDiskUsage > 0: "lru" (default) or "fifo"
-	FDCacheSize            int           // File descriptor cache size
+	InlineThreshold          int64         // Threshold for inline storage (default 64KB)
+	CompactThreshold         int64         // Threshold for compaction (default 16MB)
+	SegmentSize              int64         // Maximum segment size (default 256MB)
+	CompactionThreads        int           // Number of compaction threads
+	CompactionBytesPerSecond int64         // Shared file/recompaction payload-byte limit
+	RecompactMinSegmentAge   time.Duration // Minimum age for segment recompaction
+	RecompactMinSegments     int           // Minimum number of segments for recompaction
+	RecompactionInterval     time.Duration // How often compaction runs
+	CleanupInterval          time.Duration // How often cleanup runs
+	AccessUpdateDelay        time.Duration // How often access time is updated
+	MaxDiskUsage             int64         // Maximum disk usage for eviction
+	EvictionPolicy           string        // Eviction policy when MaxDiskUsage > 0: "lru" (default) or "fifo"
+	FDCacheSize              int           // File descriptor cache size
 }
 
 // DefaultIntegrationTestConfig returns default test configuration
@@ -88,20 +89,21 @@ func NewIntegrationTestHarness(t *testing.T, config IntegrationTestConfig) *Inte
 
 	// Initialize storage
 	s, err := storage.NewStorageWithConfig(&storage.StorageConfig{
-		DiskPath:             tmpDir,
-		TTL:                  0,
-		InlineThreshold:      int(config.InlineThreshold),
-		CompactThreshold:     config.CompactThreshold,
-		SegmentSize:          config.SegmentSize,
-		FdCacheSize:          config.FDCacheSize,
-		MaxDiskUsage:         config.MaxDiskUsage,
-		EvictionPolicy:       config.EvictionPolicy,
-		CompactionThreads:    config.CompactionThreads,
-		MinSegmentAge:        config.RecompactMinSegmentAge,
-		MinSegments:          config.RecompactMinSegments,
-		CleanupInterval:      config.CleanupInterval,
-		AccessUpdateDelay:    config.AccessUpdateDelay,
-		RecompactionInterval: config.RecompactionInterval,
+		DiskPath:                 tmpDir,
+		TTL:                      0,
+		InlineThreshold:          int(config.InlineThreshold),
+		CompactThreshold:         config.CompactThreshold,
+		SegmentSize:              config.SegmentSize,
+		FdCacheSize:              config.FDCacheSize,
+		MaxDiskUsage:             config.MaxDiskUsage,
+		EvictionPolicy:           config.EvictionPolicy,
+		CompactionThreads:        config.CompactionThreads,
+		CompactionBytesPerSecond: config.CompactionBytesPerSecond,
+		MinSegmentAge:            config.RecompactMinSegmentAge,
+		MinSegments:              config.RecompactMinSegments,
+		CleanupInterval:          config.CleanupInterval,
+		AccessUpdateDelay:        config.AccessUpdateDelay,
+		RecompactionInterval:     config.RecompactionInterval,
 	})
 	require.NoError(t, err)
 

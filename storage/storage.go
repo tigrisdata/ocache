@@ -56,6 +56,15 @@ const (
 	// Default compaction threads
 	DefaultCompactionThreads = 1 // Default to single thread for backwards compatibility
 
+	// DefaultCompactionBytesPerSecond reserves most of a typical capped volume
+	// for serving reads while background compaction drains its backlog. It is
+	// the SERVER FLAG default only (see server/config.go): the storage layer
+	// treats a non-positive CompactionBytesPerSecond as unthrottled, matching
+	// the 0-disables convention of MaxDiskUsage, so directly constructed and
+	// embedded storage keeps its historical unthrottled behavior unless a
+	// budget is set explicitly.
+	DefaultCompactionBytesPerSecond int64 = 16 * 1024 * 1024 // 16 MiB/s
+
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
 
@@ -123,6 +132,8 @@ type StorageConfig struct {
 	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
 	EvictionPolicy       string        // Eviction order when MaxDiskUsage > 0: "lru" (default) or "fifo"
 
+	CompactionBytesPerSecond int64 // Shared file/recompaction payload-byte limit (<= 0 = unthrottled)
+
 	// RocksDB-specific configuration
 	MetadataCacheSize      int64 // RocksDB Block cache size in bytes (0 = use default)
 	MetadataBackgroundJobs int   // Max concurrent RocksDB background jobs, compactions+flushes (0 = use default)
@@ -151,6 +162,7 @@ type Storage struct {
 	meta             *metadata.MetaDB
 	diskPath         string                // Path to the disk cache directory
 	inlineThreshold  int                   // Threshold for small vs large objects
+	defaultTTL       int                   // Default entry TTL (seconds) applied when a Put has no key-level TTL (0 = no default)
 	compactThreshold int64                 // Objects less than this size are compacted to segments (bytes)
 	segmentManager   *segment.Manager      // Segment manager for large objects on disk
 	fileManager      *files.FileManager    // File manager for large objects on disk
@@ -194,6 +206,10 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	if config.FdCacheSize <= 0 {
 		config.FdCacheSize = DefaultFdCacheSize
 	}
+	// CompactionBytesPerSecond deliberately has NO default clamp: non-positive
+	// means unthrottled (NewCompactionRateLimiter returns nil). The 16 MiB/s
+	// default is applied by the server flag only, so library/embedded users are
+	// never silently throttled by an upgrade.
 	if config.DeleteBatchSize <= 0 {
 		config.DeleteBatchSize = DefaultDeleteBatchSize
 	}
@@ -227,8 +243,15 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		rocksConfig.MaxBackgroundJobs = config.MetadataBackgroundJobs
 	}
 
-	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances
-	meta, err := metadata.NewMetaDB(config.DiskPath, config.TTL, mergeOp, rocksConfig)
+	// Use isolated instance constructor to avoid singleton sharing between multiple storage instances.
+	// The DB is opened WITHOUT engine-level TTL (0): RocksDB's TTL compaction filter drops EVERY
+	// key not rewritten within the window — including per-segment delete-index records, the FIFO
+	// eviction index, and bucketed access keys — silently erasing the recompactor's only
+	// fragmentation signal and orphaning dead segment bytes forever. Entry expiry is owned by the
+	// cleaner, which scans metadata and stages reclamation; the engine TTL was redundant for that.
+	// OpenDbWithTTL(…, 0) keeps the on-disk value format (timestamp suffixes) so existing DBs
+	// remain readable; 0 means "never expire".
+	meta, err := metadata.NewMetaDB(config.DiskPath, 0, mergeOp, rocksConfig)
 	if err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to open metadata DB")
 		return nil, storageErrors.NewInternalError("Init", err)
@@ -274,6 +297,8 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		SegmentManager:    segmentManager,
 		DeletionQueue:     deletionQueue,
 		CompactionThreads: DefaultCompactionThreads,
+
+		CompactionBytesPerSecond: config.CompactionBytesPerSecond,
 	}
 
 	if config.CompactionThreads > 0 {
@@ -312,6 +337,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		meta:             meta,
 		diskPath:         config.DiskPath,
 		inlineThreshold:  config.InlineThreshold,
+		defaultTTL:       config.TTL,
 		compactThreshold: config.CompactThreshold,
 		segmentManager:   segmentManager,
 		fileManager:      fileManager,
@@ -1020,6 +1046,15 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		metrics.Errors.WithLabelValues("io", "put").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
 		return storageErrors.NewIOError("Put", key, err)
+	}
+
+	// Apply the configured default when the caller sets no key-level TTL.
+	// This implements StorageConfig.TTL's documented contract app-side: expiry
+	// is enforced by the cleaner (which stages file/segment reclamation), not
+	// by a RocksDB engine TTL — the engine filter silently dropped internal
+	// bookkeeping keys and orphaned backing bytes.
+	if ttl <= 0 {
+		ttl = s.defaultTTL
 	}
 
 	// Determine expiry timestamp if TTL is specified

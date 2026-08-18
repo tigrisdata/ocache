@@ -13,12 +13,14 @@ import (
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/storage/benchio"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
 	"github.com/tigrisdata/ocache/storage/utils"
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 
 	zlog "github.com/rs/zerolog/log"
@@ -37,10 +39,17 @@ type SegmentRecompactor struct {
 	fragThreshold float64
 	minSegmentAge time.Duration
 	minSegments   int
+	rateLimiter   *rate.Limiter
 }
 
-// NewSegmentRecompactor creates a new segment recompactor
+// NewSegmentRecompactor creates a new segment recompactor without a rate limit.
+// NewCompactorWithConfig uses the internal constructor to share its limiter
+// with file compaction workers.
 func NewSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int) *SegmentRecompactor {
+	return newSegmentRecompactor(meta, sm, deletionQueue, fragThreshold, minSegmentAge, minSegments, nil)
+}
+
+func newSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQueue *deletion.Queue, fragThreshold float64, minSegmentAge time.Duration, minSegments int, rateLimiter *rate.Limiter) *SegmentRecompactor {
 	return &SegmentRecompactor{
 		sm:            sm,
 		meta:          meta,
@@ -48,6 +57,7 @@ func NewSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQ
 		fragThreshold: fragThreshold,
 		minSegmentAge: minSegmentAge,
 		minSegments:   minSegments,
+		rateLimiter:   rateLimiter,
 	}
 }
 
@@ -187,6 +197,12 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 
 	copiedEntries := uint32(0)
 	copiedBytes := int64(0)
+	// failedEntries counts live entries this pass could not migrate (a copy
+	// failure, or a segment read error that hides everything beyond it). Any
+	// failure must keep the old segment alive: at least one live entry's
+	// metadata still points into it, and removing it would make that data
+	// permanently unreadable. Deleted/moved entries are skips, not failures.
+	failedEntries := 0
 
 	// Iterate through all entries in the segment
 	for {
@@ -201,6 +217,9 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 			if err == io.EOF {
 				break // End of segment
 			}
+			// A read error can hide any number of live entries beyond it, so
+			// this pass is incomplete — the old segment must survive.
+			failedEntries++
 			zlog.Error().Err(err).Int64("offset", iter.CurrentPosition()).
 				Msg("recompactor: failed to read entry")
 			break
@@ -224,6 +243,7 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 
 		// This is a live entry, copy it to the new segment
 		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, entry, meta, wb, advice); err != nil {
+			failedEntries++
 			zlog.Error().Err(err).Str("key", entry.Key).
 				Msg("recompactor: failed to copy entry")
 			continue
@@ -262,6 +282,23 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 				Msg("recompactor: failed to commit metadata")
 			return fmt.Errorf("failed to commit metadata updates: %w", err)
 		}
+	}
+
+	// An incomplete pass must NOT remove the old segment: at least one live
+	// entry's metadata still points into it (a failed copy, or a read error that
+	// hid the rest of the segment), and deleting it would make that data
+	// permanently unreadable. The entries copied above were already committed
+	// and re-point at the new segment; the old segment stays tracked, keeps its
+	// delete index, and a later recompaction pass retries — copied entries are
+	// then skipped as moved. The all-entries-dead case (copiedEntries == 0 with
+	// no failures) still falls through to removal below.
+	if failedEntries > 0 {
+		zlog.Warn().
+			Str("segment", oldSeg.Path()).
+			Int("failed", failedEntries).
+			Uint32("copied", copiedEntries).
+			Msg("recompactor: incomplete pass; keeping old segment for a later retry")
+		return nil
 	}
 
 	// This ensures no new reads can start on the old segment after metadata points to new segment
@@ -306,9 +343,11 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
 	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch, advice *cacheAdvice,
 ) error {
-	// Create a section reader for the value data (no checksum verification per review)
+	// Create a section reader for the value data (no checksum verification per review).
+	// The wrapper charges the direct payload reads to the benchmark-only shared lane.
 	valueOffset := entry.Offset + entry.HeaderSize
-	dataReader := io.NewSectionReader(oldFile, valueOffset, entry.ValueLength)
+	payloadReader := benchio.WrapPayloadReaderAtForBenchmark(oldFile)
+	dataReader := io.NewSectionReader(payloadReader, valueOffset, entry.ValueLength)
 
 	// Check if we need a new segment
 	// NOTE: FinalizeSegment and AcquireOpenSegmentWithReservation are thread-safe - the segment
@@ -340,8 +379,13 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 		Checksum:    entry.Checksum,
 	}
 
+	var reader io.Reader = dataReader
+	if sr.rateLimiter != nil {
+		reader = newRateLimitedReader(ctx, reader, entry.ValueLength, sr.rateLimiter)
+	}
+
 	// Use segment's WriteEntry function
-	newOffset, err := (*newSeg).WriteEntry(entry.Key, dataReader, vm)
+	newOffset, err := (*newSeg).WriteEntry(entry.Key, reader, vm)
 	if err != nil {
 		return fmt.Errorf("failed to write entry: %w", err)
 	}

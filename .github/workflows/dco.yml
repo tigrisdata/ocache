@@ -32,6 +32,20 @@ jobs:
           for sha in $commits; do
             author="$(git show -s --format='%an <%ae>' "$sha")"
             signoffs="$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")"
+            # Bot-authored commits (e.g. squash merges of bot-opened PRs) cannot
+            # attest the DCO themselves; the human who reviewed and merged is the
+            # attestation. Require only that SOME sign-off trailer is present.
+            case "$author" in
+              *"[bot]"*)
+                if [ -n "$signoffs" ]; then
+                  echo "ok    ${sha:0:12}  $author (bot; human sign-off present)"
+                else
+                  echo "::error::bot commit ${sha:0:12} carries no Signed-off-by trailer at all"
+                  fail=1
+                fi
+                continue
+                ;;
+            esac
             if printf '%s\n' "$signoffs" | grep -qxF "$author"; then
               echo "ok    ${sha:0:12}  $author"
             else

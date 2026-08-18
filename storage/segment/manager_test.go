@@ -5,10 +5,12 @@ package segment
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tigrisdata/ocache/storage/fd"
 	pb "github.com/tigrisdata/ocache/storage/proto"
@@ -239,6 +241,115 @@ func TestManager_AcquireOpenSegment(t *testing.T) {
 
 	if !hasFile {
 		t.Error("Acquired segment should have an open file")
+	}
+}
+
+type errorAfterReader struct {
+	reader    io.Reader
+	remaining int
+	err       error
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, r.err
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.remaining -= n
+	return n, err
+}
+
+func TestManager_WriteEntryRollsBackInterruptedPayload(t *testing.T) {
+	basePath := t.TempDir()
+	_ = fd.NewFdCache(100)
+	manager, err := NewManager(basePath, 1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	seg, err := manager.AcquireOpenSegmentWithReservation("rollback", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prefix := []byte("retained payload")
+	prefixOffset, err := seg.WriteEntry("retained", bytes.NewReader(prefix), &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		ValueLength: int64(len(prefix)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prefixOffset != 0 {
+		t.Fatalf("prefix offset = %d, want 0", prefixOffset)
+	}
+	sizeBeforeFailure := seg.GetSize()
+
+	payload := bytes.Repeat([]byte("x"), 2*64*1024)
+	_, err = seg.WriteEntry("interrupted", &errorAfterReader{
+		reader:    bytes.NewReader(payload),
+		remaining: 64 * 1024,
+		err:       errors.New("interrupted source read"),
+	}, &pb.ValueMessage{ValueType: pb.ValueType_RAW_FILE, ValueLength: int64(len(payload))})
+	if err == nil {
+		t.Fatal("WriteEntry succeeded after the source reader failed")
+	}
+	if got := seg.GetSize(); got != sizeBeforeFailure {
+		t.Fatalf("segment size after interrupted write = %d, want %d", got, sizeBeforeFailure)
+	}
+	if got := seg.GetNumEntries(); got != 1 {
+		t.Fatalf("segment entries after interrupted write = %d, want 1", got)
+	}
+
+	want := []byte("replacement payload")
+	offset, err := seg.WriteEntry("replacement", bytes.NewReader(want), &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		ValueLength: int64(len(want)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset != sizeBeforeFailure {
+		t.Fatalf("replacement offset = %d, want %d", offset, sizeBeforeFailure)
+	}
+	if err := manager.FinalizeSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := manager.ReadEntry("replacement", seg.Path(), offset, int64(len(want)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("replacement payload = %q, want %q", got, want)
+	}
+
+	reader, err = manager.ReadEntry("retained", seg.Path(), prefixOffset, int64(len(prefix)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err = io.ReadAll(reader)
+	closeErr = reader.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if !bytes.Equal(got, prefix) {
+		t.Fatalf("retained payload = %q, want %q", got, prefix)
 	}
 }
 
@@ -900,5 +1011,64 @@ func BenchmarkManager_ReadValue(b *testing.B) {
 		}
 		io.Copy(io.Discard, rc)
 		rc.Close()
+	}
+}
+
+// TestAcquireSkipsBusySegmentWithoutBlocking is the lock-convoy regression for
+// the compaction I/O budget: WriteEntry holds a segment's mu exclusively for
+// the whole (possibly rate-limited, i.e. seconds-long) payload copy, and
+// AcquireOpenSegmentWithReservation holds the manager-wide sm.mu while probing
+// open segments. If the probe blocks on the busy segment's lock, sm.mu is held
+// for the entire copy and every Manager.ReadEntry (foreground GET) stalls
+// behind it. Acquire must skip the busy segment and return promptly instead.
+func TestAcquireSkipsBusySegmentWithoutBlocking(t *testing.T) {
+	manager, err := NewManager(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer manager.Close()
+
+	segA, err := manager.AcquireOpenSegmentWithReservation("caller-a", 0)
+	if err != nil {
+		t.Fatalf("acquire segA: %v", err)
+	}
+
+	// Simulate a mid-copy: hold segA's lock exclusively, as WriteEntry does for
+	// the duration of a (rate-limited) payload copy.
+	segA.mu.Lock()
+	defer segA.mu.Unlock()
+
+	type result struct {
+		seg *Segment
+		err error
+	}
+	acquired := make(chan result, 1)
+	go func() {
+		seg, err := manager.AcquireOpenSegmentWithReservation("caller-b", 0)
+		acquired <- result{seg, err}
+	}()
+
+	select {
+	case r := <-acquired:
+		if r.err != nil {
+			t.Fatalf("acquire while segment busy: %v", r.err)
+		}
+		if r.seg == segA {
+			t.Fatal("busy segment must not be handed to another caller")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire blocked on a busy segment's lock while holding the manager lock (serving-read convoy)")
+	}
+
+	// The manager lock must also be free for the foreground read path.
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = manager.ReadEntry("k", "/nonexistent", 0, 1)
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Manager.ReadEntry stalled behind the manager lock during a busy-segment copy")
 	}
 }
