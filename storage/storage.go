@@ -1392,6 +1392,14 @@ func (s *Storage) reconcileSegmentDeleteIndexAtStartup() {
 			live[segPath] = l
 		}
 	}
+	// A truncated scan means an incomplete live tally, and an absolute rewrite
+	// from partial knowledge would mark unseen live entries dead. Abort the
+	// whole pass: doing nothing is safe (the index just keeps yesterday's
+	// state), rewriting from a short scan is not.
+	if err := it.Err(); err != nil {
+		zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: metadata scan failed; skipping reconciliation")
+		return
+	}
 
 	known := make(map[string]struct{})
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -1400,14 +1408,19 @@ func (s *Storage) reconcileSegmentDeleteIndexAtStartup() {
 	defer batch.Destroy()
 	corrected := 0
 
-	flush := func() {
+	// Each batch holds whole per-segment corrections (Delete+Merge pairs), so a
+	// committed batch is individually consistent; on a write failure we stop
+	// issuing further corrections rather than continue with unknown state.
+	flush := func() error {
 		if batch.Count() == 0 {
-			return
+			return nil
 		}
 		if err := s.meta.Handle().Write(wo, batch); err != nil {
-			zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: batch write failed")
+			zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: batch write failed; aborting reconciliation")
+			return err
 		}
 		batch.Clear()
+		return nil
 	}
 
 	for _, seg := range s.segmentManager.GetSegments() {
@@ -1453,7 +1466,9 @@ func (s *Storage) reconcileSegmentDeleteIndexAtStartup() {
 		}
 		corrected++
 		if batch.Count() >= 1000 {
-			flush()
+			if flush() != nil {
+				return
+			}
 		}
 	}
 
@@ -1470,11 +1485,22 @@ func (s *Storage) reconcileSegmentDeleteIndexAtStartup() {
 			batch.Delete(append([]byte(nil), dit.Key().Data()...))
 			removed++
 			if batch.Count() >= 1000 {
-				flush()
+				if flush() != nil {
+					return
+				}
 			}
 		}
 	}
-	flush()
+	// A short index scan can only make orphan-row removal incomplete — rows we
+	// did not see are simply kept — but skip the final write so we do not act
+	// on it either.
+	if err := dit.Err(); err != nil {
+		zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndexAtStartup: delete-index scan failed; skipping remaining cleanup")
+		return
+	}
+	if flush() != nil {
+		return
+	}
 
 	if corrected > 0 || removed > 0 {
 		zlog.Info().Int("corrected", corrected).Int("removed_orphan_rows", removed).
