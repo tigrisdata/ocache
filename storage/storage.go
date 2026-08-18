@@ -1472,6 +1472,13 @@ func (s *Storage) reconcileSegmentDeleteIndexAtStartup() {
 		}
 	}
 
+	// Commit the per-segment corrections before starting the orphan-row scan:
+	// they are complete and correct on their own, and must not be discarded if
+	// the second scan fails.
+	if flush() != nil {
+		return
+	}
+
 	// Remove index rows for segments that no longer exist: they can only
 	// mislead (and would otherwise persist forever, since segment paths embed
 	// creation timestamps and are never reused).
