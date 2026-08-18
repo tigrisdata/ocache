@@ -1182,6 +1182,17 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	}
 	batch.Put(metaKey, val)
 
+	// The replaced value's backing bytes are now unreachable, so they have to be
+	// reclaimed too. A segment copy is credited in THIS batch: the
+	// `!delete:segment/` record is the recompactor's only evidence that those
+	// bytes are dead, so losing it (crash between the row and the merge) orphans
+	// them permanently and undetectably. A replaced raw file is queued after the
+	// commit instead — a lost queue row leaves a file that a directory scan can
+	// still find.
+	if prev != nil && prev.ValueType == pb.ValueType_SEGMENT && prev.SegmentPath != "" {
+		batch.Merge(keys.MakeDeleteIndexKey(prev.SegmentPath), merge.MakeDeleteIndexOperand(1, prev.ValueLength))
+	}
+
 	// Index the key for eviction only if a disk cap is set. Each policy maintains
 	// its own index; the eviction scan walks whichever one applies oldest-first.
 	if s.cleaner.maxDiskUsage > 0 {
@@ -1200,10 +1211,10 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		return 0, err
 	}
 
-	// Staged only after the write commits: the metadata row still pointed at
-	// these bytes until now, so reclaiming earlier could strand a live row over
-	// deleted data if the batch failed (same discipline as evictByIndex.commit).
-	if prev != nil {
+	// Queued only after the write commits: the metadata row still pointed at this
+	// file until now, so queueing earlier could delete data a live row still
+	// references if the batch failed (the discipline evictByIndex.commit uses).
+	if prev != nil && prev.ValueType == pb.ValueType_RAW_FILE {
 		s.stageFileDeletion(prev)
 	}
 	return prevSize, nil
@@ -1315,6 +1326,105 @@ func (s *Storage) notifyDelete(size int64) {
 	s.cleaner.UpdateSize(-size)
 }
 
+// segmentLiveness is the live-entry tally a metadata scan accumulates for one
+// segment: entries still referenced, and their payload bytes.
+type segmentLiveness struct {
+	entries int64
+	bytes   int64
+}
+
+// reconcileSegmentDeleteIndex re-derives each finalized segment's dead-byte
+// credit from a completed metadata scan and applies the difference to the
+// `!delete:segment/` index. It is the self-healing half of dead-byte accounting:
+// the incremental credit (DeleteKey, eviction, Put-overwrite) is exact only in
+// the uncontended case — two overlapping Puts of one key can read the same
+// previous row and leave the intermediate value's bytes uncredited — and any
+// credit lost before this existed is invisible forever, since a segment holding
+// nothing but dead bytes looks identical to a live one. Deriving liveness from
+// the metadata rows themselves needs no lock on the write path and recovers
+// whatever the incremental path missed, including a pre-existing backlog.
+//
+// live must come from a scan pinned to ro's snapshot, so it is exactly the set
+// of rows that existed when the snapshot was taken. Corrections are applied
+// snapshot-relative — Merge(derived - credited_at_snapshot), never a Put of the
+// derived value — so a credit committed during the scan survives instead of
+// being stomped by a scan that could not see it (the discipline
+// reconcileFromMetadata already uses for totalSize, #205).
+//
+// Only segments whose last write predates the snapshot are considered: one still
+// being written — or finalized during the scan — has live entries the scan never
+// saw, and crediting those as dead would trigger a pointless recompaction of live
+// data. Corrections are also clamped to be additive: reconciliation fills in
+// missing credit and never withdraws credit the incremental path recorded.
+//
+// Memory is O(segments), not O(keys). Returns the number of segments corrected.
+func (s *Storage) reconcileSegmentDeleteIndex(ro *grocksdb.ReadOptions, live map[string]segmentLiveness, snapshotAt time.Time) int {
+	if s.segmentManager == nil {
+		return 0
+	}
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+
+	corrected := 0
+	for _, seg := range s.segmentManager.GetSegments() {
+		if seg == nil || seg.HasOpenFile() {
+			// Still being written: entry count and payload total are not final.
+			continue
+		}
+		// A segment whose last write lands after the snapshot may hold entries the
+		// scan never saw, which would read as dead. Skip it; the next pass, whose
+		// snapshot covers those writes, corrects it.
+		info, err := os.Stat(seg.Path())
+		if err != nil || info.ModTime().After(snapshotAt) {
+			continue
+		}
+
+		entries, dataBytes := int64(seg.GetNumEntries()), seg.GetDataBytes()
+		if entries <= 0 || dataBytes <= 0 {
+			// No footer totals to derive from (pre-footer segment, or empty).
+			continue
+		}
+
+		l := live[seg.Path()]
+		deadEntries, deadBytes := entries-l.entries, dataBytes-l.bytes
+		if deadEntries <= 0 || deadBytes <= 0 {
+			continue
+		}
+
+		key := keys.MakeDeleteIndexKey(seg.Path())
+		creditedEntries, creditedBytes, err := s.deleteIndexStatsWithOptions(ro, key)
+		if err != nil {
+			zlog.Error().Err(err).Str("segment", seg.Path()).
+				Msg("storage.reconcileSegmentDeleteIndex: failed to read delete index")
+			continue
+		}
+		dEntries, dBytes := deadEntries-creditedEntries, deadBytes-creditedBytes
+		if dEntries <= 0 && dBytes <= 0 {
+			continue
+		}
+		batch.Merge(key, merge.MakeDeleteIndexOperand(max(dEntries, 0), max(dBytes, 0)))
+		corrected++
+
+		if batch.Count() >= 1000 {
+			if err := s.meta.Handle().Write(wo, batch); err != nil {
+				zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndex: batch write failed")
+			}
+			batch.Clear()
+		}
+	}
+
+	if batch.Count() > 0 {
+		if err := s.meta.Handle().Write(wo, batch); err != nil {
+			zlog.Error().Err(err).Msg("storage.reconcileSegmentDeleteIndex: batch write failed")
+			return 0
+		}
+	}
+	return corrected
+}
+
 // purgeDanglingRawFile tombstones a metadata entry whose backing raw file no
 // longer exists on disk (a dangling reference left by a write that did not
 // survive an unclean shutdown).
@@ -1375,10 +1485,14 @@ func (s *Storage) GetDeleteIndexStats(segmentPath string) (deletedEntries, delet
 		return 0, 0, nil
 	}
 
-	deleteIndexKey := keys.MakeDeleteIndexKey(segmentPath)
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
+	return s.deleteIndexStatsWithOptions(ro, keys.MakeDeleteIndexKey(segmentPath))
+}
 
+// deleteIndexStatsWithOptions reads a delete-index row under caller-supplied read
+// options, so a reconciliation can read the credit as of its pinned snapshot.
+func (s *Storage) deleteIndexStatsWithOptions(ro *grocksdb.ReadOptions, deleteIndexKey []byte) (deletedEntries, deletedBytes int64, err error) {
 	slice, err := s.meta.Handle().Get(ro, deleteIndexKey)
 	if err != nil {
 		return 0, 0, err
