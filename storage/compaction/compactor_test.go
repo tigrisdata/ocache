@@ -251,6 +251,98 @@ func TestCopyFileIntoSegment(t *testing.T) {
 	assert.Equal(t, pb.ValueType_SEGMENT, vm.ValueType)
 }
 
+func TestCompactFilesDefersSourceDeletionUntilMetadataCommit(t *testing.T) {
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	deletionQueue := deletion.NewQueue(meta, defaultDeletionQueueConfig())
+	compactor := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                   meta,
+		FileManager:              fm,
+		SegmentManager:           sm,
+		DeletionQueue:            deletionQueue,
+		CompactionBytesPerSecond: compactionCopyChunkSize,
+	})
+
+	const entries = 2
+	payload := bytes.Repeat([]byte("x"), 2*compactionCopyChunkSize)
+	paths := make([]string, entries)
+	writeOptions := grocksdb.NewDefaultWriteOptions()
+	defer writeOptions.Destroy()
+	for i := range entries {
+		key := fmt.Sprintf("deferred-delete-%d", i)
+		path := filepath.Join(tmpDir, "files", key)
+		require.NoError(t, os.WriteFile(path, payload, 0o644))
+		paths[i] = path
+
+		indexKey, indexValue := PrepareEntryForCompaction(key, path)
+		require.NoError(t, meta.Handle().Put(writeOptions, indexKey, indexValue))
+		value, err := proto.Marshal(&pb.ValueMessage{
+			ValueType:   pb.ValueType_RAW_FILE,
+			ValueLength: int64(len(payload)),
+			RawFilePath: path,
+		})
+		require.NoError(t, err)
+		require.NoError(t, meta.Handle().Put(writeOptions, keys.MakeMetadataKey(key), value))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		compactor.CompactFiles(ctx, 0)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("rate-limited compaction did not stop")
+		}
+	}()
+
+	// Wait until the first source payload has been copied while the second one
+	// is still waiting for shared-rate admission.
+	require.Eventually(t, func() bool {
+		for _, seg := range sm.GetSegments() {
+			if seg.GetSize() >= int64(len(payload)) {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("compaction committed before the second rate-limited copy")
+	default:
+	}
+
+	// Process any queued deletion while metadata remains in the uncommitted
+	// batch. A source file must remain readable until that batch is committed.
+	for range 20 {
+		deletionQueue.ProcessBatch()
+		time.Sleep(10 * time.Millisecond)
+	}
+	for i, path := range paths {
+		metadata, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey(fmt.Sprintf("deferred-delete-%d", i))))
+		require.NoError(t, err)
+		require.Equal(t, pb.ValueType_RAW_FILE, metadata.ValueType)
+		require.FileExists(t, path)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rate-limited compaction did not finish")
+	}
+	for i := range entries {
+		metadata, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey(fmt.Sprintf("deferred-delete-%d", i))))
+		require.NoError(t, err)
+		require.Equal(t, pb.ValueType_SEGMENT, metadata.ValueType)
+	}
+}
+
 func TestCommit(t *testing.T) {
 	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
 	defer cleanup()

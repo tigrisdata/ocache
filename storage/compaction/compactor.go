@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	grocksdb "github.com/linxGnu/grocksdb"
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/storage/benchio"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/files"
@@ -24,6 +26,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/segment"
 	"github.com/tigrisdata/ocache/storage/utils"
 
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -63,6 +66,10 @@ type CompactorConfig struct {
 	MinSegmentAge        time.Duration
 	MinSegments          int
 	RecompactionInterval time.Duration
+
+	// CompactionBytesPerSecond is shared by file compaction and recompaction.
+	// A non-positive value disables limiting for directly constructed compactors.
+	CompactionBytesPerSecond int64
 }
 
 // ErrFileSizeMismatch is returned when a file's actual size doesn't match its metadata
@@ -84,6 +91,7 @@ type Compactor struct {
 	fdCache              *fd.FdCache
 	deletionQueue        *deletion.Queue
 	compactionThreads    int
+	rateLimiter          *rate.Limiter
 	recompactor          *SegmentRecompactor
 	recompactionInterval time.Duration
 
@@ -113,14 +121,26 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 		ctx:                  ctx,
 		cancel:               cancel,
 		recompactionInterval: cfg.RecompactionInterval,
+
+		rateLimiter: NewCompactionRateLimiter(cfg.CompactionBytesPerSecond),
 	}
 
 	// Set up recompactor if configured
 	if cfg.EnableRecompaction && cfg.FragThreshold > 0 {
-		c.recompactor = NewSegmentRecompactor(cfg.MetaDB, cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge, cfg.MinSegments)
+		c.recompactor = newSegmentRecompactor(cfg.MetaDB, cfg.SegmentManager, cfg.DeletionQueue, cfg.FragThreshold, cfg.MinSegmentAge, cfg.MinSegments, c.rateLimiter)
 	}
 
 	return c
+}
+
+// RateLimitBytesPerSecond reports the configured shared payload-read budget, or
+// 0 when compaction is unthrottled. Exposed so callers (and tests) can verify
+// the configured budget actually reached the compactor.
+func (c *Compactor) RateLimitBytesPerSecond() int64 {
+	if c.rateLimiter == nil {
+		return 0
+	}
+	return int64(c.rateLimiter.Limit())
 }
 
 // Start launches background goroutines for file and segment compaction
@@ -263,8 +283,9 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 	wb := grocksdb.NewWriteBatch()
 	defer wb.Destroy()
 	var (
-		processed   int
-		bytesCopied int64
+		processed                int
+		bytesCopied              int64
+		filesToDeleteAfterCommit []string
 	)
 	advice := newCacheAdvice()
 
@@ -401,9 +422,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 				// deletes both the file and the metadata.
 				wb.Delete(k)
 				c.purgeDanglingMeta(wb, entry.userKey, entry.filePath)
-				if err := c.deletionQueue.Add(entry.filePath); err != nil {
-					zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: failed to queue corrupted file for deletion")
-				}
+				filesToDeleteAfterCommit = append(filesToDeleteAfterCommit, entry.filePath)
 				zlog.Warn().
 					Str("key", sizeMismatchErr.Key).
 					Str("file", sizeMismatchErr.FilePath).
@@ -416,12 +435,10 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 			continue
 		}
 
-		// Housekeeping - queue successfully compacted file for deletion and cleanup indexes
-		wb.Delete(k) // remove compaction index row
-
-		if err := c.deletionQueue.Add(entry.filePath); err != nil {
-			zlog.Error().Err(err).Str("path", entry.filePath).Msg("compactor: failed to queue compacted file for deletion")
-		}
+		// Housekeeping - clean up the index and defer source deletion until the
+		// metadata batch is committed.
+		wb.Delete(k)
+		filesToDeleteAfterCommit = append(filesToDeleteAfterCommit, entry.filePath)
 
 		processed++
 		bytesCopied += entry.fileInfo.Size()
@@ -433,6 +450,16 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 			zlog.Error().Err(err).Msg("compactor: commit failed")
 		}
 		return processed, bytesCopied
+	}
+
+	// Do not expose a source file to the deletion queue until the synced
+	// segment and its metadata rewrite have both been published. With a
+	// rate-limited copy, this batch can stay open long enough for a queue
+	// worker to otherwise delete a raw file still referenced by foreground reads.
+	for _, filePath := range filesToDeleteAfterCommit {
+		if err := c.deletionQueue.Add(filePath); err != nil {
+			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue source file for deletion")
+		}
 	}
 
 	// Record compaction metrics
@@ -637,7 +664,13 @@ func (c *Compactor) copyFileIntoSegment(ctx context.Context, seg *segment.Segmen
 		return err
 	}
 
-	segOff, err := seg.WriteEntry(userKey, f, vm)
+	// Charge direct raw-file payload reads to the benchmark-only shared lane.
+	var reader io.Reader = benchio.WrapPayloadReaderForBenchmark(f)
+	if c.rateLimiter != nil {
+		reader = newRateLimitedReader(ctx, reader, vm.ValueLength, c.rateLimiter)
+	}
+
+	segOff, err := seg.WriteEntry(userKey, reader, vm)
 	if err != nil {
 		return err
 	}

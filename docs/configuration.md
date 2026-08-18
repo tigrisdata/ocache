@@ -24,7 +24,7 @@ OCache can be configured through command-line flags when starting the server.
 | `-disk`              | string | `/var/cache` | Directory for disk cache storage                                                                 |
 | `-threshold`         | int    | 65536        | Small object threshold in bytes (64KB). Objects smaller than this are stored in RocksDB          |
 | `-segment-size`      | int64  | 268435456    | Segment size in bytes (256MB) for large object storage                                           |
-| `-compact-threshold` | int64  | 16777216     | Compaction threshold in bytes (16MB). Objects less than this are eligible for segment compaction |
+| `-compact-threshold` | int64  | 67108864     | Compaction threshold in bytes (64MB). Objects less than this are eligible for segment compaction |
 | `-max-disk-usage`    | int64  | 0            | Maximum disk usage in bytes (0 = unlimited). When set, enables eviction                          |
 | `-eviction-policy`   | string | `lru`        | Eviction order when `-max-disk-usage` is set: `lru` (reads refresh recency) or `fifo` (evict oldest-written first; reads do not protect data) |
 
@@ -78,13 +78,28 @@ OCache can be configured through command-line flags when starting the server.
 
 ### Compaction Configuration
 
-| Flag                            | Type     | Default | Description                                                |
-| ------------------------------- | -------- | ------- | ---------------------------------------------------------- |
-| `-compaction-threads`           | int      | 2       | Number of concurrent compaction threads                    |
-| `-fragmentation-threshold`      | float64  | 0.3     | Segment fragmentation threshold for recompaction (0.0-1.0) |
-| `-recompaction-min-segment-age` | duration | 1h      | Minimum age for a segment before recompaction              |
-| `-recompaction-min-segments`    | int      | 3       | Minimum number of segments required before recompaction    |
-| `-disable-recompaction`         | bool     | false   | Disable automatic segment recompaction                     |
+| Flag                            | Type     | Default  | Description                                                                 |
+| ------------------------------- | -------- | -------- | --------------------------------------------------------------------------- |
+| `-compaction-threads`           | int      | 1        | Number of concurrent file-compaction workers                               |
+| `-compaction-bytes-per-second`  | int64    | 16777216 | Shared file/recompaction payload-byte budget per second (16 MiB/s)         |
+| `-fragmentation-threshold`      | float64  | 0.5      | Segment fragmentation threshold for recompaction (0.0-1.0)                 |
+| `-recompaction-min-segment-age` | duration | 2h       | Minimum age for a segment before recompaction                              |
+| `-recompaction-min-segments`    | int      | 2        | Minimum number of segments required before recompaction                    |
+| `-disable-recompaction`         | bool     | false    | Disable automatic segment recompaction                                     |
+
+> **Compaction I/O budget.** File compaction workers and segment recompaction
+> share one 16 MiB/s token budget with at most a 64 KiB startup burst. It
+> admits payload bytes before each source read, so raising `-compaction-threads`
+> does not raise total compaction
+> throughput. The volume still sees both source reads and segment writes; choose
+> a budget below the capacity needed by serving reads. Compaction work is never
+> discarded for rate limiting, but a sustained serving load can intentionally
+> grow the background backlog. Once I/O is available, the backlog continues to
+> drain at the configured payload rate. Setting `0` disables the budget entirely
+> (matching `-max-disk-usage` semantics); the 16 MiB/s default applies to the
+> server flag only — embedded/library storage is unthrottled unless a budget is
+> set explicitly. The setting is read at startup, so changing it requires a
+> restart.
 
 ### TTL and Cleanup
 

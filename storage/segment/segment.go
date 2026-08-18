@@ -259,7 +259,7 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 // WriteEntry writes an entry to a segment from an io.Reader
 func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
 	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
-		return 0, utils.WrapError("invalid value type", key, nil)
+		return 0, fmt.Errorf("invalid value type for %s", key)
 	}
 
 	header := BuildValueHeader(key, vm.ValueLength, vm.Checksum, CurrentValueHeaderVersion)
@@ -281,30 +281,48 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 
 	// Check if segment file is still open
 	if s.file == nil {
-		return 0, utils.WrapError("segment file is closed", s.path, nil)
+		return 0, fmt.Errorf("segment file is closed: %s", s.path)
 	}
 
 	// Ensure we have a writable segment with space
 	// Offset where this value will be written inside the segment
 	startOffset := s.size
 
-	// Sequential write: header then payload
-	if _, err := s.file.Write(header); err != nil {
-		return 0, utils.WrapError("failed to write value header", s.path, err)
+	// A cancellation in a rate-limited reader can happen after a prior payload
+	// chunk has been written. Keep a failed entry unpublished by restoring both
+	// the file and the next write offset before returning its error.
+	rollback := func(writeErr error) (int64, error) {
+		if err := s.file.Truncate(startOffset); err != nil {
+			return 0, utils.WrapError("rollback failed after value write", s.path, err)
+		}
+		if _, err := s.file.Seek(startOffset, io.SeekStart); err != nil {
+			return 0, utils.WrapError("seek after value write rollback", s.path, err)
+		}
+		return 0, writeErr
 	}
 
-	// Copy with progress tracking for large files using pooled buffer
-	buf, release := bufferpool.AcquireBuffer(64 * 1024) // 64KB buffer
+	// Sequential write: header then payload.
+	headerWritten, err := s.file.Write(header)
+	if err != nil {
+		return rollback(utils.WrapError("failed to write value header", s.path, err))
+	}
+	if headerWritten != len(header) {
+		return rollback(utils.WrapError("short write for value header", s.path, io.ErrShortWrite))
+	}
+
+	// Copy with a bounded pooled buffer. The rate-limited compaction reader
+	// bounds each source read to the same 64 KiB burst.
+	buf, release := bufferpool.AcquireBuffer(64 * 1024)
 	defer release()
 
 	bytesWritten, err := io.CopyBuffer(s.file, r, buf)
 	if err != nil {
-		return 0, utils.WrapError("copy value to segment", key, err)
+		return rollback(utils.WrapError("copy value to segment", key, err))
 	}
 
-	// Verify we wrote the expected amount
+	// Verify we wrote the expected amount.
 	if bytesWritten != vm.ValueLength {
-		return 0, utils.WrapError(fmt.Sprintf("wrote %d bytes, expected %d", bytesWritten, vm.ValueLength), key, nil)
+		return rollback(fmt.Errorf("copy value to segment %s: wrote %d bytes, expected %d: %w", key, bytesWritten, vm.ValueLength, io.ErrUnexpectedEOF))
 	}
 
 	s.size += needed

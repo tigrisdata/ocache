@@ -9,6 +9,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestNewStorageWithConfig_CompactionBytesPerSecond verifies that the storage
+// layer treats an unset budget as unthrottled — the 16 MiB/s default is a
+// server-flag concern only, so library/embedded users are never silently
+// throttled by an upgrade — while preserving an explicit limit.
+func TestNewStorageWithConfig_CompactionBytesPerSecond(t *testing.T) {
+	t.Run("unset stays unthrottled", func(t *testing.T) {
+		config := &StorageConfig{DiskPath: t.TempDir(), DisableRecompaction: true}
+		s, err := NewStorageWithConfig(config)
+		require.NoError(t, err)
+		defer s.Close()
+
+		require.LessOrEqual(t, config.CompactionBytesPerSecond, int64(0),
+			"storage must not clamp an unset budget to a throttling default")
+		require.Zero(t, s.compactor.RateLimitBytesPerSecond(),
+			"the compactor must be unthrottled when no budget is configured")
+	})
+
+	t.Run("explicit value reaches the compactor", func(t *testing.T) {
+		const limit = int64(2 * 1024 * 1024)
+		config := &StorageConfig{
+			DiskPath:                 t.TempDir(),
+			DisableRecompaction:      true,
+			CompactionBytesPerSecond: limit,
+		}
+		s, err := NewStorageWithConfig(config)
+		require.NoError(t, err)
+		defer s.Close()
+
+		require.Equal(t, limit, config.CompactionBytesPerSecond)
+		// Assert the budget is actually plumbed through to the compactor's
+		// limiter, not just preserved on the input config.
+		require.Equal(t, limit, s.compactor.RateLimitBytesPerSecond())
+	})
+}
+
 // TestNewStorageWithConfig_DeleteBatchSize verifies the deletion-queue batch
 // size is configurable: an unset value falls back to DefaultDeleteBatchSize,
 // and an explicit value is preserved. NewStorageWithConfig applies the default

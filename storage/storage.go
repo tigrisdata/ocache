@@ -56,6 +56,15 @@ const (
 	// Default compaction threads
 	DefaultCompactionThreads = 1 // Default to single thread for backwards compatibility
 
+	// DefaultCompactionBytesPerSecond reserves most of a typical capped volume
+	// for serving reads while background compaction drains its backlog. It is
+	// the SERVER FLAG default only (see server/config.go): the storage layer
+	// treats a non-positive CompactionBytesPerSecond as unthrottled, matching
+	// the 0-disables convention of MaxDiskUsage, so directly constructed and
+	// embedded storage keeps its historical unthrottled behavior unless a
+	// budget is set explicitly.
+	DefaultCompactionBytesPerSecond int64 = 16 * 1024 * 1024 // 16 MiB/s
+
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
 
@@ -122,6 +131,8 @@ type StorageConfig struct {
 	RecoveryWorkers      int           // Number of parallel workers for startup file recovery (<= 0 = default)
 	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
 	EvictionPolicy       string        // Eviction order when MaxDiskUsage > 0: "lru" (default) or "fifo"
+
+	CompactionBytesPerSecond int64 // Shared file/recompaction payload-byte limit (<= 0 = unthrottled)
 
 	// RocksDB-specific configuration
 	MetadataCacheSize      int64 // RocksDB Block cache size in bytes (0 = use default)
@@ -194,6 +205,10 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	if config.FdCacheSize <= 0 {
 		config.FdCacheSize = DefaultFdCacheSize
 	}
+	// CompactionBytesPerSecond deliberately has NO default clamp: non-positive
+	// means unthrottled (NewCompactionRateLimiter returns nil). The 16 MiB/s
+	// default is applied by the server flag only, so library/embedded users are
+	// never silently throttled by an upgrade.
 	if config.DeleteBatchSize <= 0 {
 		config.DeleteBatchSize = DefaultDeleteBatchSize
 	}
@@ -281,6 +296,8 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		SegmentManager:    segmentManager,
 		DeletionQueue:     deletionQueue,
 		CompactionThreads: DefaultCompactionThreads,
+
+		CompactionBytesPerSecond: config.CompactionBytesPerSecond,
 	}
 
 	if config.CompactionThreads > 0 {

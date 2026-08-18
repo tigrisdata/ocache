@@ -21,6 +21,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
+	"github.com/tigrisdata/ocache/storage/utils"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -434,4 +435,70 @@ func TestIsSegmentFragmented(t *testing.T) {
 	assert.True(t, sm.IsSegmentFragmented(seg.Path(), 600, 0.5))   // 60% > 50%
 	assert.False(t, sm.IsSegmentFragmented(seg.Path(), 200, 0.25)) // 20% < 25%
 	assert.True(t, sm.IsSegmentFragmented(seg.Path(), 300, 0.25))  // 30% > 25%
+}
+
+// TestSegmentRecompaction_IncompletePassKeepsOldSegment is the data-loss guard
+// for a partial recompaction pass: when a live entry cannot be migrated (here, a
+// truncated payload makes its copy — or the scan beyond it — fail), the old
+// segment must NOT be removed or queued for deletion, because that entry's
+// metadata still points into it. The successfully copied entries are committed;
+// the segment stays tracked for a later retry.
+func TestSegmentRecompaction_IncompletePassKeepsOldSegment(t *testing.T) {
+	recompactor, sm, meta, _, cleanup := setupTestRecompactor(t)
+	defer cleanup()
+
+	entries := map[string][]byte{
+		"intact-1": []byte("intact-value-one-0123456789"),
+		"intact-2": []byte("intact-value-two-0123456789"),
+		"victim":   []byte("victim-value-0123456789abcdef"),
+	}
+	seg, err := createTestSegmentWithEntries(t, sm, meta, entries)
+	require.NoError(t, err)
+
+	// Find the entry at the highest offset (last in file order) and truncate the
+	// segment file mid-payload so migrating it must fail.
+	type located struct {
+		key    string
+		offset int64
+		length int64
+	}
+	var last located
+	var firstKey string
+	firstOffset := int64(-1)
+	for key := range entries {
+		vm, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey(key)))
+		require.NoError(t, err)
+		require.Equal(t, seg.Path(), vm.SegmentPath)
+		if vm.SegmentOffset > last.offset || last.key == "" {
+			last = located{key, vm.SegmentOffset, vm.ValueLength}
+		}
+		if firstOffset == -1 || vm.SegmentOffset < firstOffset {
+			firstOffset = vm.SegmentOffset
+			firstKey = key
+		}
+	}
+	cut := last.offset + segment.CalculateValueHeaderSize(last.key) + last.length/2
+	require.NoError(t, os.Truncate(seg.Path(), cut))
+
+	// Run the pass directly; the incomplete-pass guard must not surface an error.
+	require.NoError(t, recompactor.recompactSegment(context.Background(), seg))
+
+	// The old segment must survive: file present, still tracked by the manager
+	// (an intact entry's original bytes remain readable at its old location),
+	// and nothing queued for deletion.
+	_, err = os.Stat(seg.Path())
+	require.NoError(t, err, "old segment file must not be deleted after an incomplete pass")
+
+	vm, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey(firstKey)))
+	require.NoError(t, err)
+	reader, err := sm.ReadEntry(firstKey, seg.Path(), firstOffset, int64(len(entries[firstKey])))
+	require.NoError(t, err, "old segment must still be tracked by the manager")
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, entries[firstKey], got)
+	_ = vm
+
+	require.Zero(t, recompactor.deletionQueue.GetQueueDepth(),
+		"an incomplete pass must not queue the old segment for deletion")
 }
