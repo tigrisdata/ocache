@@ -559,6 +559,7 @@ help:
 	@echo "  test-integration-coverage   - Run integration tests with coverage"
 	@echo "  bench                       - Run benchmarks"
 	@echo "  bench-integration           - Compile integration benchmarks (set INTEGRATION_BENCH_BINARY)"
+	@echo "  build-bench-compaction-serving-reads - Compile the compaction/serving benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"

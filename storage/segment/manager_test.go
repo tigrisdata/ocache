@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tigrisdata/ocache/storage/fd"
 	pb "github.com/tigrisdata/ocache/storage/proto"
@@ -1010,5 +1011,64 @@ func BenchmarkManager_ReadValue(b *testing.B) {
 		}
 		io.Copy(io.Discard, rc)
 		rc.Close()
+	}
+}
+
+// TestAcquireSkipsBusySegmentWithoutBlocking is the lock-convoy regression for
+// the compaction I/O budget: WriteEntry holds a segment's mu exclusively for
+// the whole (possibly rate-limited, i.e. seconds-long) payload copy, and
+// AcquireOpenSegmentWithReservation holds the manager-wide sm.mu while probing
+// open segments. If the probe blocks on the busy segment's lock, sm.mu is held
+// for the entire copy and every Manager.ReadEntry (foreground GET) stalls
+// behind it. Acquire must skip the busy segment and return promptly instead.
+func TestAcquireSkipsBusySegmentWithoutBlocking(t *testing.T) {
+	manager, err := NewManager(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer manager.Close()
+
+	segA, err := manager.AcquireOpenSegmentWithReservation("caller-a", 0)
+	if err != nil {
+		t.Fatalf("acquire segA: %v", err)
+	}
+
+	// Simulate a mid-copy: hold segA's lock exclusively, as WriteEntry does for
+	// the duration of a (rate-limited) payload copy.
+	segA.mu.Lock()
+	defer segA.mu.Unlock()
+
+	type result struct {
+		seg *Segment
+		err error
+	}
+	acquired := make(chan result, 1)
+	go func() {
+		seg, err := manager.AcquireOpenSegmentWithReservation("caller-b", 0)
+		acquired <- result{seg, err}
+	}()
+
+	select {
+	case r := <-acquired:
+		if r.err != nil {
+			t.Fatalf("acquire while segment busy: %v", r.err)
+		}
+		if r.seg == segA {
+			t.Fatal("busy segment must not be handed to another caller")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire blocked on a busy segment's lock while holding the manager lock (serving-read convoy)")
+	}
+
+	// The manager lock must also be free for the foreground read path.
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		_, _ = manager.ReadEntry("k", "/nonexistent", 0, 1)
+	}()
+	select {
+	case <-readDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Manager.ReadEntry stalled behind the manager lock during a busy-segment copy")
 	}
 }

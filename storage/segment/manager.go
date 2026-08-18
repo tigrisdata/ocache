@@ -117,7 +117,17 @@ func (sm *Manager) AcquireOpenSegmentWithReservation(callerID string, needed int
 
 	// Look for an existing segment with enough space
 	for _, seg := range sm.openSegments {
-		seg.mu.RLock()
+		// Never block on a busy segment while holding the manager-wide sm.mu:
+		// WriteEntry holds seg.mu exclusively for the whole payload copy, which
+		// under the compaction I/O budget can take seconds per entry. Blocking
+		// here would hold sm.mu for that entire copy and stall every
+		// Manager.ReadEntry (the foreground GET path for all segment-resident
+		// objects) behind it. An exclusively-locked segment is necessarily
+		// mid-copy by its reserving owner, so it could not be handed to this
+		// caller anyway — skip it.
+		if !seg.mu.TryRLock() {
+			continue
+		}
 		if seg.file != nil && seg.Remaining() >= needed {
 			// Check reservation status
 			if seg.reservedBy == "" || seg.reservedBy == callerID {

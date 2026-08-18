@@ -22,9 +22,11 @@ func TestNewStorageWithConfig_CompactionBytesPerSecond(t *testing.T) {
 
 		require.LessOrEqual(t, config.CompactionBytesPerSecond, int64(0),
 			"storage must not clamp an unset budget to a throttling default")
+		require.Zero(t, s.compactor.RateLimitBytesPerSecond(),
+			"the compactor must be unthrottled when no budget is configured")
 	})
 
-	t.Run("explicit value preserved", func(t *testing.T) {
+	t.Run("explicit value reaches the compactor", func(t *testing.T) {
 		const limit = int64(2 * 1024 * 1024)
 		config := &StorageConfig{
 			DiskPath:                 t.TempDir(),
@@ -36,6 +38,9 @@ func TestNewStorageWithConfig_CompactionBytesPerSecond(t *testing.T) {
 		defer s.Close()
 
 		require.Equal(t, limit, config.CompactionBytesPerSecond)
+		// Assert the budget is actually plumbed through to the compactor's
+		// limiter, not just preserved on the input config.
+		require.Equal(t, limit, s.compactor.RateLimitBytesPerSecond())
 	})
 }
 

@@ -133,6 +133,16 @@ func NewCompactorWithConfig(cfg *CompactorConfig) *Compactor {
 	return c
 }
 
+// RateLimitBytesPerSecond reports the configured shared payload-read budget, or
+// 0 when compaction is unthrottled. Exposed so callers (and tests) can verify
+// the configured budget actually reached the compactor.
+func (c *Compactor) RateLimitBytesPerSecond() int64 {
+	if c.rateLimiter == nil {
+		return 0
+	}
+	return int64(c.rateLimiter.Limit())
+}
+
 // Start launches background goroutines for file and segment compaction
 func (c *Compactor) Start() {
 	// Start multiple file compaction workers
