@@ -259,7 +259,7 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 // WriteEntry writes an entry to a segment from an io.Reader
 func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
 	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
-		return 0, utils.WrapError("invalid value type", key, nil)
+		return 0, fmt.Errorf("invalid value type for %s", key)
 	}
 
 	header := BuildValueHeader(key, vm.ValueLength, vm.Checksum, CurrentValueHeaderVersion)
@@ -281,7 +281,7 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 
 	// Check if segment file is still open
 	if s.file == nil {
-		return 0, utils.WrapError("segment file is closed", s.path, nil)
+		return 0, fmt.Errorf("segment file is closed: %s", s.path)
 	}
 
 	// Ensure we have a writable segment with space
@@ -322,7 +322,7 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 
 	// Verify we wrote the expected amount.
 	if bytesWritten != vm.ValueLength {
-		return rollback(utils.WrapError(fmt.Sprintf("wrote %d bytes, expected %d", bytesWritten, vm.ValueLength), key, nil))
+		return rollback(fmt.Errorf("copy value to segment %s: wrote %d bytes, expected %d: %w", key, bytesWritten, vm.ValueLength, io.ErrUnexpectedEOF))
 	}
 
 	s.size += needed
