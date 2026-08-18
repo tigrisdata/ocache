@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"bytes"
 	"testing"
 	"time"
 
@@ -59,4 +60,45 @@ func TestDeleteIndexSurvivesEntryTTL(t *testing.T) {
 	require.NoError(t, proto.Unmarshal(slice.Data(), &entry))
 	require.EqualValues(t, 2, entry.DeletedEntries)
 	require.EqualValues(t, 250, entry.DeletedBytes)
+}
+
+// StorageConfig.TTL's documented contract — "default TTL when no key-level TTL
+// is set" — must be applied app-side by Put now that the metadata DB carries no
+// engine-level TTL. A Put with ttl=0 under a configured default must produce an
+// entry with an expiry the cleaner can act on; without the default it must not.
+func TestPut_AppliesConfiguredDefaultTTL(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configTTL  int
+		wantExpiry bool
+	}{
+		{"default applied when configured", 3600, true},
+		{"no default means no expiry", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewStorageWithConfig(&StorageConfig{
+				DiskPath:            t.TempDir(),
+				TTL:                 tc.configTTL,
+				DisableRecompaction: true,
+			})
+			require.NoError(t, err)
+			defer s.Close()
+
+			require.NoError(t, s.Put("k", bytes.NewReader([]byte("v")), 0))
+
+			ro := grocksdb.NewDefaultReadOptions()
+			defer ro.Destroy()
+			slice, err := s.meta.Handle().Get(ro, keys.MakeMetadataKey("k"))
+			require.NoError(t, err)
+			defer slice.Free()
+			require.True(t, slice.Exists())
+			var vm pb.ValueMessage
+			require.NoError(t, proto.Unmarshal(slice.Data(), &vm))
+			if tc.wantExpiry {
+				require.Greater(t, vm.Expiry, time.Now().Unix(), "expiry must be set from the configured default TTL")
+			} else {
+				require.Zero(t, vm.Expiry, "no default and no key TTL must mean no expiry")
+			}
+		})
+	}
 }

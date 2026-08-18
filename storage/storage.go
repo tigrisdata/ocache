@@ -162,6 +162,7 @@ type Storage struct {
 	meta             *metadata.MetaDB
 	diskPath         string                // Path to the disk cache directory
 	inlineThreshold  int                   // Threshold for small vs large objects
+	defaultTTL       int                   // Default entry TTL (seconds) applied when a Put has no key-level TTL (0 = no default)
 	compactThreshold int64                 // Objects less than this size are compacted to segments (bytes)
 	segmentManager   *segment.Manager      // Segment manager for large objects on disk
 	fileManager      *files.FileManager    // File manager for large objects on disk
@@ -336,6 +337,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		meta:             meta,
 		diskPath:         config.DiskPath,
 		inlineThreshold:  config.InlineThreshold,
+		defaultTTL:       config.TTL,
 		compactThreshold: config.CompactThreshold,
 		segmentManager:   segmentManager,
 		fileManager:      fileManager,
@@ -1044,6 +1046,15 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		metrics.Errors.WithLabelValues("io", "put").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to read value")
 		return storageErrors.NewIOError("Put", key, err)
+	}
+
+	// Apply the configured default when the caller sets no key-level TTL.
+	// This implements StorageConfig.TTL's documented contract app-side: expiry
+	// is enforced by the cleaner (which stages file/segment reclamation), not
+	// by a RocksDB engine TTL — the engine filter silently dropped internal
+	// bookkeeping keys and orphaned backing bytes.
+	if ttl <= 0 {
+		ttl = s.defaultTTL
 	}
 
 	// Determine expiry timestamp if TTL is specified
