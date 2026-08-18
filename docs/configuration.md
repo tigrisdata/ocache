@@ -95,8 +95,11 @@ OCache can be configured through command-line flags when starting the server.
 > a budget below the capacity needed by serving reads. Compaction work is never
 > discarded for rate limiting, but a sustained serving load can intentionally
 > grow the background backlog. Once I/O is available, the backlog continues to
-> drain at the configured payload rate. Non-positive values use the default
-> budget. The setting is read at startup, so changing it requires a restart.
+> drain at the configured payload rate. Setting `0` disables the budget entirely
+> (matching `-max-disk-usage` semantics); the 16 MiB/s default applies to the
+> server flag only — embedded/library storage is unthrottled unless a budget is
+> set explicitly. The setting is read at startup, so changing it requires a
+> restart.
 
 ### TTL and Cleanup
 

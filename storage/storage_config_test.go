@@ -9,16 +9,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNewStorageWithConfig_CompactionBytesPerSecond verifies that background
-// compaction gets a conservative default while preserving an explicit limit.
+// TestNewStorageWithConfig_CompactionBytesPerSecond verifies that the storage
+// layer treats an unset budget as unthrottled — the 16 MiB/s default is a
+// server-flag concern only, so library/embedded users are never silently
+// throttled by an upgrade — while preserving an explicit limit.
 func TestNewStorageWithConfig_CompactionBytesPerSecond(t *testing.T) {
-	t.Run("default applied when unset", func(t *testing.T) {
+	t.Run("unset stays unthrottled", func(t *testing.T) {
 		config := &StorageConfig{DiskPath: t.TempDir(), DisableRecompaction: true}
 		s, err := NewStorageWithConfig(config)
 		require.NoError(t, err)
 		defer s.Close()
 
-		require.Equal(t, DefaultCompactionBytesPerSecond, config.CompactionBytesPerSecond)
+		require.LessOrEqual(t, config.CompactionBytesPerSecond, int64(0),
+			"storage must not clamp an unset budget to a throttling default")
 	})
 
 	t.Run("explicit value preserved", func(t *testing.T) {
