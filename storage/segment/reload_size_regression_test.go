@@ -75,10 +75,15 @@ func TestReloadedFinalizedSegment_KeepsSizeForFragmentation(t *testing.T) {
 	ratio := m2.GetFragmentationRatio(path, liveBytes)
 	t.Logf("fragmentation ratio for a fully-dead reloaded segment = %v (recompaction threshold 0.5)", ratio)
 
-	if reloaded.GetSize() == 0 {
-		t.Errorf("BUG: reloaded finalized segment reports size 0 (file is %d bytes)", fi.Size())
+	// Exact equality, not merely non-zero: a restored size that is positive but
+	// wrong still skews every fragmentation ratio the recompactor computes.
+	if got := reloaded.GetSize(); got != liveBytes {
+		t.Errorf("reloaded finalized segment reports size %d, want %d (file is %d bytes)", got, liveBytes, fi.Size())
 	}
-	if ratio <= 0.5 {
-		t.Errorf("BUG: fully-dead reloaded segment has fragmentation %v <= 0.5, recompactor will skip it forever", ratio)
+	if reloaded.GetNumEntries() != 8 {
+		t.Errorf("reloaded segment reports %d entries, want 8", reloaded.GetNumEntries())
+	}
+	if ratio != 1 {
+		t.Errorf("fully-dead reloaded segment has fragmentation %v, want 1 (threshold 0.5)", ratio)
 	}
 }
