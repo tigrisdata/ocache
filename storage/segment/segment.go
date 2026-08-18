@@ -69,6 +69,16 @@ func (s *Segment) GetNumEntries() uint32 {
 	return s.numEntries
 }
 
+// GetDataBytes returns the total bytes of value payloads stored in the segment,
+// excluding entry headers. It is restored from the footer when a finalized
+// segment is loaded, so it is the payload-unit total to compare live payload
+// bytes against.
+func (s *Segment) GetDataBytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.dataBytes
+}
+
 // HasOpenFile returns true if the segment has an open file.
 func (s *Segment) HasOpenFile() bool {
 	s.mu.RLock()
