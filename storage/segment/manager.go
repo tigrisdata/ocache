@@ -282,6 +282,13 @@ func (sm *Manager) loadSegments() error {
 					segment.version = ver
 					segment.numEntries = ent
 					segment.dataBytes = bytes
+					// Restore the written-bytes size. FinalizeSegment truncates the
+					// file to seg.size before appending the footer, so the file is
+					// exactly size+footer. Without this GetSize() stays 0 and
+					// GetFragmentationRatio short-circuits to 0.0, so every segment
+					// written by an earlier process is permanently unreclaimable —
+					// its dead bytes can never reach the recompaction threshold.
+					segment.size = stat.Size() - int64(SegmentFooterSize)
 
 					// Closed segment – we don't keep a cached descriptor; rely on fdCache.
 					file.Close()
