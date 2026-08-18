@@ -1172,7 +1172,14 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// The row is overwritten in place, so the replaced value's bytes have to leave
 	// the cleaner's accounting here — otherwise repeated Puts of the same key
 	// inflate totalSize forever and eviction starts chasing bytes that don't exist.
-	prevSize := s.existingValueLength(key, metaKey)
+	// The replaced value's backing bytes must also be reclaimed (segment dead-byte
+	// credit / raw-file deletion), or an overwrite orphans them with no
+	// `!delete:segment/` record and the recompactor can never see them.
+	prev := s.existingValue(key, metaKey)
+	var prevSize int64
+	if prev != nil {
+		prevSize = prev.ValueLength
+	}
 	batch.Put(metaKey, val)
 
 	// Index the key for eviction only if a disk cap is set. Each policy maintains
@@ -1192,6 +1199,13 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		return 0, err
 	}
+
+	// Staged only after the write commits: the metadata row still pointed at
+	// these bytes until now, so reclaiming earlier could strand a live row over
+	// deleted data if the batch failed (same discipline as evictByIndex.commit).
+	if prev != nil {
+		s.stageFileDeletion(prev)
+	}
 	return prevSize, nil
 }
 
@@ -1204,29 +1218,27 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 // Destroy'd).
 var putPointReadOpts = metadata.CreateReadOptions(false, false)
 
-// existingValueLength returns the ValueLength of the metadata row currently
-// stored under metaKey, or 0 when the key is absent or its row cannot be read.
-func (s *Storage) existingValueLength(key string, metaKey []byte) int64 {
+// existingValue returns the metadata row currently stored under metaKey, or nil
+// when the key is absent or its row cannot be decoded. The inline Data payload
+// is skipped: callers need only the control fields (length, type, backing
+// paths).
+func (s *Storage) existingValue(key string, metaKey []byte) *pb.ValueMessage {
 	slice, err := s.meta.Handle().Get(putPointReadOpts, metaKey)
 	if err != nil {
-		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValueLength: db.Get error, size accounting may drift")
-		return 0
+		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValue: db.Get error, size accounting may drift")
+		return nil
 	}
 	defer slice.Free()
 	if !slice.Exists() {
-		return 0
+		return nil
 	}
 
-	// Only value_length is needed here, so extract it straight off the wire
-	// instead of a full proto.Unmarshal — that avoids copying the previous
-	// inline Data payload (up to the inline threshold, 64 KiB) on every
-	// overwrite of an inline key.
-	length, ok := valueMessageValueLength(slice.Data())
-	if !ok {
-		zlog.Error().Str("key", key).Msg("storage.existingValueLength: failed to decode previous value message")
-		return 0
+	valueMsg := &pb.ValueMessage{}
+	if !unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
+		zlog.Error().Str("key", key).Msg("storage.existingValue: failed to decode previous value message")
+		return nil
 	}
-	return length
+	return valueMsg
 }
 
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
