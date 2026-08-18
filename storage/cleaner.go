@@ -395,15 +395,11 @@ func (c *Cleaner) reconcileFromMetadata() {
 	start := time.Now()
 	var totalSize int64
 	backfill := c.maxDiskUsage > 0
-	// Per-segment live tally, keyed by segment path: O(segments) memory, not
-	// O(keys). Consumed by reconcileSegmentDeleteIndex once the scan completes.
-	segLive := make(map[string]segmentLiveness)
 
 	// Pin the scan before reading the counter: a write the scan cannot see then
 	// also has its delta applied after tracked was read, so it survives.
 	snapshot := c.storage.meta.Handle().NewSnapshot()
 	defer c.storage.meta.Handle().ReleaseSnapshot(snapshot)
-	snapshotAt := time.Now()
 	tracked := c.totalSize.Load()
 
 	ro := metadata.CreateReadOptions(false, false)
@@ -469,19 +465,12 @@ func (c *Cleaner) reconcileFromMetadata() {
 			continue
 		}
 
-		// This scan needs value_length for every row (the total) plus the segment
-		// each row still references (per-segment liveness), so read both straight
-		// off the wire rather than fully decoding each message — that skips a
-		// Data-payload copy per inline row (up to the 64 KiB inline threshold) on
-		// both the startup scan and the hourly reconciliation.
-		if segPath, length, ok := valueMessageSegmentRef(it.Value().Data()); ok {
+		// This scan sums only value_length across every metadata row, so read
+		// it directly off the wire rather than fully decoding each message —
+		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
+		// threshold) on both the startup scan and the hourly reconciliation.
+		if length, ok := valueMessageValueLength(it.Value().Data()); ok {
 			totalSize += length
-			if segPath != "" {
-				l := segLive[segPath]
-				l.entries++
-				l.bytes += length
-				segLive[segPath] = l
-			}
 		}
 
 		if backfill && !backrefBroken {
@@ -537,15 +526,6 @@ func (c *Cleaner) reconcileFromMetadata() {
 	}
 
 	c.totalSize.Add(totalSize - tracked)
-
-	// Derive each finalized segment's dead bytes from the liveness this scan just
-	// measured and correct the delete index, so credit the incremental path missed
-	// (overlapping same-key Puts) or never recorded (bytes orphaned before that
-	// path existed) still reaches the recompactor.
-	if corrected := c.storage.reconcileSegmentDeleteIndex(ro, segLive, snapshotAt); corrected > 0 {
-		zlog.Info().Int("segments", corrected).
-			Msg("cleaner: corrected segment dead-byte credit from metadata liveness")
-	}
 
 	// Publish the freshly computed size to the gauges.
 	c.refreshSizeMetrics()
