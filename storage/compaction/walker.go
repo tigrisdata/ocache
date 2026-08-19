@@ -38,18 +38,10 @@ import (
 // an entry deleted mid-walk still counts live for this pass, which errs
 // conservative (recompaction postponed one rotation).
 
-const (
-	// DefaultSegmentWalkBudget is how many segments one recompaction pass may
-	// walk. Rotation freshness = segments / budget × recompaction interval
-	// (e.g. 3,000 segments at 8/min ≈ 6 h), while hint-priority ordering gets
-	// hot-churn segments walked far sooner.
-	DefaultSegmentWalkBudget = 8
-
-	// DefaultSegmentWalkInterval is how long a walked segment's derivation is
-	// trusted before it is walked again, bounding re-walks of segments whose
-	// stale hint keeps ranking them first.
-	DefaultSegmentWalkInterval = 1 * time.Hour
-)
+// DefaultSegmentWalkInterval is how long a walked segment's derivation is
+// trusted before it is walked again (hint growth bypasses it). Walk volume
+// needs no count cap: reads are paced by the shared compaction I/O limiter.
+const DefaultSegmentWalkInterval = 1 * time.Hour
 
 // walkSegmentLiveness derives a closed segment's dead entries and bytes from
 // ground truth: footer totals minus the entries whose metadata rows still

@@ -43,10 +43,9 @@ type SegmentRecompactor struct {
 	minSegments   int
 	rateLimiter   *rate.Limiter
 
-	// Walk-gated recompaction (RFC-009): per-pass walk budget, per-segment
-	// re-walk interval, and walk recency. See walker.go. walkBudget <= 0
-	// disables walking (and with it, all recompaction gating).
-	walkBudget   int
+	// Walk-gated recompaction (RFC-009): per-segment re-walk interval and walk
+	// recency. See walker.go. Walk volume needs no count cap: the shared I/O
+	// limiter paces the reads and walkInterval bounds re-derivation.
 	walkInterval time.Duration
 	walkStates   map[string]walkRecord
 }
@@ -78,7 +77,6 @@ func newSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQ
 		minSegmentAge: minSegmentAge,
 		minSegments:   minSegments,
 		rateLimiter:   rateLimiter,
-		walkBudget:    DefaultSegmentWalkBudget,
 		walkInterval:  DefaultSegmentWalkInterval,
 		walkStates:    make(map[string]walkRecord),
 	}
@@ -98,9 +96,12 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		metrics.RecompactionDuration.Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
 
-	// Candidate selection (RFC-009): every eligible segment, ordered by
-	// delete-index hint (bytes credited, descending) then walk staleness, so
-	// hot-churn segments are examined first while rotation guarantees the rest.
+	// Candidate selection (RFC-009): every eligible segment not derived within
+	// the walk interval (hint growth bypasses it), ordered by delete-index hint
+	// (bytes credited, descending) then walk staleness, so reclaim-worthy
+	// segments are walked and recompacted first. No count cap is needed: walk
+	// reads draw from the shared compaction I/O limiter, so even a whole-fleet
+	// pass (first pass after restart) is paced rather than bursty.
 	segments := sr.sm.GetSegments()
 	totalSegments := len(segments)
 
@@ -114,10 +115,6 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 			Msg("recompactor: too few segments to safely recompact")
 		return nil
 	}
-	if sr.walkBudget <= 0 {
-		return nil
-	}
-
 	// Get the current open segment to ensure we never try to recompact it
 	openSegments := sr.sm.GetOpenSegments()
 	now := time.Now()
@@ -160,10 +157,6 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		}
 		return candidates[i].lastWalked.Before(candidates[j].lastWalked)
 	})
-	if len(candidates) > sr.walkBudget {
-		candidates = candidates[:sr.walkBudget]
-	}
-
 	recompactedCount := 0
 	for _, c := range candidates {
 		if ctx.Err() != nil {

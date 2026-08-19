@@ -40,9 +40,11 @@ Failure handling is strict, because deriving from partial knowledge would count 
 
 Each recompaction pass (default 1/min):
 
-1. **Candidates**: every closed segment past the existing `MinSegmentAgeForRecompaction` gate, excluding segments walked within the walk interval (default 1 h, in-memory recency — a restart just restarts the rotation).
-2. **Order**: delete-index hint bytes descending, then walk staleness — hot-churn segments are examined immediately, rotation covers everything else (3,000 segments at the default budget of 8/pass ≈ 6 h).
-3. **Gate**: walk each selected segment; if derived `deadBytes / size ≥ FragThreshold`, recompact it in the same pass via the existing copy path (whose per-entry re-verification also handles entries that die between walk and copy).
+1. **Candidates**: every closed segment past the existing `MinSegmentAgeForRecompaction` gate, excluding segments derived within the walk interval (default 1 h, in-memory recency — a restart just restarts the rotation). Hint growth since the last walk bypasses the interval.
+2. **Order**: delete-index hint bytes descending, then walk staleness — reclaim-worthy segments are walked and recompacted first.
+3. **Gate**: walk each candidate; if derived `deadBytes / size ≥ FragThreshold`, recompact it in the same pass via the existing copy path (whose per-entry re-verification also handles entries that die between walk and copy).
+
+There is deliberately **no per-pass count cap**: walk reads draw from the shared compaction I/O limiter, so even a whole-fleet pass — the first after a restart, or the hourly re-expiry — is paced (a 3,000-segment fleet at typical entry sizes is ~90 s of budgeted I/O) rather than bursty, and the pass checks cancellation per candidate.
 
 The delete index is consulted only for ordering. Its credits remain worth keeping accurate — they are what make prioritization responsive — so `DeleteKey` and the TTL cleaner now merge segment credit **in the same batch** as the metadata delete (the discipline the Put-overwrite fix introduced in #225/#228), eliminating the crash windows between commit and credit in either direction. But no correctness depends on them anymore: the historical orphan backlog, credits lost to any future bug, and inflated credits from racing writers are all absorbed by the walk, which converges within one rotation.
 
@@ -54,7 +56,7 @@ The delete index is consulted only for ordering. Its credits remain worth keepin
 
 ### Cost
 
-Each entry visit touches ~one 4 KiB page of the segment file (header and key share it): ~1 MiB of physical read per 256 MiB segment at typical 1 MiB entries, 16 MiB at the 64 KiB worst case. Per pass at the default budget of 8 walks, that is ~0.13 MiB/s sustained (worst case ~2 MiB/s) — but to keep the small-read burst from landing as an IOPS spike, **walk reads draw from the same shared compaction I/O limiter as payload copies** (one page-cost reservation per entry), so walks, compaction, and recompaction together stay under the configured `CompactionBytesPerSecond` ceiling. Metadata point lookups are not charged (block-cache hits, no meaningful byte cost). No metadata scan is ever taken; memory is O(live segments) for walk recency.
+Each entry visit touches ~one 4 KiB page of the segment file (header and key share it): ~1 MiB of physical read per 256 MiB segment at typical 1 MiB entries, 16 MiB at the 64 KiB worst case. Steady-state walk volume is fleet-size / walk-interval (~50 segments/min for 3,000 segments — ~0.8 MiB/s typical); to keep the small-read burst from landing as an IOPS spike, **walk reads draw from the same shared compaction I/O limiter as payload copies** (one page-cost reservation per entry), so walks, compaction, and recompaction together stay under the configured `CompactionBytesPerSecond` ceiling. Metadata point lookups are not charged (block-cache hits, no meaningful byte cost). No metadata scan is ever taken; memory is O(live segments) for walk recency.
 
 ### Responsiveness
 
