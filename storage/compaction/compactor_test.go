@@ -192,12 +192,15 @@ func TestEnsureCapacity(t *testing.T) {
 
 	// Test 1: When segment has enough capacity
 	ctx := context.Background()
-	err = c.ensureCapacity(ctx, &seg, "test", 100, newCacheAdvice())
+	emptyBatch := grocksdb.NewWriteBatch()
+	defer emptyBatch.Destroy()
+	var noDeletes []string
+	err = c.ensureCapacity(ctx, &seg, "test", 100, newCacheAdvice(), emptyBatch, &noDeletes)
 	assert.NoError(t, err)
 	assert.Equal(t, initialPath, seg.Path()) // Same segment
 
 	// Test 2: When segment needs rotation
-	err = c.ensureCapacity(ctx, &seg, "test", initialRemaining+1, newCacheAdvice())
+	err = c.ensureCapacity(ctx, &seg, "test", initialRemaining+1, newCacheAdvice(), emptyBatch, &noDeletes)
 	assert.NoError(t, err)
 	assert.NotEqual(t, initialPath, seg.Path()) // New segment
 }
@@ -1510,4 +1513,115 @@ func TestCompactFiles_ConcurrentDeleteRace(t *testing.T) {
 		"sentinel Expiry=1 is what triggers storage.Get to report not-found")
 	assert.Empty(t, got.RawFilePath, "sentinel must not reference any raw file")
 	assert.Empty(t, got.SegmentPath, "sentinel must not reference any segment")
+}
+
+// A destination segment must never become closed (and therefore recompaction-
+// and walk-eligible) while the metadata for the entries inside it is still
+// sitting in this run's uncommitted batch. A run iterates the whole compaction
+// index, so under a large backlog and a rate-limited copy that batch would
+// otherwise stay open for hours while segments are finalized along the way,
+// and a liveness derivation would read such a segment as fully dead and
+// reclaim it out from under the pending publication.
+//
+// The run is deliberately slowed with a tiny I/O budget and observed by
+// polling for the rollover, so the assertion lands while the run is still in
+// flight rather than after everything has been committed anyway.
+func TestCompactFiles_PublishesBeforeFinalizingSegment(t *testing.T) {
+	tmpDir, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// Small segments so a handful of entries force a rollover, and a slow
+	// budget so the run is still in progress when we look.
+	segSize := int64(8 * 1024)
+	smSmall, err := segment.NewManager(filepath.Join(tmpDir, "small"), segSize)
+	require.NoError(t, err)
+	_ = sm
+
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:                   meta,
+		FileManager:              fm,
+		SegmentManager:           smSmall,
+		DeletionQueue:            deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+		CompactionBytesPerSecond: 8 * 1024, // 8 KiB/s: seconds per entry
+	})
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	const entries = 6
+	payload := bytes.Repeat([]byte("z"), 4*1024)
+	keysWritten := make([]string, 0, entries)
+	for i := range entries {
+		key := fmt.Sprintf("rollover-%d", i)
+		path := filepath.Join(tmpDir, "files", key+".dat")
+		require.NoError(t, os.WriteFile(path, payload, 0o644))
+
+		idxKey, idxVal := PrepareEntryForCompaction(key, path)
+		require.NoError(t, meta.Handle().Put(wo, idxKey, idxVal))
+
+		row, err := proto.Marshal(&pb.ValueMessage{
+			ValueLength: int64(len(payload)),
+			ValueType:   pb.ValueType_RAW_FILE,
+			RawFilePath: path,
+		})
+		require.NoError(t, err)
+		require.NoError(t, meta.Handle().Put(wo, keys.MakeMetadataKey(key), row))
+		keysWritten = append(keysWritten, key)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.CompactFiles(ctx, 0)
+	}()
+
+	// Wait for the first rollover: a second segment existing means the first
+	// one has been finalized.
+	var closedSeg *segment.Segment
+	deadline := time.After(30 * time.Second)
+	for closedSeg == nil {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("no segment rollover observed; cannot exercise the invariant")
+		case <-done:
+			t.Fatal("run finished before a rollover could be observed")
+		default:
+		}
+		for _, s := range smSmall.GetSegments() {
+			if !s.HasOpenFile() && s.GetNumEntries() > 0 {
+				closedSeg = s
+			}
+		}
+	}
+
+	// The invariant: every entry inside the closed segment already has
+	// metadata pointing at it. Before publishing at rollover, these rows still
+	// said RAW_FILE and a liveness walk would have derived the segment as
+	// fully dead.
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	published := 0
+	for _, key := range keysWritten {
+		slice, err := meta.Handle().Get(ro, keys.MakeMetadataKey(key))
+		require.NoError(t, err)
+		if !slice.Exists() {
+			slice.Free()
+			continue
+		}
+		var vm pb.ValueMessage
+		require.NoError(t, proto.Unmarshal(slice.Data(), &vm))
+		slice.Free()
+		if vm.ValueType == pb.ValueType_SEGMENT && vm.SegmentPath == closedSeg.Path() {
+			published++
+		}
+	}
+	assert.EqualValues(t, closedSeg.GetNumEntries(), published,
+		"closed segment %s holds %d entries but only %d have published metadata — a walk would read it as dead",
+		closedSeg.Path(), closedSeg.GetNumEntries(), published)
+
+	cancel()
+	<-done
 }
