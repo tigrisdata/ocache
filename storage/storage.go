@@ -781,15 +781,14 @@ func (s *Storage) DeleteKey(key string) error {
 	// length, backing paths) are needed, so decode skipping the inline Data
 	// payload to avoid copying it (up to 64 KiB) on every delete of an inline key.
 	dataSize := int64(0)
+	decoded := false
 	valueMsg := &pb.ValueMessage{}
 	if unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
+		decoded = true
 		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
 		dataSize = valueMsg.ValueLength
 		// Notify cleaner about size reduction
 		s.notifyDelete(valueMsg.ValueLength)
-
-		// Clean up backing files if necessary
-		s.stageFileDeletion(valueMsg)
 	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -800,6 +799,16 @@ func (s *Storage) DeleteKey(key string) error {
 	// Delete key and its eviction-index entries in a single batch
 	batch.Delete(metaKey)
 	s.stageEvictionIndexDeletes(batch, ro, key)
+	// A segment value's dead-byte credit rides the SAME batch as the row
+	// delete: the credit is the recompactor's only evidence those bytes are
+	// dead, so committing it atomically with the delete means neither a crash
+	// after the write (credit lost) nor a failed write (credit for a live row)
+	// is possible. Raw files are queued after the commit instead — a lost
+	// queue row is still recoverable by a directory scan, while premature
+	// queueing could delete data a live row still references.
+	if decoded && valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
+		batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+	}
 
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		metrics.StorageOperations.WithLabelValues("delete", storageType, "error").Inc()
@@ -807,6 +816,12 @@ func (s *Storage) DeleteKey(key string) error {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteKey: db.Write error")
 		// RocksDB errors are typically temporary
 		return mapRocksDBError("DeleteKey", key, err)
+	}
+
+	// Queue raw-file reclaim only after the metadata delete is durable (the
+	// discipline evictByIndex and putLow use).
+	if decoded && valueMsg.ValueType == pb.ValueType_RAW_FILE {
+		s.stageFileDeletion(valueMsg)
 	}
 
 	metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
