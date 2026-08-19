@@ -124,12 +124,26 @@ run_eviction_suite() {
         # with a clear cause instead of misattributing it to an eviction bug.
         fail_test "RESULT_${policy}_protection" "[${policy}] setup could not reliably write/read the order keys; protection check inconclusive"
     else
-        # LRU updates access time asynchronously (buffered, flushed ~every second
-        # via DefaultAccessUpdateInterval), so wait for the read-bumps to persist
-        # before triggering eviction — otherwise eviction runs against stale access
-        # times and this races. Wait several flush intervals for CI headroom.
-        echo "Waiting for access-time updates to flush..."
-        sleep 8
+        # LRU access-time updates are queued by the read path and persisted by
+        # the accessUpdater's background ticker, so eviction triggered too soon
+        # runs against stale access times. Sleeping for "a few flush intervals"
+        # raced repeatedly on CI (the flush is not bounded by the ticker period:
+        # the batch is time-gated and the writes are asynchronous).
+        #
+        # Restart instead of sleeping: accessUpdater.Stop() drains the update
+        # channel and flushes unconditionally before the process exits, so a
+        # graceful restart is a HARD guarantee that every bump above is durable
+        # — no timing assumption at all. The access index lives in RocksDB, so
+        # recency survives the restart (Test 4 covers that property directly).
+        echo "Restarting server to flush access-time updates durably..."
+        restart_server "${policy}-eviction" \
+          -disk "$dir" \
+          -threshold 1000 \
+          -compact-threshold 1500 \
+          -max-disk-usage 51200 \
+          -eviction-policy "$policy" \
+          -ttl-cleanup-interval 5s \
+          -v
 
         # Phase 2: push well over the cap (10 more keys -> 60KB total) to force
         # eviction of ~8 keys. There are 15 un-read keys (6-20) to absorb that, so

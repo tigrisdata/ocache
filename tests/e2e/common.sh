@@ -109,7 +109,11 @@ restart_server() {
     local server_args="$*"
 
     stop_server
-    start_server "$test_name" $server_args
+    # cleanup=false explicitly: a restart must preserve the data directory, and
+    # start_server consumes its second argument as that flag — without it the
+    # first server flag would be swallowed as "cleanup" and dropped from the
+    # command line.
+    start_server "$test_name" "false" $server_args
 }
 
 # =============================================================================
