@@ -467,17 +467,28 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	// Old segment values are one-pass recompaction input.
 	dropFileCache(oldFile, entry.Offset, totalNeeded)
 
-	// Update metadata to point to new location
+	// Publish the new location via a compare-and-swap merge, never an
+	// unconditional Put: the batch commits only at the end of the whole
+	// (rate-limited) segment pass, and a concurrent Put may replace this key
+	// in that window — clobbering its row would make the newly written value
+	// unreachable and roll the key back to the recompacted copy of the old
+	// bytes. The operand overloads RawFilePath with the OLD segment path as
+	// the precondition (the convention the file compactor uses with raw
+	// paths, see merge.mergeMetadataCAS): the swap applies only while the row
+	// still points into the old segment, so a newer write always wins and
+	// this copy simply becomes dead space in the new segment.
+	oldPath := meta.SegmentPath
 	meta.SegmentPath = (*newSeg).Path()
 	meta.SegmentOffset = newOffset
+	meta.RawFilePath = oldPath
 
-	metaBytes, err := proto.Marshal(meta)
+	operand, err := proto.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
 	metaKey := keys.MakeMetadataKey(entry.Key)
-	wb.Put(metaKey, metaBytes)
+	wb.Merge(metaKey, operand)
 
 	return nil
 }
