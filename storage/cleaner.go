@@ -12,6 +12,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"google.golang.org/protobuf/proto"
@@ -320,7 +321,14 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 			// Defer file reclaim to flush(): the backing file is freed only once
 			// this batch's write succeeds (see pendingFiles), never before.
-			pendingFiles = append(pendingFiles, valueMsg)
+			// Segment credit rides the same batch as the metadata delete
+			// (atomic: no crash window between commit and credit); raw files
+			// are queued after the batch commits, in flush().
+			if valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
+				batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+			} else {
+				pendingFiles = append(pendingFiles, valueMsg)
+			}
 		}
 
 		it.Key().Free()

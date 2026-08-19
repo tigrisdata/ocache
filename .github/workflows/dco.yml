@@ -9,6 +9,12 @@ permissions:
 
 jobs:
   dco:
+    # Enforce on the PR that INTRODUCES a commit, not on the release PR that
+    # promotes main into release. Those commits were already gated here when
+    # they landed on main, and by then their history is immutable (main is
+    # protected), so a re-check can only report a defect nobody can remediate
+    # — as happened when a squash merge dropped a signed commit's trailers.
+    if: github.event.pull_request.base.ref != 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

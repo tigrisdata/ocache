@@ -177,13 +177,27 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			continue
 		}
 
-		// CAS precondition: must be a RAW_FILE → SEGMENT transition with a
-		// non-empty expected path carried on the operand.
-		if !hadBase ||
-			base.ValueType != pb.ValueType_RAW_FILE ||
-			op.ValueType != pb.ValueType_SEGMENT ||
-			op.RawFilePath == "" ||
-			base.RawFilePath != op.RawFilePath {
+		// CAS precondition: a SEGMENT-typed operand with a non-empty
+		// RawFilePath applies only when the base still references the path
+		// the writer observed when it started migrating this entry:
+		//
+		//   - RAW_FILE base whose RawFilePath matches — the file compactor's
+		//     raw → segment migration; or
+		//   - SEGMENT base whose SegmentPath matches — the recompactor's
+		//     segment → segment copy (closed segments are append-only, so a
+		//     path match proves the row is unchanged since the copy's read).
+		//
+		// The two can never cross-match: raw files and segments live in
+		// disjoint directories. On mismatch a concurrent Put replaced the
+		// entry between the writer's read and this merge; the operand is
+		// dropped so the newer write wins, and the bytes the writer already
+		// copied become dead space the walk-gated recompactor reclaims.
+		if !hadBase || op.ValueType != pb.ValueType_SEGMENT || op.RawFilePath == "" {
+			continue
+		}
+		rawMatch := base.ValueType == pb.ValueType_RAW_FILE && base.RawFilePath == op.RawFilePath
+		segMatch := base.ValueType == pb.ValueType_SEGMENT && base.SegmentPath == op.RawFilePath
+		if !rawMatch && !segMatch {
 			continue
 		}
 

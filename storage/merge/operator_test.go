@@ -287,3 +287,69 @@ func TestFullMerge_RoutingPreserved_DeleteIndex(t *testing.T) {
 	assert.Equal(t, int64(3), entry.DeletedEntries)
 	assert.Equal(t, int64(300), entry.DeletedBytes)
 }
+
+// The recompactor publishes its segment→segment copies through the same CAS
+// merge the file compactor uses for raw→segment, overloading RawFilePath with
+// the OLD segment path as the precondition. The swap must apply while the row
+// still points into the old segment, and must be dropped once a concurrent Put
+// has replaced it — otherwise recompaction would roll a newer value back.
+func TestMergeMetadataCAS_SegmentToSegment(t *testing.T) {
+	op := NewMultiplexOperator()
+	metaKey := keys.MakeMetadataKey("k")
+
+	mustMarshal := func(vm *pb.ValueMessage) []byte {
+		b, err := proto.Marshal(vm)
+		require.NoError(t, err)
+		return b
+	}
+	operand := mustMarshal(&pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		SegmentPath:   "/segments/new.seg",
+		SegmentOffset: 4096,
+		ValueLength:   100,
+		RawFilePath:   "/segments/old.seg", // CAS precondition
+	})
+
+	t.Run("applies while the row still points at the old segment", func(t *testing.T) {
+		base := mustMarshal(&pb.ValueMessage{
+			ValueType:     pb.ValueType_SEGMENT,
+			SegmentPath:   "/segments/old.seg",
+			SegmentOffset: 512,
+			ValueLength:   100,
+		})
+		out, ok := op.FullMerge(metaKey, base, [][]byte{operand})
+		require.True(t, ok)
+		var got pb.ValueMessage
+		require.NoError(t, proto.Unmarshal(out, &got))
+		require.Equal(t, "/segments/new.seg", got.SegmentPath)
+		require.EqualValues(t, 4096, got.SegmentOffset)
+		require.Empty(t, got.RawFilePath, "the overloaded precondition must not persist")
+	})
+
+	t.Run("dropped when a concurrent write moved the row elsewhere", func(t *testing.T) {
+		base := mustMarshal(&pb.ValueMessage{
+			ValueType:   pb.ValueType_RAW_FILE,
+			RawFilePath: "/files/fresh-put.dat",
+			ValueLength: 7,
+		})
+		out, ok := op.FullMerge(metaKey, base, [][]byte{operand})
+		require.True(t, ok)
+		var got pb.ValueMessage
+		require.NoError(t, proto.Unmarshal(out, &got))
+		require.Equal(t, pb.ValueType_RAW_FILE, got.ValueType, "a newer Put must win")
+		require.Equal(t, "/files/fresh-put.dat", got.RawFilePath)
+	})
+
+	t.Run("dropped when the row already moved to another segment", func(t *testing.T) {
+		base := mustMarshal(&pb.ValueMessage{
+			ValueType:   pb.ValueType_SEGMENT,
+			SegmentPath: "/segments/other.seg",
+			ValueLength: 100,
+		})
+		out, ok := op.FullMerge(metaKey, base, [][]byte{operand})
+		require.True(t, ok)
+		var got pb.ValueMessage
+		require.NoError(t, proto.Unmarshal(out, &got))
+		require.Equal(t, "/segments/other.seg", got.SegmentPath)
+	})
+}

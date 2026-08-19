@@ -9,9 +9,10 @@ import (
 
 // ValueMessage protobuf field numbers used by the wire-level extractors below.
 const (
-	valueDataField   protowire.Number = 2 // bytes data — the large payload we skip
-	valueExpiryField protowire.Number = 3
-	valueLengthField protowire.Number = 7
+	valueDataField    protowire.Number = 2 // bytes data — the large payload we skip
+	valueExpiryField  protowire.Number = 3
+	valueSegPathField protowire.Number = 5
+	valueLengthField  protowire.Number = 7
 )
 
 // valueMessageVarintField extracts a varint-typed scalar field (identified by
@@ -51,6 +52,52 @@ func valueMessageVarintField(buf []byte, want protowire.Number) (val int64, ok b
 		buf = buf[n:]
 	}
 	return val, true
+}
+
+// valueMessageSegmentRef extracts value_length (field 7) and segment_path
+// (field 5) in one pass, without copying Data. segmentPath is empty for values
+// that do not live in a segment: the stored-value invariant documented on
+// ValueMessage.raw_file_path is that segment_path is non-empty iff value_type is
+// SEGMENT, so the path alone identifies the class and value_type need not be
+// read. Malformed records return ok=false, matching valueMessageVarintField.
+//
+// Used by the reconciliation scan, which needs both fields for every metadata
+// row (total size, plus per-segment live bytes) and must not pay a payload copy
+// per row.
+func valueMessageSegmentRef(buf []byte) (segmentPath string, valueLength int64, ok bool) {
+	for len(buf) > 0 {
+		num, typ, n := protowire.ConsumeTag(buf)
+		if n < 0 {
+			return "", 0, false
+		}
+		buf = buf[n:]
+
+		switch {
+		case num == valueLengthField && typ == protowire.VarintType:
+			v, vn := protowire.ConsumeVarint(buf)
+			if vn < 0 {
+				return "", 0, false
+			}
+			valueLength = int64(v)
+			buf = buf[vn:]
+			continue
+		case num == valueSegPathField && typ == protowire.BytesType:
+			v, vn := protowire.ConsumeBytes(buf)
+			if vn < 0 {
+				return "", 0, false
+			}
+			segmentPath = string(v)
+			buf = buf[vn:]
+			continue
+		}
+
+		n = protowire.ConsumeFieldValue(num, typ, buf)
+		if n < 0 {
+			return "", 0, false
+		}
+		buf = buf[n:]
+	}
+	return segmentPath, valueLength, true
 }
 
 // valueMessageValueLength extracts ValueMessage.value_length (field 7) off the
