@@ -5,10 +5,12 @@ package compaction
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
@@ -40,6 +42,13 @@ type SegmentRecompactor struct {
 	minSegmentAge time.Duration
 	minSegments   int
 	rateLimiter   *rate.Limiter
+
+	// Walk-gated recompaction (RFC-009): per-pass walk budget, per-segment
+	// re-walk interval, and walk recency. See walker.go. walkBudget <= 0
+	// disables walking (and with it, all recompaction gating).
+	walkBudget   int
+	walkInterval time.Duration
+	walkStates   map[string]time.Time
 }
 
 // NewSegmentRecompactor creates a new segment recompactor without a rate limit.
@@ -58,6 +67,9 @@ func newSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQ
 		minSegmentAge: minSegmentAge,
 		minSegments:   minSegments,
 		rateLimiter:   rateLimiter,
+		walkBudget:    DefaultSegmentWalkBudget,
+		walkInterval:  DefaultSegmentWalkInterval,
+		walkStates:    make(map[string]time.Time),
 	}
 }
 
@@ -75,7 +87,9 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		metrics.RecompactionDuration.Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
 
-	// Get all segments
+	// Candidate selection (RFC-009): every eligible segment, ordered by
+	// delete-index hint (bytes credited, descending) then walk staleness, so
+	// hot-churn segments are examined first while rotation guarantees the rest.
 	segments := sr.sm.GetSegments()
 	totalSegments := len(segments)
 
@@ -89,14 +103,21 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 			Msg("recompactor: too few segments to safely recompact")
 		return nil
 	}
+	if sr.walkBudget <= 0 {
+		return nil
+	}
 
 	// Get the current open segment to ensure we never try to recompact it
 	openSegments := sr.sm.GetOpenSegments()
+	now := time.Now()
 
-	recompactedCount := 0
-	// Process segments, checking eligibility for each
+	type candidate struct {
+		seg        *segment.Segment
+		hintBytes  int64
+		lastWalked time.Time
+	}
+	var candidates []candidate
 	for i, seg := range segments {
-		// Check if this segment is eligible for recompaction
 		eligible, reason := sr.isSegmentEligibleForRecompaction(seg, openSegments, i, totalSegments)
 		if !eligible {
 			zlog.Debug().
@@ -105,49 +126,75 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 				Msg("recompactor: skipping segment")
 			continue
 		}
+		if last, ok := sr.walkStates[seg.Path()]; ok && now.Sub(last) < sr.walkInterval {
+			continue // recently derived; trust it until the interval elapses
+		}
+		// The delete index is a prioritization HINT only — the walk below is
+		// the decision. A hint read failure therefore just loses priority.
+		_, hintBytes, err := sr.getDeleteIndexStats(seg.Path())
+		if err != nil {
+			zlog.Error().Err(err).Str("segment", seg.Path()).
+				Msg("recompactor: failed to read delete-index hint")
+			hintBytes = 0
+		}
+		candidates = append(candidates, candidate{seg: seg, hintBytes: hintBytes, lastWalked: sr.walkStates[seg.Path()]})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].hintBytes != candidates[j].hintBytes {
+			return candidates[i].hintBytes > candidates[j].hintBytes
+		}
+		return candidates[i].lastWalked.Before(candidates[j].lastWalked)
+	})
+	if len(candidates) > sr.walkBudget {
+		candidates = candidates[:sr.walkBudget]
+	}
 
-		// Check context cancellation
+	recompactedCount := 0
+	for _, c := range candidates {
 		if ctx.Err() != nil {
 			zlog.Info().Msg("recompactor: interrupted by cancellation")
 			return ctx.Err()
 		}
 
-		// Check fragmentation level
-		deletedEntries, deletedBytes, err := sr.getDeleteIndexStats(seg.Path())
+		deadEntries, deadBytes, err := sr.walkSegmentLiveness(ctx, c.seg)
+		// Record the attempt even on failure so a damaged segment is retried
+		// once per interval instead of hot-looping every pass.
+		sr.walkStates[c.seg.Path()] = now
+		metrics.SegmentWalks.Inc()
 		if err != nil {
-			zlog.Error().Err(err).Str("segment", seg.Path()).
-				Msg("recompactor: failed to get delete index stats")
+			zlog.Error().Err(err).Str("segment", c.seg.Path()).
+				Msg("recompactor: segment walk aborted; leaving segment untouched")
 			continue
 		}
-
-		// Skip if no deletions
-		if deletedEntries == 0 {
+		if deadBytes <= 0 {
 			continue
 		}
-
-		// Check if segment is fragmented enough
-		if !sr.sm.IsSegmentFragmented(seg.Path(), deletedBytes, sr.fragThreshold) {
+		size := c.seg.GetSize()
+		if size <= 0 || float64(deadBytes)/float64(size) < sr.fragThreshold {
 			continue
 		}
 
 		zlog.Info().
-			Str("segment", seg.Path()).
-			Int64("deletedEntries", deletedEntries).
-			Int64("deletedBytes", deletedBytes).
-			Float64("fragmentation", sr.sm.GetFragmentationRatio(seg.Path(), deletedBytes)).
-			Msg("recompactor: found fragmented segment")
+			Str("segment", c.seg.Path()).
+			Int64("derivedDeadEntries", deadEntries).
+			Int64("derivedDeadBytes", deadBytes).
+			Float64("fragmentation", float64(deadBytes)/float64(size)).
+			Int64("hintBytes", c.hintBytes).
+			Msg("recompactor: walk derived fragmented segment")
 
-		// Recompact this segment
-		if err := sr.recompactSegment(ctx, seg); err != nil {
-			zlog.Error().Err(err).Str("segment", seg.Path()).
+		if err := sr.recompactSegment(ctx, c.seg); err != nil {
+			zlog.Error().Err(err).Str("segment", c.seg.Path()).
 				Msg("recompactor: failed to recompact segment")
 			continue
 		}
+		delete(sr.walkStates, c.seg.Path())
 
 		// Increment segments counter
 		metrics.RecompactionSegments.Inc()
 		recompactedCount++
 	}
+
+	sr.pruneWalkStates()
 
 	if recompactedCount > 0 {
 		zlog.Info().Int("count", recompactedCount).
@@ -229,7 +276,17 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 		metaKey := keys.MakeMetadataKey(entry.Key)
 		meta, err := utils.GetMetadata(sr.meta, string(metaKey))
 		if err != nil {
-			// Entry has been deleted, skip it
+			if errors.Is(err, utils.ErrMetadataNotFound) {
+				// Entry has been deleted, skip it
+				continue
+			}
+			// A transient lookup failure is NOT evidence of deletion: skipping
+			// a live entry here and then removing the old segment would make
+			// its data permanently unreadable. Count the pass incomplete so
+			// the old segment survives for a later retry.
+			failedEntries++
+			zlog.Error().Err(err).Str("key", entry.Key).
+				Msg("recompactor: metadata lookup failed; keeping old segment")
 			continue
 		}
 
