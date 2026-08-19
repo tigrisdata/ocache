@@ -450,6 +450,9 @@ var (
 		},
 	)
 
+	SegmentWalks = promauto.NewCounter(
+		prometheus.CounterOpts{Name: "ocache_segment_walks_total", Help: "Segments walked to derive liveness for recompaction gating"})
+
 	RecompactionSegments = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "ocache_recompaction_segments_total",

@@ -405,7 +405,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 		}
 
 		// Compact the entry
-		if err := c.compactEntry(ctx, entry, &seg, workerCallerID, wb, advice); err != nil {
+		if err := c.compactEntry(ctx, entry, &seg, workerCallerID, wb, advice, &filesToDeleteAfterCommit); err != nil {
 			if err == context.Canceled {
 				zlog.Debug().Msg("compactor: compaction cancelled")
 				return processed, bytesCopied
@@ -456,11 +456,7 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 	// segment and its metadata rewrite have both been published. With a
 	// rate-limited copy, this batch can stay open long enough for a queue
 	// worker to otherwise delete a raw file still referenced by foreground reads.
-	for _, filePath := range filesToDeleteAfterCommit {
-		if err := c.deletionQueue.Add(filePath); err != nil {
-			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue source file for deletion")
-		}
-	}
+	c.queueCompactedSources(&filesToDeleteAfterCommit)
 
 	// Record compaction metrics
 	duration := time.Since(start)
@@ -581,7 +577,7 @@ func (c *Compactor) purgeDanglingMeta(wb *grocksdb.WriteBatch, userKey, filePath
 }
 
 // compactEntry performs the actual compaction of a single entry
-func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch, advice *cacheAdvice) error {
+func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, seg **segment.Segment, callerID string, wb *grocksdb.WriteBatch, advice *cacheAdvice, pendingDeletes *[]string) error {
 	// Validate file size matches metadata
 	if entry.fileInfo.Size() != entry.metadata.ValueLength {
 		zlog.Error().
@@ -604,7 +600,7 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 	totalNeeded := headerSize + entry.metadata.ValueLength
 
 	// Ensure we have space in the current segment
-	if err := c.ensureCapacity(ctx, seg, callerID, totalNeeded, advice); err != nil {
+	if err := c.ensureCapacity(ctx, seg, callerID, totalNeeded, advice, wb, pendingDeletes); err != nil {
 		return err
 	}
 
@@ -721,9 +717,26 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 	return nil
 }
 
+// queueCompactedSources hands the raw files replaced by a committed batch to
+// the deletion queue and empties the pending list. Callers must invoke it only
+// after the metadata that replaces those files is durable: with a rate-limited
+// copy the batch stays open long enough for a queue worker to otherwise delete
+// a raw file that foreground reads still reference.
+func (c *Compactor) queueCompactedSources(pending *[]string) {
+	if pending == nil {
+		return
+	}
+	for _, filePath := range *pending {
+		if err := c.deletionQueue.Add(filePath); err != nil {
+			zlog.Error().Err(err).Str("path", filePath).Msg("compactor: failed to queue source file for deletion")
+		}
+	}
+	*pending = (*pending)[:0]
+}
+
 // ensureCapacity ensures that the segment has at least the needed bytes
 // available, finalising and acquiring a fresh segment when necessary.
-func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64, advice *cacheAdvice) error {
+func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64, advice *cacheAdvice, wb *grocksdb.WriteBatch, pendingDeletes *[]string) error {
 	if (*seg).Remaining() >= needed {
 		return nil
 	}
@@ -732,6 +745,27 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// Publish everything copied into this segment BEFORE it is finalized.
+	//
+	// A run iterates the whole compaction index, so without this the metadata
+	// batch stays open for the entire run — hours under a large backlog and a
+	// rate-limited copy — while destination segments are finalized along the
+	// way. Those finalized segments would then be closed (recompaction- and
+	// walk-eligible) while every entry in them still had its metadata pointing
+	// at a raw file, so a liveness derivation would read them as fully dead and
+	// reclaim a segment this run is about to publish rows into. Committing here
+	// makes "closed segment implies its metadata is published" an invariant,
+	// which is what the walk relies on — no timing assumption about how long a
+	// run takes. commit() syncs the segment before writing the metadata, so the
+	// sync-before-publish ordering is preserved.
+	if err := c.commit(ctx, *seg, wb, advice); err != nil {
+		return err
+	}
+	wb.Clear()
+	// Source files are exposed to the deletion queue only after the metadata
+	// that replaces them is durable — the same rule the end-of-run commit uses.
+	c.queueCompactedSources(pendingDeletes)
 
 	// Finalize the segment first, then release it
 	// This prevents other threads from acquiring it while it's being finalized
