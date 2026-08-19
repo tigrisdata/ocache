@@ -54,7 +54,11 @@ The delete index is consulted only for ordering. Its credits remain worth keepin
 
 ### Cost
 
-Per pass: at most `walkBudget` walks × (file open + header-hop + ≤4,096 point-gets) ≈ tens of milliseconds. No metadata scan is ever taken; memory is O(live segments) for walk recency.
+Each entry visit touches ~one 4 KiB page of the segment file (header and key share it): ~1 MiB of physical read per 256 MiB segment at typical 1 MiB entries, 16 MiB at the 64 KiB worst case. Per pass at the default budget of 8 walks, that is ~0.13 MiB/s sustained (worst case ~2 MiB/s) — but to keep the small-read burst from landing as an IOPS spike, **walk reads draw from the same shared compaction I/O limiter as payload copies** (one page-cost reservation per entry), so walks, compaction, and recompaction together stay under the configured `CompactionBytesPerSecond` ceiling. Metadata point lookups are not charged (block-cache hits, no meaningful byte cost). No metadata scan is ever taken; memory is O(live segments) for walk recency.
+
+### Responsiveness
+
+Walk recency records the delete-index hint observed at derivation time. Hint **growth** since the last walk bypasses the re-walk interval, so credited deletions are re-derived on the very next pass — matching the old gate's reactivity — while the interval only bounds re-walks for segments whose hint is unchanged (the drift the credits missed). A derived-fragmented segment whose rewrite fails is retried on the next pass, not parked for the interval: reclaim matters most under the disk pressure that makes rewrites fail.
 
 ## Metrics
 

@@ -48,7 +48,18 @@ type SegmentRecompactor struct {
 	// disables walking (and with it, all recompaction gating).
 	walkBudget   int
 	walkInterval time.Duration
-	walkStates   map[string]time.Time
+	walkStates   map[string]walkRecord
+}
+
+// walkRecord remembers when a segment was last derived and the delete-index
+// hint observed at that moment. Hint GROWTH since the last walk invalidates
+// the derivation immediately — new deaths were credited — so credited
+// deletions trigger re-derivation on the very next pass, while the interval
+// only bounds re-walks for segments whose hint is unchanged (covering drift
+// the credits missed).
+type walkRecord struct {
+	at        time.Time
+	hintBytes int64
 }
 
 // NewSegmentRecompactor creates a new segment recompactor without a rate limit.
@@ -69,7 +80,7 @@ func newSegmentRecompactor(meta *metadata.MetaDB, sm *segment.Manager, deletionQ
 		rateLimiter:   rateLimiter,
 		walkBudget:    DefaultSegmentWalkBudget,
 		walkInterval:  DefaultSegmentWalkInterval,
-		walkStates:    make(map[string]time.Time),
+		walkStates:    make(map[string]walkRecord),
 	}
 }
 
@@ -126,9 +137,6 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 				Msg("recompactor: skipping segment")
 			continue
 		}
-		if last, ok := sr.walkStates[seg.Path()]; ok && now.Sub(last) < sr.walkInterval {
-			continue // recently derived; trust it until the interval elapses
-		}
 		// The delete index is a prioritization HINT only — the walk below is
 		// the decision. A hint read failure therefore just loses priority.
 		_, hintBytes, err := sr.getDeleteIndexStats(seg.Path())
@@ -137,7 +145,14 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 				Msg("recompactor: failed to read delete-index hint")
 			hintBytes = 0
 		}
-		candidates = append(candidates, candidate{seg: seg, hintBytes: hintBytes, lastWalked: sr.walkStates[seg.Path()]})
+		if rec, ok := sr.walkStates[seg.Path()]; ok &&
+			now.Sub(rec.at) < sr.walkInterval && hintBytes <= rec.hintBytes {
+			// Recently derived and nothing new credited since: trust the
+			// derivation until the interval elapses. Hint growth bypasses the
+			// interval so credited deletions are re-derived next pass.
+			continue
+		}
+		candidates = append(candidates, candidate{seg: seg, hintBytes: hintBytes, lastWalked: sr.walkStates[seg.Path()].at})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].hintBytes != candidates[j].hintBytes {
@@ -159,7 +174,7 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		deadEntries, deadBytes, err := sr.walkSegmentLiveness(ctx, c.seg)
 		// Record the attempt even on failure so a damaged segment is retried
 		// once per interval instead of hot-looping every pass.
-		sr.walkStates[c.seg.Path()] = now
+		sr.walkStates[c.seg.Path()] = walkRecord{at: now, hintBytes: c.hintBytes}
 		metrics.SegmentWalks.Inc()
 		if err != nil {
 			zlog.Error().Err(err).Str("segment", c.seg.Path()).
@@ -185,6 +200,10 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 		if err := sr.recompactSegment(ctx, c.seg); err != nil {
 			zlog.Error().Err(err).Str("segment", c.seg.Path()).
 				Msg("recompactor: failed to recompact segment")
+			// A derived-fragmented segment whose rewrite failed must be
+			// retried promptly — reclaim matters most under the disk pressure
+			// that makes rewrites fail — not parked for the walk interval.
+			delete(sr.walkStates, c.seg.Path())
 			continue
 		}
 		delete(sr.walkStates, c.seg.Path())

@@ -67,10 +67,29 @@ func (sr *SegmentRecompactor) walkSegmentLiveness(ctx context.Context, seg *segm
 		return 0, 0, err
 	}
 
+	// Each entry visit touches roughly one 4 KiB page of the segment file
+	// (the header and key share it). Draw that from the shared compaction I/O
+	// budget so walks and payload copies together stay under the configured
+	// ceiling, and so a burst of small walk reads is paced instead of landing
+	// as an IOPS spike. Metadata point lookups are not charged: they are
+	// almost always block-cache hits and have no meaningful byte cost to
+	// account.
+	walkPageCost := int64(4096)
+	if sr.rateLimiter != nil {
+		if burst := int64(sr.rateLimiter.Burst()); burst > 0 && walkPageCost > burst {
+			walkPageCost = burst
+		}
+	}
+
 	var walked, liveEntries, liveBytes int64
 	for {
 		if ctx.Err() != nil {
 			return 0, 0, ctx.Err()
+		}
+		if sr.rateLimiter != nil {
+			if err := sr.rateLimiter.WaitN(ctx, int(walkPageCost)); err != nil {
+				return 0, 0, err
+			}
 		}
 		entry, err := iter.Next()
 		if err != nil {
