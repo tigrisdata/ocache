@@ -69,7 +69,7 @@ graph TB
 
 **Compactor**: Manages raw file to segment migration with support for multiple parallel workers. Each worker processes a partition of the compaction index, acquires segment reservations independently, and performs batch metadata updates.
 
-**SegmentRecompactor**: Handles defragmentation of segments with high dead space ratio. Monitors segment fragmentation levels, copies live data to new segments, and safely deletes old fragmented segments.
+**SegmentRecompactor**: Handles defragmentation of segments with high dead space ratio. Derives each candidate segment's dead space from the segment's own entries checked against metadata ([RFC-009](RFC-009-walk-gated-recompaction.md)), copies live data to new segments, and safely deletes old fragmented segments.
 
 **Deletion Queue**: Centralized queue for safe file deletion with configurable grace period. Processes deletions in batches, handles both raw files and segments, and maintains statistics.
 
@@ -198,37 +198,55 @@ PROCEDURE MigrateFile(entry, segment, writeBatch):
 
 #### Fragmentation Analysis
 
-The recompactor analyzes segment fragmentation by examining deletion statistics maintained in RocksDB:
+> **Superseded by [RFC-009](RFC-009-walk-gated-recompaction.md).** Fragmentation is no longer
+> *decided* by the delete index. That index is an incremental counter, and reclaim was gated on it,
+> so any missed credit was permanent: the mechanism that would reset the counter only ran when the
+> counter said to. The recompactor now derives dead bytes from ground truth and uses the delete
+> index only to order candidates. The procedure below reflects the current design.
+
+The recompactor derives each candidate segment's dead bytes by walking the segment itself, and
+consults the delete index only as a prioritization hint:
 
 ```
-PROCEDURE AnalyzeFragmentation():
+PROCEDURE SelectAndReclaim():
     candidates = []
 
     FOR EACH segment IN ListAllSegments():
-        // Skip hot segments to avoid recompacting recently written data
-        IF Age(segment) < MinimumAge:
+        // Skip hot segments: also excludes segments whose metadata may still be
+        // in an in-flight compaction batch.
+        IF Age(segment) < MinimumAge OR IsOpen(segment):
             CONTINUE
+        // Trust a recent derivation unless new deaths were credited since.
+        IF WalkedRecently(segment) AND NOT HintGrew(segment):
+            CONTINUE
+        ADD segment TO candidates
 
-        // Retrieve deletion statistics from delete index
-        delete_stats = GetDeleteIndexEntry(segment.path)
+    // Hint only: credited dead bytes order the work, they do not decide it.
+    SORT candidates BY DeleteIndexBytes(segment) DESCENDING, LastWalked ASCENDING
 
-        // Calculate fragmentation as ratio of dead to total space
-        fragmentation = delete_stats.deleted_bytes / segment.data_bytes
+    FOR EACH segment IN candidates:
+        // Ground truth: footer totals minus entries whose metadata still
+        // points at this segment+offset (the same liveness test the copy
+        // path applies before moving an entry). Any read or lookup failure
+        // aborts the derivation rather than under-counting live data.
+        live = 0
+        FOR EACH entry IN WalkEntryHeaders(segment):    // header-hop, no payload reads
+            meta = GetMetadata(entry.key)
+            IF meta EXISTS AND meta.segment_path == segment.path
+                          AND meta.segment_offset == entry.offset:
+                live += entry.value_length
 
-        IF fragmentation >= FragmentationThreshold:
-            candidate = {
-                segment: segment,
-                fragmentation: fragmentation,
-                live_bytes: segment.data_bytes - delete_stats.deleted_bytes,
-                dead_bytes: delete_stats.deleted_bytes
-            }
-            ADD candidate TO candidates
+        IF WalkedEntries != segment.num_entries:        // truncation reads as clean EOF
+            ABORT this segment
 
-    // Prioritize most fragmented segments
-    SORT candidates BY fragmentation DESCENDING
-
-    RETURN candidates
+        dead = segment.data_bytes - live
+        IF dead / segment.size >= FragmentationThreshold:
+            RecompactSegment(segment)
 ```
+
+Cost is bounded by construction: only objects above the inline threshold reach segments, so a
+256 MB segment holds at most a few thousand entries, and walk reads draw from the shared
+compaction I/O budget (`-compaction-bytes-per-second`) alongside payload copies.
 
 **Key Considerations:**
 
