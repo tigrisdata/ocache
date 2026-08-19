@@ -166,8 +166,12 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 
 		deadEntries, deadBytes, err := sr.walkSegmentLiveness(ctx, c.seg)
 		// Record the attempt even on failure so a damaged segment is retried
-		// once per interval instead of hot-looping every pass.
-		sr.walkStates[c.seg.Path()] = walkRecord{at: now, hintBytes: c.hintBytes}
+		// once per interval instead of hot-looping every pass. Stamp the walk's
+		// COMPLETION time, not the pass start: without a count cap a pass can
+		// run long (rate-limited whole-fleet walks), and pass-start stamps
+		// would expire retained derivations prematurely, re-walking the fleet
+		// every pass.
+		sr.walkStates[c.seg.Path()] = walkRecord{at: time.Now(), hintBytes: c.hintBytes}
 		metrics.SegmentWalks.Inc()
 		if err != nil {
 			zlog.Error().Err(err).Str("segment", c.seg.Path()).
