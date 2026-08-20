@@ -28,7 +28,9 @@ These options control how the client connects to the cache:
 | `--workload`             | Workload type (A, B, C) or custom mix | `A`               |
 | `--seed`                 | Random seed for reproducibility       | Current timestamp |
 | `--no-progress`          | Disable progress output               | `false`           |
-| `--force-streaming`      | Force streaming for all operations    | `false`           |
+| `--force-streaming`      | Force streaming for writes; reads always stream | `false`           |
+
+Read operations always stream their responses because the benchmark does not consume values. `--force-streaming` therefore only affects writes below the automatic streaming threshold.
 
 **Workload Types:**
 

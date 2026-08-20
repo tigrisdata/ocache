@@ -27,7 +27,7 @@ const (
 	OpNum
 )
 
-// StreamingThreshold defines the size threshold (4MB) above which streaming is automatically used
+// StreamingThreshold defines the size threshold (4MB) above which YCSB writes automatically use streaming.
 const StreamingThreshold = 4 * 1024 * 1024 // 4MB
 
 var opNames = []string{"read", "update"}
@@ -90,7 +90,7 @@ type YCSBConfig struct {
 	Workload           string        // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
 	Seed               int64         // Seed for random number generation (for reproducibility)
 	NoProgress         bool          // Disable progress output during benchmark
-	ForceStreaming     bool          // Force streaming for all operations regardless of size
+	ForceStreaming     bool          // Force streaming for writes regardless of size; reads always stream
 }
 
 type Result struct {
@@ -388,6 +388,9 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		}
 	}()
 
+	// Write transport selection is fixed for the duration of a run.
+	useStreamingWrites := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+
 	var wg sync.WaitGroup
 	opsPerWorker := cfg.NumOps / cfg.Concurrency
 	resultCh := make(chan struct {
@@ -435,20 +438,14 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 				// Use context with timeout for individual operations
 				opCtx, opCancel := context.WithTimeout(ctx, 5*time.Second)
 
-				// Determine if streaming should be used
-				useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
-
 				switch op {
 				case OpRead:
-					if useStreaming {
-						// Use streaming for reads, discard output for benchmarking
-						opErr = c.GetStream(opCtx, k, io.Discard)
-					} else {
-						_, opErr = c.Get(opCtx, k)
-					}
+					// YCSB does not consume read values, so drain chunks to io.Discard
+					// rather than assemble a result slice.
+					opErr = c.GetStream(opCtx, k, io.Discard)
 				case OpUpdate:
 					val := generateValue(localRng, cfg.ValueSize)
-					if useStreaming {
+					if useStreamingWrites {
 						// Use streaming for writes
 						opErr = c.PutStream(opCtx, k, bytes.NewReader(val), 0)
 					} else {
