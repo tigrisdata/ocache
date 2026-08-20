@@ -397,7 +397,7 @@ func init() {
 	benchCmd.Flags().StringVar(&workload, "workload", "A", "Workload type or custom mix (e.g. A, B, read=70,update=30)")
 	benchCmd.Flags().Int64Var(&seed, "seed", time.Now().UnixNano(), "Random seed")
 	benchCmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress output during benchmark")
-	benchCmd.Flags().BoolVar(&forceStreaming, "force-streaming", false, "Force streaming for all operations regardless of size")
+	benchCmd.Flags().BoolVar(&forceStreaming, "force-streaming", false, "Force streaming for writes regardless of size; reads always stream")
 
 	// cluster command flags and subcommands
 	clusterCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")

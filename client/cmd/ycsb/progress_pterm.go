@@ -287,11 +287,11 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 	// Determine streaming mode
 	var streamingMode string
 	if cfg.ForceStreaming {
-		streamingMode = "Forced Streaming"
+		streamingMode = "Streaming reads and writes (forced)"
 	} else if cfg.ValueSize > StreamingThreshold {
-		streamingMode = fmt.Sprintf("Auto Streaming (size %d > 4MB)", cfg.ValueSize)
+		streamingMode = fmt.Sprintf("Streaming reads and writes (size %d > 4MB)", cfg.ValueSize)
 	} else {
-		streamingMode = "Standard (non-streaming)"
+		streamingMode = "Streaming reads; standard writes"
 	}
 
 	// Create summary table
