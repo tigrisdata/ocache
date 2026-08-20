@@ -242,6 +242,12 @@ build-bench-compaction-serving-reads: proto
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/compaction-serving-reads.test" .
 
+.PHONY: build-bench-ycsb-progress-reporter
+build-bench-ycsb-progress-reporter:
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@$(MAKE) test-client CLIENT_TEST_PACKAGES=./cmd/ycsb CLIENT_TEST_OUTPUT="$(PERFLOOP_BUILD_OUTPUT_DIR)/ycsb-progress-reporter.test"
+
 # Compile the cleaner reconciliation benchmark once so paired runs measure the
 # scheduled cleanup-loop tick without Go compilation. BENCH_OUTPUT is supplied
 # by the benchmark runner.
@@ -272,6 +278,10 @@ stop:
 TEST ?=
 TESTRUN ?=
 TESTFLAGS := $(if $(TEST),-run $(TEST),$(if $(TESTRUN),-run $(TESTRUN),))
+# Benchmark build targets use these overrides to share the client test setup and flags.
+CLIENT_TEST_PACKAGES ?= ./...
+CLIENT_TEST_OUTPUT ?=
+CLIENT_TEST_ARGS := -v -timeout 30s $(TESTFLAGS)
 
 .PHONY: test
 test: test-server test-storage test-client test-coordinator test-embedded
@@ -303,7 +313,7 @@ test-storage-reconcile: proto
 test-client: proto
 	@echo "Running client tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
-	@cd client && go test -v -timeout 30s $(TESTFLAGS) ./...
+	@cd client && go test $(CLIENT_TEST_ARGS) $(if $(CLIENT_TEST_OUTPUT),-c -o "$(CLIENT_TEST_OUTPUT)") $(CLIENT_TEST_PACKAGES)
 
 .PHONY: test-coordinator
 test-coordinator: proto
