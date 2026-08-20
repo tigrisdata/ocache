@@ -242,6 +242,8 @@ build-bench-compaction-serving-reads: proto
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/compaction-serving-reads.test" .
 
+# Compile the YCSB reporter benchmarks through test-client so they reuse its
+# proto generation, timeout, and package settings.
 .PHONY: build-bench-ycsb-progress-reporter
 build-bench-ycsb-progress-reporter:
 	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
