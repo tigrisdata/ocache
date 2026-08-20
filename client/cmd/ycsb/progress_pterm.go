@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,12 @@ type PtermProgressReporter struct {
 	completedOps atomic.Int64
 	errorCount   atomic.Int64
 	startTime    time.Time
+
+	done      chan struct{}
+	stopOnce  sync.Once
+	metricsWg sync.WaitGroup
+	ptermMu   sync.Mutex
+	stopped   bool
 
 	// Per-operation type counters
 	opCounts [OpNum]atomic.Int64
@@ -45,6 +52,7 @@ func NewPtermProgressReporter(totalOps int) *PtermProgressReporter {
 	pr := &PtermProgressReporter{
 		totalOps:  int64(totalOps),
 		startTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 	pr.currentOpsPerSec.Store(float64(0))
 	pr.overallOpsPerSec.Store(float64(0))
@@ -72,7 +80,11 @@ func (pr *PtermProgressReporter) Start() error {
 	pr.liveText, _ = pterm.DefaultArea.Start()
 
 	// Start metrics update goroutine
-	go pr.updateMetrics()
+	pr.metricsWg.Add(1)
+	go func() {
+		defer pr.metricsWg.Done()
+		pr.updateMetrics()
+	}()
 
 	return nil
 }
@@ -85,10 +97,16 @@ func (pr *PtermProgressReporter) updateMetrics() {
 	lastOps := int64(0)
 	lastTime := pr.startTime
 
-	for range ticker.C {
+	for {
+		select {
+		case <-pr.done:
+			return
+		case <-ticker.C:
+		}
+
 		completed := pr.completedOps.Load()
 		if completed >= pr.totalOps {
-			break
+			return
 		}
 
 		// Calculate metrics
@@ -150,8 +168,10 @@ func (pr *PtermProgressReporter) RecordOp(opType OpType, latency time.Duration, 
 		pr.errorCount.Add(1)
 	}
 
-	// Update progress bar
-	if pr.progressBar != nil {
+	// pterm progress bars are shared by all workers but are not concurrency-safe.
+	pr.ptermMu.Lock()
+	defer pr.ptermMu.Unlock()
+	if !pr.stopped && pr.progressBar != nil {
 		pr.progressBar.Increment()
 	}
 }
@@ -168,13 +188,24 @@ func (pr *PtermProgressReporter) UpdateLatencies(p50, p95, p99, p999 float64) {
 
 // Stop stops the progress reporting
 func (pr *PtermProgressReporter) Stop() {
-	if pr.progressBar != nil {
-		// This will remove the progress bar when done
-		pr.progressBar.Stop()
-	}
-	if pr.liveText != nil {
-		pr.liveText.Stop()
-	}
+	pr.stopOnce.Do(func() {
+		close(pr.done)
+
+		pr.ptermMu.Lock()
+		pr.stopped = true
+		pr.ptermMu.Unlock()
+		pr.metricsWg.Wait()
+
+		pr.ptermMu.Lock()
+		defer pr.ptermMu.Unlock()
+		if pr.progressBar != nil {
+			// This will remove the progress bar when done.
+			pr.progressBar.Stop()
+		}
+		if pr.liveText != nil {
+			pr.liveText.Stop()
+		}
+	})
 }
 
 // GetStats returns final statistics
