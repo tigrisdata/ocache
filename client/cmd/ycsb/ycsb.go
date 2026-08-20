@@ -159,9 +159,9 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 	}
 	defer client.Close()
 
-	// Use pterm spinner for preloading only if progress is enabled
+	// Use pterm spinner for preloading only when progress output is enabled.
 	var spinner *pterm.SpinnerPrinter
-	if !cfg.NoProgress {
+	if !cfg.NoProgress && pterm.Output {
 		spinner, _ = pterm.DefaultSpinner.
 			WithText(fmt.Sprintf("Preloading %d keys...", cfg.NumKeys)).
 			Start()
