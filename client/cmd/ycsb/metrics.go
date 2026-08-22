@@ -6,7 +6,6 @@ package ycsb
 import (
 	"fmt"
 	"math"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -129,27 +128,201 @@ func (mc *MetricsCollector) GetPerOperationStats() map[OpType]OperationStats {
 			continue
 		}
 
-		// Sort latencies for percentile calculation
-		sorted := make([]time.Duration, len(latencies))
-		copy(sorted, latencies)
-		sort.Slice(sorted, func(i, j int) bool {
-			return sorted[i] < sorted[j]
-		})
+		snapshot := make([]time.Duration, len(latencies))
+		minLatency, maxLatency := latencies[0], latencies[0]
+		var totalLatency time.Duration
+		for i, latency := range latencies {
+			snapshot[i] = latency
+			if latency < minLatency {
+				minLatency = latency
+			}
+			if latency > maxLatency {
+				maxLatency = latency
+			}
+			totalLatency += latency
+		}
 
+		percentiles := selectOperationPercentiles(snapshot)
 		stats[opType] = OperationStats{
 			Count:       len(latencies),
 			ErrorCount:  mc.errorsByOp[opType],
-			MinLatency:  sorted[0],
-			MaxLatency:  sorted[len(sorted)-1],
-			AvgLatency:  calculateAverage(latencies),
-			P50Latency:  percentile(sorted, 0.50),
-			P95Latency:  percentile(sorted, 0.95),
-			P99Latency:  percentile(sorted, 0.99),
-			P999Latency: percentile(sorted, 0.999),
+			MinLatency:  minLatency,
+			MaxLatency:  maxLatency,
+			AvgLatency:  totalLatency / time.Duration(len(latencies)),
+			P50Latency:  percentiles[0],
+			P95Latency:  percentiles[1],
+			P99Latency:  percentiles[2],
+			P999Latency: percentiles[3],
 		}
 	}
 
 	return stats
+}
+
+const operationPercentileCount = 4
+
+var operationPercentiles = [operationPercentileCount]float64{0.50, 0.95, 0.99, 0.999}
+
+func selectOperationPercentiles(values []time.Duration) [operationPercentileCount]time.Duration {
+	if len(values) == 0 {
+		return [operationPercentileCount]time.Duration{}
+	}
+
+	var ranks [operationPercentileCount * 2]int
+	rankCount := 0
+	for _, percentile := range operationPercentiles {
+		lo, hi := percentileRanks(len(values), percentile)
+		rankCount = insertDurationRank(&ranks, rankCount, lo)
+		if hi < len(values) {
+			rankCount = insertDurationRank(&ranks, rankCount, hi)
+		}
+	}
+
+	selectDurationRanks(values, ranks[:rankCount])
+
+	var result [operationPercentileCount]time.Duration
+	for i, percentile := range operationPercentiles {
+		result[i] = selectedPercentile(values, percentile)
+	}
+	return result
+}
+
+func percentileRanks(length int, percentile float64) (int, int) {
+	position := percentile * float64(length-1)
+	lo := int(position)
+	return lo, lo + 1
+}
+
+func insertDurationRank(ranks *[operationPercentileCount * 2]int, count, rank int) int {
+	index := 0
+	for index < count && ranks[index] < rank {
+		index++
+	}
+	if index < count && ranks[index] == rank {
+		return count
+	}
+
+	for i := count; i > index; i-- {
+		ranks[i] = ranks[i-1]
+	}
+	ranks[index] = rank
+	return count + 1
+}
+
+// selectDurationRanks places the requested order statistics at their indexes
+// without sorting the other values.
+func selectDurationRanks(values []time.Duration, ranks []int) {
+	type selection struct {
+		low, high          int
+		rankStart, rankEnd int
+	}
+
+	var pending [operationPercentileCount * 2]selection
+	pendingCount := 1
+	pending[0] = selection{low: 0, high: len(values) - 1, rankEnd: len(ranks)}
+
+	for pendingCount > 0 {
+		pendingCount--
+		current := pending[pendingCount]
+		if current.low >= current.high || current.rankStart == current.rankEnd {
+			continue
+		}
+
+		middle := current.low + (current.high-current.low)/2
+		pivot := medianDuration(values[current.low], values[middle], values[current.high])
+		lessEnd, greaterStart := partitionDurations(values, current.low, current.high, pivot)
+
+		leftEnd := current.rankStart
+		for leftEnd < current.rankEnd && ranks[leftEnd] < lessEnd {
+			leftEnd++
+		}
+		rightStart := leftEnd
+		for rightStart < current.rankEnd && ranks[rightStart] < greaterStart {
+			rightStart++
+		}
+
+		if current.rankStart < leftEnd {
+			pending[pendingCount] = selection{
+				low:       current.low,
+				high:      lessEnd - 1,
+				rankStart: current.rankStart,
+				rankEnd:   leftEnd,
+			}
+			pendingCount++
+		}
+		if rightStart < current.rankEnd {
+			pending[pendingCount] = selection{
+				low:       greaterStart,
+				high:      current.high,
+				rankStart: rightStart,
+				rankEnd:   current.rankEnd,
+			}
+			pendingCount++
+		}
+	}
+}
+
+func medianDuration(first, second, third time.Duration) time.Duration {
+	if first < second {
+		if second < third {
+			return second
+		}
+		if first < third {
+			return third
+		}
+		return first
+	}
+	if first < third {
+		return first
+	}
+	if second < third {
+		return third
+	}
+	return second
+}
+
+func partitionDurations(values []time.Duration, low, high int, pivot time.Duration) (int, int) {
+	lessEnd, current, greaterStart := low, low, high
+	for current <= greaterStart {
+		switch {
+		case values[current] < pivot:
+			values[lessEnd], values[current] = values[current], values[lessEnd]
+			lessEnd++
+			current++
+		case values[current] > pivot:
+			values[current], values[greaterStart] = values[greaterStart], values[current]
+			greaterStart--
+		default:
+			current++
+		}
+	}
+	return lessEnd, greaterStart + 1
+}
+
+// selectedPercentile returns a percentile when its interpolation endpoints
+// have already been placed at their sorted indexes.
+func selectedPercentile(values []time.Duration, percentile float64) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	if percentile <= 0 {
+		return values[0]
+	}
+	if percentile >= 1 {
+		return values[len(values)-1]
+	}
+
+	position := percentile * float64(len(values)-1)
+	lo := int(position)
+	hi := lo + 1
+	if hi >= len(values) {
+		return values[lo]
+	}
+
+	fraction := position - float64(lo)
+	loValue := float64(values[lo])
+	hiValue := float64(values[hi])
+	return time.Duration(loValue + fraction*(hiValue-loValue))
 }
 
 // OperationStats holds statistics for a single operation type
@@ -203,19 +376,6 @@ func (mc *MetricsCollector) GetThroughputSeries() []ThroughputPoint {
 	result := make([]ThroughputPoint, len(mc.throughputSeries))
 	copy(result, mc.throughputSeries)
 	return result
-}
-
-// calculateAverage calculates the average of durations
-func calculateAverage(durations []time.Duration) time.Duration {
-	if len(durations) == 0 {
-		return 0
-	}
-
-	var sum time.Duration
-	for _, d := range durations {
-		sum += d
-	}
-	return sum / time.Duration(len(durations))
 }
 
 // RenderHistogram creates an ASCII histogram visualization
