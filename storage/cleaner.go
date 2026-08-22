@@ -15,7 +15,6 @@ import (
 	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -307,9 +306,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 		value := it.Value().Data()
 
-		// Try to decode as proto ValueMessage
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(value, valueMsg); err != nil {
+		// The usual TTL scan only needs expiry. Validate and read it directly
+		// from the wire so non-expiring rows do not allocate a reconstructed
+		// control message or copy their inline Data payload.
+		expiry, ok := valueMessageExpiry(value)
+		if !ok {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
 			c.storage.stageEvictionIndexDeletes(batch, ro, key)
@@ -319,11 +320,23 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			continue
 		}
 
-		// Check if expired
-		if valueMsg.Expiry > 0 {
-			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Bool("expired", now >= valueMsg.Expiry).Msg("cleaner: checking expiry")
+		if expiry > 0 {
+			zlog.Debug().Str("key", key).Int64("expiry", expiry).Int64("now", now).Bool("expired", now >= expiry).Msg("cleaner: checking expiry")
 		}
-		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
+		if expiry > 0 && now >= expiry {
+			// Only expired rows need their remaining control fields to account for
+			// the deletion and reclaim a raw file or segment. Keep the existing
+			// decode guard even though the expiry scan has validated the wire form.
+			valueMsg := &pb.ValueMessage{}
+			if !unmarshalValueMessageSkippingData(value, valueMsg) {
+				batch.Delete(keyBytes)
+				c.storage.stageEvictionIndexDeletes(batch, ro, key)
+				pendingCleaned++
+				it.Key().Free()
+				it.Value().Free()
+				continue
+			}
+
 			batch.Delete(keyBytes)
 			c.storage.stageEvictionIndexDeletes(batch, ro, key)
 			pendingCleaned++
@@ -486,9 +499,12 @@ func (c *Cleaner) reconcileFromMetadata() {
 			continue
 		}
 
-		var valueMsg pb.ValueMessage
-		if err := proto.Unmarshal(it.Value().Data(), &valueMsg); err == nil {
-			totalSize += valueMsg.ValueLength
+		// This scan sums only value_length across every metadata row, so read
+		// it directly off the wire rather than fully decoding each message —
+		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
+		// threshold) on both the startup scan and the hourly reconciliation.
+		if length, ok := valueMessageValueLength(it.Value().Data()); ok {
+			totalSize += length
 		}
 
 		if backfill && !backrefBroken {

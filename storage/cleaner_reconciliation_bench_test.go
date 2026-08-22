@@ -192,6 +192,43 @@ func TestCleanerCleanupExpiredInlineData(t *testing.T) {
 	}
 }
 
+// TestCleanerCleanupDeletesInvalidMetadata keeps the TTL scanner's malformed-row
+// behavior aligned with the former full protobuf decode.
+func TestCleanerCleanupDeletesInvalidMetadata(t *testing.T) {
+	storage, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: DefaultInlineThreshold,
+		CleanupInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	key := "invalid-cleanup-metadata"
+	// raw_file_path is a protobuf string, so this invalid UTF-8 row must be
+	// treated as malformed even though it has no expiry.
+	value := []byte{4<<3 | 2, 1, 0xff, 7 << 3, 1}
+	if err := storage.meta.Handle().Put(wo, keys.MakeMetadataKey(key), value); err != nil {
+		t.Fatal(err)
+	}
+
+	storage.cleaner.cleanupExpiredKeys()
+
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	slice, err := storage.meta.Handle().Get(ro, keys.MakeMetadataKey(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slice.Free()
+	if slice.Exists() {
+		t.Fatal("invalid metadata remains after TTL cleanup")
+	}
+}
+
 func newCleanerReconciliationFixture(tb testing.TB, inlineCount, rawCount int, capped bool) *cleanerReconciliationFixture {
 	tb.Helper()
 

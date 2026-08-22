@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/tigrisdata/ocache/storage/proto"
@@ -80,10 +81,59 @@ func TestValueMessageValueLength_MalformedIsNotOK(t *testing.T) {
 
 	_, ok := valueMessageValueLength(buf)
 	require.False(t, ok, "truncated varint must be rejected")
+	_, ok = valueMessageExpiry(buf)
+	require.False(t, ok, "truncated varint must be rejected")
 
 	// A lone continuation byte with no valid tag is also malformed.
 	_, ok = valueMessageValueLength([]byte{0x80})
 	require.False(t, ok)
+	_, ok = valueMessageExpiry([]byte{0x80})
+	require.False(t, ok)
+}
+
+func TestValueMessageValueLength_InvalidFieldNumberIsNotOK(t *testing.T) {
+	buf := protowire.AppendTag(nil, protowire.MaxValidNumber+1, protowire.VarintType)
+	buf = protowire.AppendVarint(buf, 1)
+
+	var msg pb.ValueMessage
+	require.Error(t, proto.Unmarshal(buf, &msg))
+	_, ok := valueMessageValueLength(buf)
+	require.False(t, ok)
+	_, ok = valueMessageExpiry(buf)
+	require.False(t, ok)
+}
+
+// String fields reject invalid UTF-8 during proto.Unmarshal. The wire scanner
+// must reject every such row too, even though it only reads value_length.
+func TestValueMessageValueLength_InvalidStringIsNotOK(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		field       byte
+		lengthFirst bool
+	}{
+		{name: "raw_file_path_before_length", field: 4},
+		{name: "raw_file_path_after_length", field: 4, lengthFirst: true},
+		{name: "segment_path_before_length", field: 5},
+		{name: "segment_path_after_length", field: 5, lengthFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stringField := []byte{tc.field<<3 | 2, 1, 0xff}
+			lengthField := []byte{7 << 3, 1}
+			buf := append(stringField, lengthField...)
+			if tc.lengthFirst {
+				buf = append(lengthField, stringField...)
+			}
+
+			var msg pb.ValueMessage
+			require.Error(t, proto.Unmarshal(buf, &msg))
+			_, ok := valueMessageValueLength(buf)
+			require.False(t, ok)
+			_, ok = valueMessageExpiry(buf)
+			require.False(t, ok)
+			_, _, ok = valueMessageSegmentRef(buf)
+			require.False(t, ok)
+		})
+	}
 }
 
 // valueMessageExpiry must agree with a full decode's Expiry field across shapes.
@@ -101,6 +151,20 @@ func TestValueMessageExpiry_MatchesFullDecode(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, m.Expiry, got)
 	}
+}
+
+// A repeated expiry field must take its final value, matching proto scalar merge.
+func TestValueMessageExpiry_LastWinsOnDuplicateField(t *testing.T) {
+	tag := protowireTagVarint(t, 3)
+	buf := append(append(append([]byte{}, tag...), 10), append(append([]byte{}, tag...), 20)...)
+
+	var msg pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(buf, &msg))
+
+	got, ok := valueMessageExpiry(buf)
+	require.True(t, ok)
+	require.Equal(t, msg.Expiry, got)
+	require.Equal(t, int64(20), got)
 }
 
 // unmarshalValueMessageSkippingData must reproduce a full proto.Unmarshal on
