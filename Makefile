@@ -242,6 +242,16 @@ build-bench-compaction-serving-reads: proto
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/compaction-serving-reads.test" .
 
+# Compile the cleaner reconciliation benchmark once so paired runs measure the
+# scheduled cleanup-loop tick without Go compilation. BENCH_OUTPUT is supplied
+# by the benchmark runner.
+BENCH_OUTPUT ?=
+.PHONY: build-storage-bench
+build-storage-bench: proto
+	@test -n "$(BENCH_OUTPUT)" || { echo "BENCH_OUTPUT is required"; exit 1; }
+	@mkdir -p "$(dir $(BENCH_OUTPUT))"
+	@cd storage && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(BENCH_OUTPUT)" .
+
 .PHONY: run-background
 run-background:
 	@echo "Starting ocache in background..."
@@ -280,6 +290,14 @@ test-storage: proto
 	@echo "Running storage tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
+
+.PHONY: test-storage-wire
+test-storage-wire: proto
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s -run '^TestValueMessage' .
+
+.PHONY: test-storage-reconcile
+test-storage-reconcile: proto
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s -run '^TestCleaner' .
 
 .PHONY: test-client
 test-client: proto

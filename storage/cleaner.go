@@ -15,7 +15,6 @@ import (
 	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -82,6 +81,9 @@ type Cleaner struct {
 	// up to an hour, bounding the window in which the cap cannot reclaim them.
 	backfillPending atomic.Bool
 
+	// lastSizeRecalc is owned by cleanupLoop and initialized when that loop starts.
+	lastSizeRecalc time.Time
+
 	// stats
 	totalSize   atomic.Int64
 	cleanedKeys atomic.Int64
@@ -90,6 +92,10 @@ type Cleaner struct {
 	// background loop coordination
 	closeCh chan struct{}
 	wg      sync.WaitGroup
+
+	// onTickComplete is set only by package tests and benchmarks to observe a
+	// completed cleanup-loop iteration without changing the work it performs.
+	onTickComplete func()
 }
 
 // NewCleaner creates a new Cleaner for background TTL cleanup and LRU eviction
@@ -150,10 +156,13 @@ func (c *Cleaner) cleanupLoop() {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	// Track when we last cleaned up old buckets
+	// Track when we last cleaned up old buckets.
 	lastBucketCleanup := time.Now()
-	// Track when we last re-derived the total size from the metadata
-	lastSizeRecalc := time.Now()
+	// Track when we last re-derived the total size from the metadata. A caller
+	// may seed this before the loop starts to make the normal hourly condition due.
+	if c.lastSizeRecalc.IsZero() {
+		c.lastSizeRecalc = time.Now()
+	}
 
 	for {
 		select {
@@ -162,9 +171,9 @@ func (c *Cleaner) cleanupLoop() {
 			// Also re-run promptly (every tick) while a prior backfill was left
 			// incomplete, so uncovered keys become evictable within a tick rather
 			// than waiting for the hourly recalc.
-			if c.backfillPending.Load() || time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
+			if c.backfillPending.Load() || time.Since(c.lastSizeRecalc) > totalSizeRecalcInterval {
 				c.calculateTotalSize()
-				lastSizeRecalc = time.Now()
+				c.lastSizeRecalc = time.Now()
 			}
 
 			c.cleanupExpiredKeys()
@@ -191,6 +200,9 @@ func (c *Cleaner) cleanupLoop() {
 				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
+			}
+			if c.onTickComplete != nil {
+				c.onTickComplete()
 			}
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: background loop stopping")
@@ -294,9 +306,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 		value := it.Value().Data()
 
-		// Try to decode as proto ValueMessage
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(value, valueMsg); err != nil {
+		// The usual TTL scan only needs expiry. Validate and read it directly
+		// from the wire so non-expiring rows do not allocate a reconstructed
+		// control message or copy their inline Data payload.
+		expiry, ok := valueMessageExpiry(value)
+		if !ok {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
 			c.storage.stageEvictionIndexDeletes(batch, ro, key)
@@ -306,11 +320,23 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			continue
 		}
 
-		// Check if expired
-		if valueMsg.Expiry > 0 {
-			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Bool("expired", now >= valueMsg.Expiry).Msg("cleaner: checking expiry")
+		if expiry > 0 {
+			zlog.Debug().Str("key", key).Int64("expiry", expiry).Int64("now", now).Bool("expired", now >= expiry).Msg("cleaner: checking expiry")
 		}
-		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
+		if expiry > 0 && now >= expiry {
+			// Only expired rows need their remaining control fields to account for
+			// the deletion and reclaim a raw file or segment. Keep the existing
+			// decode guard even though the expiry scan has validated the wire form.
+			valueMsg := &pb.ValueMessage{}
+			if !unmarshalValueMessageSkippingData(value, valueMsg) {
+				batch.Delete(keyBytes)
+				c.storage.stageEvictionIndexDeletes(batch, ro, key)
+				pendingCleaned++
+				it.Key().Free()
+				it.Value().Free()
+				continue
+			}
+
 			batch.Delete(keyBytes)
 			c.storage.stageEvictionIndexDeletes(batch, ro, key)
 			pendingCleaned++

@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"unicode/utf8"
+
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
@@ -11,6 +13,7 @@ import (
 const (
 	valueDataField    protowire.Number = 2 // bytes data — the large payload we skip
 	valueExpiryField  protowire.Number = 3
+	valueRawPathField protowire.Number = 4
 	valueSegPathField protowire.Number = 5
 	valueLengthField  protowire.Number = 7
 )
@@ -20,15 +23,16 @@ const (
 // payload (field 2), which can be as large as the inline threshold (64 KiB by
 // default).
 //
-// It scans and validates the entire message the way proto.Unmarshal would: a
-// structurally malformed record returns ok=false, a message with no such field
+// It scans and validates the entire message the way proto.Unmarshal would,
+// including UTF-8 validity for ValueMessage's string fields: a structurally
+// malformed record returns ok=false, a message with no such field
 // returns (0, true), and a repeated field takes the last value (matching proto's
 // scalar last-wins merge). buf is never retained — the caller may Free the
 // backing RocksDB slice immediately after this returns.
 func valueMessageVarintField(buf []byte, want protowire.Number) (val int64, ok bool) {
 	for len(buf) > 0 {
 		num, typ, n := protowire.ConsumeTag(buf)
-		if n < 0 {
+		if n < 0 || !num.IsValid() {
 			return 0, false
 		}
 		buf = buf[n:]
@@ -39,6 +43,14 @@ func valueMessageVarintField(buf []byte, want protowire.Number) (val int64, ok b
 				return 0, false
 			}
 			val = int64(v)
+			buf = buf[vn:]
+			continue
+		}
+		if (num == valueRawPathField || num == valueSegPathField) && typ == protowire.BytesType {
+			v, vn := protowire.ConsumeBytes(buf)
+			if vn < 0 || !utf8.Valid(v) {
+				return 0, false
+			}
 			buf = buf[vn:]
 			continue
 		}
@@ -67,7 +79,7 @@ func valueMessageVarintField(buf []byte, want protowire.Number) (val int64, ok b
 func valueMessageSegmentRef(buf []byte) (segmentPath string, valueLength int64, ok bool) {
 	for len(buf) > 0 {
 		num, typ, n := protowire.ConsumeTag(buf)
-		if n < 0 {
+		if n < 0 || !num.IsValid() {
 			return "", 0, false
 		}
 		buf = buf[n:]
@@ -81,12 +93,14 @@ func valueMessageSegmentRef(buf []byte) (segmentPath string, valueLength int64, 
 			valueLength = int64(v)
 			buf = buf[vn:]
 			continue
-		case num == valueSegPathField && typ == protowire.BytesType:
+		case (num == valueRawPathField || num == valueSegPathField) && typ == protowire.BytesType:
 			v, vn := protowire.ConsumeBytes(buf)
-			if vn < 0 {
+			if vn < 0 || !utf8.Valid(v) {
 				return "", 0, false
 			}
-			segmentPath = string(v)
+			if num == valueSegPathField {
+				segmentPath = string(v)
+			}
 			buf = buf[vn:]
 			continue
 		}
@@ -109,8 +123,9 @@ func valueMessageValueLength(buf []byte) (length int64, ok bool) {
 }
 
 // valueMessageExpiry extracts ValueMessage.expiry (field 3) off the wire without
-// copying Data. The key-listing scan reads only expiry to skip expired rows. See
-// Perfloop case case_527g56fg8z.
+// copying Data. Key-listing and TTL cleanup scans read only expiry to skip
+// ordinary rows without reconstructing their control messages. See Perfloop case
+// case_527g56fg8z.
 func valueMessageExpiry(buf []byte) (expiry int64, ok bool) {
 	return valueMessageVarintField(buf, valueExpiryField)
 }
@@ -131,7 +146,7 @@ func unmarshalValueMessageSkippingData(buf []byte, msg *pb.ValueMessage) bool {
 	stripped := make([]byte, 0, 128)
 	for len(buf) > 0 {
 		num, typ, tn := protowire.ConsumeTag(buf)
-		if tn < 0 {
+		if tn < 0 || !num.IsValid() {
 			return false
 		}
 		vn := protowire.ConsumeFieldValue(num, typ, buf[tn:])
