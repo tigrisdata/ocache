@@ -82,6 +82,9 @@ type Cleaner struct {
 	// up to an hour, bounding the window in which the cap cannot reclaim them.
 	backfillPending atomic.Bool
 
+	// lastSizeRecalc is owned by cleanupLoop and initialized when that loop starts.
+	lastSizeRecalc time.Time
+
 	// stats
 	totalSize   atomic.Int64
 	cleanedKeys atomic.Int64
@@ -90,6 +93,10 @@ type Cleaner struct {
 	// background loop coordination
 	closeCh chan struct{}
 	wg      sync.WaitGroup
+
+	// onTickComplete is set only by package tests and benchmarks to observe a
+	// completed cleanup-loop iteration without changing the work it performs.
+	onTickComplete func()
 }
 
 // NewCleaner creates a new Cleaner for background TTL cleanup and LRU eviction
@@ -150,10 +157,13 @@ func (c *Cleaner) cleanupLoop() {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	// Track when we last cleaned up old buckets
+	// Track when we last cleaned up old buckets.
 	lastBucketCleanup := time.Now()
-	// Track when we last re-derived the total size from the metadata
-	lastSizeRecalc := time.Now()
+	// Track when we last re-derived the total size from the metadata. A caller
+	// may seed this before the loop starts to make the normal hourly condition due.
+	if c.lastSizeRecalc.IsZero() {
+		c.lastSizeRecalc = time.Now()
+	}
 
 	for {
 		select {
@@ -162,9 +172,9 @@ func (c *Cleaner) cleanupLoop() {
 			// Also re-run promptly (every tick) while a prior backfill was left
 			// incomplete, so uncovered keys become evictable within a tick rather
 			// than waiting for the hourly recalc.
-			if c.backfillPending.Load() || time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
+			if c.backfillPending.Load() || time.Since(c.lastSizeRecalc) > totalSizeRecalcInterval {
 				c.calculateTotalSize()
-				lastSizeRecalc = time.Now()
+				c.lastSizeRecalc = time.Now()
 			}
 
 			c.cleanupExpiredKeys()
@@ -191,6 +201,9 @@ func (c *Cleaner) cleanupLoop() {
 				time.Since(lastBucketCleanup) > accessBucketCleanupInterval {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
+			}
+			if c.onTickComplete != nil {
+				c.onTickComplete()
 			}
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: background loop stopping")
@@ -473,12 +486,9 @@ func (c *Cleaner) reconcileFromMetadata() {
 			continue
 		}
 
-		// This scan sums only value_length across every metadata row, so read
-		// it directly off the wire rather than fully decoding each message —
-		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
-		// threshold) on both the startup scan and the hourly reconciliation.
-		if length, ok := valueMessageValueLength(it.Value().Data()); ok {
-			totalSize += length
+		var valueMsg pb.ValueMessage
+		if err := proto.Unmarshal(it.Value().Data(), &valueMsg); err == nil {
+			totalSize += valueMsg.ValueLength
 		}
 
 		if backfill && !backrefBroken {
