@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,12 +68,15 @@ func TestGetNodeTokens_ResponseSlicesRemainStableDuringRingUpdates(t *testing.T)
 	require.NoError(t, waitForTopologySnapshot(manager, 0, topologySnapshotPropagationMax))
 
 	stopReaders := make(chan struct{})
+	readerReady := make(chan struct{}, topologySnapshotReaderCount)
 	readerErrs := make(chan error, topologySnapshotReaderCount)
+	var marshaled atomic.Uint64
 	var readers sync.WaitGroup
 	for range topologySnapshotReaderCount {
 		readers.Add(1)
 		go func() {
 			defer readers.Done()
+			ready := false
 			for {
 				select {
 				case <-stopReaders:
@@ -87,8 +91,28 @@ func TestGetNodeTokens_ResponseSlicesRemainStableDuringRingUpdates(t *testing.T)
 					}
 					return
 				}
+				marshaled.Add(1)
+				if !ready {
+					readerReady <- struct{}{}
+					ready = true
+				}
 			}
 		}()
+	}
+
+	for range topologySnapshotReaderCount {
+		select {
+		case <-readerReady:
+		case err := <-readerErrs:
+			close(stopReaders)
+			readers.Wait()
+			require.NoError(t, err)
+			return
+		case <-time.After(topologySnapshotPropagationMax):
+			close(stopReaders)
+			readers.Wait()
+			t.Fatal("topology readers did not marshal their initial snapshots")
+		}
 	}
 
 	var updateErr error
@@ -98,6 +122,11 @@ func TestGetNodeTokens_ResponseSlicesRemainStableDuringRingUpdates(t *testing.T)
 			break
 		}
 		if err := waitForTopologySnapshot(manager, generation, topologySnapshotPropagationMax); err != nil {
+			updateErr = err
+			break
+		}
+		readCount := marshaled.Load()
+		if err := waitForTopologyMarshal(&marshaled, readCount, topologySnapshotPropagationMax); err != nil {
 			updateErr = err
 			break
 		}
@@ -148,6 +177,17 @@ func waitForTopologySnapshot(manager *RingManager, generation int, timeout time.
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func waitForTopologyMarshal(marshaled *atomic.Uint64, after uint64, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for marshaled.Load() <= after {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("topology readers did not marshal after a ring update")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
 }
 
 func marshalAndVerifyTopologySnapshot(assignments map[string][]uint32) error {
