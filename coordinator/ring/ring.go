@@ -9,7 +9,6 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -809,12 +808,10 @@ func (rm *RingManager) GetNodeTokens() map[string][]uint32 {
 			continue
 		}
 
-		// Copy tokens to a new slice
+		// The dskit ring reader materializes tokens in sorted order. Keep a
+		// separate slice so topology responses cannot mutate ring state.
 		tokens := make([]uint32, len(inst.Tokens))
 		copy(tokens, inst.Tokens)
-
-		// Ensure tokens are sorted (they should already be, but be safe)
-		sort.Slice(tokens, func(i, j int) bool { return tokens[i] < tokens[j] })
 
 		result[inst.Id] = tokens
 	}
