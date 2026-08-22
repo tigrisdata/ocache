@@ -9,7 +9,6 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
@@ -779,7 +778,8 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 
 // GetNodeTokens returns token assignments for all active nodes in the ring.
 // Used by GetClusterTopology to provide clients with token data for routing.
-// Returns a map of nodeID -> sorted list of tokens.
+// Returns a map of nodeID -> sorted list of tokens. Token slices alias the
+// current ring snapshot and must be treated as read-only.
 //
 // Important: This only returns tokens for ACTIVE nodes because:
 // 1. JOINING/PENDING nodes are not yet ready to serve requests
@@ -809,14 +809,9 @@ func (rm *RingManager) GetNodeTokens() map[string][]uint32 {
 			continue
 		}
 
-		// Copy tokens to a new slice
-		tokens := make([]uint32, len(inst.Tokens))
-		copy(tokens, inst.Tokens)
-
-		// Ensure tokens are sorted (they should already be, but be safe)
-		sort.Slice(tokens, func(i, j int) bool { return tokens[i] < tokens[j] })
-
-		result[inst.Id] = tokens
+		// The ring reader publishes replacement descriptors on updates. The
+		// response path treats the current snapshot's token slice as read-only.
+		result[inst.Id] = inst.Tokens
 	}
 
 	zlog.Debug().
