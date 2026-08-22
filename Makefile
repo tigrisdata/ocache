@@ -242,6 +242,13 @@ build-bench-compaction-serving-reads: proto
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/compaction-serving-reads.test" .
 
+# Compile the YCSB final-report benchmark once so paired runs exclude Go compilation.
+.PHONY: build-bench-ycsb-per-operation-stats
+build-bench-ycsb-per-operation-stats:
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd client/cmd/ycsb && go test -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/ycsb-per-operation-stats.test" .
+
 # Compile the cleaner reconciliation benchmark once so paired runs measure the
 # scheduled cleanup-loop tick without Go compilation. BENCH_OUTPUT is supplied
 # by the benchmark runner.
