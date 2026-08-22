@@ -233,8 +233,8 @@ bench-integration: proto
 	@mkdir -p "$(dir $(INTEGRATION_BENCH_BINARY))"
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(INTEGRATION_BENCH_BINARY)" .
 
-# Compile the compaction/serving benchmark once so paired runs do not include
-# Go compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+# Compile performance benchmarks once so paired runs do not include Go
+# compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
 PERFLOOP_BUILD_OUTPUT_DIR ?=
 .PHONY: build-bench-compaction-serving-reads
 build-bench-compaction-serving-reads: proto
@@ -251,6 +251,13 @@ build-storage-bench: proto
 	@test -n "$(BENCH_OUTPUT)" || { echo "BENCH_OUTPUT is required"; exit 1; }
 	@mkdir -p "$(dir $(BENCH_OUTPUT))"
 	@cd storage && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(BENCH_OUTPUT)" .
+
+.PHONY: build-bench-cache-service-topology
+build-bench-cache-service-topology:
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd server && go test $(LDFLAGS) -tags=ocache_topology_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-topology.test" ./service
+	@cd server && go build -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/topology-profile" ./cmd/topology-profile
 
 .PHONY: run-background
 run-background:
@@ -310,6 +317,12 @@ test-coordinator: proto
 	@echo "Running coordinator tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd coordinator && go test -v -timeout 30s $(TESTFLAGS) ./...
+
+.PHONY: test-cache-service-topology
+test-cache-service-topology:
+	@echo "Running CacheService topology benchmark tests..."
+	@cd server && go test -v ./cmd/topology-profile
+	@cd server && go test $(LDFLAGS) -tags=ocache_topology_benchmark -v -timeout 60s -run '^TestCacheServiceGetTopology' ./service
 
 .PHONY: test-embedded
 test-embedded: proto
@@ -561,6 +574,7 @@ help:
 	@echo "  test-server                 - Run server tests only"
 	@echo "  test-client                 - Run client tests only"
 	@echo "  test-coordinator            - Run coordinator tests only"
+	@echo "  test-cache-service-topology - Run CacheService topology benchmark tests"
 	@echo "  test-race                   - Run tests with race detector"
 	@echo "  test-coverage               - Run tests with coverage report"
 	@echo "  test-e2e                    - Run end-to-end tests"
@@ -578,6 +592,7 @@ help:
 	@echo "  bench                       - Run benchmarks"
 	@echo "  bench-integration           - Compile integration benchmarks (set INTEGRATION_BENCH_BINARY)"
 	@echo "  build-bench-compaction-serving-reads - Compile the compaction/serving benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
+	@echo "  build-bench-cache-service-topology - Compile the CacheService topology benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"
