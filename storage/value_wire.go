@@ -11,6 +11,7 @@ import (
 
 // ValueMessage protobuf field numbers used by the wire-level extractors below.
 const (
+	valueTypeField    protowire.Number = 1
 	valueDataField    protowire.Number = 2 // bytes data — the large payload we skip
 	valueExpiryField  protowire.Number = 3
 	valueRawPathField protowire.Number = 4
@@ -130,16 +131,79 @@ func valueMessageExpiry(buf []byte) (expiry int64, ok bool) {
 	return valueMessageVarintField(buf, valueExpiryField)
 }
 
+// valueMessageCleanupFields is the part of ValueMessage needed after a row is
+// deleted or replaced. Paths are owned strings because callers may retain this
+// value after releasing the RocksDB slice that supplied the wire data.
+type valueMessageCleanupFields struct {
+	valueType   pb.ValueType
+	valueLength int64
+	rawFilePath string
+	segmentPath string
+}
+
+// decodeValueMessageCleanupFields extracts the control fields used to account
+// for and reclaim a deleted or replaced value without materializing Data. It
+// validates the complete wire message, including UTF-8 for stored paths. Scalar
+// fields are last-wins, matching protobuf decoding; fields with an unexpected
+// wire type are skipped as unknown fields are by proto.Unmarshal.
+func decodeValueMessageCleanupFields(buf []byte) (fields valueMessageCleanupFields, ok bool) {
+	for len(buf) > 0 {
+		num, typ, n := protowire.ConsumeTag(buf)
+		if n < 0 || !num.IsValid() {
+			return valueMessageCleanupFields{}, false
+		}
+		buf = buf[n:]
+
+		switch {
+		case num == valueTypeField && typ == protowire.VarintType:
+			value, vn := protowire.ConsumeVarint(buf)
+			if vn < 0 {
+				return valueMessageCleanupFields{}, false
+			}
+			fields.valueType = pb.ValueType(value)
+			buf = buf[vn:]
+			continue
+		case num == valueLengthField && typ == protowire.VarintType:
+			value, vn := protowire.ConsumeVarint(buf)
+			if vn < 0 {
+				return valueMessageCleanupFields{}, false
+			}
+			fields.valueLength = int64(value)
+			buf = buf[vn:]
+			continue
+		case num == valueRawPathField && typ == protowire.BytesType:
+			value, vn := protowire.ConsumeBytes(buf)
+			if vn < 0 || !utf8.Valid(value) {
+				return valueMessageCleanupFields{}, false
+			}
+			fields.rawFilePath = string(value)
+			buf = buf[vn:]
+			continue
+		case num == valueSegPathField && typ == protowire.BytesType:
+			value, vn := protowire.ConsumeBytes(buf)
+			if vn < 0 || !utf8.Valid(value) {
+				return valueMessageCleanupFields{}, false
+			}
+			fields.segmentPath = string(value)
+			buf = buf[vn:]
+			continue
+		}
+
+		// This also advances past Data without allocating a Data-sized slice.
+		n = protowire.ConsumeFieldValue(num, typ, buf)
+		if n < 0 {
+			return valueMessageCleanupFields{}, false
+		}
+		buf = buf[n:]
+	}
+	return fields, true
+}
+
 // unmarshalValueMessageSkippingData decodes buf into msg exactly as
 // proto.Unmarshal would, except it drops the Data field (field 2) — up to the
-// 64 KiB inline threshold — which the delete and eviction callers never read. It
-// rebuilds the message wire without field 2 and defers to the generated decoder
-// for the remaining (small) fields, so their semantics (last-wins merge, wire
-// validation) are identical to a full decode. Returns false on a malformed
-// record — the same fallback those callers already took when proto.Unmarshal
-// errored. buf is not retained.
-//
-// See Perfloop case case_1mzwqcjjvr.
+// 64 KiB inline threshold — which cleaner callers never read. It rebuilds the
+// message wire without field 2 and defers to the generated decoder for the
+// remaining fields. Returns false on a malformed record.
 func unmarshalValueMessageSkippingData(buf []byte, msg *pb.ValueMessage) bool {
 	// Control fields (type/paths/lengths) are small; 128 covers the common case
 	// and append grows it only for unusually long raw-file/segment paths.

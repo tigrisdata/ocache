@@ -744,11 +744,15 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 func (s *Storage) stageFileDeletion(valueMsg *pb.ValueMessage) {
 	switch valueMsg.ValueType {
 	case pb.ValueType_RAW_FILE:
-		if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-			zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("storage: failed to queue raw file for deletion")
-		}
+		s.stageRawFileDeletion(valueMsg.RawFilePath)
 	case pb.ValueType_SEGMENT:
 		s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
+	}
+}
+
+func (s *Storage) stageRawFileDeletion(rawFilePath string) {
+	if err := s.deletionQueue.Add(rawFilePath); err != nil {
+		zlog.Error().Err(err).Str("path", rawFilePath).Msg("storage: failed to queue raw file for deletion")
 	}
 }
 
@@ -781,14 +785,12 @@ func (s *Storage) DeleteKey(key string) error {
 	// length, backing paths) are needed, so decode skipping the inline Data
 	// payload to avoid copying it (up to 64 KiB) on every delete of an inline key.
 	dataSize := int64(0)
-	decoded := false
-	valueMsg := &pb.ValueMessage{}
-	if unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
-		decoded = true
-		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
-		dataSize = valueMsg.ValueLength
+	valueMsg, decoded := decodeValueMessageCleanupFields(slice.Data())
+	if decoded {
+		storageType = pb.ValueType_name[int32(valueMsg.valueType)]
+		dataSize = valueMsg.valueLength
 		// Notify cleaner about size reduction
-		s.notifyDelete(valueMsg.ValueLength)
+		s.notifyDelete(valueMsg.valueLength)
 	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -806,8 +808,8 @@ func (s *Storage) DeleteKey(key string) error {
 	// is possible. Raw files are queued after the commit instead — a lost
 	// queue row is still recoverable by a directory scan, while premature
 	// queueing could delete data a live row still references.
-	if decoded && valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
-		batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+	if decoded && valueMsg.valueType == pb.ValueType_SEGMENT && valueMsg.segmentPath != "" {
+		batch.Merge(keys.MakeDeleteIndexKey(valueMsg.segmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.valueLength))
 	}
 
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
@@ -820,8 +822,8 @@ func (s *Storage) DeleteKey(key string) error {
 
 	// Queue raw-file reclaim only after the metadata delete is durable (the
 	// discipline evictByIndex and putLow use).
-	if decoded && valueMsg.ValueType == pb.ValueType_RAW_FILE {
-		s.stageFileDeletion(valueMsg)
+	if decoded && valueMsg.valueType == pb.ValueType_RAW_FILE {
+		s.stageRawFileDeletion(valueMsg.rawFilePath)
 	}
 
 	metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
@@ -1190,10 +1192,10 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// The replaced value's backing bytes must also be reclaimed (segment dead-byte
 	// credit / raw-file deletion), or an overwrite orphans them with no
 	// `!delete:segment/` record and the recompactor can never see them.
-	prev := s.existingValue(key, metaKey)
+	prev, hasPrev := s.existingValue(key, metaKey)
 	var prevSize int64
-	if prev != nil {
-		prevSize = prev.ValueLength
+	if hasPrev {
+		prevSize = prev.valueLength
 	}
 	batch.Put(metaKey, val)
 
@@ -1204,8 +1206,8 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// them permanently and undetectably. A replaced raw file is queued after the
 	// commit instead — a lost queue row leaves a file that a directory scan can
 	// still find.
-	if prev != nil && prev.ValueType == pb.ValueType_SEGMENT && prev.SegmentPath != "" {
-		batch.Merge(keys.MakeDeleteIndexKey(prev.SegmentPath), merge.MakeDeleteIndexOperand(1, prev.ValueLength))
+	if hasPrev && prev.valueType == pb.ValueType_SEGMENT && prev.segmentPath != "" {
+		batch.Merge(keys.MakeDeleteIndexKey(prev.segmentPath), merge.MakeDeleteIndexOperand(1, prev.valueLength))
 	}
 
 	// Index the key for eviction only if a disk cap is set. Each policy maintains
@@ -1229,8 +1231,8 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Queued only after the write commits: the metadata row still pointed at this
 	// file until now, so queueing earlier could delete data a live row still
 	// references if the batch failed (the discipline evictByIndex.commit uses).
-	if prev != nil && prev.ValueType == pb.ValueType_RAW_FILE {
-		s.stageFileDeletion(prev)
+	if hasPrev && prev.valueType == pb.ValueType_RAW_FILE {
+		s.stageRawFileDeletion(prev.rawFilePath)
 	}
 	return prevSize, nil
 }
@@ -1244,27 +1246,27 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 // Destroy'd).
 var putPointReadOpts = metadata.CreateReadOptions(false, false)
 
-// existingValue returns the metadata row currently stored under metaKey, or nil
-// when the key is absent or its row cannot be decoded. The inline Data payload
-// is skipped: callers need only the control fields (length, type, backing
-// paths).
-func (s *Storage) existingValue(key string, metaKey []byte) *pb.ValueMessage {
+// existingValue returns the cleanup fields from the metadata row currently
+// stored under metaKey. It reports false when the key is absent or its row
+// cannot be decoded. The inline Data payload is skipped because callers need
+// only the control fields used for accounting and backing-file cleanup.
+func (s *Storage) existingValue(key string, metaKey []byte) (valueMessageCleanupFields, bool) {
 	slice, err := s.meta.Handle().Get(putPointReadOpts, metaKey)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValue: db.Get error, size accounting may drift")
-		return nil
+		return valueMessageCleanupFields{}, false
 	}
 	defer slice.Free()
 	if !slice.Exists() {
-		return nil
+		return valueMessageCleanupFields{}, false
 	}
 
-	valueMsg := &pb.ValueMessage{}
-	if !unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
+	valueMsg, ok := decodeValueMessageCleanupFields(slice.Data())
+	if !ok {
 		zlog.Error().Str("key", key).Msg("storage.existingValue: failed to decode previous value message")
-		return nil
+		return valueMessageCleanupFields{}, false
 	}
-	return valueMsg
+	return valueMsg, true
 }
 
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time

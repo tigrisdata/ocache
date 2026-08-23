@@ -260,6 +260,14 @@ build-bench-cache-topology-rpc:
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && go test $(LDFLAGS) -tags=ocache_topology_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-topology-rpc.test" ./service
 
+# Compile the CacheService delete benchmark once so paired runs do not include
+# Go compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+.PHONY: build-bench-cache-service-delete
+build-bench-cache-service-delete: proto
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-delete.test" ./service
+
 .PHONY: run-background
 run-background:
 	@echo "Starting ocache in background..."
@@ -587,6 +595,7 @@ help:
 	@echo "  bench-integration           - Compile integration benchmarks (set INTEGRATION_BENCH_BINARY)"
 	@echo "  build-bench-compaction-serving-reads - Compile the compaction/serving benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo "  build-bench-cache-topology-rpc - Compile the CacheService topology RPC benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
+	@echo "  build-bench-cache-service-delete - Compile the CacheService delete benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"
