@@ -306,11 +306,11 @@ func compactBenchmarkRawValues(tb testing.TB, fixture *cleanerReconciliationFixt
 
 		allSegments := true
 		for _, key := range fixture.rawKeys {
-			value := fixture.storage.existingValue(key, keys.MakeMetadataKey(key))
-			if value == nil {
+			value, ok := fixture.storage.existingValue(key, keys.MakeMetadataKey(key))
+			if !ok {
 				tb.Fatalf("missing compacted metadata for %q", key)
 			}
-			if value.ValueType != pb.ValueType_SEGMENT {
+			if value.valueType != pb.ValueType_SEGMENT {
 				allSegments = false
 				break
 			}
