@@ -43,8 +43,10 @@ func TestStorage_PutGetDelete_LargeObject(t *testing.T) {
 	defer cleanup()
 	key := "largekey"
 	value := []byte("this is a large value that should spill to disk")
-	err := s.Put(key, bytes.NewReader(value), 0)
+	reader := &writerToReadRecorder{reader: bytes.NewReader(value)}
+	err := s.Put(key, reader, 0)
 	assert.NoError(t, err, "Put failed")
+	assert.Equal(t, 1, reader.writeToCalls, "large WriterTo input should retain its direct write path")
 
 	r, found, err := s.Get(key, 0, 0)
 	assert.NoError(t, err, "Get failed")
