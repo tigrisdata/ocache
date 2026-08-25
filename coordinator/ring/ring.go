@@ -882,7 +882,7 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 				// that merge, reuse those authoritative counts. Check the pending
 				// entries first so a same-cardinality replacement is reconciled
 				// instead of being accepted by a length-only test.
-				if values.pending && !snapshot.pendingMatches(ringDesc) && localStateMatches && snapshot.cache.current.Load() == values && d.rm.heartbeatCASSnapshot.Load() == values {
+				if values.pending && !values.pendingOverflow && !snapshot.pendingMatches(ringDesc) && localStateMatches && snapshot.cache.current.Load() == values && d.rm.heartbeatCASSnapshot.Load() == values {
 					clusterNodesActive.Set(float64(values.active))
 					clusterNodesTotal.Set(float64(values.total))
 					return

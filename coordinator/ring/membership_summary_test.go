@@ -808,7 +808,7 @@ func TestPendingAdditionsDoNotRescanAnUnmergedDescriptor(t *testing.T) {
 	// Keep the decoded additions pending and make the callback continue to see
 	// the pre-merge descriptor. The callback must retain the scanned counts, not
 	// rebuild them on every heartbeat while waiting for the watcher.
-	for member := 1000; member < 1257; member++ {
+	for member := 1000; member < 1100; member++ {
 		rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
 			fmt.Sprintf("member-%d", member): {
 				Id:        fmt.Sprintf("member-%d", member),
@@ -923,6 +923,56 @@ func TestMembershipSnapshotBoundsPendingDecodedAdditions(t *testing.T) {
 	assert.False(t, after.pending)
 	assert.False(t, after.values.pendingOverflow)
 	assert.Equal(t, len(initial.Ingesters), after.total)
+}
+
+func TestMembershipSnapshotOverflowReconcilesSameCardinalityHeartbeat(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lastKnownNodes: make(map[string]dskitring.InstanceState, 300),
+	}
+	lifecycler := &dskitring.BasicLifecycler{}
+	rm.lifecycler = lifecycler
+	delegate := &ringDelegate{rm: rm}
+	initial := heartbeatBenchmarkDesc(300)
+	rm.logMembershipChange(initial, 1)
+	rm.membershipWatcherObserved.Store(true)
+	rm.membershipChangeObserverPresent.Store(true)
+	rm.heartbeatCASActive.Store(true)
+	rm.heartbeatCASIdentity.Store(true)
+	rm.membershipLocalState.Store(int32(dskitring.ACTIVE))
+	rm.membershipLocalStateKnown.Store(true)
+	local := initial.Ingesters["member-1"]
+
+	for i := 0; i <= maxPendingMembershipChanges; i++ {
+		id := fmt.Sprintf("stale-%d", i)
+		rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+			id: {Id: id, State: dskitring.JOINING, Timestamp: int64(i + 1)},
+		}})
+	}
+
+	// The first callback sees the pre-merge descriptor. It must reconcile the
+	// overflow state instead of publishing the partially tracked counts.
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(lifecycler, initial, &local)
+
+	replacement := initial.Clone().(*dskitring.Desc)
+	delete(replacement.Ingesters, "member-0")
+	replacement.Ingesters[fmt.Sprintf("stale-%d", maxPendingMembershipChanges)] = dskitring.InstanceDesc{
+		Id:        fmt.Sprintf("stale-%d", maxPendingMembershipChanges),
+		State:     dskitring.JOINING,
+		Timestamp: int64(maxPendingMembershipChanges + 1),
+	}
+
+	// The dropped member replaces one ACTIVE member without changing total
+	// cardinality. Overflow must still force a full descriptor validation.
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(lifecycler, replacement, &local)
+
+	values := rm.membershipSnapshot().read()
+	assert.Equal(t, 299, values.active)
+	assert.Equal(t, 300, values.total)
+	assert.Equal(t, float64(299), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(300), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
 }
 
 func TestMembershipClientDoesNotAddDescriptorEntries(t *testing.T) {
