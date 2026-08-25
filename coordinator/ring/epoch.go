@@ -74,10 +74,14 @@ func ComputeRingEpoch(ringDesc *ring.Desc) uint64 {
 		return 0
 	}
 
-	// Sort node IDs for determinism - map iteration order is not guaranteed
+	// Sort node IDs for determinism - map iteration order is not guaranteed.
+	// Include every descriptor entry, matching the ring's membership semantics.
 	ids := make([]string, 0, len(ringDesc.Ingesters))
 	for id := range ringDesc.Ingesters {
 		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return 0
 	}
 	sort.Strings(ids)
 

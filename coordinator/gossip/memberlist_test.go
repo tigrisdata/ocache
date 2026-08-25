@@ -9,9 +9,32 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	dskitring "github.com/grafana/dskit/ring"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMembershipCodecNotifiesDecodedRingChange(t *testing.T) {
+	codec := newMembershipCodec(dskitring.GetCodec())
+	var observed *dskitring.Desc
+	codec.RegisterRingChangeObserver(func(desc *dskitring.Desc) {
+		observed = desc
+	})
+
+	input := &dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"node-a": {Id: "node-a", State: dskitring.LEAVING, Timestamp: 2},
+	}}
+	data, err := codec.Encode(input)
+	require.NoError(t, err)
+	decoded, err := codec.Decode(data)
+	require.NoError(t, err)
+
+	assert.Same(t, decoded, observed)
+	assert.Equal(t, input, observed)
+	standardDecoded, err := dskitring.GetCodec().Decode(data)
+	require.NoError(t, err)
+	assert.Equal(t, input, standardDecoded)
+}
 
 func TestMemberlistConfig_ApplyDefaults(t *testing.T) {
 	tests := []struct {
@@ -147,6 +170,7 @@ func TestMemberlistConfig_ToKVConfig(t *testing.T) {
 	assert.Equal(t, cfg.GossipNodes, mlCfg.GossipNodes)
 	assert.Equal(t, cfg.PushPullInterval, mlCfg.PushPullInterval)
 	assert.Equal(t, cfg.LeaveTimeout, mlCfg.LeaveTimeout)
+	assert.Equal(t, DefaultLeftIngestersTimeout, mlCfg.LeftIngestersTimeout)
 	assert.Equal(t, cfg.NodeName, mlCfg.NodeName)
 	assert.Equal(t, cfg.RandomizeNodeName, mlCfg.RandomizeNodeName)
 }

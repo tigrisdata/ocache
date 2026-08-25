@@ -26,6 +26,11 @@ const (
 
 	// DefaultLeaveTimeout is the default timeout for leave announcements
 	DefaultLeaveTimeout = 5 * time.Second
+
+	// DefaultLeftIngestersTimeout matches dskit's standard retention period for
+	// LEFT ring entries. It also lets the memberlist store discard the short-lived
+	// membership-summary tombstones after a repair.
+	DefaultLeftIngestersTimeout = 5 * time.Minute
 )
 
 // memberlistConfig holds configuration for the memberlist KV store
@@ -114,14 +119,15 @@ func (c *memberlistConfig) ApplyDefaults() {
 // ToKVConfig converts to dskit memberlist.KVConfig
 func (c *memberlistConfig) ToKVConfig() memberlist.KVConfig {
 	cfg := memberlist.KVConfig{
-		JoinMembers:       c.JoinMembers,
-		AbortIfJoinFails:  c.AbortIfJoinFails,
-		LeaveTimeout:      c.LeaveTimeout,
-		GossipInterval:    c.GossipInterval,
-		GossipNodes:       c.GossipNodes,
-		PushPullInterval:  c.PushPullInterval,
-		NodeName:          c.NodeName,
-		RandomizeNodeName: c.RandomizeNodeName,
+		JoinMembers:          c.JoinMembers,
+		AbortIfJoinFails:     c.AbortIfJoinFails,
+		LeaveTimeout:         c.LeaveTimeout,
+		LeftIngestersTimeout: DefaultLeftIngestersTimeout,
+		GossipInterval:       c.GossipInterval,
+		GossipNodes:          c.GossipNodes,
+		PushPullInterval:     c.PushPullInterval,
+		NodeName:             c.NodeName,
+		RandomizeNodeName:    c.RandomizeNodeName,
 		// RetransmitMult is the multiplier for number of retransmissions.
 		// Default hashicorp memberlist uses 4, dskit uses 2. We use 4 for faster convergence.
 		RetransmitMult: 4,

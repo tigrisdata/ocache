@@ -11,10 +11,13 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/ring"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator/gossip"
 )
 
@@ -60,6 +63,41 @@ func (t *testLogCapture) getMessagesOfType(msgType string) []map[string]interfac
 	}
 	return result
 }
+
+type watcherTestClient struct {
+	started chan struct{}
+	updates chan interface{}
+}
+
+func (c *watcherTestClient) List(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
+func (c *watcherTestClient) Get(context.Context, string) (interface{}, error) {
+	return nil, nil
+}
+
+func (c *watcherTestClient) Delete(context.Context, string) error {
+	return nil
+}
+
+func (c *watcherTestClient) CAS(context.Context, string, func(interface{}) (interface{}, bool, error)) error {
+	return nil
+}
+
+func (c *watcherTestClient) WatchKey(ctx context.Context, _ string, f func(interface{}) bool) {
+	close(c.started)
+	select {
+	case value := <-c.updates:
+		f(value)
+	case <-ctx.Done():
+	}
+}
+
+func (c *watcherTestClient) WatchPrefix(context.Context, string, func(string, interface{}) bool) {
+}
+
+var _ kv.Client = (*watcherTestClient)(nil)
 
 func TestTokenForKey_Deterministic(t *testing.T) {
 	// Create a minimal RingManager just to access tokenForKey
@@ -385,6 +423,281 @@ func TestLogMembershipChange_LogsEpochUpdate(t *testing.T) {
 	require.Len(t, epochMsgs, 1)
 	assert.Equal(t, uint64(12345), epochMsgs[0]["epoch"])
 	assert.Equal(t, 1, epochMsgs[0]["node_count"])
+}
+
+func TestOnRingInstanceHeartbeatInitializesMembershipSnapshot(t *testing.T) {
+	rm := &RingManager{}
+	delegate := &ringDelegate{rm: rm}
+	ringDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+			"node2": {Id: "node2", State: ring.JOINING},
+			"node3": {Id: "node3", State: ring.LEAVING},
+		},
+	}
+
+	delegate.OnRingInstanceHeartbeat(nil, ringDesc, nil)
+
+	counts := rm.membershipCounts.Load()
+	require.NotNil(t, counts)
+	assert.Equal(t, 1, counts.active)
+	assert.Equal(t, 3, counts.total)
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(3), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestHeartbeatRefreshesMembershipSnapshotBeforeWatcher(t *testing.T) {
+	rm := &RingManager{}
+	delegate := &ringDelegate{rm: rm}
+	initialDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+		},
+	}
+	delegate.OnRingInstanceHeartbeat(nil, initialDesc, nil)
+
+	// The heartbeat can observe a descriptor change before the KV watcher. It
+	// must refresh both gauges rather than publish the previous snapshot.
+	emptyDesc := &ring.Desc{Ingesters: map[string]ring.InstanceDesc{}}
+	delegate.OnRingInstanceHeartbeat(nil, emptyDesc, nil)
+
+	counts := rm.membershipCounts.Load()
+	require.NotNil(t, counts)
+	assert.Equal(t, 0, counts.active)
+	assert.Equal(t, 0, counts.total)
+	assert.Equal(t, float64(0), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(0), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestHeartbeatRefreshesRemoteStateBeforeWatcher(t *testing.T) {
+	rm := &RingManager{}
+	delegate := &ringDelegate{rm: rm}
+	initialDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"local":  {Id: "local", State: ring.ACTIVE},
+			"remote": {Id: "remote", State: ring.ACTIVE},
+		},
+	}
+	delegate.OnRingInstanceHeartbeat(nil, initialDesc, nil)
+
+	changedDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"local":  {Id: "local", State: ring.ACTIVE},
+			"remote": {Id: "remote", State: ring.LEAVING},
+		},
+	}
+	delegate.OnRingInstanceHeartbeat(nil, changedDesc, nil)
+
+	counts := rm.membershipCounts.Load()
+	require.NotNil(t, counts)
+	assert.Equal(t, 1, counts.active)
+	assert.Equal(t, 2, counts.total)
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestHeartbeatRefreshesRemoteStateAfterWatcherBeforeHeartbeat(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lastKnownNodes: map[string]ring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	initialDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"local":  {Id: "local", State: ring.ACTIVE},
+			"remote": {Id: "remote", State: ring.ACTIVE},
+		},
+	}
+	rm.logMembershipChange(initialDesc, 1)
+
+	// A remote state transition can reach the heartbeat callback before the
+	// asynchronous watcher handles the corresponding update. Keep the callback
+	// bound to the manager so the descriptor identity check is the only
+	// transition signal available to the heartbeat path.
+	lifecycler := &ring.BasicLifecycler{}
+	rm.lifecycler = lifecycler
+	localInstance := initialDesc.Ingesters["local"]
+	changedDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"local":  {Id: "local", State: ring.ACTIVE},
+			"remote": {Id: "remote", State: ring.LEAVING},
+		},
+	}
+	delegate.OnRingInstanceHeartbeat(lifecycler, changedDesc, &localInstance)
+
+	counts := rm.membershipCounts.Load()
+	require.NotNil(t, counts)
+	assert.Equal(t, 1, counts.active)
+	assert.Equal(t, 2, counts.total)
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestHeartbeatRefreshesRemoteStateAfterWatcherWithoutCASContext(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lastKnownNodes: map[string]ring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	initialDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"local":  {Id: "local", State: ring.ACTIVE},
+			"remote": {Id: "remote", State: ring.ACTIVE},
+		},
+	}
+	rm.logMembershipChange(initialDesc, 1)
+	rm.membershipWatcherObserved.Store(true)
+
+	lifecycler := &ring.BasicLifecycler{}
+	rm.lifecycler = lifecycler
+	localInstance := initialDesc.Ingesters["local"]
+	changedDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"local":  {Id: "local", State: ring.ACTIVE},
+			"remote": {Id: "remote", State: ring.LEAVING},
+		},
+	}
+	delegate.OnRingInstanceHeartbeat(lifecycler, changedDesc, &localInstance)
+
+	counts := rm.membershipCounts.Load()
+	require.NotNil(t, counts)
+	assert.Equal(t, 1, counts.active)
+	assert.Equal(t, 2, counts.total)
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestHeartbeatRefreshesChangedInstanceStateBeforeWatcher(t *testing.T) {
+	rm := &RingManager{}
+	delegate := &ringDelegate{rm: rm}
+	initialDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+		},
+	}
+	initialInstance := initialDesc.Ingesters["node1"]
+	delegate.OnRingInstanceHeartbeat(nil, initialDesc, &initialInstance)
+
+	changedDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.LEAVING},
+		},
+	}
+	changedInstance := changedDesc.Ingesters["node1"]
+	delegate.OnRingInstanceHeartbeat(nil, changedDesc, &changedInstance)
+
+	counts := rm.membershipCounts.Load()
+	require.NotNil(t, counts)
+	assert.Equal(t, 0, counts.active)
+	assert.Equal(t, 1, counts.total)
+	assert.Equal(t, float64(0), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestRingWatcherProcessesFirstEmptyDescriptor(t *testing.T) {
+	watcher := &watcherTestClient{
+		started: make(chan struct{}),
+		updates: make(chan interface{}, 1),
+	}
+	rm := &RingManager{
+		epoch:          NewEpoch(),
+		kvClient:       watcher,
+		logger:         log.NewNopLogger(),
+		lastKnownNodes: map[string]ring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	nonEmptyDesc := &ring.Desc{
+		Ingesters: map[string]ring.InstanceDesc{
+			"node1": {Id: "node1", State: ring.ACTIVE},
+		},
+	}
+	delegate.OnRingInstanceHeartbeat(nil, nonEmptyDesc, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rm.startRingWatcher(ctx)
+	<-watcher.started
+	emptyDesc := &ring.Desc{Ingesters: map[string]ring.InstanceDesc{}}
+	watcher.updates <- emptyDesc
+
+	require.Eventually(t, func() bool {
+		rm.stateMu.Lock()
+		observed := rm.membershipWatcherObserved.Load()
+		rm.stateMu.Unlock()
+		counts := rm.membershipCounts.Load()
+		return observed && counts != nil && counts.active == 0 && counts.total == 0
+	}, time.Second, time.Millisecond)
+	delegate.OnRingInstanceHeartbeat(nil, emptyDesc, nil)
+	assert.Equal(t, float64(0), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(0), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestMembershipSnapshotTracksStateAndMembershipChanges(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lastKnownNodes: map[string]ring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+
+	tests := []struct {
+		name   string
+		desc   *ring.Desc
+		active float64
+		total  float64
+	}{
+		{
+			name: "registration",
+			desc: &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+				"node1": {Id: "node1", State: ring.JOINING},
+			}},
+			active: 0,
+			total:  1,
+		},
+		{
+			name: "active transition",
+			desc: &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+				"node1": {Id: "node1", State: ring.ACTIVE},
+			}},
+			active: 1,
+			total:  1,
+		},
+		{
+			name: "joining member",
+			desc: &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+				"node1": {Id: "node1", State: ring.ACTIVE},
+				"node2": {Id: "node2", State: ring.JOINING},
+			}},
+			active: 1,
+			total:  2,
+		},
+		{
+			name: "leaving transition",
+			desc: &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+				"node1": {Id: "node1", State: ring.LEAVING},
+				"node2": {Id: "node2", State: ring.ACTIVE},
+			}},
+			active: 1,
+			total:  2,
+		},
+		{
+			name: "removal",
+			desc: &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+				"node2": {Id: "node2", State: ring.ACTIVE},
+			}},
+			active: 1,
+			total:  1,
+		},
+	}
+
+	for epoch, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rm.logMembershipChange(tc.desc, uint64(epoch+1))
+			delegate.OnRingInstanceHeartbeat(nil, tc.desc, nil)
+
+			assert.Equal(t, tc.active, testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+			assert.Equal(t, tc.total, testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+		})
+	}
 }
 
 func TestReadinessGate_HoldsJoiningUntilMarkReady(t *testing.T) {
