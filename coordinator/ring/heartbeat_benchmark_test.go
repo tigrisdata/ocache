@@ -95,6 +95,7 @@ func prepareHeartbeatBenchmark(manager *RingManager, ringDesc *dskitring.Desc) {
 	for _, name := range []string{
 		"membershipWatcherObserved",
 		"membershipChangeObserverPresent",
+		"heartbeatCASIdentity",
 		"heartbeatCASActive",
 	} {
 		setHeartbeatBenchmarkBool(value.FieldByName(name))
