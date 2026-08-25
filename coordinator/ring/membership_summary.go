@@ -469,6 +469,22 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 		if known {
 			old = oldValue.(membershipEntryState)
 		}
+
+		// Heartbeats advance timestamps without changing membership counts. Keep
+		// the timestamp index current for a later state transition, but do not
+		// invalidate the synchronized count snapshot or force the next heartbeat
+		// back through the full descriptor scan.
+		if known && instance.State == old.state {
+			if instance.Timestamp > old.timestamp {
+				old.timestamp = instance.Timestamp
+				cache.states.Store(id, old)
+				if old.pending {
+					cache.pending.Store(id, old)
+				}
+			}
+			continue
+		}
+
 		newer := !known || instance.Timestamp > old.timestamp
 		leftOverride := known && instance.Timestamp == old.timestamp && old.state != dskitring.LEFT && instance.State == dskitring.LEFT
 		if !newer && !leftOverride {
@@ -492,13 +508,17 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 		cache.pending.Store(id, entry)
 	}
 
-	if changed {
-		// A decoded delta is only a partial view. Even when its counts are
-		// unchanged, a full watcher value must validate it before the fast
-		// heartbeat path can use the snapshot again.
-		next.synchronized = false
-		next.descriptorValidated = false
+	if !changed {
+		// Timestamp-only heartbeats update the side index above, but leave the
+		// atomic count value and its identity intact for an in-flight CAS.
+		return
 	}
+
+	// A decoded delta is only a partial view. Membership changes must be
+	// validated by a full watcher value before the fast heartbeat path can use
+	// the snapshot again.
+	next.synchronized = false
+	next.descriptorValidated = false
 	next.pending = hasPendingMembershipChange(cache)
 	cache.store(&next)
 	s.active = next.active

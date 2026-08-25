@@ -157,6 +157,78 @@ func TestMembershipSnapshotApplyDeltaInvalidatesSynchronization(t *testing.T) {
 	assert.Equal(t, 1, values.total)
 }
 
+func TestMembershipSnapshotIgnoresTimestampOnlyDelta(t *testing.T) {
+	rm := &RingManager{}
+	counts := rm.membershipSnapshot()
+	initial := &dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"active":  {Id: "active", State: dskitring.ACTIVE, Timestamp: 1},
+		"joining": {Id: "joining", State: dskitring.JOINING, Timestamp: 1},
+	}}
+	require.True(t, counts.replaceValuesIfCurrent(
+		nil,
+		1,
+		2,
+		map[string]dskitring.InstanceState{
+			"active":  dskitring.ACTIVE,
+			"joining": dskitring.JOINING,
+		},
+		map[string]int64{
+			"active":  1,
+			"joining": 1,
+		},
+		initial,
+		true,
+		false,
+	))
+
+	before := counts.read()
+	counts.applyDelta(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"active": {Id: "active", State: dskitring.ACTIVE, Timestamp: 2},
+	}})
+
+	after := counts.read()
+	require.Same(t, before.values, after.values, "a timestamp-only heartbeat must not replace the fast-path snapshot")
+	assert.True(t, after.synchronized)
+	assert.False(t, after.pending)
+	assert.True(t, after.values.descriptorValidated)
+	assert.Equal(t, 1, after.active)
+	assert.Equal(t, 2, after.total)
+	updated, ok := counts.cache.states.Load("active")
+	require.True(t, ok)
+	assert.Equal(t, int64(2), updated.(membershipEntryState).timestamp)
+
+	// A normal CAS heartbeat can keep using the same immutable snapshot after
+	// the remote timestamp advances; it must not fall back to countMembership.
+	lifecycler := &dskitring.BasicLifecycler{}
+	rm.lifecycler = lifecycler
+	rm.membershipWatcherObserved.Store(true)
+	rm.membershipChangeObserverPresent.Store(true)
+	rm.heartbeatCASActive.Store(true)
+	rm.heartbeatCASIdentity.Store(true)
+	rm.heartbeatCASSnapshot.Store(after.values)
+	local := initial.Ingesters["active"]
+	(&ringDelegate{rm: rm}).OnRingInstanceHeartbeat(lifecycler, initial, &local)
+	assert.Same(t, after.values, counts.read().values, "timestamp-only updates must preserve the callback snapshot")
+
+	// Once a real state transition is pending, later heartbeats in that same
+	// state must advance its timestamp without dropping the pending marker.
+	counts.applyDelta(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"active": {Id: "active", State: dskitring.LEAVING, Timestamp: 3},
+	}})
+	counts.applyDelta(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"active": {Id: "active", State: dskitring.LEAVING, Timestamp: 4},
+	}})
+
+	pending := counts.read()
+	assert.False(t, pending.synchronized)
+	assert.True(t, pending.pending)
+	assert.Equal(t, 0, pending.active)
+	updated, ok = counts.cache.states.Load("active")
+	require.True(t, ok)
+	assert.Equal(t, int64(4), updated.(membershipEntryState).timestamp)
+	assert.True(t, updated.(membershipEntryState).pending)
+}
+
 func TestHeartbeatSameTimestampAuthoritativeStateWins(t *testing.T) {
 	rm := &RingManager{logger: log.NewNopLogger(), lastKnownNodes: map[string]dskitring.InstanceState{}}
 	delegate := &ringDelegate{rm: rm}
