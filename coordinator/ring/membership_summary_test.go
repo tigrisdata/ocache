@@ -33,7 +33,18 @@ func (c *membershipSnapshotTestClient) CAS(_ context.Context, _ string, f func(i
 	return nil
 }
 
+type membershipSnapshotObservedClient struct {
+	*membershipSnapshotTestClient
+}
+
+func (c *membershipSnapshotObservedClient) Get(context.Context, string) (interface{}, error) {
+	return c.desc.Clone(), nil
+}
+
+func (c *membershipSnapshotObservedClient) RegisterRingChangeObserver(func(*dskitring.Desc)) {}
+
 var _ kv.Client = (*membershipSnapshotTestClient)(nil)
+var _ kv.Client = (*membershipSnapshotObservedClient)(nil)
 
 func membershipTestDesc(states ...dskitring.InstanceState) *dskitring.Desc {
 	ingesters := make(map[string]dskitring.InstanceDesc, len(states))
@@ -843,6 +854,75 @@ func TestPendingAdditionsDoNotRescanAnUnmergedDescriptor(t *testing.T) {
 	assert.Same(t, afterState, rm.membershipSnapshot().read().values)
 	assert.Equal(t, float64(1000), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
 	assert.Equal(t, float64(1000), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestMembershipClientReconcilesPendingAfterCAS(t *testing.T) {
+	rm := &RingManager{
+		logger:     log.NewNopLogger(),
+		lifecycler: &dskitring.BasicLifecycler{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	initial := membershipTestDesc(dskitring.ACTIVE, dskitring.ACTIVE)
+	rm.logMembershipChange(initial, 1)
+	rm.membershipWatcherObserved.Store(true)
+	rm.membershipChangeObserverPresent.Store(true)
+	rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"stale": {Id: "stale", State: dskitring.JOINING, Timestamp: 1},
+	}})
+
+	store := &membershipSnapshotObservedClient{
+		membershipSnapshotTestClient: &membershipSnapshotTestClient{desc: initial},
+	}
+	client := &membershipClient{delegate: store, manager: rm}
+	local := initial.Ingesters["node-a"]
+	require.NoError(t, client.CAS(context.Background(), RingKey, func(in interface{}) (interface{}, bool, error) {
+		delegate.OnRingInstanceHeartbeat(rm.lifecycler, in.(*dskitring.Desc), &local)
+		return in, true, nil
+	}))
+
+	values := rm.membershipSnapshot().read()
+	assert.False(t, values.pending)
+	assert.Equal(t, len(initial.Ingesters), values.total)
+	_, staleKnown := rm.membershipSnapshot().cache.states.Load("stale")
+	assert.False(t, staleKnown)
+}
+
+func TestMembershipSnapshotBoundsPendingDecodedAdditions(t *testing.T) {
+	rm := &RingManager{}
+	counts := rm.membershipSnapshot()
+	initial := membershipTestDesc(dskitring.ACTIVE, dskitring.ACTIVE, dskitring.JOINING, dskitring.LEAVING, dskitring.PENDING, dskitring.ACTIVE, dskitring.JOINING, dskitring.LEAVING, dskitring.PENDING, dskitring.ACTIVE)
+	counts.replace(initial, true)
+
+	for i := 0; i < 1000; i++ {
+		id := fmt.Sprintf("stale-%d", i)
+		counts.applyDelta(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+			id: {Id: id, State: dskitring.JOINING, Timestamp: int64(i + 1)},
+		}})
+	}
+
+	pending := 0
+	counts.cache.pending.Range(func(_, _ interface{}) bool {
+		pending++
+		return true
+	})
+	states := 0
+	counts.cache.states.Range(func(_, _ interface{}) bool {
+		states++
+		return true
+	})
+	values := counts.read().values
+	require.NotNil(t, values)
+	assert.LessOrEqual(t, pending, maxPendingMembershipChanges)
+	assert.LessOrEqual(t, states, len(initial.Ingesters)+maxPendingMembershipChanges)
+	assert.True(t, values.pendingOverflow)
+
+	// A complete watcher value is authoritative and clears both the retained
+	// entries and the overflow marker before the fast path is reused.
+	counts.replace(initial, true)
+	after := counts.read()
+	assert.False(t, after.pending)
+	assert.False(t, after.values.pendingOverflow)
+	assert.Equal(t, len(initial.Ingesters), after.total)
 }
 
 func TestMembershipClientDoesNotAddDescriptorEntries(t *testing.T) {

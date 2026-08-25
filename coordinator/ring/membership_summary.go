@@ -12,6 +12,11 @@ import (
 	dskitring "github.com/grafana/dskit/ring"
 )
 
+// Pending decoded changes bridge the short interval between memberlist decoding
+// a delta and installing it in the ring store. Bound this side index so rejected
+// stale deltas cannot retain an unbounded number of IDs.
+const maxPendingMembershipChanges = 256
+
 // membershipEntryCount is deliberately O(1) on the normal ring format. The
 // optimized heartbeat path never writes bookkeeping entries into Ingesters, so
 // len is the real membership cardinality and can be compared without another
@@ -47,6 +52,10 @@ type membershipSnapshotValues struct {
 	// the memberlist merge: repeated callbacks can reuse those counts without
 	// comparing cloned descriptor pointers or scanning the ring again.
 	callbackValidated bool
+	// pendingOverflow means the bounded pending index could not retain every
+	// decoded change. It keeps the snapshot on the authoritative fallback until a
+	// complete watcher value replaces it.
+	pendingOverflow bool
 }
 
 type membershipEntryState struct {
@@ -62,10 +71,11 @@ type membershipEntryState struct {
 // heartbeat path. Delta updates serialize only with one another; stable reads
 // do not take their update lock.
 type membershipSnapshotCache struct {
-	updateMu sync.Mutex
-	current  atomic.Pointer[membershipSnapshotValues]
-	states   sync.Map // map[string]membershipEntryState
-	pending  sync.Map // set of IDs whose decoded delta is not in a full descriptor yet
+	updateMu     sync.Mutex
+	current      atomic.Pointer[membershipSnapshotValues]
+	states       sync.Map // map[string]membershipEntryState
+	pending      sync.Map // set of IDs whose decoded delta is not in a full descriptor yet
+	pendingCount int      // guarded by updateMu
 }
 
 func (cache *membershipSnapshotCache) store(values *membershipSnapshotValues) {
@@ -76,6 +86,30 @@ func newMembershipSnapshotCache() *membershipSnapshotCache {
 	cache := &membershipSnapshotCache{}
 	cache.current.Store(&membershipSnapshotValues{})
 	return cache
+}
+
+// storePending and deletePending keep the bounded pending cardinality in sync
+// with the side index. Callers hold updateMu.
+func (cache *membershipSnapshotCache) storePending(id string, entry membershipEntryState) {
+	if _, loaded := cache.pending.LoadOrStore(id, entry); !loaded {
+		cache.pendingCount++
+		return
+	}
+	cache.pending.Store(id, entry)
+}
+
+func (cache *membershipSnapshotCache) deletePending(id string) {
+	if _, loaded := cache.pending.LoadAndDelete(id); loaded {
+		cache.pendingCount--
+	}
+}
+
+func (cache *membershipSnapshotCache) clearPending() {
+	cache.pending.Range(func(key, _ interface{}) bool {
+		cache.pending.Delete(key)
+		return true
+	})
+	cache.pendingCount = 0
 }
 
 // read returns a consistent view of the counters. The state index is kept
@@ -140,7 +174,7 @@ func (s *membershipCountSnapshot) confirmPending(desc *dskitring.Desc) {
 		if !ok || instance.State != change.state || instance.Timestamp != change.timestamp {
 			return true
 		}
-		cache.pending.Delete(id)
+		cache.deletePending(id)
 		if current, known := cache.states.Load(id); known {
 			entry := current.(membershipEntryState)
 			entry.pending = false
@@ -151,7 +185,7 @@ func (s *membershipCountSnapshot) confirmPending(desc *dskitring.Desc) {
 	})
 
 	values := cache.current.Load()
-	if values != nil && values.pending && !hasPendingMembershipChange(cache) {
+	if values != nil && values.pending && !values.pendingOverflow && !hasPendingMembershipChange(cache) {
 		next := *values
 		next.pending = false
 		cache.store(&next)
@@ -159,12 +193,7 @@ func (s *membershipCountSnapshot) confirmPending(desc *dskitring.Desc) {
 }
 
 func hasPendingMembershipChange(cache *membershipSnapshotCache) bool {
-	pending := false
-	cache.pending.Range(func(_, _ interface{}) bool {
-		pending = true
-		return false
-	})
-	return pending
+	return cache.pendingCount > 0
 }
 
 // membershipStatesMatch reports whether a complete watcher value has the same
@@ -355,15 +384,29 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 	activeCount := active
 	totalCount := total
 	pendingToRetain := make(map[string]membershipEntryState)
+	pendingOverflow := values != nil && values.pendingOverflow
+	if mergeNewer {
+		// A complete watcher value is the authoritative store state. It clears
+		// any bounded pending overflow left by an earlier decoded delta.
+		pendingOverflow = false
+	}
 	if retainPending {
 		// A heartbeat descriptor can be the value that a local CAS read before
-		// the decoded change was merged. Keep an absent pending entry in the
-		// side index so a later same-cardinality descriptor can prove the new
-		// member is present. A watcher value is authoritative and does not use
-		// this path, so it may discard an absent stale registration.
+		// the decoded change was merged. Keep a bounded number of absent pending
+		// entries so a later same-cardinality descriptor can prove the new member
+		// is present. A watcher value is authoritative and does not use this
+		// path, so it may discard an absent stale registration.
+		retainedAbsent := 0
 		for id, cached := range pendingChanges {
 			authoritative, exists := merged[id]
-			if (retainAbsentPending && !exists) || (exists && membershipEntryIsNewer(cached, authoritative)) {
+			if !exists && retainAbsentPending {
+				if retainedAbsent < maxPendingMembershipChanges {
+					pendingToRetain[id] = cached
+					retainedAbsent++
+				} else {
+					pendingOverflow = true
+				}
+			} else if exists && membershipEntryIsNewer(cached, authoritative) {
 				pendingToRetain[id] = cached
 			}
 		}
@@ -404,17 +447,14 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 		cache.states.Delete(key)
 		return true
 	})
-	cache.pending.Range(func(key, _ interface{}) bool {
-		cache.pending.Delete(key)
-		return true
-	})
+	cache.clearPending()
 
 	stateCopy := make(map[string]dskitring.InstanceState, len(merged))
 	timestampCopy := make(map[string]int64, len(merged))
 	for id, entry := range merged {
 		cache.states.Store(id, entry)
 		if entry.pending {
-			cache.pending.Store(id, entry)
+			cache.storePending(id, entry)
 		}
 		stateCopy[id] = entry.state
 		timestampCopy[id] = entry.timestamp
@@ -424,9 +464,9 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 			entry.counted = false
 			cache.states.Store(id, entry)
 		}
-		cache.pending.Store(id, entry)
+		cache.storePending(id, entry)
 	}
-	pending := hasPendingMembershipChange(cache)
+	pending := hasPendingMembershipChange(cache) || pendingOverflow
 	synchronized = synchronized && !pending
 	descriptorValidated = descriptorValidated && synchronized
 	cache.store(&membershipSnapshotValues{
@@ -437,6 +477,7 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 		pending:             pending,
 		descriptorValidated: descriptorValidated,
 		callbackValidated:   !mergeNewer,
+		pendingOverflow:     pendingOverflow,
 	})
 
 	// Keep these fields useful to package tests without putting them on the
@@ -509,7 +550,7 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 				old.timestamp = instance.Timestamp
 				cache.states.Store(id, old)
 				if old.pending {
-					cache.pending.Store(id, old)
+					cache.storePending(id, old)
 				}
 			}
 			continue
@@ -521,6 +562,15 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 			continue
 		}
 		changed = true
+
+		// An unknown decoded member may be rejected by a newer tombstone and
+		// never reach the full descriptor or watcher. Do not let those IDs grow
+		// the side indexes without limit. Overflow deliberately invalidates the
+		// fast path; a complete descriptor will restore an exact snapshot.
+		if !known && (next.pendingOverflow || cache.pendingCount >= maxPendingMembershipChanges) {
+			next.pendingOverflow = true
+			continue
+		}
 
 		counted := !known || old.counted
 		if counted {
@@ -538,7 +588,7 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 
 		entry := membershipEntryState{state: instance.State, timestamp: instance.Timestamp, pending: true, counted: counted}
 		cache.states.Store(id, entry)
-		cache.pending.Store(id, entry)
+		cache.storePending(id, entry)
 	}
 
 	if !changed {
@@ -553,7 +603,7 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 	next.synchronized = false
 	next.descriptorValidated = false
 	next.callbackValidated = false
-	next.pending = hasPendingMembershipChange(cache)
+	next.pending = hasPendingMembershipChange(cache) || next.pendingOverflow
 	cache.store(&next)
 	s.active = next.active
 	s.total = next.total
@@ -647,7 +697,31 @@ func (c *membershipClient) CAS(ctx context.Context, key string, f func(interface
 		c.manager.heartbeatCASIdentity.Store(false)
 		c.manager.heartbeatCASSnapshot.Store(nil)
 	}()
-	return c.delegate.CAS(ctx, key, f)
+
+	err := c.delegate.CAS(ctx, key, f)
+	if err != nil {
+		return err
+	}
+
+	// Decode observers run before memberlist merges a value. Once CAS returns,
+	// read the store only when a decoded delta is still pending so rejected
+	// stale additions can be discarded without adding work to stable beats.
+	counts := c.manager.membershipSnapshot()
+	read := counts.read()
+	if !read.pending {
+		return nil
+	}
+	value, getErr := c.delegate.Get(ctx, key)
+	if getErr != nil {
+		return nil
+	}
+	desc, ok := value.(*dskitring.Desc)
+	if !ok || desc == nil {
+		return nil
+	}
+	synchronized := c.manager.membershipWatcherObserved.Load() && c.manager.membershipChangeObserverPresent.Load()
+	counts.replace(desc, synchronized)
+	return nil
 }
 
 func (c *membershipClient) WatchKey(ctx context.Context, key string, f func(interface{}) bool) {
