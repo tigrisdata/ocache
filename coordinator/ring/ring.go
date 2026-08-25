@@ -873,21 +873,36 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 	// racing with it sends the callback through the authoritative fallback.
 	if normalHeartbeatContext {
 		if snapshot := d.rm.membershipCounts.Load(); snapshot != nil && snapshot.cache != nil {
-			if values := snapshot.cache.current.Load(); values != nil && values == heartbeatCASSnapshot && values.descriptorValidated && values.synchronized && !values.pending && values.total == len(ringDesc.Ingesters) {
+			if values := snapshot.cache.current.Load(); values != nil && values == heartbeatCASSnapshot && values.callbackValidated {
 				localStateKnown := d.rm.membershipLocalStateKnown.Load()
-				if localStateKnown && d.rm.membershipLocalState.Load() == int32(instanceDesc.State) {
+				localStateMatches := localStateKnown && d.rm.membershipLocalState.Load() == int32(instanceDesc.State)
+
+				// A decoded change may be waiting for memberlist to merge it. If
+				// this callback still sees the descriptor that was scanned before
+				// that merge, reuse those authoritative counts. Check the pending
+				// entries first so a same-cardinality replacement is reconciled
+				// instead of being accepted by a length-only test.
+				if values.pending && !snapshot.pendingMatches(ringDesc) && localStateMatches && snapshot.cache.current.Load() == values && d.rm.heartbeatCASSnapshot.Load() == values {
 					clusterNodesActive.Set(float64(values.active))
 					clusterNodesTotal.Set(float64(values.total))
 					return
 				}
-				if snapshot.updateLocalStateIfCurrent(values, ringDesc, instanceID, instanceDesc) {
-					d.rm.membershipLocalState.Store(int32(instanceDesc.State))
-					d.rm.membershipLocalStateKnown.Store(true)
-					if updated := snapshot.cache.current.Load(); updated != nil {
-						d.rm.heartbeatCASSnapshot.Store(updated)
-						clusterNodesActive.Set(float64(updated.active))
-						clusterNodesTotal.Set(float64(updated.total))
+
+				if values.descriptorValidated && values.synchronized && !values.pending && values.total == len(ringDesc.Ingesters) {
+					if localStateMatches {
+						clusterNodesActive.Set(float64(values.active))
+						clusterNodesTotal.Set(float64(values.total))
 						return
+					}
+					if snapshot.updateLocalStateIfCurrent(values, ringDesc, instanceID, instanceDesc) {
+						d.rm.membershipLocalState.Store(int32(instanceDesc.State))
+						d.rm.membershipLocalStateKnown.Store(true)
+						if updated := snapshot.cache.current.Load(); updated != nil {
+							d.rm.heartbeatCASSnapshot.Store(updated)
+							clusterNodesActive.Set(float64(updated.active))
+							clusterNodesTotal.Set(float64(updated.total))
+							return
+						}
 					}
 				}
 			}
@@ -923,7 +938,13 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 	if !read.synchronized || !read.values.descriptorValidated || read.total != membershipEntryCount(ringDesc) || instanceStateChanged || pendingMismatch || (!normalHeartbeatContext && read.pending) || missingHeartbeatContext || (read.descriptor != ringDesc && !normalHeartbeatContext) {
 		refreshed := countMembership(ringDesc)
 		synchronized := d.rm.membershipWatcherObserved.Load() && d.rm.membershipChangeObserverPresent.Load()
-		if counts.replaceValuesIfCurrent(read.values, refreshed.active, refreshed.total, refreshed.states, refreshed.timestamps, refreshed.descriptor, synchronized, retainPending) {
+		var replaced bool
+		if normalHeartbeatContext {
+			replaced = counts.replaceValuesIfCurrentRetainingAbsent(read.values, refreshed.active, refreshed.total, refreshed.states, refreshed.timestamps, refreshed.descriptor, synchronized, retainPending)
+		} else {
+			replaced = counts.replaceValuesIfCurrent(read.values, refreshed.active, refreshed.total, refreshed.states, refreshed.timestamps, refreshed.descriptor, synchronized, retainPending)
+		}
+		if replaced {
 			read = counts.read()
 			if normalHeartbeatContext {
 				d.rm.heartbeatCASSnapshot.Store(read.values)

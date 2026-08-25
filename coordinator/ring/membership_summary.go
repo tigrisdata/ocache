@@ -42,12 +42,20 @@ type membershipSnapshotValues struct {
 	// the heartbeat path. A watcher snapshot with a new member or state is
 	// therefore never trusted solely because its cardinality is unchanged.
 	descriptorValidated bool
+	// callbackValidated means the counts came from the descriptor passed to a
+	// heartbeat callback. It remains useful while a decoded delta is waiting for
+	// the memberlist merge: repeated callbacks can reuse those counts without
+	// comparing cloned descriptor pointers or scanning the ring again.
+	callbackValidated bool
 }
 
 type membershipEntryState struct {
 	state     dskitring.InstanceState
 	timestamp int64
 	pending   bool
+	// counted is false when a pending decoded member is absent from the
+	// descriptor used for the current counters.
+	counted bool
 }
 
 // membershipSnapshotCache keeps the counters in one atomic value for the
@@ -99,18 +107,22 @@ func (s *membershipCountSnapshot) pendingMatches(desc *dskitring.Desc) bool {
 		return false
 	}
 
+	// Probe one pending entry. A mismatch is enough to prove that this callback
+	// still has the pre-merge descriptor. If the probe matches, confirmPending
+	// checks the remaining entries once and the fallback reconciles the complete
+	// descriptor. This keeps repeated callbacks on an unmerged descriptor O(1)
+	// even when many decoded changes are waiting for the memberlist merge.
 	matches := true
+	checked := false
 	cache.pending.Range(func(key, value interface{}) bool {
 		id := key.(string)
 		change := value.(membershipEntryState)
 		instance, ok := desc.Ingesters[id]
-		if !ok || instance.State != change.state || instance.Timestamp != change.timestamp {
-			matches = false
-			return false
-		}
-		return true
+		matches = ok && instance.State == change.state && instance.Timestamp == change.timestamp
+		checked = true
+		return false
 	})
-	return matches
+	return !checked || matches
 }
 
 func (s *membershipCountSnapshot) confirmPending(desc *dskitring.Desc) {
@@ -132,6 +144,7 @@ func (s *membershipCountSnapshot) confirmPending(desc *dskitring.Desc) {
 		if current, known := cache.states.Load(id); known {
 			entry := current.(membershipEntryState)
 			entry.pending = false
+			entry.counted = true
 			cache.states.Store(id, entry)
 		}
 		return true
@@ -225,7 +238,7 @@ func (s *membershipCountSnapshot) updateLocalStateIfCurrent(expected *membership
 		}
 		next := *values
 		next.descriptor = descriptor
-		cache.states.Store(instanceID, membershipEntryState{state: current.state, timestamp: instanceDesc.Timestamp})
+		cache.states.Store(instanceID, membershipEntryState{state: current.state, timestamp: instanceDesc.Timestamp, counted: true})
 		cache.store(&next)
 		s.descriptor = descriptor
 		s.synchronized = next.synchronized
@@ -243,7 +256,7 @@ func (s *membershipCountSnapshot) updateLocalStateIfCurrent(expected *membership
 		next.active++
 	}
 	next.descriptor = descriptor
-	cache.states.Store(instanceID, membershipEntryState{state: instanceDesc.State, timestamp: instanceDesc.Timestamp})
+	cache.states.Store(instanceID, membershipEntryState{state: instanceDesc.State, timestamp: instanceDesc.Timestamp, counted: true})
 	cache.store(&next)
 	s.active = next.active
 	s.total = next.total
@@ -272,6 +285,7 @@ func replaceMergedMembershipEntry(merged map[string]membershipEntryState, id str
 	} else if current.state != dskitring.ACTIVE && candidate.state == dskitring.ACTIVE {
 		*active = *active + 1
 	}
+	candidate.counted = true
 	merged[id] = candidate
 }
 
@@ -286,14 +300,18 @@ func (s *membershipCountSnapshot) replaceValues(active, total int, states map[st
 // not changed since the caller read it. It is used by heartbeat transition
 // fallbacks, where the callback's descriptor is the authoritative input.
 func (s *membershipCountSnapshot) replaceValuesIfCurrent(expected *membershipSnapshotValues, active, total int, states map[string]dskitring.InstanceState, timestamps map[string]int64, descriptor *dskitring.Desc, synchronized, retainPending bool) bool {
-	return s.replaceValuesInternal(expected, false, retainPending, active, total, states, timestamps, descriptor, synchronized)
+	return s.replaceValuesInternal(expected, false, retainPending, false, active, total, states, timestamps, descriptor, synchronized)
+}
+
+func (s *membershipCountSnapshot) replaceValuesIfCurrentRetainingAbsent(expected *membershipSnapshotValues, active, total int, states map[string]dskitring.InstanceState, timestamps map[string]int64, descriptor *dskitring.Desc, synchronized, retainPending bool) bool {
+	return s.replaceValuesInternal(expected, false, retainPending, true, active, total, states, timestamps, descriptor, synchronized)
 }
 
 func (s *membershipCountSnapshot) replaceValuesMerged(expected *membershipSnapshotValues, active, total int, states map[string]dskitring.InstanceState, timestamps map[string]int64, descriptor *dskitring.Desc, synchronized bool) bool {
-	return s.replaceValuesInternal(expected, true, false, active, total, states, timestamps, descriptor, synchronized)
+	return s.replaceValuesInternal(expected, true, false, false, active, total, states, timestamps, descriptor, synchronized)
 }
 
-func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnapshotValues, mergeNewer, retainPending bool, active, total int, states map[string]dskitring.InstanceState, timestamps map[string]int64, descriptor *dskitring.Desc, synchronized bool) bool {
+func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnapshotValues, mergeNewer, retainPending, retainAbsentPending bool, active, total int, states map[string]dskitring.InstanceState, timestamps map[string]int64, descriptor *dskitring.Desc, synchronized bool) bool {
 	cache := s.ensureCache()
 	cache.updateMu.Lock()
 	defer cache.updateMu.Unlock()
@@ -332,24 +350,27 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 
 	merged := make(map[string]membershipEntryState, len(states))
 	for id, state := range states {
-		merged[id] = membershipEntryState{state: state, timestamp: timestamps[id]}
+		merged[id] = membershipEntryState{state: state, timestamp: timestamps[id], counted: true}
 	}
 	activeCount := active
 	totalCount := total
 	pendingToRetain := make(map[string]membershipEntryState)
 	if retainPending {
-		// An ID absent from the authoritative descriptor may be a stale
-		// registration rejected by a newer LEFT tombstone that dskit removed
-		// before this callback. Only retain a pending entry when the descriptor
-		// contains the same member and the delta is demonstrably newer.
+		// A heartbeat descriptor can be the value that a local CAS read before
+		// the decoded change was merged. Keep an absent pending entry in the
+		// side index so a later same-cardinality descriptor can prove the new
+		// member is present. A watcher value is authoritative and does not use
+		// this path, so it may discard an absent stale registration.
 		for id, cached := range pendingChanges {
 			authoritative, exists := merged[id]
-			if exists && membershipEntryIsNewer(cached, authoritative) {
+			if (retainAbsentPending && !exists) || (exists && membershipEntryIsNewer(cached, authoritative)) {
 				pendingToRetain[id] = cached
 			}
 		}
 		for id, cached := range pendingToRetain {
-			replaceMergedMembershipEntry(merged, id, cached, &activeCount, &totalCount)
+			if authoritative, exists := merged[id]; exists && membershipEntryIsNewer(cached, authoritative) {
+				replaceMergedMembershipEntry(merged, id, cached, &activeCount, &totalCount)
+			}
 		}
 	}
 	if mergeNewer {
@@ -398,6 +419,13 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 		stateCopy[id] = entry.state
 		timestampCopy[id] = entry.timestamp
 	}
+	for id, entry := range pendingToRetain {
+		if _, exists := merged[id]; !exists {
+			entry.counted = false
+			cache.states.Store(id, entry)
+		}
+		cache.pending.Store(id, entry)
+	}
 	pending := hasPendingMembershipChange(cache)
 	synchronized = synchronized && !pending
 	descriptorValidated = descriptorValidated && synchronized
@@ -408,6 +436,7 @@ func (s *membershipCountSnapshot) replaceValuesInternal(expected *membershipSnap
 		synchronized:        synchronized,
 		pending:             pending,
 		descriptorValidated: descriptorValidated,
+		callbackValidated:   !mergeNewer,
 	})
 
 	// Keep these fields useful to package tests without putting them on the
@@ -432,6 +461,7 @@ func (s *membershipCountSnapshot) markUnsynchronized() {
 	}
 	next := *values
 	next.synchronized = false
+	next.callbackValidated = false
 	cache.store(&next)
 	s.synchronized = false
 }
@@ -492,18 +522,21 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 		}
 		changed = true
 
-		if !known {
-			next.total++
-		} else if old.state == dskitring.ACTIVE && instance.State != dskitring.ACTIVE {
-			next.active--
-		} else if old.state != dskitring.ACTIVE && instance.State == dskitring.ACTIVE {
-			next.active++
-		}
-		if !known && instance.State == dskitring.ACTIVE {
-			next.active++
+		counted := !known || old.counted
+		if counted {
+			if !known {
+				next.total++
+			} else if old.state == dskitring.ACTIVE && instance.State != dskitring.ACTIVE {
+				next.active--
+			} else if old.state != dskitring.ACTIVE && instance.State == dskitring.ACTIVE {
+				next.active++
+			}
+			if !known && instance.State == dskitring.ACTIVE {
+				next.active++
+			}
 		}
 
-		entry := membershipEntryState{state: instance.State, timestamp: instance.Timestamp, pending: true}
+		entry := membershipEntryState{state: instance.State, timestamp: instance.Timestamp, pending: true, counted: counted}
 		cache.states.Store(id, entry)
 		cache.pending.Store(id, entry)
 	}
@@ -519,6 +552,7 @@ func (s *membershipCountSnapshot) applyDelta(desc *dskitring.Desc) {
 	// the snapshot again.
 	next.synchronized = false
 	next.descriptorValidated = false
+	next.callbackValidated = false
 	next.pending = hasPendingMembershipChange(cache)
 	cache.store(&next)
 	s.active = next.active

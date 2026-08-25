@@ -5,6 +5,7 @@ package ring
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/go-kit/log"
@@ -308,6 +309,41 @@ func TestHeartbeatDropsDecodedMemberAbsentFromAuthoritativeDescriptor(t *testing
 	assert.True(t, values.synchronized)
 	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
 	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestNormalHeartbeatDropsStaleDecodedAdditionAfterWatcher(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lifecycler:     &dskitring.BasicLifecycler{},
+		lastKnownNodes: map[string]dskitring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	rm.membershipWatcherObserved.Store(true)
+	rm.membershipChangeObserverPresent.Store(true)
+	rm.heartbeatCASActive.Store(true)
+	rm.heartbeatCASIdentity.Store(true)
+
+	authoritative := &dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"local":  {Id: "local", State: dskitring.ACTIVE, Timestamp: 2},
+		"remote": {Id: "remote", State: dskitring.ACTIVE, Timestamp: 2},
+	}}
+	rm.logMembershipChange(authoritative, 1)
+	rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"stale": {Id: "stale", State: dskitring.ACTIVE, Timestamp: 1},
+	}})
+
+	local := authoritative.Ingesters["local"]
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, authoritative.Clone().(*dskitring.Desc), &local)
+	assert.True(t, rm.membershipSnapshot().read().pending)
+
+	// The authoritative watcher omits the stale registration. It must clear the
+	// pending side index rather than resurrecting that member on the next beat.
+	rm.logMembershipChange(authoritative, 2)
+	values := rm.membershipSnapshot().read()
+	assert.False(t, values.pending)
+	assert.Equal(t, 2, values.total)
+	assert.Equal(t, 2, values.active)
 }
 
 func TestExistingReservedNameRemainsAClusterMember(t *testing.T) {
@@ -692,6 +728,121 @@ func TestMembershipSnapshotTracksWatcherStateChanges(t *testing.T) {
 		assert.Equal(t, wantActive[i], counts.active)
 		assert.Equal(t, wantTotal[i], counts.total)
 	}
+}
+
+func TestPendingAdditionCannotHideSameCardinalityReplacement(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lifecycler:     &dskitring.BasicLifecycler{},
+		lastKnownNodes: map[string]dskitring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	rm.membershipWatcherObserved.Store(true)
+	rm.membershipChangeObserverPresent.Store(true)
+	rm.heartbeatCASActive.Store(true)
+	rm.heartbeatCASIdentity.Store(true)
+
+	initial := &dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"local":  {Id: "local", State: dskitring.ACTIVE, Timestamp: 1},
+		"remote": {Id: "remote", State: dskitring.ACTIVE, Timestamp: 1},
+	}}
+	rm.logMembershipChange(initial, 1)
+	local := initial.Ingesters["local"]
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, initial, &local)
+
+	// The decoder observes a new member before the memberlist merge. A
+	// concurrent heartbeat can still receive the old descriptor.
+	rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"joining": {Id: "joining", State: dskitring.JOINING, Timestamp: 2},
+	}})
+	old := initial.Clone().(*dskitring.Desc)
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, old, &local)
+
+	// The same decoded change is now visible, replacing the old remote member.
+	// Cardinality alone cannot distinguish this descriptor from the old one.
+	replaced := &dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"local":   local,
+		"joining": {Id: "joining", State: dskitring.JOINING, Timestamp: 2},
+	}}
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, replaced, &local)
+
+	counts := rm.membershipSnapshot().read()
+	assert.Equal(t, 1, counts.active)
+	assert.Equal(t, 2, counts.total)
+	assert.Equal(t, float64(1), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(2), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
+}
+
+func TestPendingAdditionsDoNotRescanAnUnmergedDescriptor(t *testing.T) {
+	rm := &RingManager{
+		logger:         log.NewNopLogger(),
+		lifecycler:     &dskitring.BasicLifecycler{},
+		lastKnownNodes: map[string]dskitring.InstanceState{},
+	}
+	delegate := &ringDelegate{rm: rm}
+	rm.membershipWatcherObserved.Store(true)
+	rm.membershipChangeObserverPresent.Store(true)
+	rm.heartbeatCASActive.Store(true)
+	rm.heartbeatCASIdentity.Store(true)
+
+	initial := heartbeatBenchmarkDesc(1000)
+	rm.logMembershipChange(initial, 1)
+	local := initial.Ingesters["member-0"]
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, initial, &local)
+
+	// Keep the decoded additions pending and make the callback continue to see
+	// the pre-merge descriptor. The callback must retain the scanned counts, not
+	// rebuild them on every heartbeat while waiting for the watcher.
+	for member := 1000; member < 1257; member++ {
+		rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+			fmt.Sprintf("member-%d", member): {
+				Id:        fmt.Sprintf("member-%d", member),
+				State:     dskitring.JOINING,
+				Timestamp: int64(member),
+			},
+		}})
+	}
+
+	old := initial.Clone().(*dskitring.Desc)
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, old, &local)
+	first := rm.membershipSnapshot().read().values
+	require.NotNil(t, first)
+	assert.True(t, first.pending)
+	assert.Equal(t, 1000, first.total)
+
+	for i := 0; i < 100; i++ {
+		rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+		delegate.OnRingInstanceHeartbeat(rm.lifecycler, old.Clone().(*dskitring.Desc), &local)
+	}
+
+	assert.Same(t, first, rm.membershipSnapshot().read().values)
+	assert.Equal(t, 1000, rm.membershipSnapshot().read().total)
+
+	// A later decoded state transition for an addition that is still absent
+	// must update the pending side index without changing counts for the old
+	// descriptor.
+	rm.applyMembershipChange(&dskitring.Desc{Ingesters: map[string]dskitring.InstanceDesc{
+		"member-1000": {Id: "member-1000", State: dskitring.ACTIVE, Timestamp: 2000},
+	}})
+	rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+	delegate.OnRingInstanceHeartbeat(rm.lifecycler, old, &local)
+	afterState := rm.membershipSnapshot().read().values
+	assert.Equal(t, 1000, afterState.active)
+	assert.Equal(t, 1000, afterState.total)
+
+	for i := 0; i < 100; i++ {
+		rm.heartbeatCASSnapshot.Store(rm.membershipSnapshot().read().values)
+		delegate.OnRingInstanceHeartbeat(rm.lifecycler, old.Clone().(*dskitring.Desc), &local)
+	}
+
+	assert.Same(t, afterState, rm.membershipSnapshot().read().values)
+	assert.Equal(t, float64(1000), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("active")))
+	assert.Equal(t, float64(1000), testutil.ToFloat64(metrics.ClusterNodes.WithLabelValues("total")))
 }
 
 func TestMembershipClientDoesNotAddDescriptorEntries(t *testing.T) {
