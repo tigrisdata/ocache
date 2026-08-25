@@ -97,19 +97,71 @@ func prepareHeartbeatBenchmark(manager *RingManager, ringDesc *dskitring.Desc) {
 		"membershipChangeObserverPresent",
 		"heartbeatCASActive",
 	} {
-		field := value.FieldByName(name)
-		if !field.IsValid() || !field.CanAddr() {
-			continue
-		}
-		// These are atomic.Bool fields in the optimized revision. Reaching them
-		// by name keeps this benchmark source compilable on the scan baseline,
-		// where the fields do not exist.
-		field = reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
-		store := field.Addr().MethodByName("Store")
-		if store.IsValid() {
-			store.Call([]reflect.Value{reflect.ValueOf(true)})
-		}
+		setHeartbeatBenchmarkBool(value.FieldByName(name))
 	}
+	setHeartbeatBenchmarkSnapshot(value)
+	if manager.lifecycler != nil {
+		localInstance := ringDesc.Ingesters["member-0"]
+		(&ringDelegate{rm: manager}).OnRingInstanceHeartbeat(manager.lifecycler, ringDesc, &localInstance)
+		setHeartbeatBenchmarkSnapshot(value)
+	}
+}
+
+func setHeartbeatBenchmarkBool(field reflect.Value) {
+	if !field.IsValid() || !field.CanAddr() {
+		return
+	}
+	// These are atomic.Bool fields in the optimized revision. Reaching them
+	// by name keeps this benchmark source compilable on the scan baseline,
+	// where the fields do not exist.
+	field = writableHeartbeatBenchmarkValue(field)
+	store := field.Addr().MethodByName("Store")
+	if store.IsValid() {
+		store.Call([]reflect.Value{reflect.ValueOf(true)})
+	}
+}
+
+func setHeartbeatBenchmarkSnapshot(manager reflect.Value) {
+	counts := loadHeartbeatBenchmarkAtomic(manager.FieldByName("membershipCounts"))
+	if !counts.IsValid() || counts.IsNil() {
+		return
+	}
+	cache := writableHeartbeatBenchmarkValue(counts.Elem().FieldByName("cache"))
+	if !cache.IsValid() || cache.IsNil() {
+		return
+	}
+	current := loadHeartbeatBenchmarkAtomic(cache.Elem().FieldByName("current"))
+	if !current.IsValid() || current.IsNil() {
+		return
+	}
+	field := manager.FieldByName("heartbeatCASSnapshot")
+	if !field.IsValid() || !field.CanAddr() {
+		return
+	}
+	field = writableHeartbeatBenchmarkValue(field)
+	store := field.Addr().MethodByName("Store")
+	if store.IsValid() {
+		store.Call([]reflect.Value{current})
+	}
+}
+
+func loadHeartbeatBenchmarkAtomic(field reflect.Value) reflect.Value {
+	if !field.IsValid() || !field.CanAddr() {
+		return reflect.Value{}
+	}
+	field = writableHeartbeatBenchmarkValue(field)
+	load := field.Addr().MethodByName("Load")
+	if !load.IsValid() {
+		return reflect.Value{}
+	}
+	return load.Call(nil)[0]
+}
+
+func writableHeartbeatBenchmarkValue(field reflect.Value) reflect.Value {
+	if !field.IsValid() || !field.CanAddr() {
+		return reflect.Value{}
+	}
+	return reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
 }
 
 func heartbeatBenchmarkDesc(members int) *dskitring.Desc {
