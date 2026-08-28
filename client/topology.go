@@ -27,6 +27,12 @@ type TopologyManager struct {
 	refreshInterval time.Duration
 	dialOpts        []grpc.DialOption
 	mu              sync.RWMutex // Protects topology updates
+
+	// retryEpoch keeps a topology refresh alive when a pool dial failed after
+	// the topology itself was published. This lets the next same-epoch refresh
+	// retry the missing pool instead of treating the topology as unchanged.
+	retryEpoch   atomic.Uint64
+	retryPending atomic.Bool
 }
 
 // NewTopologyManager creates a new topology manager
@@ -139,46 +145,57 @@ func (tm *TopologyManager) fetchTopologyFromAddress(ctx context.Context, addr st
 	return resp.Topology, nil
 }
 
-// UpdateTopology updates the internal state based on new topology.
-// With content-addressable epochs, same epoch = same ring state, so we
-// use equality check (not >=) to detect changes.
-func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (map[string]bool, bool) {
-	// Guard against nil topology
+// preparedTopology contains the state needed to publish a topology update.
+type preparedTopology struct {
+	baseEpoch   uint64
+	epoch       uint64
+	activeNodes map[string]bool
+	activeAddrs map[string]bool
+	ring        *ringState
+}
+
+// prepareTopology builds a topology update without publishing it. The client
+// stages its connection pools from this state before applying it to the token
+// ring, so readers never observe a ring without its new connections.
+func (tm *TopologyManager) prepareTopology(topology *clusterpb.ClusterTopology) (*preparedTopology, bool) {
+	return tm.prepareTopologyWithRetry(topology, false)
+}
+
+// prepareTopologyForRetry rebuilds a topology update whose epoch is already
+// published but still has a pool that failed to stage.
+func (tm *TopologyManager) prepareTopologyForRetry(topology *clusterpb.ClusterTopology) (*preparedTopology, bool) {
+	return tm.prepareTopologyWithRetry(topology, true)
+}
+
+func (tm *TopologyManager) prepareTopologyWithRetry(topology *clusterpb.ClusterTopology, allowSameEpoch bool) (*preparedTopology, bool) {
 	if topology == nil {
 		return nil, false
 	}
 
-	// Fast path: check epoch without lock first
-	currentEpoch := tm.topologyEpoch.Load()
-	if currentEpoch == topology.Epoch {
-		return nil, false // Same ring state, no update needed
+	tm.mu.RLock()
+	baseEpoch := tm.topologyEpoch.Load()
+	tm.mu.RUnlock()
+	if !allowSameEpoch && baseEpoch == topology.Epoch {
+		return nil, false
 	}
 
-	// Slow path: acquire lock and re-check to prevent race conditions
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-
-	// Re-check epoch under lock to prevent concurrent updates from
-	// overwriting newer topology with older data
-	currentEpoch = tm.topologyEpoch.Load()
-	if currentEpoch == topology.Epoch {
-		return nil, false // Another goroutine already updated
-	}
-
-	// Build active nodes and addresses
 	activeNodes := make(map[string]bool)
+	activeAddrs := make(map[string]bool)
 	nodeAddresses := make(map[string]string)
 	for _, node := range topology.Nodes {
-		if node.Status == clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
-			// Use listen address for client connections
-			listenAddr := node.ListenAddress
-			if listenAddr == "" {
-				// ListenAddress is required - skip improperly configured nodes
-				continue
-			}
-			activeNodes[node.Id] = true
-			nodeAddresses[node.Id] = listenAddr
+		if node.Status != clusterpb.NodeStatus_NODE_STATUS_ACTIVE {
+			continue
 		}
+
+		// Use listen address for client connections.
+		listenAddr := node.ListenAddress
+		if listenAddr == "" {
+			// ListenAddress is required - skip improperly configured nodes.
+			continue
+		}
+		activeNodes[node.Id] = true
+		activeAddrs[listenAddr] = true
+		nodeAddresses[node.Id] = listenAddr
 	}
 
 	// Build token map from RingConfig.NodeTokens, but only for active nodes.
@@ -186,20 +203,47 @@ func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (
 	nodeTokens := make(map[string][]uint32)
 	if topology.RingConfig != nil {
 		for _, nt := range topology.RingConfig.NodeTokens {
-			// Only include tokens for nodes that are active
 			if activeNodes[nt.NodeId] {
-				nodeTokens[nt.NodeId] = nt.Tokens
+				nodeTokens[nt.NodeId] = append([]uint32(nil), nt.Tokens...)
 			}
 		}
 	}
 
-	// Update the token ring (thread-safe internally)
-	tm.ring.Update(nodeTokens, nodeAddresses)
+	return &preparedTopology{
+		baseEpoch:   baseEpoch,
+		epoch:       topology.Epoch,
+		activeNodes: activeNodes,
+		activeAddrs: activeAddrs,
+		ring:        buildRingState(nodeTokens, nodeAddresses),
+	}, true
+}
 
-	// Store new epoch
-	tm.topologyEpoch.Store(topology.Epoch)
+// applyPreparedTopology publishes a topology if the state it was prepared
+// from is still current. The ring and epoch are changed together under the
+// topology lock after pool staging; the client then publishes the matching
+// connection set pointer.
+func (tm *TopologyManager) applyPreparedTopology(update *preparedTopology) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 
-	return activeNodes, true
+	if tm.topologyEpoch.Load() != update.baseEpoch {
+		return false
+	}
+
+	tm.ring.state.Store(update.ring)
+	tm.topologyEpoch.Store(update.epoch)
+	return true
+}
+
+// UpdateTopology updates the internal state based on new topology.
+// With content-addressable epochs, same epoch = same ring state, so we use
+// equality check (not >=) to detect changes.
+func (tm *TopologyManager) UpdateTopology(topology *clusterpb.ClusterTopology) (map[string]bool, bool) {
+	update, changed := tm.prepareTopology(topology)
+	if !changed || !tm.applyPreparedTopology(update) {
+		return nil, false
+	}
+	return update.activeNodes, true
 }
 
 // GetNodeForKey returns the node address for a given key.
@@ -223,6 +267,29 @@ func (tm *TopologyManager) GetNodeInfoForKey(key string) (nodeID, address string
 // Uses atomic load for lock-free access.
 func (tm *TopologyManager) GetTopologyEpoch() uint64 {
 	return tm.topologyEpoch.Load()
+}
+
+func (tm *TopologyManager) requestTopologyRetry(epoch uint64) {
+	tm.retryEpoch.Store(epoch)
+	tm.retryPending.Store(true)
+}
+
+func (tm *TopologyManager) shouldRetryTopology(epoch uint64) bool {
+	return tm.retryPending.Load() && tm.retryEpoch.Load() == epoch
+}
+
+func (tm *TopologyManager) clearTopologyRetry() {
+	tm.retryPending.Store(false)
+}
+
+// getNodeAddressesAndEpoch returns a coherent topology snapshot for connection
+// reconciliation. The read lock keeps the ring state and epoch from being
+// observed across the middle of an update.
+func (tm *TopologyManager) getNodeAddressesAndEpoch() (map[string]string, uint64) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	return tm.ring.GetNodeAddresses(), tm.topologyEpoch.Load()
 }
 
 // GetNodeAddresses returns all node addresses
@@ -253,6 +320,34 @@ func (tm *TopologyManager) TopologyRefreshLoop(ctx context.Context, updateFn fun
 
 			if changed && updateFn != nil {
 				updateFn()
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// TopologyRefreshLoopWithTopology refreshes topology without publishing it
+// until updateFn has staged the corresponding connection pools. A pending
+// same-epoch retry is also delivered so a failed pool dial can recover.
+func (tm *TopologyManager) TopologyRefreshLoopWithTopology(ctx context.Context, updateFn func(*clusterpb.ClusterTopology)) {
+	ticker := time.NewTicker(tm.refreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			fetchCtx, cancel := context.WithTimeout(ctx, TopologyDetectTimeout)
+			topology, err := tm.FetchTopology(fetchCtx)
+			cancel()
+			if err != nil || topology == nil {
+				continue
+			}
+			if tm.GetTopologyEpoch() == topology.Epoch && !tm.shouldRetryTopology(topology.Epoch) {
+				continue
+			}
+			if updateFn != nil {
+				updateFn(topology)
 			}
 		case <-ctx.Done():
 			return

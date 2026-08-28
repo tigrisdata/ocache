@@ -6,6 +6,7 @@ package cacheclient
 import (
 	"context"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,7 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 	clusterpb "github.com/tigrisdata/ocache/coordinator/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // TestTopologyRefreshLoop_PeriodicUpdate verifies automatic refresh
@@ -190,6 +193,93 @@ func TestUpdateTopology_PoolManagement(t *testing.T) {
 	assert.Len(t, connectedNodes, 2)
 	assert.Contains(t, connectedNodes, addresses[0])
 	assert.Contains(t, connectedNodes, addresses[2])
+}
+
+// TestTopology_RetiresRemovedPoolWhenNewMemberDialFails ensures a partial
+// refresh does not keep pools for members removed by the attempted topology.
+func TestTopology_RetiresRemovedPoolWhenNewMemberDialFails(t *testing.T) {
+	servers := make([]*testServer, 2)
+	addresses := make([]string, 2)
+	for i := range servers {
+		server, err := newTestServerWithAddr()
+		require.NoError(t, err)
+		defer server.Stop()
+		servers[i] = server
+		addresses[i] = server.address
+	}
+
+	initial := setupSimpleTopology(addresses)
+	servers[0].cacheService.SetClusterTopology(initial)
+	badAddr := "127.0.0.1:1"
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{addresses[0]},
+		ConnectionPoolSize: 1,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+			grpc.WithTimeout(50 * time.Millisecond),
+		},
+	})
+	require.NoError(t, err)
+	defer client.Close()
+	require.ElementsMatch(t, addresses, client.GetConnectedNodes())
+
+	updated := setupSimpleTopology([]string{addresses[0], badAddr})
+	updated.Epoch = 2
+	require.NoError(t, client.UpdateTopology(updated))
+
+	assert.Equal(t, []string{addresses[0]}, client.GetConnectedNodes())
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
+}
+
+// TestTopology_RetriesFailedPoolAtSameEpoch ensures a transient pool dial
+// failure is retried even when the topology epoch does not change.
+func TestTopology_RetriesFailedPoolAtSameEpoch(t *testing.T) {
+	servers := make([]*testServer, 2)
+	addresses := make([]string, 2)
+	for i := range servers {
+		server, err := newTestServerWithAddr()
+		require.NoError(t, err)
+		defer server.Stop()
+		servers[i] = server
+		addresses[i] = server.address
+	}
+
+	initial := setupSimpleTopology([]string{addresses[0]})
+	servers[0].cacheService.SetClusterTopology(initial)
+	var attempts atomic.Int32
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == addresses[1] && attempts.Add(1) == 1 {
+			return nil, fmt.Errorf("transient dial failure")
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{addresses[0]},
+		ConnectionPoolSize: 1,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+			grpc.FailOnNonTempDialError(true),
+			grpc.WithTimeout(100 * time.Millisecond),
+		},
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	updated := setupSimpleTopology(addresses)
+	updated.Epoch = 2
+	require.NoError(t, client.UpdateTopology(updated))
+	require.Equal(t, int32(1), attempts.Load())
+	assert.Equal(t, []string{addresses[0]}, client.GetConnectedNodes())
+
+	require.NoError(t, client.UpdateTopology(updated))
+	assert.Equal(t, int32(2), attempts.Load())
+	assert.ElementsMatch(t, addresses, client.GetConnectedNodes())
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
 }
 
 // TestTopology_ConcurrentReads tests concurrent read operations during topology changes
@@ -528,6 +618,513 @@ func TestTopology_TokenReassignment(t *testing.T) {
 	// Verify the ring has been updated
 	assert.True(t, client.HasRing())
 	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
+}
+
+// TestTopology_NoRoutingGapWhileAddingNode ensures the refresh path does not
+// expose a new ring while its member pool is still being constructed.
+func TestTopology_NoRoutingGapWhileAddingNode(t *testing.T) {
+	servers := make([]*testServer, 3)
+	addresses := make([]string, 3)
+	for i := range servers {
+		server, err := newTestServerWithAddr()
+		require.NoError(t, err)
+		servers[i] = server
+		addresses[i] = server.address
+		defer server.Stop()
+	}
+
+	initial := setupSimpleTopology(addresses[:2])
+	added := setupSimpleTopology(addresses)
+	added.Epoch = 2
+	for _, server := range servers {
+		server.cacheService.SetClusterTopology(initial)
+	}
+
+	var block atomic.Bool
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDial := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == addresses[2] && block.Load() {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{addresses[0]},
+		ConnectionPoolSize: 1,
+		RefreshInterval:    2 * time.Millisecond,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		block.Store(false)
+		releaseDial()
+		if client != nil {
+			_ = client.Close()
+		}
+	}()
+
+	newRing := NewTokenRing()
+	nodeTokens := make(map[string][]uint32)
+	nodeAddresses := make(map[string]string)
+	for _, node := range added.Nodes {
+		nodeAddresses[node.Id] = node.ListenAddress
+	}
+	for _, nodeTokensForNode := range added.RingConfig.NodeTokens {
+		nodeTokens[nodeTokensForNode.NodeId] = nodeTokensForNode.Tokens
+	}
+	newRing.Update(nodeTokens, nodeAddresses)
+
+	var key string
+	for i := 0; i < 100000; i++ {
+		candidate := string(rune(i))
+		oldAddr, oldErr := client.topology.GetNodeForKey(candidate)
+		newAddr, newErr := newRing.GetNodeForKey(candidate)
+		if oldErr == nil && newErr == nil && oldAddr != addresses[2] && newAddr == addresses[2] {
+			key = candidate
+			break
+		}
+	}
+	require.NotEmpty(t, key, "no key moved to added member")
+
+	block.Store(true)
+	for _, server := range servers {
+		server.cacheService.SetClusterTopology(added)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		releaseDial()
+		_ = client.Close()
+		t.Fatal("refresh did not start blocked dial")
+	}
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, routeErr := client.Route(key)
+		if routeErr != nil {
+			releaseDial()
+			_ = client.Close()
+			t.Fatalf("route failed while new pool was staging: %v", routeErr)
+		}
+	}
+
+	releaseDial()
+	block.Store(false)
+	deadline = time.Now().Add(time.Second)
+	for client.GetTopologyEpoch() != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
+}
+
+// TestTopology_WaitsForReplacementBeforeRoutingRemovedOwner ensures a route
+// does not use a removed pool while its replacement is being staged.
+func TestTopology_WaitsForReplacementBeforeRoutingRemovedOwner(t *testing.T) {
+	oldServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer oldServer.Stop()
+	newServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer newServer.Stop()
+
+	initial := setupSimpleTopology([]string{oldServer.address})
+	oldServer.cacheService.SetClusterTopology(initial)
+	var block atomic.Bool
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == newServer.address && block.Load() {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{oldServer.address},
+		ConnectionPoolSize: 1,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		block.Store(false)
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = client.Close()
+	}()
+
+	block.Store(true)
+	updated := setupSimpleTopology([]string{newServer.address})
+	updated.Epoch = 2
+	updateDone := make(chan error, 1)
+	go func() { updateDone <- client.UpdateTopology(updated) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("replacement dial did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	getDone := make(chan error, 1)
+	go func() {
+		_, routeErr := client.Get(ctx, "replacement-route-key")
+		getDone <- routeErr
+	}()
+	listDone := make(chan error, 1)
+	go func() {
+		_, _, _, routeErr := client.ListPage(ctx, "", 1, "")
+		listDone <- routeErr
+	}()
+	select {
+	case routeErr := <-getDone:
+		t.Fatalf("keyed operation returned before its context expired: %v", routeErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case routeErr := <-listDone:
+		t.Fatalf("round-robin operation returned before its context expired: %v", routeErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	require.ErrorIs(t, <-getDone, context.DeadlineExceeded)
+	require.ErrorIs(t, <-listDone, context.DeadlineExceeded)
+
+	close(release)
+	require.NoError(t, <-updateDone)
+	conn, routeErr := client.Route("replacement-route-key")
+	require.NoError(t, routeErr)
+	require.NotNil(t, conn)
+	assert.Equal(t, newServer.address, conn.address)
+}
+
+// TestTopology_CloseCancelsBlockedPoolStaging ensures Close interrupts a
+// blocking replacement dial instead of waiting for an unreachable member.
+func TestTopology_CloseCancelsBlockedPoolStaging(t *testing.T) {
+	oldServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer oldServer.Stop()
+	newServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer newServer.Stop()
+
+	initial := setupSimpleTopology([]string{oldServer.address})
+	oldServer.cacheService.SetClusterTopology(initial)
+	var block atomic.Bool
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDial := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == newServer.address && block.Load() {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{oldServer.address},
+		ConnectionPoolSize: 1,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		block.Store(false)
+		releaseDial()
+		_ = client.Close()
+	}()
+
+	block.Store(true)
+	updated := setupSimpleTopology([]string{newServer.address})
+	updated.Epoch = 2
+	updateDone := make(chan error, 1)
+	go func() { updateDone <- client.UpdateTopology(updated) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("replacement dial did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close() }()
+	select {
+	case closeErr := <-closeDone:
+		require.NoError(t, closeErr)
+	case <-time.After(time.Second):
+		releaseDial()
+		t.Fatal("Close waited for the blocked replacement dial")
+	}
+	select {
+	case updateErr := <-updateDone:
+		require.NoError(t, updateErr)
+	case <-time.After(time.Second):
+		t.Fatal("topology update did not stop after Close")
+	}
+}
+
+// TestTopology_RoutingRetryCancelsBlockedPoolStaging ensures a routing-error
+// retry stops a replacement dial when the operation context expires.
+func TestTopology_RoutingRetryCancelsBlockedPoolStaging(t *testing.T) {
+	oldServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer oldServer.Stop()
+	newServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer newServer.Stop()
+
+	initial := setupSimpleTopology([]string{oldServer.address})
+	oldServer.cacheService.SetClusterTopology(initial)
+
+	var block atomic.Bool
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDial := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == newServer.address && block.Load() {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{oldServer.address},
+		ConnectionPoolSize: 1,
+		RefreshInterval:    time.Hour,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		block.Store(false)
+		releaseDial()
+		_ = client.Close()
+	}()
+
+	block.Store(true)
+	updated := setupSimpleTopology([]string{oldServer.address, newServer.address})
+	updated.Epoch = 2
+	oldServer.cacheService.SetClusterTopology(updated)
+	oldServer.cacheService.getError = status.Error(codes.Unavailable, "routing error")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	operationDone := make(chan error, 1)
+	go func() {
+		_, err := client.Get(ctx, "routing-retry-cancellation-key")
+		operationDone <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("routing retry did not start replacement dial")
+	}
+
+	select {
+	case err := <-operationDone:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("routing retry waited past the operation deadline")
+	}
+
+	releaseDial()
+	assert.Equal(t, uint64(1), client.GetTopologyEpoch())
+	assert.Equal(t, []string{oldServer.address}, client.GetConnectedNodes())
+}
+
+// TestTopology_RoutingRetryCancelsWhileBackgroundStages ensures an operation
+// deadline also interrupts waiting for a concurrent background refresh.
+func TestTopology_RoutingRetryCancelsWhileBackgroundStages(t *testing.T) {
+	oldServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer oldServer.Stop()
+	newServer, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer newServer.Stop()
+
+	initial := setupSimpleTopology([]string{oldServer.address})
+	oldServer.cacheService.SetClusterTopology(initial)
+
+	var block atomic.Bool
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDial := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == newServer.address && block.Load() {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{oldServer.address},
+		ConnectionPoolSize: 1,
+		RefreshInterval:    time.Hour,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+		},
+	})
+	require.NoError(t, err)
+	defer func() {
+		block.Store(false)
+		releaseDial()
+		_ = client.Close()
+	}()
+
+	block.Store(true)
+	updated := setupSimpleTopology([]string{oldServer.address, newServer.address})
+	updated.Epoch = 2
+	oldServer.cacheService.SetClusterTopology(updated)
+	oldServer.cacheService.getError = status.Error(codes.Unavailable, "routing error")
+
+	backgroundDone := make(chan error, 1)
+	go func() {
+		backgroundDone <- client.UpdateTopology(updated)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background refresh did not start replacement dial")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	operationDone := make(chan error, 1)
+	go func() {
+		_, err := client.Get(ctx, "background-refresh-cancellation-key")
+		operationDone <- err
+	}()
+
+	select {
+	case err := <-operationDone:
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("routing retry waited for background staging after its deadline")
+	}
+
+	block.Store(false)
+	releaseDial()
+	require.NoError(t, <-backgroundDone)
+	assert.Equal(t, uint64(2), client.GetTopologyEpoch())
+	assert.ElementsMatch(t, []string{oldServer.address, newServer.address}, client.GetConnectedNodes())
+}
+
+// TestTopology_RetainsReachablePoolWhenMemberDialFails ensures a failed member
+// does not discard pools which were constructed for reachable members.
+func TestTopology_RetainsReachablePoolWhenMemberDialFails(t *testing.T) {
+	server, err := newTestServerWithAddr()
+	require.NoError(t, err)
+	defer server.Stop()
+
+	badAddr := "127.0.0.1:1"
+	topology := setupSimpleTopology([]string{server.address, badAddr})
+	server.cacheService.SetClusterTopology(topology)
+
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		if addr == badAddr {
+			return nil, fmt.Errorf("dial disabled for test member")
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+	client, err := NewClusterClient(&ClientConfig{
+		Addrs:              []string{server.address},
+		ConnectionPoolSize: 1,
+		DialOpts: []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer),
+			grpc.WithBlock(),
+			grpc.FailOnNonTempDialError(true),
+			grpc.WithTimeout(50 * time.Millisecond),
+		},
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	assert.Equal(t, []string{server.address}, client.GetConnectedNodes())
+	var key string
+	for i := 0; i < 100000; i++ {
+		candidate := fmt.Sprintf("reachable-member-key-%d", i)
+		addr, routeErr := client.topology.GetNodeForKey(candidate)
+		if routeErr == nil && addr == server.address {
+			key = candidate
+			break
+		}
+	}
+	require.NotEmpty(t, key, "no key owned by reachable member")
+	_, err = client.Route(key)
+	assert.NoError(t, err)
 }
 
 // isTransientError checks if an error is transient (expected during topology changes)
