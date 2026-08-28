@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -22,19 +23,23 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 )
 
+const minHostBufferCapacity = ring.GetBufferSize + 1
+
 // instanceDescPool is a sync.Pool for reusing InstanceDesc slices in hot-path ring lookups.
 // This reduces GC pressure from frequent allocations during IsLocal() and GetNode() calls.
 var instanceDescPool = sync.Pool{
 	New: func() interface{} {
-		// Pre-allocate with capacity for typical replication factors
-		return make([]ring.InstanceDesc, 0, 3)
+		// Leave room for a typical replication factor plus JOINING and LEAVING instances.
+		return make([]ring.InstanceDesc, 0, ring.GetBufferSize)
 	},
 }
 
-// zonePool is a sync.Pool for reusing zone string slices in hot-path ring lookups.
-var zonePool = sync.Pool{
+// hostPool is a sync.Pool for reusing host string slices in hot-path ring lookups.
+var hostPool = sync.Pool{
 	New: func() interface{} {
-		return make([]string, 0, 3)
+		// Ring.Get does not return its host buffer, so leave room for one more
+		// transition replica than dskit's typical descriptor capacity.
+		return make([]string, 0, minHostBufferCapacity)
 	},
 }
 
@@ -48,14 +53,94 @@ func releaseInstanceDescBuffer(buf []ring.InstanceDesc) {
 	instanceDescPool.Put(buf[:0])
 }
 
-// acquireZoneBuffer gets a zone string slice from the pool.
-func acquireZoneBuffer() []string {
-	return zonePool.Get().([]string)[:0]
+// acquireHostBuffer gets a host string slice from the pool with at least
+// minCapacity entries of backing storage.
+func acquireHostBuffer(minCapacity int) []string {
+	buf := hostPool.Get().([]string)[:0]
+	if cap(buf) < minCapacity {
+		return make([]string, 0, minCapacity)
+	}
+	return buf
 }
 
-// releaseZoneBuffer returns a zone string slice to the pool.
-func releaseZoneBuffer(buf []string) {
-	zonePool.Put(buf[:0])
+// acquireWriteHostBuffer sizes the host buffer for Ring.Get with ring.Write.
+// Each non-ACTIVE member can extend the replica set by one instance, so the
+// cached capacity is replication factor plus the current non-ACTIVE count.
+// Unlike the descriptor slice, dskit does not return its host slice, so the
+// caller must avoid growth before the call.
+func (rm *RingManager) acquireWriteHostBuffer() []string {
+	capacity := int(rm.hostBufferCapacity.Load())
+	if capacity == 0 {
+		capacity = rm.initialHostBufferCapacity()
+		rm.hostBufferCapacity.CompareAndSwap(0, int64(capacity))
+	}
+	return acquireHostBuffer(capacity)
+}
+
+// acquireReadHostBuffer sizes the host buffer for a non-extending Ring.Get.
+func (rm *RingManager) acquireReadHostBuffer() []string {
+	capacity := rm.ring.ReplicationFactor()
+	if capacity < minHostBufferCapacity {
+		capacity = minHostBufferCapacity
+	}
+	return acquireHostBuffer(capacity)
+}
+
+// initialHostBufferCapacity derives a conservative capacity for a manager that
+// has not received a ring descriptor callback yet. This path is used only for
+// direct fixtures or a lookup before Start; production updates the cache from
+// lifecycle descriptors.
+func (rm *RingManager) initialHostBufferCapacity() int {
+	total := rm.ring.InstancesCount()
+	if total == 0 {
+		return minHostBufferCapacity
+	}
+
+	// GetAllHealthy exposes the instance states through dskit's public API. Any
+	// omitted unhealthy instance is treated as non-ACTIVE for a safe upper bound.
+	nonActive := total
+	if replicationSet, err := rm.ring.GetAllHealthy(ring.Reporting); err == nil {
+		nonActive = total - len(replicationSet.Instances)
+		for _, instance := range replicationSet.Instances {
+			if instance.State != ring.ACTIVE {
+				nonActive++
+			}
+		}
+	}
+	return calculateHostBufferCapacity(total, rm.ring.ReplicationFactor(), nonActive)
+}
+
+func calculateHostBufferCapacity(total, replicationFactor, nonActive int) int {
+	capacity := replicationFactor + nonActive
+	if capacity > total {
+		capacity = total
+	}
+	if capacity < minHostBufferCapacity {
+		capacity = minHostBufferCapacity
+	}
+	return capacity
+}
+
+// updateHostBufferCapacity publishes the Ring.Get write bound from a topology
+// descriptor for subsequent lookups.
+func (rm *RingManager) updateHostBufferCapacity(ringDesc *ring.Desc) {
+	nonActive := 0
+	for _, instance := range ringDesc.Ingesters {
+		if instance.State != ring.ACTIVE {
+			nonActive++
+		}
+	}
+	capacity := calculateHostBufferCapacity(
+		len(ringDesc.Ingesters),
+		rm.ring.ReplicationFactor(),
+		nonActive,
+	)
+	rm.hostBufferCapacity.Store(int64(capacity))
+}
+
+// releaseHostBuffer returns a host string slice to the pool.
+func releaseHostBuffer(buf []string) {
+	hostPool.Put(buf[:0])
 }
 
 // NodeStatus represents the status of a node in the cluster
@@ -136,6 +221,11 @@ type RingManager struct {
 
 	// Pre-allocated operation for GetPrimaryNode (includes all states except LEFT)
 	allStatesOp ring.Operation
+
+	// hostBufferCapacity tracks the number of instances in the latest ring
+	// descriptor. It is updated by ring lifecycle callbacks so lookups can size
+	// their host buffer without taking another ring lock.
+	hostBufferCapacity atomic.Int64
 
 	// Service lifecycle
 	services    *services.Manager
@@ -260,6 +350,9 @@ func (rm *RingManager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start ring services: %w", err)
 	}
 
+	// Seed the lookup capacity before the watcher receives its first update.
+	rm.hostBufferCapacity.Store(int64(rm.initialHostBufferCapacity()))
+
 	// Initialize lastKnownNodes map for tracking membership changes
 	rm.lastKnownNodes = make(map[string]ring.InstanceState)
 
@@ -339,6 +432,8 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 			if !ok || ringDesc == nil {
 				return true // continue watching
 			}
+
+			rm.updateHostBufferCapacity(ringDesc)
 
 			// Compute new epoch from ring state
 			newEpoch := rm.epoch.Set(ringDesc)
@@ -425,12 +520,17 @@ func (rm *RingManager) IsLocal(key string) bool {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	zoneBuf := acquireZoneBuffer()
-	defer releaseInstanceDescBuffer(instBuf)
-	defer releaseZoneBuffer(zoneBuf)
+	hostBuf := rm.acquireWriteHostBuffer()
+	defer func() {
+		releaseInstanceDescBuffer(instBuf)
+	}()
+	defer releaseHostBuffer(hostBuf)
 
 	// Get the owner from the ring using pooled buffers
-	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, zoneBuf, nil)
+	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, hostBuf, nil)
+	if replicationSet.Instances != nil {
+		instBuf = replicationSet.Instances
+	}
 	if err != nil {
 		return false
 	}
@@ -458,11 +558,16 @@ func (rm *RingManager) GetNode(key string) (*NodeInfo, error) {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	zoneBuf := acquireZoneBuffer()
-	defer releaseInstanceDescBuffer(instBuf)
-	defer releaseZoneBuffer(zoneBuf)
+	hostBuf := rm.acquireWriteHostBuffer()
+	defer func() {
+		releaseInstanceDescBuffer(instBuf)
+	}()
+	defer releaseHostBuffer(hostBuf)
 
-	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, zoneBuf, nil)
+	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, hostBuf, nil)
+	if replicationSet.Instances != nil {
+		instBuf = replicationSet.Instances
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get node for key: %w", err)
 	}
@@ -489,12 +594,17 @@ func (rm *RingManager) GetPrimaryNode(key string) (*NodeInfo, error) {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	zoneBuf := acquireZoneBuffer()
-	defer releaseInstanceDescBuffer(instBuf)
-	defer releaseZoneBuffer(zoneBuf)
+	hostBuf := rm.acquireReadHostBuffer()
+	defer func() {
+		releaseInstanceDescBuffer(instBuf)
+	}()
+	defer releaseHostBuffer(hostBuf)
 
 	// Use pre-allocated operation that includes all states except LEFT
-	replicationSet, err := rm.ring.Get(token, rm.allStatesOp, instBuf, zoneBuf, nil)
+	replicationSet, err := rm.ring.Get(token, rm.allStatesOp, instBuf, hostBuf, nil)
+	if replicationSet.Instances != nil {
+		instBuf = replicationSet.Instances
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get primary node: %w", err)
 	}
@@ -764,6 +874,8 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 	if ringDesc == nil {
 		return
 	}
+
+	d.rm.updateHostBufferCapacity(ringDesc)
 
 	// Update metrics
 	activeCount := 0

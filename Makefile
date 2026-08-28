@@ -333,6 +333,13 @@ test-embedded: proto
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
 
+# Run the lightweight IsLocal benchmark fixture through the embedded entry point.
+# The benchmark tag omits storage construction while retaining Client.IsLocal.
+.PHONY: test-embedded-islocal
+test-embedded-islocal: proto
+	@echo "Running embedded IsLocal benchmark checks..."
+	@cd embedded && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_islocal_benchmark -count=1 -v -timeout 60s -run '^$$' -bench '^BenchmarkClientIsLocal$$' -benchtime=1x -benchmem .
+
 .PHONY: test-race
 test-race: proto
 	@echo "Running race tests for server..."
