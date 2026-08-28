@@ -1038,6 +1038,64 @@ func (br *byteRangeReader) Close() error {
 	return nil
 }
 
+// prefixReader joins an already-read prefix with the remaining stream. It
+// returns the prefix before reading the stream and exposes no WriterTo method,
+// so io.CopyBuffer uses its supplied buffer for the remainder.
+type prefixReader struct {
+	prefix []byte
+	reader io.Reader
+}
+
+func (r *prefixReader) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+
+	return r.reader.Read(p)
+}
+
+// prefixWriterToReader preserves a remainder's direct-write path after writing
+// the already-read prefix. It is only used when the remainder supplies that
+// path itself.
+type prefixWriterToReader struct {
+	prefixReader
+	writerTo io.WriterTo
+}
+
+func (r *prefixWriterToReader) WriteTo(writer io.Writer) (int64, error) {
+	prefix := r.prefix
+	if len(prefix) > 0 {
+		n, err := writer.Write(prefix)
+		if n < 0 || n > len(prefix) {
+			return 0, io.ErrShortWrite
+		}
+		r.prefix = prefix[n:]
+		if err != nil {
+			return int64(n), err
+		}
+		if n != len(prefix) {
+			return int64(n), io.ErrShortWrite
+		}
+	}
+
+	bytesWritten, err := r.writerTo.WriteTo(writer)
+	return int64(len(prefix)) + bytesWritten, err
+}
+
+// joinPrefix returns the already-read prefix followed by reader. Non-WriterTo
+// streams stay reader-only so FileManager's pooled buffer drives the remainder.
+// A WriterTo remainder keeps its direct-write path, which is used by unary
+// byte-backed Puts.
+func joinPrefix(prefix []byte, reader io.Reader) io.Reader {
+	prefixed := prefixReader{prefix: prefix, reader: reader}
+	if writerTo, ok := reader.(io.WriterTo); ok {
+		return &prefixWriterToReader{prefixReader: prefixed, writerTo: writerTo}
+	}
+	return &prefixed
+}
+
 // Put streams the body into spillWriter, stores metadata, and handles TTL
 func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	storageType := "unknown"
@@ -1085,9 +1143,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	// the value length exceeds the small-value threshold.
 	if n > s.inlineThreshold {
 		storageType = "raw_file"
-		// Combine the bytes we already read with the remaining reader and write via the segment manager
-		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
-		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, multiReader)
+		// Join the bytes already read with the remaining stream. A non-WriterTo
+		// stream uses FileManager's pooled copy buffer, while byte-backed unary
+		// readers retain their direct-write path.
+		reader := joinPrefix(firstChunk[:n], body)
+		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, reader)
 		if err != nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("file", "put").Inc()
