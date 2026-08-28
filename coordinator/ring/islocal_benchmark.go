@@ -87,6 +87,7 @@ func NewIsLocalBenchmarkManager(replicationFactor int, states []dskitring.Instan
 		ring:        dskitRing,
 		localNodeID: localNodeID,
 	}
+	manager.hostBufferCapacity.Store(int64(len(states)))
 	var closeOnce sync.Once
 	closeFixture := func() {
 		closeOnce.Do(func() {

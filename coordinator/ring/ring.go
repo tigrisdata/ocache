@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -66,7 +67,7 @@ func acquireHostBuffer(minCapacity int) []string {
 // can inspect in the current topology. Unlike the descriptor slice, dskit does
 // not return its host slice, so the caller must avoid growth before the call.
 func (rm *RingManager) acquireHostLookupBuffer() []string {
-	capacity := rm.ring.InstancesCount()
+	capacity := int(rm.hostBufferCapacity.Load())
 	if capacity < minHostBufferCapacity {
 		capacity = minHostBufferCapacity
 	}
@@ -157,6 +158,11 @@ type RingManager struct {
 	// Pre-allocated operation for GetPrimaryNode (includes all states except LEFT)
 	allStatesOp ring.Operation
 
+	// hostBufferCapacity tracks the number of instances in the latest ring
+	// descriptor. It is updated by ring lifecycle callbacks so lookups can size
+	// their host buffer without taking another ring lock.
+	hostBufferCapacity atomic.Int64
+
 	// Service lifecycle
 	services    *services.Manager
 	subservices []services.Service
@@ -196,6 +202,7 @@ func NewRingManager(cfg LifecyclerConfig, kvClient kv.Client, logger log.Logger,
 			ring.ACTIVE, ring.JOINING, ring.PENDING, ring.LEAVING,
 		}, nil),
 	}
+	rm.hostBufferCapacity.Store(minHostBufferCapacity)
 
 	// Create the ring (reader/watcher)
 	ringCfg := cfg.RingConfig.ToRingConfig()
@@ -280,6 +287,9 @@ func (rm *RingManager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start ring services: %w", err)
 	}
 
+	// Seed the lookup capacity before the watcher receives its first update.
+	rm.hostBufferCapacity.Store(int64(rm.ring.InstancesCount()))
+
 	// Initialize lastKnownNodes map for tracking membership changes
 	rm.lastKnownNodes = make(map[string]ring.InstanceState)
 
@@ -359,6 +369,8 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 			if !ok || ringDesc == nil {
 				return true // continue watching
 			}
+
+			rm.hostBufferCapacity.Store(int64(len(ringDesc.Ingesters)))
 
 			// Compute new epoch from ring state
 			newEpoch := rm.epoch.Set(ringDesc)
@@ -799,6 +811,8 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 	if ringDesc == nil {
 		return
 	}
+
+	d.rm.hostBufferCapacity.Store(int64(len(ringDesc.Ingesters)))
 
 	// Update metrics
 	activeCount := 0

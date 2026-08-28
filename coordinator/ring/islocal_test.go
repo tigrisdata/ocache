@@ -86,10 +86,12 @@ func newIsLocalTestManager(tb testing.TB, replicationFactor int, states []dskitr
 		}
 	})
 
-	return &RingManager{
+	manager := &RingManager{
 		ring:        dskitRing,
 		localNodeID: localNodeID,
 	}
+	manager.hostBufferCapacity.Store(int64(len(states)))
+	return manager
 }
 
 func TestRingManagerIsLocalPreservesOwnershipDuringTransitions(t *testing.T) {
