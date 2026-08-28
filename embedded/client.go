@@ -1,6 +1,8 @@
 // Copyright 2026 Tigris Data, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//go:build !ocache_islocal_benchmark
+
 // Package embedded provides an embedded ocache client for use in other services.
 // This allows services like TAG to embed ocache and get full cluster-aware
 // caching with metrics, routing, and cluster-wide list operations.
@@ -138,18 +140,6 @@ func (c *Config) buildStorageConfig() stor.StorageConfig {
 	return sc
 }
 
-// Client provides embedded cache access with cluster routing.
-// It implements the cacheclient.CacheClient interface.
-type Client struct {
-	config      *Config
-	storage     *stor.Storage
-	coordinator *coordinator.Coordinator
-	ops         *operations.Operations
-	service     *service.CacheService
-	grpcServer  *grpc.Server
-	grpcLis     net.Listener
-}
-
 // New creates a new embedded cache client.
 // The client provides direct access to local storage with automatic routing
 // to remote nodes when running in cluster mode.
@@ -218,18 +208,20 @@ func New(cfg *Config) (*Client, error) {
 	svc := service.NewCacheService(coord, storage)
 
 	return &Client{
-		config:      cfg,
-		storage:     storage,
 		coordinator: coord,
-		ops:         ops,
-		service:     svc,
+		resources: &clientResources{
+			config:  cfg,
+			storage: storage,
+			ops:     ops,
+			service: svc,
+		},
 	}, nil
 }
 
 // StartGRPCServer starts the gRPC server for handling remote requests.
 // This must be called in cluster mode to allow other nodes to route requests here.
 func (c *Client) StartGRPCServer() error {
-	if c.config.GRPCAddr == "" {
+	if c.resources.config.GRPCAddr == "" {
 		return errors.New("GRPCAddr not configured")
 	}
 
@@ -256,23 +248,23 @@ func (c *Client) StartGRPCServer() error {
 	)
 
 	// Append any custom server options (e.g., auth interceptors)
-	opts = append(opts, c.config.GRPCServerOptions...)
+	opts = append(opts, c.resources.config.GRPCServerOptions...)
 
-	c.grpcServer = grpc.NewServer(opts...)
-	pb.RegisterCacheServiceServer(c.grpcServer, c.service)
+	c.resources.grpcServer = grpc.NewServer(opts...)
+	pb.RegisterCacheServiceServer(c.resources.grpcServer, c.resources.service)
 
 	// Register ClusterService if clustering is enabled
 	if c.coordinator != nil {
-		clusterpb.RegisterClusterServiceServer(c.grpcServer, c.coordinator)
+		clusterpb.RegisterClusterServiceServer(c.resources.grpcServer, c.coordinator)
 	}
 
 	var err error
-	c.grpcLis, err = net.Listen("tcp", c.config.GRPCAddr)
+	c.resources.grpcLis, err = net.Listen("tcp", c.resources.config.GRPCAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", c.config.GRPCAddr, err)
+		return fmt.Errorf("failed to listen on %s: %w", c.resources.config.GRPCAddr, err)
 	}
 
-	zlog.Info().Str("addr", c.config.GRPCAddr).Msg("Starting embedded gRPC server")
+	zlog.Info().Str("addr", c.resources.config.GRPCAddr).Msg("Starting embedded gRPC server")
 
 	// Storage booted during New() and the peer-facing listener is now bound, so
 	// it is safe to advertise ACTIVE. Until this point the node stays JOINING and
@@ -284,7 +276,7 @@ func (c *Client) StartGRPCServer() error {
 
 	// Start serving in a goroutine
 	go func() {
-		if err := c.grpcServer.Serve(c.grpcLis); err != nil {
+		if err := c.resources.grpcServer.Serve(c.resources.grpcLis); err != nil {
 			zlog.Error().Err(err).Msg("gRPC server error")
 		}
 	}()
@@ -317,19 +309,19 @@ func (c *Client) WaitReady(ctx context.Context) error {
 
 // IsReady returns true if the client is ready to serve requests.
 func (c *Client) IsReady() bool {
-	return c.ops.IsReady()
+	return c.resources.ops.IsReady()
 }
 
 // --- CacheClient interface implementation ---
 
 // Put stores data for the given key.
 func (c *Client) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	return c.ops.PutBytes(ctx, key, data, int(ttlSeconds))
+	return c.resources.ops.PutBytes(ctx, key, data, int(ttlSeconds))
 }
 
 // Get retrieves data for the given key.
 func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
-	data, found, err := c.ops.GetBytes(ctx, key)
+	data, found, err := c.resources.ops.GetBytes(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -341,22 +333,22 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 
 // Delete removes a key from the cache.
 func (c *Client) Delete(ctx context.Context, key string) error {
-	return c.ops.Delete(ctx, key)
+	return c.resources.ops.Delete(ctx, key)
 }
 
 // List returns all keys matching the given prefix across the entire cluster.
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
-	return c.ops.List(ctx, prefix)
+	return c.resources.ops.List(ctx, prefix)
 }
 
 // ListPage returns a page of keys with pagination support.
 func (c *Client) ListPage(ctx context.Context, prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error) {
-	return c.ops.ListPage(ctx, prefix, limit, continuationToken)
+	return c.resources.ops.ListPage(ctx, prefix, limit, continuationToken)
 }
 
 // ListPageWithValues returns a page of key-value pairs with pagination support.
 func (c *Client) ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) (entries []cacheclient.KeyValue, nextToken string, hasMore bool, err error) {
-	pbEntries, token, more, err := c.ops.ListPageWithValues(ctx, prefix, limit, continuationToken)
+	pbEntries, token, more, err := c.resources.ops.ListPageWithValues(ctx, prefix, limit, continuationToken)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -376,12 +368,12 @@ func (c *Client) ListPageWithValues(ctx context.Context, prefix string, limit in
 
 // PutStream stores data from a reader for the given key.
 func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	return c.ops.Put(ctx, key, r, int(ttlSeconds))
+	return c.resources.ops.Put(ctx, key, r, int(ttlSeconds))
 }
 
 // GetStream retrieves data and writes it to the provided writer.
 func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
-	found, err := c.ops.GetStream(ctx, key, w)
+	found, err := c.resources.ops.GetStream(ctx, key, w)
 	if err != nil {
 		return err
 	}
@@ -393,7 +385,7 @@ func (c *Client) GetStream(ctx context.Context, key string, w io.Writer) error {
 
 // GetRange retrieves a byte range for the given key.
 func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	data, found, err := c.ops.GetRange(ctx, key, start, end)
+	data, found, err := c.resources.ops.GetRange(ctx, key, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -405,7 +397,7 @@ func (c *Client) GetRange(ctx context.Context, key string, start, end int64) ([]
 
 // GetRangeStream retrieves a byte range and writes it to the provided writer.
 func (c *Client) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	found, err := c.ops.GetRangeStream(ctx, key, start, end, w)
+	found, err := c.resources.ops.GetRangeStream(ctx, key, start, end, w)
 	if err != nil {
 		return err
 	}
@@ -422,8 +414,8 @@ func (c *Client) Close() error {
 	var errs []error
 
 	// Stop gRPC server (GracefulStop also closes the listener)
-	if c.grpcServer != nil {
-		c.grpcServer.GracefulStop()
+	if c.resources != nil && c.resources.grpcServer != nil {
+		c.resources.grpcServer.GracefulStop()
 	}
 
 	// Stop coordinator
@@ -434,8 +426,8 @@ func (c *Client) Close() error {
 	}
 
 	// Close storage (doesn't return an error)
-	if c.storage != nil {
-		c.storage.Close()
+	if c.resources != nil && c.resources.storage != nil {
+		c.resources.storage.Close()
 	}
 
 	if len(errs) > 0 {
@@ -455,12 +447,12 @@ func (c *Client) GetMode() cacheclient.ConnectionMode {
 // GetConnectedNodes returns the list of connected nodes.
 func (c *Client) GetConnectedNodes() []string {
 	if c.coordinator == nil {
-		return []string{c.config.NodeID}
+		return []string{c.resources.config.NodeID}
 	}
 
 	ring := c.coordinator.GetRing()
 	if ring == nil {
-		return []string{c.config.NodeID}
+		return []string{c.resources.config.NodeID}
 	}
 
 	nodes := ring.GetActiveNodes()
@@ -476,42 +468,25 @@ func (c *Client) GetConnectedNodes() []string {
 // Operations returns the underlying operations layer.
 // This provides direct access to the routing logic for advanced use cases.
 func (c *Client) Operations() *operations.Operations {
-	return c.ops
+	return c.resources.ops
 }
 
 // Storage returns the underlying storage layer.
 // This provides direct access to local storage for advanced use cases.
 func (c *Client) Storage() *stor.Storage {
-	return c.storage
-}
-
-// Coordinator returns the underlying coordinator.
-// Returns nil if clustering is not enabled.
-func (c *Client) Coordinator() *coordinator.Coordinator {
-	return c.coordinator
-}
-
-// IsLocal reports whether key is owned by this node — i.e. a read for it is
-// served from local storage rather than routed to a peer over gRPC. In
-// single-node (non-cluster) mode every key is local. Callers use this to
-// observe cross-node serve ratios without reaching into the coordinator.
-func (c *Client) IsLocal(key string) bool {
-	if c.coordinator == nil {
-		return true
-	}
-	return c.coordinator.IsLocal(key)
+	return c.resources.storage
 }
 
 // Service returns the gRPC service.
 // This is useful for registering additional handlers or middleware.
 func (c *Client) Service() *service.CacheService {
-	return c.service
+	return c.resources.service
 }
 
 // GetGRPCServer returns the gRPC server.
 // Returns nil if StartGRPCServer has not been called.
 func (c *Client) GetGRPCServer() *grpc.Server {
-	return c.grpcServer
+	return c.resources.grpcServer
 }
 
 // Compile-time check that Client implements CacheClient
