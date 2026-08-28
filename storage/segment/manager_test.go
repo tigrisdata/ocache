@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/tigrisdata/ocache/storage/fd"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 )
@@ -406,6 +407,125 @@ func TestManager_WriteEntry(t *testing.T) {
 
 	if seg.dataBytes != int64(len(valueData)) {
 		t.Errorf("Segment dataBytes should be %d, got %d", len(valueData), seg.dataBytes)
+	}
+}
+
+func TestManager_WriteEntrySectionReader(t *testing.T) {
+	manager, err := NewManager(t.TempDir(), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	seg, err := manager.AcquireOpenSegmentWithReservation("section-reader-test", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prefix := []byte("prefix-")
+	payload := bytes.Repeat([]byte("payload"), 1024)
+	suffix := []byte("-suffix")
+	sourceFile, err := os.CreateTemp(t.TempDir(), "section-source-*.dat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceFile.Write(append(append(prefix, payload...), suffix...)); err != nil {
+		sourceFile.Close()
+		t.Fatal(err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	source, err := os.Open(sourceFile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	section := io.NewSectionReader(source, int64(len(prefix)), int64(len(payload)))
+	key := "section-reader"
+	offset, err := seg.WriteEntry(key, section, &pb.ValueMessage{
+		ValueType:   pb.ValueType_SEGMENT,
+		ValueLength: int64(len(payload)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := make([]byte, len(payload))
+	payloadOffset := offset + CalculateValueHeaderSize(key)
+	if _, err := seg.file.ReadAt(got, payloadOffset); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("SectionReader payload was not written unchanged")
+	}
+	if seg.GetNumEntries() != 1 {
+		t.Fatalf("segment entries = %d, want 1", seg.GetNumEntries())
+	}
+	if seg.GetDataBytes() != int64(len(payload)) {
+		t.Fatalf("segment data bytes = %d, want %d", seg.GetDataBytes(), len(payload))
+	}
+}
+
+// BenchmarkManager_WriteEntrySectionReader isolates the recompactor's payload
+// copy shape: a 64 KiB SectionReader is copied into a segment through an
+// *os.File destination. /dev/null keeps calibration from growing a file, while
+// retaining the destination dispatch and the measured copy, header, and
+// pooled-buffer lifecycle.
+func BenchmarkManager_WriteEntrySectionReader(b *testing.B) {
+	originalLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.Disabled)
+	b.Cleanup(func() { zerolog.SetGlobalLevel(originalLevel) })
+
+	const valueSize = 64 * 1024
+	destination, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer destination.Close()
+
+	seg := NewSegment(os.DevNull, 0, 0, 0, 1<<62)
+	seg.SetOpenFile(destination)
+
+	sourceFile, err := os.CreateTemp(b.TempDir(), "section-source-*.dat")
+	if err != nil {
+		b.Fatal(err)
+	}
+	sourceData := bytes.Repeat([]byte("x"), valueSize)
+	if _, err := sourceFile.Write(sourceData); err != nil {
+		sourceFile.Close()
+		b.Fatal(err)
+	}
+	if err := sourceFile.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	source, err := os.Open(sourceFile.Name())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer source.Close()
+
+	section := io.NewSectionReader(source, 0, valueSize)
+	vm := &pb.ValueMessage{
+		ValueType:   pb.ValueType_SEGMENT,
+		ValueLength: valueSize,
+	}
+
+	b.SetBytes(valueSize)
+	for b.Loop() {
+		if _, err := section.Seek(0, io.SeekStart); err != nil {
+			b.Fatal(err)
+		}
+		offset, err := seg.WriteEntry("bench-key", section, vm)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if offset < 0 {
+			b.Fatal("WriteEntry returned a negative offset")
+		}
 	}
 }
 

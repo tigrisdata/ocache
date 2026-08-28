@@ -266,6 +266,37 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 	}, nil
 }
 
+// copyReaderWithBuffer copies a reader through the supplied buffer without
+// allowing an *os.File destination to replace it with its own ReaderFrom
+// implementation. The caller owns the buffer and destination synchronization.
+func copyReaderWithBuffer(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[:nr])
+			if nw < 0 || nr < nw {
+				nw = 0
+				if ew == nil {
+					ew = fmt.Errorf("invalid write result")
+				}
+			}
+			written += int64(nw)
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				return written, er
+			}
+			return written, nil
+		}
+	}
+}
+
 // WriteEntry writes an entry to a segment from an io.Reader
 func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
 	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
@@ -325,7 +356,18 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 	buf, release := bufferpool.AcquireBuffer(64 * 1024)
 	defer release()
 
-	bytesWritten, err := io.CopyBuffer(s.file, r, buf)
+	var bytesWritten int64
+	if _, ok := r.(io.WriterTo); ok {
+		// Keep the source-owned fast path, such as *os.File.WriteTo, when it is
+		// available. It can use zero-copy file operations on supported systems.
+		bytesWritten, err = io.CopyBuffer(s.file, r, buf)
+	} else {
+		// *os.File implements io.ReaderFrom. io.CopyBuffer would select it here,
+		// and its generic fallback allocates a fresh 32 KiB buffer instead of
+		// using buf. Reproduce the copy loop explicitly so SectionReader and
+		// rate-limited recompaction readers use the pooled buffer.
+		bytesWritten, err = copyReaderWithBuffer(s.file, r, buf)
+	}
 	if err != nil {
 		return rollback(utils.WrapError("copy value to segment", key, err))
 	}
