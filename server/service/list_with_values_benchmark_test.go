@@ -133,7 +133,12 @@ func TestCacheService_ListWithValuesRetainsInlineData(t *testing.T) {
 		DisableRecompaction: true,
 	})
 	require.NoError(t, err)
-	t.Cleanup(storage.Close)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			storage.Close()
+		}
+	})
 
 	service := NewCacheService(nil, storage)
 	want := map[string][]byte{
@@ -159,6 +164,7 @@ func TestCacheService_ListWithValuesRetainsInlineData(t *testing.T) {
 	// storage too before checking the response to ensure returned bytes are not
 	// backed by RocksDB iterator memory.
 	storage.Close()
+	closed = true
 	for _, entry := range response.Entries {
 		require.Contains(t, want, entry.Key)
 		require.False(t, entry.ValueOmitted)
