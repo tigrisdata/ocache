@@ -314,6 +314,10 @@ func newRecompactionSetupBenchmark(b *testing.B) *compactionServingBenchmark {
 }
 
 func startDefaultRecompactionBenchmark(b *testing.B, env *compactionServingBenchmark) {
+	startRecompactionBenchmark(b, env, DefaultRecompactionInterval)
+}
+
+func startRecompactionBenchmark(b *testing.B, env *compactionServingBenchmark, interval time.Duration) {
 	b.Helper()
 
 	env.compactor.Close()
@@ -327,7 +331,7 @@ func startDefaultRecompactionBenchmark(b *testing.B, env *compactionServingBench
 		FragThreshold:        DefaultFragmentationThreshold,
 		MinSegmentAge:        DefaultMinSegmentAgeForRecompaction,
 		MinSegments:          DefaultMinSegmentsBeforeRecompaction,
-		RecompactionInterval: DefaultRecompactionInterval,
+		RecompactionInterval: interval,
 	})
 	env.compactor = compactor
 	env.storage.compactor = compactor
