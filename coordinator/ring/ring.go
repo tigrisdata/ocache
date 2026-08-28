@@ -68,10 +68,25 @@ func acquireHostBuffer(minCapacity int) []string {
 // not return its host slice, so the caller must avoid growth before the call.
 func (rm *RingManager) acquireHostLookupBuffer() []string {
 	capacity := int(rm.hostBufferCapacity.Load())
+	if capacity == 0 {
+		capacity = rm.ring.InstancesCount()
+		if capacity < minHostBufferCapacity {
+			capacity = minHostBufferCapacity
+		}
+		rm.hostBufferCapacity.CompareAndSwap(0, int64(capacity))
+	}
 	if capacity < minHostBufferCapacity {
 		capacity = minHostBufferCapacity
 	}
 	return acquireHostBuffer(capacity)
+}
+
+// updateHostBufferCapacity publishes a topology size for subsequent lookups.
+func (rm *RingManager) updateHostBufferCapacity(instanceCount int) {
+	if instanceCount < minHostBufferCapacity {
+		instanceCount = minHostBufferCapacity
+	}
+	rm.hostBufferCapacity.Store(int64(instanceCount))
 }
 
 // releaseHostBuffer returns a host string slice to the pool.
@@ -202,7 +217,6 @@ func NewRingManager(cfg LifecyclerConfig, kvClient kv.Client, logger log.Logger,
 			ring.ACTIVE, ring.JOINING, ring.PENDING, ring.LEAVING,
 		}, nil),
 	}
-	rm.hostBufferCapacity.Store(minHostBufferCapacity)
 
 	// Create the ring (reader/watcher)
 	ringCfg := cfg.RingConfig.ToRingConfig()
@@ -288,7 +302,7 @@ func (rm *RingManager) Start(ctx context.Context) error {
 	}
 
 	// Seed the lookup capacity before the watcher receives its first update.
-	rm.hostBufferCapacity.Store(int64(rm.ring.InstancesCount()))
+	rm.updateHostBufferCapacity(rm.ring.InstancesCount())
 
 	// Initialize lastKnownNodes map for tracking membership changes
 	rm.lastKnownNodes = make(map[string]ring.InstanceState)
@@ -370,7 +384,7 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 				return true // continue watching
 			}
 
-			rm.hostBufferCapacity.Store(int64(len(ringDesc.Ingesters)))
+			rm.updateHostBufferCapacity(len(ringDesc.Ingesters))
 
 			// Compute new epoch from ring state
 			newEpoch := rm.epoch.Set(ringDesc)
@@ -812,7 +826,7 @@ func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler,
 		return
 	}
 
-	d.rm.hostBufferCapacity.Store(int64(len(ringDesc.Ingesters)))
+	d.rm.updateHostBufferCapacity(len(ringDesc.Ingesters))
 
 	// Update metrics
 	activeCount := 0
