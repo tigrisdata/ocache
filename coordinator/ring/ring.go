@@ -26,15 +26,15 @@ import (
 // This reduces GC pressure from frequent allocations during IsLocal() and GetNode() calls.
 var instanceDescPool = sync.Pool{
 	New: func() interface{} {
-		// Pre-allocate with capacity for typical replication factors
-		return make([]ring.InstanceDesc, 0, 3)
+		// Leave room for a typical replication factor plus JOINING and LEAVING instances.
+		return make([]ring.InstanceDesc, 0, ring.GetBufferSize)
 	},
 }
 
-// zonePool is a sync.Pool for reusing zone string slices in hot-path ring lookups.
-var zonePool = sync.Pool{
+// hostPool is a sync.Pool for reusing host string slices in hot-path ring lookups.
+var hostPool = sync.Pool{
 	New: func() interface{} {
-		return make([]string, 0, 3)
+		return make([]string, 0, ring.GetBufferSize)
 	},
 }
 
@@ -48,14 +48,14 @@ func releaseInstanceDescBuffer(buf []ring.InstanceDesc) {
 	instanceDescPool.Put(buf[:0])
 }
 
-// acquireZoneBuffer gets a zone string slice from the pool.
-func acquireZoneBuffer() []string {
-	return zonePool.Get().([]string)[:0]
+// acquireHostBuffer gets a host string slice from the pool.
+func acquireHostBuffer() []string {
+	return hostPool.Get().([]string)[:0]
 }
 
-// releaseZoneBuffer returns a zone string slice to the pool.
-func releaseZoneBuffer(buf []string) {
-	zonePool.Put(buf[:0])
+// releaseHostBuffer returns a host string slice to the pool.
+func releaseHostBuffer(buf []string) {
+	hostPool.Put(buf[:0])
 }
 
 // NodeStatus represents the status of a node in the cluster
@@ -425,12 +425,17 @@ func (rm *RingManager) IsLocal(key string) bool {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	zoneBuf := acquireZoneBuffer()
-	defer releaseInstanceDescBuffer(instBuf)
-	defer releaseZoneBuffer(zoneBuf)
+	hostBuf := acquireHostBuffer()
+	defer func() {
+		releaseInstanceDescBuffer(instBuf)
+	}()
+	defer releaseHostBuffer(hostBuf)
 
 	// Get the owner from the ring using pooled buffers
-	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, zoneBuf, nil)
+	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, hostBuf, nil)
+	if replicationSet.Instances != nil {
+		instBuf = replicationSet.Instances
+	}
 	if err != nil {
 		return false
 	}
@@ -458,11 +463,16 @@ func (rm *RingManager) GetNode(key string) (*NodeInfo, error) {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	zoneBuf := acquireZoneBuffer()
-	defer releaseInstanceDescBuffer(instBuf)
-	defer releaseZoneBuffer(zoneBuf)
+	hostBuf := acquireHostBuffer()
+	defer func() {
+		releaseInstanceDescBuffer(instBuf)
+	}()
+	defer releaseHostBuffer(hostBuf)
 
-	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, zoneBuf, nil)
+	replicationSet, err := rm.ring.Get(token, ring.Write, instBuf, hostBuf, nil)
+	if replicationSet.Instances != nil {
+		instBuf = replicationSet.Instances
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get node for key: %w", err)
 	}
@@ -489,12 +499,17 @@ func (rm *RingManager) GetPrimaryNode(key string) (*NodeInfo, error) {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	zoneBuf := acquireZoneBuffer()
-	defer releaseInstanceDescBuffer(instBuf)
-	defer releaseZoneBuffer(zoneBuf)
+	hostBuf := acquireHostBuffer()
+	defer func() {
+		releaseInstanceDescBuffer(instBuf)
+	}()
+	defer releaseHostBuffer(hostBuf)
 
 	// Use pre-allocated operation that includes all states except LEFT
-	replicationSet, err := rm.ring.Get(token, rm.allStatesOp, instBuf, zoneBuf, nil)
+	replicationSet, err := rm.ring.Get(token, rm.allStatesOp, instBuf, hostBuf, nil)
+	if replicationSet.Instances != nil {
+		instBuf = replicationSet.Instances
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get primary node: %w", err)
 	}
