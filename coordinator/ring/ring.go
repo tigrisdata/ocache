@@ -34,7 +34,9 @@ var instanceDescPool = sync.Pool{
 // hostPool is a sync.Pool for reusing host string slices in hot-path ring lookups.
 var hostPool = sync.Pool{
 	New: func() interface{} {
-		return make([]string, 0, ring.GetBufferSize)
+		// Ring.Get does not return its host buffer, so leave room for one more
+		// transition replica than dskit's typical descriptor capacity.
+		return make([]string, 0, ring.GetBufferSize+1)
 	},
 }
 
