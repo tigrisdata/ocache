@@ -36,6 +36,18 @@ func TestCoordinator_New(t *testing.T) {
 	assert.NotNil(t, coord.GetRouter())
 }
 
+// TestCoordinator_AcceptsRingMetadataNodeIDs preserves the base node-ID
+// contract: ring membership names are not reserved by the coordinator.
+func TestCoordinator_AcceptsRingMetadataNodeIDs(t *testing.T) {
+	for _, nodeID := range []string{
+		"__ocache_membership_summary__",
+		"__ocache_membership_summary_dirty__::node-1",
+	} {
+		assert.NoError(t, validateNodeID(nodeID), nodeID)
+	}
+	assert.NoError(t, validateNodeID("ordinary-node"))
+}
+
 // TestCoordinator_ConfigValidation verifies coordinator config validation
 func TestCoordinator_ConfigValidation(t *testing.T) {
 	// Test missing listen address

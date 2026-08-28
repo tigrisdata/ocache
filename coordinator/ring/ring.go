@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -20,6 +21,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
+)
+
+var (
+	clusterNodesActive = metrics.ClusterNodes.WithLabelValues("active")
+	clusterNodesTotal  = metrics.ClusterNodes.WithLabelValues("total")
 )
 
 // instanceDescPool is a sync.Pool for reusing InstanceDesc slices in hot-path ring lookups.
@@ -129,10 +135,26 @@ type RingManager struct {
 	// Used by clients to detect stale topology information.
 	epoch *Epoch
 
-	// stateMu protects lastEpoch and lastKnownNodes for tracking membership changes.
+	// stateMu protects watcher state used for tracking membership changes.
 	stateMu        sync.Mutex
 	lastEpoch      uint64
 	lastKnownNodes map[string]ring.InstanceState // Track previous node states for delta logging
+
+	// membershipCounts is updated by the ring watcher and synchronous ring
+	// change observer, then read by transition paths. A nil value means that no
+	// descriptor or change has been observed yet. The snapshot cache underneath
+	// it publishes one immutable values pointer for the steady-state callback.
+	membershipCounts                atomic.Pointer[membershipCountSnapshot]
+	membershipWatcherObserved       atomic.Bool
+	membershipChangeObserverPresent atomic.Bool
+	membershipLocalStateKnown       atomic.Bool
+	membershipLocalState            atomic.Int32
+	// heartbeatCASActive identifies the normal BasicLifecycler CAS callback. It
+	// lets the heartbeat distinguish a stable local CAS from direct callers that
+	// have no lifecycle context, without adding metadata to the shared ring.
+	heartbeatCASActive   atomic.Bool
+	heartbeatCASIdentity atomic.Bool
+	heartbeatCASSnapshot atomic.Pointer[membershipSnapshotValues]
 
 	// Pre-allocated operation for GetPrimaryNode (includes all states except LEFT)
 	allStatesOp ring.Operation
@@ -177,6 +199,20 @@ func NewRingManager(cfg LifecyclerConfig, kvClient kv.Client, logger log.Logger,
 		}, nil),
 	}
 
+	// Keep the ring descriptor in its original format. The cached membership
+	// snapshot is process-local; adding bookkeeping entries to Ingesters would
+	// make older readers count them as real members during a rolling upgrade.
+	// Memberlist clients additionally expose decoded ring changes before their
+	// merge, which closes the race between a fresh CAS descriptor and the async
+	// ring watcher.
+	if observerRegistrar, ok := kvClient.(interface {
+		RegisterRingChangeObserver(func(*ring.Desc))
+	}); ok {
+		observerRegistrar.RegisterRingChangeObserver(rm.applyMembershipChange)
+		rm.membershipChangeObserverPresent.Store(true)
+	}
+	lifecyclerClient := &membershipClient{delegate: kvClient, manager: rm}
+
 	// Create the ring (reader/watcher)
 	ringCfg := cfg.RingConfig.ToRingConfig()
 	// Setting KVStore.Store to empty string tells dskit we're providing our own
@@ -206,7 +242,7 @@ func NewRingManager(cfg LifecyclerConfig, kvClient kv.Client, logger log.Logger,
 		lifecyclerCfg,
 		RingName,
 		RingKey,
-		kvClient,
+		lifecyclerClient,
 		delegate,
 		logger,
 		reg,
@@ -343,11 +379,13 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 			// Compute new epoch from ring state
 			newEpoch := rm.epoch.Set(ringDesc)
 
-			// Log if epoch changed
+			// Process the first watcher value even when its epoch is zero. An
+			// empty descriptor is a valid update after the last member leaves.
 			rm.stateMu.Lock()
-			if newEpoch != rm.lastEpoch {
+			if !rm.membershipWatcherObserved.Load() || newEpoch != rm.lastEpoch {
 				rm.logMembershipChange(ringDesc, newEpoch)
 				rm.lastEpoch = newEpoch
+				rm.membershipWatcherObserved.Store(true)
 			}
 			rm.stateMu.Unlock()
 
@@ -359,10 +397,17 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 // logMembershipChange logs detailed membership changes including which nodes joined/left.
 // MUST be called with stateMu held.
 func (rm *RingManager) logMembershipChange(ringDesc *ring.Desc, newEpoch uint64) {
-	// Build current node state map
+	// Build current node state and timestamp maps while the ring descriptor is
+	// already being traversed for membership-change detection.
 	currentNodes := make(map[string]ring.InstanceState)
+	currentTimestamps := make(map[string]int64)
+	activeCount := 0
 	for id, inst := range ringDesc.Ingesters {
 		currentNodes[id] = inst.State
+		currentTimestamps[id] = inst.Timestamp
+		if inst.State == ring.ACTIVE {
+			activeCount++
+		}
 	}
 
 	// Detect new nodes (joined)
@@ -397,6 +442,17 @@ func (rm *RingManager) logMembershipChange(ringDesc *ring.Desc, newEpoch uint64)
 			)
 		}
 	}
+
+	// Update the membership snapshot before publishing the tracked state. The
+	// heartbeat callback can then read both values without traversing the ring.
+	rm.membershipSnapshot().replaceValues(
+		activeCount,
+		len(currentNodes),
+		currentNodes,
+		currentTimestamps,
+		ringDesc,
+		true,
+	)
 
 	// Update tracked state
 	rm.lastKnownNodes = currentNodes
@@ -665,6 +721,20 @@ func (rm *RingManager) instanceStateToNodeStatus(state ring.InstanceState) NodeS
 	}
 }
 
+// membershipCountSnapshot keeps the heartbeat read path on one atomic value.
+// The mutable state index is updated separately when a decoded ring delta
+// arrives before the asynchronous watcher runs.
+type membershipCountSnapshot struct {
+	active       int
+	total        int
+	states       map[string]ring.InstanceState
+	timestamps   map[string]int64
+	descriptor   *ring.Desc
+	synchronized bool
+
+	cache *membershipSnapshotCache
+}
+
 // ringDelegate implements ring.BasicLifecyclerDelegate
 type ringDelegate struct {
 	rm *RingManager
@@ -757,23 +827,149 @@ func (d *ringDelegate) OnRingInstanceStopping(lifecycler *ring.BasicLifecycler) 
 	level.Info(d.rm.logger).Log("msg", "instance stopping")
 }
 
+// countMembership returns the values needed by the cluster membership gauges.
+func countMembership(ringDesc *ring.Desc) membershipCountSnapshot {
+	counts := membershipCountSnapshot{descriptor: ringDesc}
+	if ringDesc == nil {
+		return counts
+	}
+
+	counts.states = make(map[string]ring.InstanceState, len(ringDesc.Ingesters))
+	counts.timestamps = make(map[string]int64, len(ringDesc.Ingesters))
+	for id, inst := range ringDesc.Ingesters {
+		counts.total++
+		counts.states[id] = inst.State
+		counts.timestamps[id] = inst.Timestamp
+		if inst.State == ring.ACTIVE {
+			counts.active++
+		}
+	}
+	return counts
+}
+
 // OnRingInstanceHeartbeat is called on each heartbeat.
-// Ring membership changes are detected via the KV watcher (startRingWatcher),
-// so this callback only updates metrics.
+// Ring membership changes are normally detected via the KV watcher
+// (startRingWatcher), while the memberlist codec applies decoded deltas before
+// they enter the local store. Stable heartbeats therefore read the synchronized
+// process-local snapshot and update metrics without traversing all ingesters.
 func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler, ringDesc *ring.Desc, instanceDesc *ring.InstanceDesc) {
 	if ringDesc == nil {
 		return
 	}
 
-	// Update metrics
-	activeCount := 0
-	for _, inst := range ringDesc.Ingesters {
-		if inst.State == ring.ACTIVE {
-			activeCount++
+	missingHeartbeatContext := lifecycler == nil || instanceDesc == nil || d.rm.lifecycler != lifecycler
+	normalHeartbeatContext := d.rm.heartbeatCASActive.Load() && d.rm.heartbeatCASIdentity.Load() && !missingHeartbeatContext && d.rm.membershipChangeObserverPresent.Load()
+	heartbeatCASSnapshot := d.rm.heartbeatCASSnapshot.Load()
+	instanceID := ""
+	if instanceDesc != nil {
+		instanceID = instanceDesc.Id
+		if instanceID == "" && lifecycler != nil {
+			instanceID = lifecycler.GetInstanceID()
 		}
 	}
-	metrics.ClusterNodes.WithLabelValues("active").Set(float64(activeCount))
-	metrics.ClusterNodes.WithLabelValues("total").Set(float64(len(ringDesc.Ingesters)))
+
+	// Keep the steady-state CAS path small. A local state transition can update
+	// the synchronized snapshot in O(1), while an observer or descriptor change
+	// racing with it sends the callback through the authoritative fallback.
+	if normalHeartbeatContext {
+		if snapshot := d.rm.membershipCounts.Load(); snapshot != nil && snapshot.cache != nil {
+			if values := snapshot.cache.current.Load(); values != nil && values == heartbeatCASSnapshot && values.callbackValidated {
+				localStateKnown := d.rm.membershipLocalStateKnown.Load()
+				localStateMatches := localStateKnown && d.rm.membershipLocalState.Load() == int32(instanceDesc.State)
+
+				// A decoded change may be waiting for memberlist to merge it. If
+				// this callback still sees the descriptor that was scanned before
+				// that merge, reuse those authoritative counts. Check the pending
+				// entries first so a same-cardinality replacement is reconciled
+				// instead of being accepted by a length-only test.
+				if values.pending && !values.pendingOverflow && !snapshot.pendingMatches(ringDesc) && localStateMatches && snapshot.cache.current.Load() == values && d.rm.heartbeatCASSnapshot.Load() == values {
+					clusterNodesActive.Set(float64(values.active))
+					clusterNodesTotal.Set(float64(values.total))
+					return
+				}
+
+				if values.descriptorValidated && values.synchronized && !values.pending && values.total == len(ringDesc.Ingesters) {
+					if localStateMatches {
+						clusterNodesActive.Set(float64(values.active))
+						clusterNodesTotal.Set(float64(values.total))
+						return
+					}
+					if snapshot.updateLocalStateIfCurrent(values, ringDesc, instanceID, instanceDesc) {
+						d.rm.membershipLocalState.Store(int32(instanceDesc.State))
+						d.rm.membershipLocalStateKnown.Store(true)
+						if updated := snapshot.cache.current.Load(); updated != nil {
+							d.rm.heartbeatCASSnapshot.Store(updated)
+							clusterNodesActive.Set(float64(updated.active))
+							clusterNodesTotal.Set(float64(updated.total))
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+
+	counts := d.rm.membershipSnapshot()
+
+	// A membership add or removal changes the descriptor cardinality and can be
+	// observed by this callback before the watcher runs. State changes for the
+	// instance being heartbeated are likewise visible in instanceDesc. These are
+	// transition-only fallbacks after synchronization.
+	read := counts.read()
+	pendingMismatch := read.pending && !counts.pendingMatches(ringDesc)
+	if normalHeartbeatContext && read.pending && !pendingMismatch {
+		counts.confirmPending(ringDesc)
+		// confirmPending publishes a new immutable values pointer. Refresh the
+		// read so the authoritative replacement below compares against it.
+		read = counts.read()
+	}
+	// A decoded delta can arrive after the initial pendingMatches check but
+	// before the authoritative replacement. Retain anything still pending so
+	// that replacement cannot erase a newer state that the descriptor has not
+	// incorporated yet.
+	retainPending := pendingMismatch || read.pending
+	instanceStateChanged := false
+	if !normalHeartbeatContext {
+		instanceStateChanged = counts.stateChanged(instanceID, instanceDesc)
+	} else if instanceDesc != nil {
+		localStateKnown := d.rm.membershipLocalStateKnown.Load()
+		instanceStateChanged = !localStateKnown || d.rm.membershipLocalState.Load() != int32(instanceDesc.State)
+	}
+	if !read.synchronized || !read.values.descriptorValidated || read.total != membershipEntryCount(ringDesc) || instanceStateChanged || pendingMismatch || (!normalHeartbeatContext && read.pending) || missingHeartbeatContext || (read.descriptor != ringDesc && !normalHeartbeatContext) {
+		refreshed := countMembership(ringDesc)
+		synchronized := d.rm.membershipWatcherObserved.Load() && d.rm.membershipChangeObserverPresent.Load()
+		var replaced bool
+		if normalHeartbeatContext {
+			replaced = counts.replaceValuesIfCurrentRetainingAbsent(read.values, refreshed.active, refreshed.total, refreshed.states, refreshed.timestamps, refreshed.descriptor, synchronized, retainPending)
+		} else {
+			replaced = counts.replaceValuesIfCurrent(read.values, refreshed.active, refreshed.total, refreshed.states, refreshed.timestamps, refreshed.descriptor, synchronized, retainPending)
+		}
+		if replaced {
+			read = counts.read()
+			if normalHeartbeatContext {
+				d.rm.heartbeatCASSnapshot.Store(read.values)
+			}
+		} else {
+			// A watcher or decoded delta won the update while this authoritative
+			// scan was running. Publish this callback's exact descriptor values,
+			// but force the next callback to reconcile rather than trusting a
+			// snapshot that may not contain this transition.
+			counts.markUnsynchronized()
+			read = membershipSnapshotRead{
+				active:       refreshed.active,
+				total:        refreshed.total,
+				synchronized: synchronized,
+				descriptor:   refreshed.descriptor,
+			}
+		}
+	}
+	if normalHeartbeatContext && instanceDesc != nil {
+		d.rm.membershipLocalState.Store(int32(instanceDesc.State))
+		d.rm.membershipLocalStateKnown.Store(true)
+	}
+
+	clusterNodesActive.Set(float64(read.active))
+	clusterNodesTotal.Set(float64(read.total))
 }
 
 // GetNodeTokens returns token assignments for all active nodes in the ring.

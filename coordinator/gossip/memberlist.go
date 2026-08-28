@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/kv/codec"
 	"github.com/grafana/dskit/kv/memberlist"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
@@ -20,7 +21,7 @@ import (
 type Memberlist struct {
 	cfg         memberlistConfig
 	kv          *memberlist.KV
-	client      *memberlist.Client
+	client      kv.Client
 	dnsProvider *simpleDNSProvider
 	logger      log.Logger
 	reg         prometheus.Registerer
@@ -31,6 +32,8 @@ func NewMemberlist(nodeID, clusterAddr string, seeds []string, logger log.Logger
 	cfg := newMemberlistConfig(nodeID, clusterAddr, seeds)
 
 	mlCfg := cfg.ToKVConfig()
+	ringCodec := newMembershipCodec(ring.GetCodec())
+	mlCfg.Codecs = []codec.Codec{ringCodec}
 
 	// Create DNS provider for resolving seed addresses
 	// This supports both static IPs and DNS names (e.g., Kubernetes headless services)
@@ -40,7 +43,7 @@ func NewMemberlist(nodeID, clusterAddr string, seeds []string, logger log.Logger
 	mlKV := memberlist.NewKV(mlCfg, logger, dnsProvider, reg)
 
 	// Create a client wrapper with the ring codec
-	client, err := memberlist.NewClient(mlKV, ring.GetCodec())
+	client, err := memberlist.NewClient(mlKV, ringCodec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create memberlist client: %w", err)
 	}
@@ -53,7 +56,7 @@ func NewMemberlist(nodeID, clusterAddr string, seeds []string, logger log.Logger
 	return &Memberlist{
 		cfg:         cfg,
 		kv:          mlKV,
-		client:      client,
+		client:      &observedClient{delegate: client, codec: ringCodec},
 		dnsProvider: dnsProvider,
 		logger:      logger,
 		reg:         reg,
