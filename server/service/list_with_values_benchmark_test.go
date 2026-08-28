@@ -163,8 +163,8 @@ func TestCacheService_ListWithValuesRetainsInlineData(t *testing.T) {
 	// The storage iterator is closed before ListWithValues returns. Close the
 	// storage too before checking the response to ensure returned bytes are not
 	// backed by RocksDB iterator memory.
-	storage.Close()
 	closed = true
+	storage.Close()
 	for _, entry := range response.Entries {
 		require.Contains(t, want, entry.Key)
 		require.False(t, entry.ValueOmitted)
