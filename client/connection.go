@@ -40,8 +40,20 @@ func newConnection(addr string, dialOpts []grpc.DialOption, poolSize int) (*conn
 	return newConnectionWithEpoch(addr, dialOpts, poolSize, nil, nil)
 }
 
-// newConnectionWithEpoch creates a new connection pool with epoch tracking support
+// newConnectionWithEpoch creates a new connection pool with epoch tracking support.
+// It retains the historical background-context behavior for callers that do not
+// own a lifecycle context.
 func newConnectionWithEpoch(addr string, dialOpts []grpc.DialOption, poolSize int, epochGetter EpochGetter, onMismatch EpochMismatchHandler) (*connection, error) {
+	return newConnectionWithEpochContext(context.Background(), addr, dialOpts, poolSize, epochGetter, onMismatch)
+}
+
+// newConnectionWithEpochContext creates a connection pool using ctx for every
+// blocking dial. Canceling ctx therefore interrupts a pool that is still being
+// staged, allowing its owner to close without waiting for an unreachable peer.
+func newConnectionWithEpochContext(ctx context.Context, addr string, dialOpts []grpc.DialOption, poolSize int, epochGetter EpochGetter, onMismatch EpochMismatchHandler) (*connection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if poolSize <= 0 {
 		poolSize = 3 // Default pool size
 	}
@@ -71,7 +83,7 @@ func newConnectionWithEpoch(addr string, dialOpts []grpc.DialOption, poolSize in
 			)
 		}
 
-		conn, err := grpc.Dial(addr, opts...)
+		conn, err := grpc.DialContext(ctx, addr, opts...)
 		if err != nil {
 			// Clean up any connections we've already created
 			c.closeAll()

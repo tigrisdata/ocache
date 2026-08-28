@@ -18,19 +18,46 @@ type Router interface {
 	RoundRobinRoute() (*connection, error)
 }
 
+// contextRouter is implemented by clients whose routing transition can be
+// canceled with the operation context. Router remains unchanged so existing
+// custom routers keep their current behavior.
+type contextRouter interface {
+	RouteContext(ctx context.Context, key string) (*connection, error)
+	RoundRobinRouteContext(ctx context.Context) (*connection, error)
+}
+
 // Operations provides shared implementation of cache operations
 type Operations struct {
-	router Router
+	router           Router
+	contextualRouter contextRouter
 }
 
 // NewOperations creates a new Operations instance
 func NewOperations(router Router) *Operations {
-	return &Operations{router: router}
+	o := &Operations{router: router}
+	if contextualRouter, ok := router.(contextRouter); ok {
+		o.contextualRouter = contextualRouter
+	}
+	return o
+}
+
+func (o *Operations) route(ctx context.Context, key string) (*connection, error) {
+	if o.contextualRouter != nil && ctx != nil && ctx.Done() != nil {
+		return o.contextualRouter.RouteContext(ctx, key)
+	}
+	return o.router.Route(key)
+}
+
+func (o *Operations) roundRobinRoute(ctx context.Context) (*connection, error) {
+	if o.contextualRouter != nil && ctx != nil && ctx.Done() != nil {
+		return o.contextualRouter.RoundRobinRouteContext(ctx)
+	}
+	return o.router.RoundRobinRoute()
 }
 
 // Put stores a value in the cache
 func (o *Operations) Put(ctx context.Context, key string, data []byte, ttlSeconds int64) error {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -48,7 +75,7 @@ func (o *Operations) Put(ctx context.Context, key string, data []byte, ttlSecond
 
 // PutStream streams data to the cache
 func (o *Operations) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -107,7 +134,7 @@ func (o *Operations) PutStream(ctx context.Context, key string, r io.Reader, ttl
 
 // Get retrieves a value from the cache
 func (o *Operations) Get(ctx context.Context, key string) ([]byte, error) {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +173,7 @@ func (o *Operations) Get(ctx context.Context, key string) ([]byte, error) {
 
 // GetStream streams a value from the cache
 func (o *Operations) GetStream(ctx context.Context, key string, w io.Writer) error {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -184,7 +211,7 @@ func (o *Operations) GetStream(ctx context.Context, key string, w io.Writer) err
 
 // GetRange retrieves a byte range from the cache
 func (o *Operations) GetRange(ctx context.Context, key string, start, end int64) ([]byte, error) {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +254,7 @@ func (o *Operations) GetRange(ctx context.Context, key string, start, end int64)
 
 // GetRangeStream streams a byte range from the cache
 func (o *Operations) GetRangeStream(ctx context.Context, key string, start, end int64, w io.Writer) error {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -271,7 +298,7 @@ func (o *Operations) GetRangeStream(ctx context.Context, key string, start, end 
 
 // Delete removes a key from the cache
 func (o *Operations) Delete(ctx context.Context, key string) error {
-	conn, err := o.router.Route(key)
+	conn, err := o.route(ctx, key)
 	if err != nil {
 		return err
 	}
@@ -288,7 +315,7 @@ func (o *Operations) Delete(ctx context.Context, key string) error {
 // List lists keys with optional prefix
 // Returns all keys matching the prefix (automatically handles pagination)
 func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) {
-	conn, err := o.router.RoundRobinRoute()
+	conn, err := o.roundRobinRoute(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +364,7 @@ func (o *Operations) List(ctx context.Context, prefix string) ([]string, error) 
 // ListPage returns a single page of keys with pagination support
 // Returns: (keys, continuationToken, hasMore, error)
 func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, continuationToken string) ([]string, string, bool, error) {
-	conn, err := o.router.RoundRobinRoute()
+	conn, err := o.roundRobinRoute(ctx)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -368,7 +395,7 @@ func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, con
 // ListPageWithValues returns a single page of key-value pairs with pagination support.
 // Returns: (entries, continuationToken, hasMore, error)
 func (o *Operations) ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) ([]KeyValue, string, bool, error) {
-	conn, err := o.router.RoundRobinRoute()
+	conn, err := o.roundRobinRoute(ctx)
 	if err != nil {
 		return nil, "", false, err
 	}

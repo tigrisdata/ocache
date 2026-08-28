@@ -98,6 +98,11 @@ run_eviction_suite() {
     # Read the OLDEST keys (1-5) under both policies. Under LRU this refreshes
     # them so they survive; under FIFO it must NOT protect them.
     #
+    # Access updates use Unix-second timestamps. Wait for a later second than
+    # every phase-one write so the refreshed LRU entries are newer than all of
+    # the un-read entries, rather than relying on sub-second write timing.
+    echo "Waiting for access timestamp to advance before reading..."
+    sleep 2
     # The read must return DATA for LRU to bump recency: the server refreshes
     # access time only AFTER the key is found, access buckets are hourly, and
     # eviction order within a bucket is purely by nanosecond — so an un-bumped key
