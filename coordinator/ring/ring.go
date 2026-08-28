@@ -22,6 +22,8 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 )
 
+const minHostBufferCapacity = ring.GetBufferSize + 1
+
 // instanceDescPool is a sync.Pool for reusing InstanceDesc slices in hot-path ring lookups.
 // This reduces GC pressure from frequent allocations during IsLocal() and GetNode() calls.
 var instanceDescPool = sync.Pool{
@@ -36,7 +38,7 @@ var hostPool = sync.Pool{
 	New: func() interface{} {
 		// Ring.Get does not return its host buffer, so leave room for one more
 		// transition replica than dskit's typical descriptor capacity.
-		return make([]string, 0, ring.GetBufferSize+1)
+		return make([]string, 0, minHostBufferCapacity)
 	},
 }
 
@@ -50,9 +52,25 @@ func releaseInstanceDescBuffer(buf []ring.InstanceDesc) {
 	instanceDescPool.Put(buf[:0])
 }
 
-// acquireHostBuffer gets a host string slice from the pool.
-func acquireHostBuffer() []string {
-	return hostPool.Get().([]string)[:0]
+// acquireHostBuffer gets a host string slice from the pool with at least
+// minCapacity entries of backing storage.
+func acquireHostBuffer(minCapacity int) []string {
+	buf := hostPool.Get().([]string)[:0]
+	if cap(buf) < minCapacity {
+		return make([]string, 0, minCapacity)
+	}
+	return buf
+}
+
+// acquireHostLookupBuffer sizes the host buffer for the largest set Ring.Get
+// can inspect in the current topology. Unlike the descriptor slice, dskit does
+// not return its host slice, so the caller must avoid growth before the call.
+func (rm *RingManager) acquireHostLookupBuffer() []string {
+	capacity := rm.ring.InstancesCount()
+	if capacity < minHostBufferCapacity {
+		capacity = minHostBufferCapacity
+	}
+	return acquireHostBuffer(capacity)
 }
 
 // releaseHostBuffer returns a host string slice to the pool.
@@ -427,7 +445,7 @@ func (rm *RingManager) IsLocal(key string) bool {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	hostBuf := acquireHostBuffer()
+	hostBuf := rm.acquireHostLookupBuffer()
 	defer func() {
 		releaseInstanceDescBuffer(instBuf)
 	}()
@@ -465,7 +483,7 @@ func (rm *RingManager) GetNode(key string) (*NodeInfo, error) {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	hostBuf := acquireHostBuffer()
+	hostBuf := rm.acquireHostLookupBuffer()
 	defer func() {
 		releaseInstanceDescBuffer(instBuf)
 	}()
@@ -501,7 +519,7 @@ func (rm *RingManager) GetPrimaryNode(key string) (*NodeInfo, error) {
 
 	// Acquire pooled buffers to reduce allocations
 	instBuf := acquireInstanceDescBuffer()
-	hostBuf := acquireHostBuffer()
+	hostBuf := rm.acquireHostLookupBuffer()
 	defer func() {
 		releaseInstanceDescBuffer(instBuf)
 	}()
