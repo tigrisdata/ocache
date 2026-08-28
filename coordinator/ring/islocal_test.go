@@ -108,6 +108,13 @@ func TestRingManagerIsLocalPreservesOwnershipDuringTransitions(t *testing.T) {
 			want:              true,
 		},
 		{
+			name:              "replication-factor-3-three-pending",
+			replicationFactor: 3,
+			states:            []dskitring.InstanceState{dskitring.PENDING, dskitring.PENDING, dskitring.PENDING, dskitring.ACTIVE, dskitring.ACTIVE, dskitring.ACTIVE},
+			localNodeID:       "islocal-3",
+			want:              true,
+		},
+		{
 			name:              "replication-factor-1",
 			replicationFactor: 1,
 			states:            []dskitring.InstanceState{dskitring.PENDING, dskitring.ACTIVE, dskitring.ACTIVE},

@@ -27,6 +27,12 @@ func BenchmarkClientIsLocal(b *testing.B) {
 			localNodeID:       "islocal-0",
 		},
 		{
+			name:              "replication-factor=3/three-pending",
+			replicationFactor: 3,
+			states:            []ring.InstanceState{ring.PENDING, ring.PENDING, ring.PENDING, ring.ACTIVE, ring.ACTIVE, ring.ACTIVE},
+			localNodeID:       "islocal-3",
+		},
+		{
 			name:              "replication-factor=1/transition",
 			replicationFactor: 1,
 			states:            []ring.InstanceState{ring.PENDING, ring.ACTIVE, ring.ACTIVE},
