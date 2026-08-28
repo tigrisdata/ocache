@@ -670,8 +670,8 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 			} else {
 				switch valueMsg.ValueType {
 				case pb.ValueType_INLINE:
-					data = make([]byte, len(valueMsg.Data))
-					copy(data, valueMsg.Data)
+					// proto.Unmarshal owns a copy separate from the iterator buffer.
+					data = valueMsg.Data
 				case pb.ValueType_SEGMENT:
 					r, readErr := s.segmentManager.ReadEntry(keys.ExtractUserKey(k), valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
 					if readErr == nil && r != nil {
