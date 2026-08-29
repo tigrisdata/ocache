@@ -267,6 +267,27 @@ build-bench-cache-service-delete: proto
 	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-delete.test" ./service
+# Compile the standalone file-lock benchmarks without linking the RocksDB-backed
+# FD cache. Set FILELOCK_BENCH_BINARY to the desired output path. Resolve it
+# before changing directories so relative paths are rooted at the repository.
+FILELOCK_BENCH_BINARY ?=
+FILELOCK_BENCH_OUTPUT := $(abspath $(FILELOCK_BENCH_BINARY))
+.PHONY: bench-filelock
+bench-filelock:
+	@test -n "$(FILELOCK_BENCH_BINARY)" || { echo "FILELOCK_BENCH_BINARY is required"; exit 1; }
+	@mkdir -p "$(dir $(FILELOCK_BENCH_OUTPUT))"
+	@cd storage/fd && go test -c -o "$(FILELOCK_BENCH_OUTPUT)" filelockmanager.go filelockmanager_test.go filelockmanager_bench_test.go
+
+# Compile deletion-queue benchmarks with the same RocksDB Cgo flags as storage tests.
+# Set DELETION_BENCH_BINARY to the desired output path. Resolve it before changing
+# directories so relative paths are rooted at the repository.
+DELETION_BENCH_BINARY ?=
+DELETION_BENCH_OUTPUT := $(abspath $(DELETION_BENCH_BINARY))
+.PHONY: bench-deletion
+bench-deletion:
+	@test -n "$(DELETION_BENCH_BINARY)" || { echo "DELETION_BENCH_BINARY is required"; exit 1; }
+	@mkdir -p "$(dir $(DELETION_BENCH_OUTPUT))"
+	@cd storage/deletion && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -c -o "$(DELETION_BENCH_OUTPUT)" .
 
 # Compile the CacheService ListWithValues benchmark once so paired runs do not
 # include Go compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
@@ -322,6 +343,25 @@ test-storage-wire: proto
 .PHONY: test-storage-reconcile
 test-storage-reconcile: proto
 	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s -run '^TestCleaner' .
+# FileLockManager has no RocksDB dependency, so test it directly without
+# compiling the rest of the FD cache package.
+.PHONY: test-filelock
+test-filelock:
+	@echo "Running file lock manager tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd storage/fd && go test -v -timeout 60s $(TESTFLAGS) filelockmanager.go filelockmanager_test.go filelockmanager_bench_test.go
+
+.PHONY: test-filelock-race
+test-filelock-race:
+	@echo "Running file lock manager tests with race detector..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd storage/fd && go test -race -v -timeout 60s $(TESTFLAGS) filelockmanager.go filelockmanager_test.go filelockmanager_bench_test.go
+
+.PHONY: test-deletion
+test-deletion:
+	@echo "Running deletion queue tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd storage/deletion && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test -v -timeout 60s $(TESTFLAGS) .
 
 .PHONY: test-client
 test-client: proto
@@ -583,6 +623,9 @@ help:
 	@echo "  test                        - Run unit tests (server and client)"
 	@echo "  test-all                    - Run all tests (unit and integration)"
 	@echo "  test-server                 - Run server tests only"
+	@echo "  test-filelock               - Run file lock manager tests"
+	@echo "  test-filelock-race          - Run file lock manager tests with the race detector"
+	@echo "  test-deletion               - Run deletion queue tests"
 	@echo "  test-client                 - Run client tests only"
 	@echo "  test-coordinator            - Run coordinator tests only"
 	@echo "  test-race                   - Run tests with race detector"
@@ -605,6 +648,8 @@ help:
 	@echo "  build-bench-cache-topology-rpc - Compile the CacheService topology RPC benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo "  build-bench-cache-service-delete - Compile the CacheService delete benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo "  build-bench-cache-service-list-with-values - Compile the CacheService ListWithValues benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
+	@echo "  bench-filelock              - Compile file lock benchmarks (set FILELOCK_BENCH_BINARY)"
+	@echo "  bench-deletion              - Compile deletion queue benchmarks (set DELETION_BENCH_BINARY)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"
