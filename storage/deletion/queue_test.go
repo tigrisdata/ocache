@@ -283,7 +283,7 @@ func TestQueue_PruneOldEntries_ExcludesCutoffAndNewer(t *testing.T) {
 	value.Free()
 }
 
-func TestQueue_PruneOldEntries_NormalizesLegacyTimestamp(t *testing.T) {
+func TestQueue_PruneOldEntries_KeepsLegacyTimestamp(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
 
@@ -308,12 +308,17 @@ func TestQueue_PruneOldEntries_NormalizesLegacyTimestamp(t *testing.T) {
 	value.Free()
 	value, err = queue.meta.Handle().Get(ro, legacyFutureKey)
 	require.NoError(t, err)
-	require.False(t, value.Exists(), "legacy future key should be canonicalized")
+	require.True(t, value.Exists(), "legacy future key should remain queued")
 	value.Free()
 	value, err = queue.meta.Handle().Get(ro, canonicalFutureKey)
 	require.NoError(t, err)
-	require.True(t, value.Exists(), "future queue entry should remain after canonicalization")
+	require.False(t, value.Exists(), "legacy future key should not be rewritten")
 	value.Free()
+
+	marker, err := queue.meta.Handle().Get(ro, []byte(deletionQueueCanonicalMarker))
+	require.NoError(t, err)
+	require.False(t, marker.Exists(), "legacy rows must keep the full-scan fallback")
+	marker.Free()
 }
 
 // TestQueue_PruneOldEntries_KeepsExistingFile is the regression test for the
