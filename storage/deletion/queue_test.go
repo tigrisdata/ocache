@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/keys"
@@ -95,8 +96,370 @@ func TestQueue_Deduplication(t *testing.T) {
 	_, err = os.Stat(testFile)
 	require.True(t, os.IsNotExist(err), "file should be deleted")
 
-	// Check that processed count is 1, not 5
+	// Check that processed count is 1, not 5, and all duplicate queue rows
+	// were retired with the one successful deletion.
 	require.Equal(t, int64(1), queue.processed)
+	require.Equal(t, int64(0), queue.GetQueueDepth())
+}
+
+func TestQueue_ProcessBatch_PreservesLaterQueueEntry(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	f := filepath.Join(t.TempDir(), "later-entry.bin")
+	require.NoError(t, os.WriteFile(f, []byte("first"), 0o644))
+	for i := 0; i < 5; i++ {
+		require.NoError(t, queue.Add(f))
+		time.Sleep(time.Millisecond)
+	}
+
+	// A later-generation queue key is outside this pass because it is not due.
+	// The batch must delete only keys it observed, not every key for the path.
+	futureKey := keys.MakeDeletionQueueKey(time.Now().Add(24*time.Hour).UnixNano(), f)
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Put(wo, futureKey, []byte{0x01}))
+
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, f)
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "a later queue generation must survive the earlier batch")
+}
+
+func TestQueue_ProcessBatch_DeduplicatesPastBatchBoundary(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	queue.config.BatchSize = 2
+	queue.config.RetryDelay = time.Hour
+
+	tmpDir := t.TempDir()
+	stuck := filepath.Join(tmpDir, "boundary-stuck.txt")
+	other := filepath.Join(tmpDir, "boundary-other.txt")
+	tail := filepath.Join(tmpDir, "boundary-tail.txt")
+	require.NoError(t, os.WriteFile(stuck, []byte("stuck"), 0o644))
+	require.NoError(t, os.WriteFile(other, []byte("other"), 0o644))
+	require.NoError(t, os.WriteFile(tail, []byte("tail"), 0o644))
+
+	// Put a duplicate for the locked path after an unselected distinct path
+	// and after the second distinct-path boundary. The first processing pass
+	// must still coalesce it with the selected group, or it will be retried
+	// immediately on the next tick.
+	baseTimestamp := time.Now().Add(-time.Minute).UnixNano()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp, stuck), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+1, other), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+2, tail), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+3, stuck), []byte{0x01})
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	lock := fd.GetFileLockManager().GetFileLock(stuck)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	queue.ProcessBatch()
+
+	require.FileExists(t, stuck)
+	require.NoFileExists(t, other)
+	require.FileExists(t, tail, "the distinct path beyond the batch remains queued")
+	require.Equal(t, int64(1), queue.failed)
+	require.Equal(t, int64(3), queue.GetQueueDepth(), "the unselected tail and duplicate await the next bounded scan")
+
+	// The delayed retry is not due yet, so another worker tick can retire the
+	// duplicate and process the unselected tail without making a second attempt
+	// on the locked path.
+	queue.ProcessBatch()
+	require.NoFileExists(t, tail)
+	require.Equal(t, int64(1), queue.failed)
+	require.Equal(t, int64(1), queue.GetQueueDepth())
+}
+
+func TestQueue_ProcessBatch_DeduplicatesSuccessfulPastBatchBoundary(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+	queue.config.BatchSize = 2
+
+	tmpDir := t.TempDir()
+	first := filepath.Join(tmpDir, "successful-first.txt")
+	second := filepath.Join(tmpDir, "successful-second.txt")
+	third := filepath.Join(tmpDir, "successful-third.txt")
+	for _, path := range []string{first, second, third} {
+		require.NoError(t, os.WriteFile(path, []byte(path), 0o644))
+	}
+
+	baseTimestamp := time.Now().Add(-time.Minute).UnixNano()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp, first), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+1, second), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+2, third), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+3, first), []byte{0x01})
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	queue.ProcessBatch()
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, first)
+	require.NoFileExists(t, second)
+	require.NoFileExists(t, third)
+	require.Equal(t, int64(3), queue.processed, "the duplicate after the batch boundary must not trigger another deletion attempt")
+	require.Equal(t, int64(0), queue.GetQueueDepth())
+}
+
+func TestQueue_PersistedSuccessWatermarkProtectsPathReuse(t *testing.T) {
+	dbDir := t.TempDir()
+	meta, err := metadata.NewMetaDB(dbDir, 0, nil, nil)
+	require.NoError(t, err)
+
+	config := Config{BatchSize: 1}
+	queue := NewQueue(meta, config)
+	filesDir := t.TempDir()
+	path := filepath.Join(filesDir, "reused-after-success.txt")
+	other := filepath.Join(filesDir, "other.txt")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+	require.NoError(t, os.WriteFile(other, []byte("other"), 0o644))
+
+	baseTimestamp := time.Now().Add(-time.Minute).UnixNano()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp, path), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+1, other), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+2, path), []byte{0x01})
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	queue.ProcessBatch()
+	require.NoFileExists(t, path)
+	require.Equal(t, int64(2), queue.GetQueueDepth())
+
+	// Recreate the pathname before the old duplicate is scanned, then reopen the
+	// queue. The persisted success watermark must retire that old duplicate
+	// without treating the recreated file as a new deletion request.
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
+	queue.Stop()
+	meta.Close()
+
+	meta, err = metadata.NewMetaDB(dbDir, 0, nil, nil)
+	require.NoError(t, err)
+	queue = NewQueue(meta, config)
+	defer func() {
+		queue.Stop()
+		meta.Close()
+	}()
+
+	queue.ProcessBatch()
+
+	require.FileExists(t, path, "an old successful duplicate must not delete a recreated pathname after restart")
+	require.NoFileExists(t, other)
+	require.Equal(t, int64(0), queue.GetQueueDepth())
+}
+
+func TestQueue_PrunePreservesSuccessWatermark(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+	queue.config.BatchSize = 1
+	queue.config.PruneAge = 10 * time.Second
+
+	filesDir := t.TempDir()
+	path := filepath.Join(filesDir, "pruned-success.bin")
+	other := filepath.Join(filesDir, "pruned-success-other.bin")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+	require.NoError(t, os.WriteFile(other, []byte("other"), 0o644))
+
+	now := time.Now()
+	oldTimestamp := now.Add(-30 * time.Second).UnixNano()
+	prunableDuplicate := now.Add(-20 * time.Second).UnixNano()
+	recentDuplicate := now.Add(-5 * time.Second).UnixNano()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(oldTimestamp, path), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(oldTimestamp+1, other), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(prunableDuplicate, path), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(recentDuplicate, path), []byte{0x01})
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	// The first path is deleted at the batch boundary. The two later path
+	// entries need a success watermark because they were not scanned yet.
+	queue.ProcessBatch()
+	require.NoFileExists(t, path)
+	require.NotEmpty(t, queue.successWatermarks)
+
+	// Prune only the older remaining duplicate while the newer one remains in
+	// the queue. The watermark must survive this partial cleanup.
+	queue.pruneOldEntries()
+	state, ok := queue.retryStates[path]
+	require.True(t, ok)
+	require.NotEmpty(t, state.watermarkKey)
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
+	queue.ProcessBatch()
+
+	require.FileExists(t, path, "pruning an old duplicate must not remove success protection from a newer duplicate")
+	require.Equal(t, int64(2), queue.processed, "the recreated pathname must not be deleted by an old duplicate")
+	require.Equal(t, int64(0), queue.GetQueueDepth())
+}
+
+func TestQueue_PersistedRetryWatermark(t *testing.T) {
+	dbDir := t.TempDir()
+	meta, err := metadata.NewMetaDB(dbDir, 0, nil, nil)
+	require.NoError(t, err)
+
+	config := Config{
+		BatchSize:  1,
+		RetryDelay: time.Hour,
+	}
+	queue := NewQueue(meta, config)
+
+	filesDir := t.TempDir()
+	stuck := filepath.Join(filesDir, "persisted-stuck.txt")
+	tail := filepath.Join(filesDir, "persisted-tail.txt")
+	require.NoError(t, os.WriteFile(stuck, []byte("stuck"), 0o644))
+	require.NoError(t, os.WriteFile(tail, []byte("tail"), 0o644))
+
+	baseTimestamp := time.Now().Add(-time.Minute).UnixNano()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp, stuck), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+1, tail), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+2, stuck), []byte{0x01})
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	lock := fd.GetFileLockManager().GetFileLock(stuck)
+	lock.RLock()
+	queue.ProcessBatch()
+	lock.RUnlock()
+	queue.Stop()
+	meta.Close()
+
+	meta, err = metadata.NewMetaDB(dbDir, 0, nil, nil)
+	require.NoError(t, err)
+	queue = NewQueue(meta, config)
+	defer func() {
+		queue.Stop()
+		meta.Close()
+	}()
+
+	queue.ProcessBatch()
+
+	require.FileExists(t, stuck)
+	require.NoFileExists(t, tail)
+	require.Equal(t, int64(0), queue.failed, "a persisted watermark must suppress the old duplicate after restart")
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "only the delayed retry should remain")
+}
+
+func TestQueue_PruneOldDuplicateRemovesDelayedRetry(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+	queue.config.BatchSize = 1
+	queue.config.RetryDelay = time.Hour
+	queue.config.PruneAge = time.Nanosecond
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "pruned-retry.bin")
+	other := filepath.Join(tmpDir, "pruned-other.bin")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+	require.NoError(t, os.WriteFile(other, []byte("other"), 0o644))
+
+	baseTimestamp := time.Now().Add(-time.Minute).UnixNano()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp, path), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+1, other), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+2, path), []byte{0x01})
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	lock := fd.GetFileLockManager().GetFileLock(path)
+	lock.RLock()
+	queue.ProcessBatch()
+	lock.RUnlock()
+	require.Equal(t, int64(3), queue.GetQueueDepth(), "the delayed retry, other path, and old duplicate should remain")
+
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Remove(other))
+	queue.pruneOldEntries()
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "pruning a missing old duplicate must remove its delayed retry")
+
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
+	require.NoError(t, queue.Add(path))
+	queue.ProcessBatch()
+	require.NoFileExists(t, path)
+	require.Equal(t, int64(1), queue.processed, "the recreated pathname should have one new lifecycle")
+}
+
+func TestQueue_SuccessfulRetryRemovesFailedMarker(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+	queue.config.BatchSize = 1
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "successful-retry-marker.bin")
+	other := filepath.Join(tmpDir, "successful-retry-tail.bin")
+	require.NoError(t, os.WriteFile(path, []byte("path"), 0o644))
+	require.NoError(t, os.WriteFile(other, []byte("other"), 0o644))
+
+	baseTimestamp := time.Now().Add(-time.Minute).UnixNano()
+	oldState := retryState{cutoff: baseTimestamp - 2, retryAt: baseTimestamp - 1}
+	queue.retryStates[path] = oldState
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp, path), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueKey(baseTimestamp+1, other), []byte{0x01})
+	batch.Put(keys.MakeDeletionQueueRetryStateKey(path), encodeRetryState(oldState))
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, queue.meta.Handle().Write(wo, batch))
+
+	queue.ProcessBatch()
+
+	ro := metadata.CreateReadOptions(true, false)
+	defer ro.Destroy()
+	it := queue.meta.Handle().NewIterator(ro)
+	defer it.Close()
+	prefix := []byte(keys.DeletionQueueRetryStatePrefix)
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		key := it.Key()
+		require.NotEqual(t, keys.MakeDeletionQueueRetryStateKey(path), key.Data(), "a successful retry must not leave the failed marker behind")
+		key.Free()
+		it.Value().Free()
+	}
+}
+
+func TestQueue_PathReuseSupersedesDelayedRetry(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+	queue.config.RetryDelay = time.Hour
+
+	path := filepath.Join(t.TempDir(), "reused-delayed.bin")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+
+	lock := fd.GetFileLockManager().GetFileLock(path)
+	lock.RLock()
+	require.NoError(t, queue.Add(path))
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed)
+	lock.RUnlock()
+
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
+	require.NoError(t, queue.Add(path))
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, path)
+	require.Equal(t, int64(1), queue.failed)
+	require.Equal(t, int64(1), queue.processed)
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "a new lifecycle must remove the superseded delayed retry")
 }
 
 func TestQueue_EmptyFilepath(t *testing.T) {
@@ -156,6 +519,36 @@ func TestQueue_ConcurrentAdd(t *testing.T) {
 	entries, err := os.ReadDir(tmpDir)
 	require.NoError(t, err)
 	require.Empty(t, entries, "all files should be deleted")
+}
+
+func TestQueue_ConcurrentDuplicateAdd(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	testFile := filepath.Join(t.TempDir(), "concurrent-duplicate.txt")
+	require.NoError(t, os.WriteFile(testFile, []byte("test"), 0o644))
+
+	const duplicateCount = 100
+	var wg sync.WaitGroup
+	errs := make(chan error, duplicateCount)
+	for i := 0; i < duplicateCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- queue.Add(testFile)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, testFile)
+	require.Equal(t, int64(1), queue.processed)
+	require.Equal(t, int64(0), queue.GetQueueDepth())
 }
 
 func TestQueue_BackgroundProcessing(t *testing.T) {
@@ -395,6 +788,67 @@ func TestQueue_ProcessBatch_RetryDelayDefersRetry(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 	queue.ProcessBatch()
 	require.Equal(t, int64(2), queue.failed, "stuck entry must be retried after RetryDelay elapses")
+}
+
+func TestQueue_ProcessBatch_DuplicateRetryCoalesces(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	queue.config.RetryDelay = 200 * time.Millisecond
+
+	f := filepath.Join(t.TempDir(), "duplicate-locked.bin")
+	require.NoError(t, os.WriteFile(f, []byte("x"), 0o644))
+	lock := fd.GetFileLockManager().GetFileLock(f)
+	lock.RLock()
+
+	const duplicateCount = 5
+	for i := 0; i < duplicateCount; i++ {
+		require.NoError(t, queue.Add(f))
+		time.Sleep(time.Millisecond)
+	}
+
+	// One failed filesystem attempt replaces every due duplicate with one
+	// delayed retry.
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed)
+	require.Equal(t, int64(1), queue.GetQueueDepth(), "duplicate failures must share one retry")
+	require.FileExists(t, f)
+
+	// The coalesced retry is not attempted again during its backoff window.
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed, "coalesced retry must respect RetryDelay")
+	require.Equal(t, int64(1), queue.GetQueueDepth())
+
+	lock.RUnlock()
+	time.Sleep(250 * time.Millisecond)
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, f)
+	require.Equal(t, int64(1), queue.processed)
+	require.Equal(t, int64(0), queue.GetQueueDepth())
+}
+
+func TestQueue_PathReuseStartsNewDeletionLifecycle(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	f := filepath.Join(t.TempDir(), "reused.bin")
+	require.NoError(t, os.WriteFile(f, []byte("first"), 0o644))
+	require.NoError(t, queue.Add(f))
+	queue.ProcessBatch()
+	require.NoFileExists(t, f)
+	require.Equal(t, int64(0), queue.GetQueueDepth())
+
+	// A later file at the same path gets its own queue key and is processed
+	// independently after the first lifecycle has drained.
+	require.NoError(t, os.WriteFile(f, []byte("second"), 0o644))
+	require.NoError(t, queue.Add(f))
+	require.Equal(t, int64(1), queue.GetQueueDepth())
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, f)
+	require.Equal(t, int64(2), queue.processed)
+	require.Equal(t, int64(0), queue.GetQueueDepth())
 }
 
 func TestQueue_GetQueueDepth(t *testing.T) {
