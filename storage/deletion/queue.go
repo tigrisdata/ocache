@@ -37,6 +37,18 @@ type Queue struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// The trigger and completion channel are nil for normal queues. Benchmarks
+	// use them to drive and await the same processingLoop pruning case without
+	// waiting for the hourly ticker.
+	pruneTrigger  chan struct{}
+	pruneComplete chan struct{}
+
+	// A successful full scan proves that this process has only canonical queue
+	// keys. Keep that proof in memory so a restart after a legacy writer cannot
+	// reuse stale format state from the database.
+	canonicalKeysMu    sync.Mutex
+	canonicalKeysReady bool
+
 	// Stats
 	processed int64
 	failed    int64
@@ -75,6 +87,16 @@ func (q *Queue) Stop() {
 		Int64("failed", q.failed).
 		Int64("pruned", q.pruned).
 		Msg("deletion queue: stopped")
+}
+
+func (q *Queue) signalPruneComplete() {
+	if q.pruneComplete == nil {
+		return
+	}
+	select {
+	case q.pruneComplete <- struct{}{}:
+	default:
+	}
 }
 
 // Add adds a file to the deletion queue
@@ -126,6 +148,10 @@ func (q *Queue) processingLoop() {
 			q.ProcessBatch()
 		case <-pruneTicker.C:
 			q.pruneOldEntries()
+			q.signalPruneComplete()
+		case <-q.pruneTrigger:
+			q.pruneOldEntries()
+			q.signalPruneComplete()
 		case <-depthTicker.C:
 			q.logQueueDepth()
 		case <-q.ctx.Done():
@@ -299,11 +325,54 @@ func (q *Queue) tryDelete(filepath string) bool {
 
 // pruneOldEntries removes queue entries older than PruneAge
 func (q *Queue) pruneOldEntries() {
+	q.pruneOldEntriesAt(time.Now().Add(-q.config.PruneAge).UnixNano())
+}
+
+const deletionQueueTimestampWidth = 20
+
+// isCanonicalDeletionQueueKey reports whether key uses the fixed-width timestamp
+// emitted by MakeDeletionQueueKey.
+func isCanonicalDeletionQueueKey(key []byte) bool {
+	const timestampStart = len(keys.DeletionQueuePrefix)
+	const timestampEnd = timestampStart + deletionQueueTimestampWidth
+	if len(key) <= timestampEnd || key[timestampEnd] != '/' {
+		return false
+	}
+	for i, digit := range key[timestampStart:timestampEnd] {
+		if i == 0 && digit == '-' {
+			continue
+		}
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// pruneOldEntriesAt removes entries older than cutoff. Keeping the cutoff
+// explicit makes the ordering boundary testable without changing the scheduled
+// pruning entry point.
+func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 	startTime := time.Now()
-	cutoff := time.Now().Add(-q.config.PruneAge).UnixNano()
+
+	// The first pass for each process must inspect the whole prefix because
+	// older releases wrote variable-width timestamps. If it finds only canonical
+	// parseable keys, later passes in this process can use the ordered bound.
+	// Queues with legacy rows retain the safe full-scan path. The proof is kept
+	// only in memory: a restart after a rollback must not reuse stale format
+	// state from the database.
+	q.canonicalKeysMu.Lock()
+	defer q.canonicalKeysMu.Unlock()
+	canonicalKeysReady := q.canonicalKeysReady
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
+	if canonicalKeysReady {
+		// Deletion queue keys sort by their fixed-width timestamp. The upper
+		// bound is exclusive, so entries at cutoff and newer are never decoded
+		// or visited.
+		ro.SetIterateUpperBound(keys.MakeDeletionQueueKey(cutoff, ""))
+	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -317,6 +386,8 @@ func (q *Queue) pruneOldEntries() {
 	prefix := []byte(keys.DeletionQueuePrefix)
 	pruned := 0
 	stuck := 0
+	legacyKeysFound := false
+	writeFailed := false
 
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		// Check for shutdown
@@ -327,10 +398,18 @@ func (q *Queue) pruneOldEntries() {
 		}
 
 		key := it.Key()
+		value := it.Value()
 		keyData := key.Data()
 
-		// Extract timestamp and filepath from key
+		// Extract timestamp and filepath from key. Legacy rows are left in place
+		// and force the safe full-scan path on later passes; malformed keys remain
+		// untouched.
 		timestamp, filepath, err := keys.ParseDeletionQueueKey(keyData)
+		legacy := err == nil && !canonicalKeysReady && !isCanonicalDeletionQueueKey(keyData)
+		if legacy {
+			legacyKeysFound = true
+		}
+
 		if err == nil && timestamp > 0 && timestamp < cutoff {
 			// The queue entry is the only durable record that this file must be
 			// deleted. Dropping it while the file still exists orphans the file
@@ -360,11 +439,13 @@ func (q *Queue) pruneOldEntries() {
 		}
 
 		key.Free()
-		it.Value().Free()
+		value.Free()
 
-		// Commit batch periodically
+		// Commit batch periodically. A failed write must not establish the
+		// in-memory format proof, or a later bounded pass could miss a legacy row.
 		if batch.Count() >= 100 {
 			if err := q.meta.Handle().Write(wo, batch); err != nil {
+				writeFailed = true
 				zlog.Error().
 					Err(err).
 					Msg("deletion queue: failed to prune batch")
@@ -373,13 +454,21 @@ func (q *Queue) pruneOldEntries() {
 		}
 	}
 
+	scanComplete := it.Err() == nil
+	if !scanComplete {
+		zlog.Error().Err(it.Err()).Msg("deletion queue: failed to scan entries")
+	}
 	// Commit final batch
 	if batch.Count() > 0 {
 		if err := q.meta.Handle().Write(wo, batch); err != nil {
+			writeFailed = true
 			zlog.Error().
 				Err(err).
 				Msg("deletion queue: failed to prune final batch")
 		}
+	}
+	if !canonicalKeysReady && !legacyKeysFound && scanComplete && !writeFailed {
+		q.canonicalKeysReady = true
 	}
 
 	if pruned > 0 {
