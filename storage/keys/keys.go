@@ -40,16 +40,6 @@ const (
 	// DeletionQueuePrefix is the prefix for deletion queue entries in RocksDB
 	DeletionQueuePrefix = "!del/"
 
-	// DeletionQueueRetryStatePrefix stores one generation watermark for a
-	// persistently failed deletion path. It is separate from the timestamp-
-	// ordered queue so retry-state lookups do not scan the deletion backlog.
-	DeletionQueueRetryStatePrefix = "!del_retry/"
-
-	// DeletionQueueWatermarkPrefix stores one success watermark record per
-	// bounded processing batch. The value contains all paths selected by that
-	// batch, allowing restart-safe duplicate cleanup without one key per path.
-	DeletionQueueWatermarkPrefix = "!del_wm/"
-
 	// DeleteIndexPrefix is the prefix for segment deletion tracking entries in RocksDB
 	DeleteIndexPrefix = "!delete:segment/"
 
@@ -192,27 +182,6 @@ func ParseDeletionQueueKey(key []byte) (int64, string, error) {
 // IsDeletionQueueKey checks if a key is a deletion queue entry
 func IsDeletionQueueKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(DeletionQueuePrefix))
-}
-
-// MakeDeletionQueueWatermarkKey creates a key for one success watermark
-// record. The sequence disambiguates two batches with the same cutoff.
-func MakeDeletionQueueWatermarkKey(cutoff int64, sequence uint64) []byte {
-	return []byte(fmt.Sprintf("%s%020d/%020d", DeletionQueueWatermarkPrefix, cutoff, sequence))
-}
-
-// MakeDeletionQueueRetryStateKey creates a key for the latest deletion
-// generation state for a filepath.
-func MakeDeletionQueueRetryStateKey(filepath string) []byte {
-	return []byte(DeletionQueueRetryStatePrefix + filepath)
-}
-
-// ParseDeletionQueueRetryStateKey extracts the filepath from a retry-state key.
-func ParseDeletionQueueRetryStateKey(key []byte) (string, error) {
-	keyStr := string(key)
-	if !strings.HasPrefix(keyStr, DeletionQueueRetryStatePrefix) {
-		return "", fmt.Errorf("invalid deletion queue retry state key prefix")
-	}
-	return keyStr[len(DeletionQueueRetryStatePrefix):], nil
 }
 
 // MakeDeleteIndexKey creates a delete index key for tracking segment deletions

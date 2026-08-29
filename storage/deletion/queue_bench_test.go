@@ -115,16 +115,20 @@ func seedBenchmarkQueue(b *testing.B, queue *Queue, paths []string, duplicateCou
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
 
+	generations := make([]string, len(paths))
+	for i, path := range paths {
+		generations[i] = fileGeneration(path)
+	}
 	for i := 0; i < duplicateCount; i++ {
 		batch.Put(
 			keys.MakeDeletionQueueKey(baseTimestamp+int64(i), paths[0]),
-			[]byte{0x01},
+			encodeDeletionQueueValue(generations[0]),
 		)
 	}
 	for i := 1; i < len(paths); i++ {
 		batch.Put(
 			keys.MakeDeletionQueueKey(baseTimestamp+int64(duplicateCount+i), paths[i]),
-			[]byte{0x01},
+			encodeDeletionQueueValue(generations[i]),
 		)
 	}
 
