@@ -49,9 +49,10 @@ type Queue struct {
 	// retryStates records the timestamp watermark for a filepath after it has
 	// been handled. Entries at or before the watermark belong to that same
 	// lifecycle and can be retired without another filesystem attempt. A
-	// retryAt of zero means the lifecycle succeeded; a non-zero value is a
-	// delayed retry. The map is populated before the next scan, so it also
-	// covers duplicate rows left beyond a distinct-path batch boundary.
+	// retryAt of zero means the prior lifecycle is protected by the cutoff; it
+	// is either successful or has been superseded by a later Add. A non-zero
+	// value is a delayed retry. The map is populated before the next scan, so
+	// it also covers duplicate rows left beyond a distinct-path batch boundary.
 	retryStates map[string]retryState
 
 	// Success watermarks are ordered by cutoff so cleanup does not scan every
@@ -60,6 +61,12 @@ type Queue struct {
 	successWatermarks    []successWatermark
 	successWatermarkHead int
 	watermarkSequence    uint64
+
+	// lifecycleMu serializes queue lifecycle changes with processing state. Add
+	// uses it while replacing a failed retry, and ProcessBatch holds it across
+	// the filesystem attempts and durable state commit so a late Add cannot
+	// reintroduce a stale retry transition.
+	lifecycleMu sync.Mutex
 
 	// Background processing
 	ctx    context.Context
@@ -253,17 +260,46 @@ func (q *Queue) Add(filepath string) error {
 		return fmt.Errorf("empty filepath")
 	}
 
-	key := keys.MakeDeletionQueueKey(time.Now().UnixNano(), filepath)
+	q.lifecycleMu.Lock()
+	defer q.lifecycleMu.Unlock()
+
+	timestamp := time.Now().UnixNano()
+	previous, hadState := q.retryStates[filepath]
+	supersedesDueRetry := hadState && previous.retryAt > 0 && timestamp >= previous.retryAt
+	if supersedesDueRetry && timestamp == previous.retryAt {
+		// Keep the new lifecycle strictly after the retry it supersedes. This is
+		// only reachable on a same-nanosecond boundary, but avoids key collision
+		// turning the new Add into another copy of the stale retry.
+		timestamp++
+	}
+	key := keys.MakeDeletionQueueKey(timestamp, filepath)
+
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(key, []byte{0x01})
 
-	err := q.meta.Handle().Put(wo, key, []byte{0x01})
-	if err != nil {
+	var replacement retryState
+	if supersedesDueRetry {
+		// A retry that has reached its due time is ordered before this Add. Keep
+		// a persisted protection cutoff at that retry key so all rows from the
+		// failed lifecycle are retired without another filesystem attempt. The
+		// new key is strictly later and therefore starts the new lifecycle.
+		replacement = retryState{cutoff: previous.retryAt}
+		batch.Delete(keys.MakeDeletionQueueKey(previous.retryAt, filepath))
+		batch.Put(keys.MakeDeletionQueueRetryStateKey(filepath), encodeRetryState(replacement))
+	}
+
+	if err := q.meta.Handle().Write(wo, batch); err != nil {
 		zlog.Error().
 			Str("filepath", filepath).
 			Err(err).
 			Msg("deletion queue: failed to add entry")
 		return err
+	}
+	if supersedesDueRetry {
+		q.retryStates[filepath] = replacement
 	}
 
 	// Increment added counter
@@ -304,6 +340,16 @@ func (q *Queue) processingLoop() {
 	}
 }
 
+func queueKeysAreAtOrBefore(queueKeys [][]byte, cutoff int64) bool {
+	for _, queueKey := range queueKeys {
+		timestamp, _, err := keys.ParseDeletionQueueKey(queueKey)
+		if err != nil || timestamp > cutoff {
+			return false
+		}
+	}
+	return true
+}
+
 // ProcessBatch processes a batch of deletion requests
 func (q *Queue) ProcessBatch() {
 	startTime := time.Now()
@@ -318,6 +364,13 @@ func (q *Queue) ProcessBatch() {
 	retired := make([][]byte, 0)
 
 	// Scan and deduplicate
+	q.lifecycleMu.Lock()
+	retryStates := make(map[string]retryState, len(q.retryStates))
+	for filepath, state := range q.retryStates {
+		retryStates[filepath] = state
+	}
+	q.lifecycleMu.Unlock()
+
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 
@@ -371,7 +424,7 @@ func (q *Queue) ProcessBatch() {
 		// can be retired without consuming a distinct-path slot or attempting
 		// the filesystem again. A later Add has a newer timestamp and starts a
 		// new lifecycle.
-		if state, ok := q.retryStates[filepath]; ok &&
+		if state, ok := retryStates[filepath]; ok &&
 			ts <= state.cutoff && (state.retryAt == 0 || state.retryAt > nowNanos) {
 			retired = append(retired, bytes.Clone(keyData))
 			key.Free()
@@ -435,6 +488,9 @@ func (q *Queue) ProcessBatch() {
 		batch.Delete(watermark.key)
 	}
 
+	q.lifecycleMu.Lock()
+	defer q.lifecycleMu.Unlock()
+
 	successful := 0
 	failed := 0
 	successfulPaths := make([]string, 0, len(seen))
@@ -442,11 +498,20 @@ func (q *Queue) ProcessBatch() {
 	stateNeeded := !scanComplete && scannedThrough <= nowNanos
 
 	for filepath, queueKeys := range seen {
+		previous, hadState := q.retryStates[filepath]
+		if hadState && previous.retryAt == 0 && queueKeysAreAtOrBefore(queueKeys, previous.cutoff) {
+			// Add can supersede a due retry after the iterator snapshot was
+			// created. Retire only the old keys observed by this pass; the newer
+			// Add remains in RocksDB for the next lifecycle attempt.
+			for _, queueKey := range queueKeys {
+				batch.Delete(queueKey)
+			}
+			continue
+		}
 		// One filesystem attempt represents the whole logical deletion. The
 		// queue rows observed above are retired below in the same WriteBatch,
 		// so a failed attempt can be replaced by one delayed retry instead of
 		// leaving duplicate due rows behind.
-		previous, hadState := q.retryStates[filepath]
 		deleted := q.tryDelete(filepath)
 		for _, queueKey := range queueKeys {
 			batch.Delete(queueKey)
@@ -466,10 +531,10 @@ func (q *Queue) ProcessBatch() {
 
 			next := retryState{cutoff: nowNanos}
 			if stateNeeded {
-				if hadState && previous.retryAt > 0 {
-					// Replace a failed lifecycle with the batch success
-					// watermark. The old per-path failure marker is no longer
-					// authoritative and must not be reloaded after restart.
+				if hadState {
+					// Replace any prior lifecycle marker with the batch success
+					// watermark. This also removes the persisted protection marker
+					// that Add creates when it supersedes a due retry.
 					batch.Delete(keys.MakeDeletionQueueRetryStateKey(filepath))
 				}
 				// Persist one batch watermark below for every successful path. The
@@ -478,7 +543,7 @@ func (q *Queue) ProcessBatch() {
 				stateChanges[filepath] = &next
 				successfulPaths = append(successfulPaths, filepath)
 			} else {
-				if hadState && previous.retryAt > 0 {
+				if hadState {
 					batch.Delete(keys.MakeDeletionQueueRetryStateKey(filepath))
 				}
 				stateChanges[filepath] = nil
@@ -650,6 +715,18 @@ func (q *Queue) pruneOldEntries() {
 		if batch.Count() == 0 {
 			return
 		}
+
+		q.lifecycleMu.Lock()
+		defer q.lifecycleMu.Unlock()
+
+		// Add state-marker deletes only after taking the lifecycle lock. If Add
+		// replaced a failed retry while this batch was being scanned, leaving its
+		// marker out of this write preserves the newer lifecycle protection.
+		for _, pending := range pendingStateDeletes {
+			if state, ok := q.retryStates[pending.filepath]; ok && state == pending.state {
+				batch.Delete(keys.MakeDeletionQueueRetryStateKey(pending.filepath))
+			}
+		}
 		if err := q.meta.Handle().Write(wo, batch); err != nil {
 			zlog.Error().
 				Err(err).
@@ -698,12 +775,14 @@ func (q *Queue) pruneOldEntries() {
 			// ordered scan crosses its cutoff, so a pathname can be safely reused.
 			if _, statErr := os.Stat(filepath); os.IsNotExist(statErr) {
 				batch.Delete(bytes.Clone(keyData))
-				if state, ok := q.retryStates[filepath]; ok && state.retryAt > 0 {
+				q.lifecycleMu.Lock()
+				state, ok := q.retryStates[filepath]
+				q.lifecycleMu.Unlock()
+				if ok && state.retryAt > 0 {
 					// A failed lifecycle may have a delayed queue row after
 					// this old duplicate. Remove that row too; otherwise a
 					// later pathname reuse could process the stale retry.
 					batch.Delete(keys.MakeDeletionQueueKey(state.retryAt, filepath))
-					batch.Delete(keys.MakeDeletionQueueRetryStateKey(filepath))
 					pendingStateDeletes = append(pendingStateDeletes, retryStateDeletion{
 						filepath: filepath,
 						state:    state,

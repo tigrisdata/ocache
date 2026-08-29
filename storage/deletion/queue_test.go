@@ -462,6 +462,81 @@ func TestQueue_PathReuseSupersedesDelayedRetry(t *testing.T) {
 	require.Equal(t, int64(0), queue.GetQueueDepth(), "a new lifecycle must remove the superseded delayed retry")
 }
 
+func TestQueue_PathReuseSupersedesDueDelayedRetry(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+	queue.config.RetryDelay = 20 * time.Millisecond
+
+	path := filepath.Join(t.TempDir(), "reused-due-retry.bin")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+
+	lock := fd.GetFileLockManager().GetFileLock(path)
+	lock.RLock()
+	require.NoError(t, queue.Add(path))
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed)
+	retryState, ok := queue.retryStates[path]
+	require.True(t, ok)
+	lock.RUnlock()
+
+	// Let the old retry become due before the pathname is reused. Add must
+	// replace that retry with a protection cutoff, or the stale row is scanned
+	// first and deletes the new file before its own queue entry is reached.
+	time.Sleep(time.Until(time.Unix(0, retryState.retryAt)) + time.Millisecond)
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
+	require.NoError(t, queue.Add(path))
+
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, path)
+	require.Equal(t, int64(1), queue.failed, "the superseded retry must not make another attempt")
+	require.Equal(t, int64(1), queue.processed, "the new lifecycle must be the only successful attempt")
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "the due retry must be removed with the new lifecycle")
+}
+
+func TestQueue_PathReuseSupersedesDueDelayedRetryAfterRestart(t *testing.T) {
+	dbDir := t.TempDir()
+	meta, err := metadata.NewMetaDB(dbDir, 0, nil, nil)
+	require.NoError(t, err)
+
+	config := Config{BatchSize: 1, RetryDelay: 20 * time.Millisecond}
+	queue := NewQueue(meta, config)
+	filesDir := t.TempDir()
+	path := filepath.Join(filesDir, "reused-due-retry-restart.bin")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
+
+	lock := fd.GetFileLockManager().GetFileLock(path)
+	lock.RLock()
+	require.NoError(t, queue.Add(path))
+	queue.ProcessBatch()
+	require.Equal(t, int64(1), queue.failed)
+	retryState, ok := queue.retryStates[path]
+	require.True(t, ok)
+	lock.RUnlock()
+
+	time.Sleep(time.Until(time.Unix(0, retryState.retryAt)) + time.Millisecond)
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o644))
+	require.NoError(t, queue.Add(path))
+
+	queue.Stop()
+	meta.Close()
+	meta, err = metadata.NewMetaDB(dbDir, 0, nil, nil)
+	require.NoError(t, err)
+	queue = NewQueue(meta, config)
+	defer func() {
+		queue.Stop()
+		meta.Close()
+	}()
+
+	queue.ProcessBatch()
+
+	require.NoFileExists(t, path)
+	require.Equal(t, int64(1), queue.processed, "the new lifecycle must be the only successful attempt after restart")
+	require.Equal(t, int64(0), queue.GetQueueDepth(), "the stale due retry must not survive restart")
+}
+
 func TestQueue_EmptyFilepath(t *testing.T) {
 	queue, cleanup := setupTestQueue(t)
 	defer cleanup()
