@@ -174,12 +174,11 @@ func TestQueue_BackgroundProcessing(t *testing.T) {
 	err = queue.Add(testFile)
 	require.NoError(t, err)
 
-	// Wait for background processing
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify file is deleted
-	_, err = os.Stat(testFile)
-	require.True(t, os.IsNotExist(err), "file should be deleted by background processing")
+	// Wait for background processing to delete the file.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(testFile)
+		return os.IsNotExist(err)
+	}, 500*time.Millisecond, 10*time.Millisecond, "file should be deleted by background processing")
 }
 
 func TestQueue_LockedFile(t *testing.T) {
