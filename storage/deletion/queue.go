@@ -299,8 +299,14 @@ func (q *Queue) tryDelete(filepath string) bool {
 
 // pruneOldEntries removes queue entries older than PruneAge
 func (q *Queue) pruneOldEntries() {
+	q.pruneOldEntriesAt(time.Now().Add(-q.config.PruneAge).UnixNano())
+}
+
+// pruneOldEntriesAt removes entries older than cutoff. Keeping the cutoff
+// explicit makes the ordering boundary testable without changing the scheduled
+// pruning entry point.
+func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 	startTime := time.Now()
-	cutoff := time.Now().Add(-q.config.PruneAge).UnixNano()
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
