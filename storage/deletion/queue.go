@@ -330,6 +330,9 @@ func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
+	// Deletion queue keys sort by their fixed-width timestamp. The upper bound
+	// is exclusive, so entries at cutoff and newer are never decoded or visited.
+	ro.SetIterateUpperBound(keys.MakeDeletionQueueKey(cutoff, ""))
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
