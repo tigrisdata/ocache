@@ -371,6 +371,7 @@ func (q *Queue) ProcessBatch() {
 	}
 	q.lifecycleMu.Unlock()
 
+	nowNanos := time.Now().UnixNano()
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 
@@ -379,7 +380,6 @@ func (q *Queue) ProcessBatch() {
 
 	prefix := []byte(keys.DeletionQueuePrefix)
 	count := 0
-	nowNanos := time.Now().UnixNano()
 	scannedThrough := int64(0)
 	scanComplete := true
 
