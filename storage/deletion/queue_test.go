@@ -283,6 +283,39 @@ func TestQueue_PruneOldEntries_ExcludesCutoffAndNewer(t *testing.T) {
 	value.Free()
 }
 
+func TestQueue_PruneOldEntries_NormalizesLegacyTimestamp(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	cutoff := int64(1700000000000000000)
+	legacyKey := []byte(fmt.Sprintf("%s%d/%s", keys.DeletionQueuePrefix, cutoff-1, "/legacy/old-missing"))
+	legacyFutureKey := []byte(fmt.Sprintf("%s%d/%s", keys.DeletionQueuePrefix, cutoff+1, "/legacy/future-missing"))
+	canonicalFutureKey := keys.MakeDeletionQueueKey(cutoff+1, "/legacy/future-missing")
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	for _, key := range [][]byte{legacyKey, legacyFutureKey} {
+		require.NoError(t, queue.meta.Handle().Put(wo, key, []byte{0x01}))
+	}
+
+	queue.pruneOldEntriesAt(cutoff)
+
+	require.Equal(t, int64(1), queue.pruned)
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	value, err := queue.meta.Handle().Get(ro, legacyKey)
+	require.NoError(t, err)
+	require.False(t, value.Exists(), "legacy old queue entry should be pruned")
+	value.Free()
+	value, err = queue.meta.Handle().Get(ro, legacyFutureKey)
+	require.NoError(t, err)
+	require.False(t, value.Exists(), "legacy future key should be canonicalized")
+	value.Free()
+	value, err = queue.meta.Handle().Get(ro, canonicalFutureKey)
+	require.NoError(t, err)
+	require.True(t, value.Exists(), "future queue entry should remain after canonicalization")
+	value.Free()
+}
+
 // TestQueue_PruneOldEntries_KeepsExistingFile is the regression test for the
 // secondary leak in issue #156: pruneOldEntries used to drop queue entries by
 // age alone, abandoning a file that was still on disk (e.g. a deletion that kept

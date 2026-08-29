@@ -27,6 +27,8 @@ type Config struct {
 	RetryDelay      time.Duration // Backoff before a failed deletion is retried (0 = retry next cycle)
 }
 
+const deletionQueueCanonicalMarker = "!del_format_v1"
+
 // Queue manages centralized file deletion
 type Queue struct {
 	meta   *metadata.MetaDB
@@ -42,6 +44,12 @@ type Queue struct {
 	// waiting for the hourly ticker.
 	pruneTrigger  chan struct{}
 	pruneComplete chan struct{}
+
+	// The first pruning pass canonicalizes rows written before the fixed-width
+	// deletion-key format was enforced. The marker is durable, while this flag
+	// avoids another point lookup for the lifetime of this queue.
+	canonicalKeysMu    sync.Mutex
+	canonicalKeysReady bool
 
 	// Stats
 	processed int64
@@ -322,11 +330,101 @@ func (q *Queue) pruneOldEntries() {
 	q.pruneOldEntriesAt(time.Now().Add(-q.config.PruneAge).UnixNano())
 }
 
+// ensureCanonicalDeletionQueue rewrites parseable legacy rows to the current
+// fixed-width key format before pruning relies on byte ordering. New rows are
+// already canonical because Add uses MakeDeletionQueueKey. The durable marker
+// lets later queue instances skip this one-time compatibility scan.
+func (q *Queue) ensureCanonicalDeletionQueue() bool {
+	q.canonicalKeysMu.Lock()
+	defer q.canonicalKeysMu.Unlock()
+	if q.canonicalKeysReady {
+		return true
+	}
+
+	ro := metadata.CreateReadOptions(false, false)
+	marker, err := q.meta.Handle().Get(ro, []byte(deletionQueueCanonicalMarker))
+	ro.Destroy()
+	if err != nil {
+		zlog.Error().Err(err).Msg("deletion queue: failed to check key format marker")
+		return false
+	}
+	if marker.Exists() {
+		marker.Free()
+		q.canonicalKeysReady = true
+		return true
+	}
+	marker.Free()
+
+	type rewrite struct {
+		old       []byte
+		canonical []byte
+		value     []byte
+	}
+	rewrites := make([]rewrite, 0)
+	ro = metadata.CreateReadOptions(true, false)
+	it := q.meta.Handle().NewIterator(ro)
+	prefix := []byte(keys.DeletionQueuePrefix)
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		select {
+		case <-q.ctx.Done():
+			it.Close()
+			ro.Destroy()
+			return false
+		default:
+		}
+
+		key := it.Key()
+		value := it.Value()
+		keyData := key.Data()
+		timestamp, filepath, parseErr := keys.ParseDeletionQueueKey(keyData)
+		if parseErr == nil {
+			canonical := keys.MakeDeletionQueueKey(timestamp, filepath)
+			if !bytes.Equal(keyData, canonical) {
+				rewrites = append(rewrites, rewrite{
+					old:       bytes.Clone(keyData),
+					canonical: canonical,
+					value:     bytes.Clone(value.Data()),
+				})
+			}
+		}
+		key.Free()
+		value.Free()
+	}
+	if err := it.Err(); err != nil {
+		it.Close()
+		ro.Destroy()
+		zlog.Error().Err(err).Msg("deletion queue: failed to scan key formats")
+		return false
+	}
+	it.Close()
+	ro.Destroy()
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	for _, item := range rewrites {
+		batch.Delete(item.old)
+		batch.Put(item.canonical, item.value)
+	}
+	batch.Put([]byte(deletionQueueCanonicalMarker), []byte{1})
+	if err := q.meta.Handle().Write(wo, batch); err != nil {
+		zlog.Error().Err(err).Msg("deletion queue: failed to canonicalize key formats")
+		return false
+	}
+
+	q.canonicalKeysReady = true
+	return true
+}
+
 // pruneOldEntriesAt removes entries older than cutoff. Keeping the cutoff
 // explicit makes the ordering boundary testable without changing the scheduled
 // pruning entry point.
 func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 	startTime := time.Now()
+	if !q.ensureCanonicalDeletionQueue() {
+		return
+	}
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
