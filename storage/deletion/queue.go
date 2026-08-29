@@ -37,6 +37,12 @@ type Queue struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// The trigger and completion channel are nil for normal queues. Benchmarks
+	// use them to drive and await the same processingLoop pruning case without
+	// waiting for the hourly ticker.
+	pruneTrigger  chan struct{}
+	pruneComplete chan struct{}
+
 	// Stats
 	processed int64
 	failed    int64
@@ -75,6 +81,16 @@ func (q *Queue) Stop() {
 		Int64("failed", q.failed).
 		Int64("pruned", q.pruned).
 		Msg("deletion queue: stopped")
+}
+
+func (q *Queue) signalPruneComplete() {
+	if q.pruneComplete == nil {
+		return
+	}
+	select {
+	case q.pruneComplete <- struct{}{}:
+	default:
+	}
 }
 
 // Add adds a file to the deletion queue
@@ -126,6 +142,10 @@ func (q *Queue) processingLoop() {
 			q.ProcessBatch()
 		case <-pruneTicker.C:
 			q.pruneOldEntries()
+			q.signalPruneComplete()
+		case <-q.pruneTrigger:
+			q.pruneOldEntries()
+			q.signalPruneComplete()
 		case <-depthTicker.C:
 			q.logQueueDepth()
 		case <-q.ctx.Done():

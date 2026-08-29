@@ -43,10 +43,18 @@ func BenchmarkQueuePruneOldEntries(b *testing.B) {
 	for _, tc := range pruneBenchmarkCases {
 		b.Run(tc.name, func(b *testing.B) {
 			queue, _ := newPruneBenchmarkQueue(b, tc)
+			queue.pruneTrigger = make(chan struct{})
+			queue.pruneComplete = make(chan struct{}, 1)
+			queue.Start()
+			runPrune := func() {
+				queue.pruneTrigger <- struct{}{}
+				<-queue.pruneComplete
+			}
+			runPrune() // Migrate any legacy rows before timing steady-state pruning.
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				queue.pruneOldEntries()
+				runPrune()
 			}
 		})
 	}
