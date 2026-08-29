@@ -149,12 +149,23 @@ func clearBenchmarkQueue(b *testing.B, meta *metadata.MetaDB) {
 
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
-	prefix := []byte(keys.DeletionQueuePrefix)
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		key := it.Key()
-		batch.Delete(bytes.Clone(key.Data()))
-		key.Free()
-		it.Value().Free()
+	// Keep the lifecycle namespaces explicit so this benchmark setup also
+	// compiles at its comparison revision, before those keys were introduced.
+	const (
+		retryStatePrefix = "!del_retry/"
+		watermarkPrefix  = "!del_wm/"
+	)
+	for _, prefix := range [][]byte{
+		[]byte(keys.DeletionQueuePrefix),
+		[]byte(retryStatePrefix),
+		[]byte(watermarkPrefix),
+	} {
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			key := it.Key()
+			batch.Delete(bytes.Clone(key.Data()))
+			key.Free()
+			it.Value().Free()
+		}
 	}
 
 	if batch.Count() == 0 {
