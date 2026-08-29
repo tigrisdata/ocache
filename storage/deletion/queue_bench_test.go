@@ -42,11 +42,11 @@ func BenchmarkQueuePruneOldEntries(b *testing.B) {
 
 	for _, tc := range pruneBenchmarkCases {
 		b.Run(tc.name, func(b *testing.B) {
-			queue, cutoff := newPruneBenchmarkQueue(b, tc)
+			queue, _ := newPruneBenchmarkQueue(b, tc)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				queue.pruneOldEntriesAt(cutoff)
+				queue.pruneOldEntries()
 			}
 		})
 	}
@@ -107,7 +107,7 @@ func newPruneBenchmarkQueue(b *testing.B, tc pruneBenchmarkCase) (*Queue, int64)
 		b.Fatal(err)
 	}
 
-	cutoff := time.Now().UnixNano()
+	cutoff := time.Now().Add(-time.Hour).UnixNano()
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 	for i := 0; i < tc.total; i++ {
@@ -117,7 +117,7 @@ func newPruneBenchmarkQueue(b *testing.B, tc pruneBenchmarkCase) (*Queue, int64)
 			timestamp = cutoff - int64(tc.aged-i)
 			filepath = retainedPath
 		} else {
-			timestamp = cutoff + int64(i-tc.aged+1)
+			timestamp = cutoff + int64(time.Minute) + int64(i-tc.aged)
 			filepath = fmt.Sprintf("/future/%06d", i)
 		}
 		key := keys.MakeDeletionQueueKey(timestamp, filepath)
