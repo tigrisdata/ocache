@@ -252,6 +252,14 @@ build-storage-bench: proto
 	@mkdir -p "$(dir $(BENCH_OUTPUT))"
 	@cd storage && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(BENCH_OUTPUT)" .
 
+# Compile the deletion queue benchmark once so paired runs do not include Go
+# compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+.PHONY: build-bench-deletion-queue
+build-bench-deletion-queue: proto
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd storage/deletion && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/deletion-queue.test" .
+
 # Compile the topology RPC benchmark once so paired runs do not include Go
 # compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
 .PHONY: build-bench-cache-topology-rpc
