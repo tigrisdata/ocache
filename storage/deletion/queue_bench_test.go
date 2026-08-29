@@ -50,7 +50,7 @@ func BenchmarkQueuePruneOldEntries(b *testing.B) {
 				queue.pruneTrigger <- struct{}{}
 				<-queue.pruneComplete
 			}
-			runPrune() // Migrate any legacy rows before timing steady-state pruning.
+			runPrune() // Complete the initial full-format scan before timing steady-state pruning.
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {

@@ -314,11 +314,44 @@ func TestQueue_PruneOldEntries_KeepsLegacyTimestamp(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, value.Exists(), "legacy future key should not be rewritten")
 	value.Free()
+}
 
-	marker, err := queue.meta.Handle().Get(ro, []byte(deletionQueueCanonicalMarker))
+func TestQueue_PruneOldEntries_DoesNotTrustPersistedFormatMarker(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	// This marker was written by an earlier implementation. A legacy writer can
+	// add variable-width rows after it, so a new process must not use the marker
+	// to install a lexical cutoff.
+	cutoff := int64(1700000000000000000)
+	legacyOldKey := []byte(fmt.Sprintf("%s%d/%s", keys.DeletionQueuePrefix, cutoff-1, "/rollback/old-missing"))
+	legacyFutureKey := []byte(fmt.Sprintf("%s%d/%s", keys.DeletionQueuePrefix, cutoff+1, "/rollback/future-missing"))
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	for _, entry := range []struct {
+		key   []byte
+		value []byte
+	}{
+		{key: []byte("!del_format_v1"), value: []byte{1}},
+		{key: legacyOldKey, value: []byte{1}},
+		{key: legacyFutureKey, value: []byte{1}},
+	} {
+		require.NoError(t, queue.meta.Handle().Put(wo, entry.key, entry.value))
+	}
+
+	queue.pruneOldEntriesAt(cutoff)
+
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	value, err := queue.meta.Handle().Get(ro, legacyOldKey)
 	require.NoError(t, err)
-	require.False(t, marker.Exists(), "legacy rows must keep the full-scan fallback")
-	marker.Free()
+	require.False(t, value.Exists(), "legacy old queue entry must be pruned after rollback")
+	value.Free()
+	value, err = queue.meta.Handle().Get(ro, legacyFutureKey)
+	require.NoError(t, err)
+	require.True(t, value.Exists(), "legacy future queue entry must remain queued")
+	value.Free()
+	require.Equal(t, int64(1), queue.pruned)
 }
 
 // TestQueue_PruneOldEntries_KeepsExistingFile is the regression test for the

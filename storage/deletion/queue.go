@@ -27,8 +27,6 @@ type Config struct {
 	RetryDelay      time.Duration // Backoff before a failed deletion is retried (0 = retry next cycle)
 }
 
-const deletionQueueCanonicalMarker = "!del_format_v1"
-
 // Queue manages centralized file deletion
 type Queue struct {
 	meta   *metadata.MetaDB
@@ -45,9 +43,9 @@ type Queue struct {
 	pruneTrigger  chan struct{}
 	pruneComplete chan struct{}
 
-	// The durable marker records that a prefix scan found no parseable legacy
-	// key format. This flag avoids another point lookup for the lifetime of the
-	// queue; queues containing legacy rows retain the safe full-scan path.
+	// A successful full scan proves that this process has only canonical queue
+	// keys. Keep that proof in memory so a restart after a legacy writer cannot
+	// reuse stale format state from the database.
 	canonicalKeysMu    sync.Mutex
 	canonicalKeysReady bool
 
@@ -333,8 +331,7 @@ func (q *Queue) pruneOldEntries() {
 const deletionQueueTimestampWidth = 20
 
 // isCanonicalDeletionQueueKey reports whether key uses the fixed-width timestamp
-// emitted by MakeDeletionQueueKey. It avoids rebuilding canonical keys for the
-// common case while the compatibility scan is in progress.
+// emitted by MakeDeletionQueueKey.
 func isCanonicalDeletionQueueKey(key []byte) bool {
 	const timestampStart = len(keys.DeletionQueuePrefix)
 	const timestampEnd = timestampStart + deletionQueueTimestampWidth
@@ -358,27 +355,15 @@ func isCanonicalDeletionQueueKey(key []byte) bool {
 func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 	startTime := time.Now()
 
-	// The first pass must inspect the whole prefix because older releases wrote
-	// variable-width timestamps. If it finds only canonical parseable keys, the
-	// durable marker lets later passes use the ordered bound. Queues with legacy
-	// keys retain the safe full-scan path instead of paying a migration rewrite.
+	// The first pass for each process must inspect the whole prefix because
+	// older releases wrote variable-width timestamps. If it finds only canonical
+	// parseable keys, later passes in this process can use the ordered bound.
+	// Queues with legacy rows retain the safe full-scan path. The proof is kept
+	// only in memory: a restart after a rollback must not reuse stale format
+	// state from the database.
 	q.canonicalKeysMu.Lock()
 	defer q.canonicalKeysMu.Unlock()
 	canonicalKeysReady := q.canonicalKeysReady
-	if !canonicalKeysReady {
-		ro := metadata.CreateReadOptions(false, false)
-		marker, err := q.meta.Handle().Get(ro, []byte(deletionQueueCanonicalMarker))
-		ro.Destroy()
-		if err != nil {
-			zlog.Error().Err(err).Msg("deletion queue: failed to check key format marker")
-			return
-		}
-		canonicalKeysReady = marker.Exists()
-		marker.Free()
-		if canonicalKeysReady {
-			q.canonicalKeysReady = true
-		}
-	}
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
@@ -456,8 +441,8 @@ func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 		key.Free()
 		value.Free()
 
-		// Commit batch periodically. A failed write must not be followed by a
-		// format marker, or a later bounded pass could miss a legacy row.
+		// Commit batch periodically. A failed write must not establish the
+		// in-memory format proof, or a later bounded pass could miss a legacy row.
 		if batch.Count() >= 100 {
 			if err := q.meta.Handle().Write(wo, batch); err != nil {
 				writeFailed = true
@@ -473,10 +458,6 @@ func (q *Queue) pruneOldEntriesAt(cutoff int64) {
 	if !scanComplete {
 		zlog.Error().Err(it.Err()).Msg("deletion queue: failed to scan entries")
 	}
-	if !canonicalKeysReady && !legacyKeysFound && scanComplete && !writeFailed {
-		batch.Put([]byte(deletionQueueCanonicalMarker), []byte{1})
-	}
-
 	// Commit final batch
 	if batch.Count() > 0 {
 		if err := q.meta.Handle().Write(wo, batch); err != nil {
