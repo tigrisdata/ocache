@@ -6,6 +6,7 @@ package keys
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -39,6 +40,16 @@ const (
 
 	// DeletionQueuePrefix is the prefix for deletion queue entries in RocksDB
 	DeletionQueuePrefix = "!del/"
+
+	// DeletionQueueRetryStatePrefix stores one generation watermark for a
+	// persistently failed deletion path. It is separate from the timestamp-
+	// ordered queue so retry-state lookups do not scan the deletion backlog.
+	DeletionQueueRetryStatePrefix = "!del_retry/"
+
+	// DeletionQueueWatermarkPrefix stores one success watermark record per
+	// bounded processing batch. The value contains all paths selected by that
+	// batch, allowing restart-safe duplicate cleanup without one key per path.
+	DeletionQueueWatermarkPrefix = "!del_wm/"
 
 	// DeleteIndexPrefix is the prefix for segment deletion tracking entries in RocksDB
 	DeleteIndexPrefix = "!delete:segment/"
@@ -182,6 +193,49 @@ func ParseDeletionQueueKey(key []byte) (int64, string, error) {
 // IsDeletionQueueKey checks if a key is a deletion queue entry
 func IsDeletionQueueKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(DeletionQueuePrefix))
+}
+
+// MakeDeletionQueueWatermarkKey creates a key for one success watermark
+// record. The sequence disambiguates two batches with the same cutoff.
+func MakeDeletionQueueWatermarkKey(cutoff int64, sequence uint64) []byte {
+	return []byte(fmt.Sprintf("%s%020d/%020d", DeletionQueueWatermarkPrefix, cutoff, sequence))
+}
+
+// ParseDeletionQueueWatermarkKey extracts the cutoff and sequence from a
+// success watermark key.
+func ParseDeletionQueueWatermarkKey(key []byte) (int64, uint64, error) {
+	keyStr := string(key)
+	if !strings.HasPrefix(keyStr, DeletionQueueWatermarkPrefix) {
+		return 0, 0, fmt.Errorf("invalid deletion queue watermark key prefix")
+	}
+	parts := strings.SplitN(keyStr[len(DeletionQueueWatermarkPrefix):], "/", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid deletion queue watermark key format")
+	}
+	cutoff, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse watermark cutoff: %w", err)
+	}
+	sequence, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to parse watermark sequence: %w", err)
+	}
+	return cutoff, sequence, nil
+}
+
+// MakeDeletionQueueRetryStateKey creates a key for the latest deletion
+// generation state for a filepath.
+func MakeDeletionQueueRetryStateKey(filepath string) []byte {
+	return []byte(DeletionQueueRetryStatePrefix + filepath)
+}
+
+// ParseDeletionQueueRetryStateKey extracts the filepath from a retry-state key.
+func ParseDeletionQueueRetryStateKey(key []byte) (string, error) {
+	keyStr := string(key)
+	if !strings.HasPrefix(keyStr, DeletionQueueRetryStatePrefix) {
+		return "", fmt.Errorf("invalid deletion queue retry state key prefix")
+	}
+	return keyStr[len(DeletionQueueRetryStatePrefix):], nil
 }
 
 // MakeDeleteIndexKey creates a delete index key for tracking segment deletions
