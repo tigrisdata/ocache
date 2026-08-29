@@ -55,6 +55,41 @@ func TestFileLockManager_GetFileLock(t *testing.T) {
 	}
 }
 
+func TestFileLockManager_ConcurrentMissUsesOneLock(t *testing.T) {
+	const (
+		path    = "/test/file.txt"
+		workers = 100
+	)
+
+	manager := &FileLockManager{}
+	locks := make([]*sync.RWMutex, workers)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := range workers {
+		go func() {
+			defer wg.Done()
+			<-start
+			locks[i] = manager.GetFileLock(path)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if locks[0] == nil {
+		t.Fatal("GetFileLock returned nil")
+	}
+	if !manager.HasLock(path) {
+		t.Fatal("GetFileLock did not retain the lock")
+	}
+	for i, lock := range locks {
+		if lock != locks[0] {
+			t.Fatalf("GetFileLock returned a different lock to worker %d", i)
+		}
+	}
+}
+
 func TestFileLockManager_RemoveFileLock(t *testing.T) {
 	// Reset singleton for testing
 	lockManagerOnce = sync.Once{}
