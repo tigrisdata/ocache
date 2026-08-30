@@ -1,0 +1,71 @@
+---
+{
+   "kind": "pipeline",
+   "name": "validate-pr",
+   "steps": [
+      {
+         "commands": [
+            "make mod-check"
+         ],
+         "image": "golang:1.21.3",
+         "name": "make-mod-check"
+      },
+      {
+         "commands": [
+            "make lint"
+         ],
+         "depends_on": [
+            "make-mod-check"
+         ],
+         "image": "golang:1.21.3",
+         "name": "make-lint"
+      },
+      {
+         "commands": [
+            "make test"
+         ],
+         "depends_on": [
+            "make-lint"
+         ],
+         "image": "golang:1.20.10",
+         "name": "make-test (go 1.20.10)"
+      },
+      {
+         "commands": [
+            "make test"
+         ],
+         "depends_on": [
+            "make-lint"
+         ],
+         "image": "golang:1.21.3",
+         "name": "make-test (go 1.21.3)"
+      },
+      {
+         "commands": [
+            "make test-benchmarks"
+         ],
+         "depends_on": [
+            "make-lint"
+         ],
+         "image": "golang:1.21.3",
+         "name": "make-test-benchmarks (go 1.21.3)"
+      },
+      {
+         "commands": [
+            "apt-get update && apt-get -y install unzip",
+            "go mod vendor",
+            "make check-protos"
+         ],
+         "depends_on": [
+            "make-mod-check"
+         ],
+         "image": "golang:1.21.3",
+         "name": "make-check-protos"
+      }
+   ]
+}
+---
+kind: signature
+hmac: 2419eded398bf02c5da0040762394904d32600544b660d06378c1e75ec9432c4
+
+...

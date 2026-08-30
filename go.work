@@ -11,3 +11,5 @@ use (
 	./storage
 	./tests/integration
 )
+
+replace github.com/grafana/dskit => ./third_party/dskit

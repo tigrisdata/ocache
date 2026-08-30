@@ -440,7 +440,9 @@ func TestReadinessGate_HoldsJoiningUntilMarkReady(t *testing.T) {
 	// Releasing the gate lets it transition to ACTIVE.
 	rm.MarkReady()
 
-	waitCtx, waitCancel := context.WithTimeout(ctx, 10*time.Second)
+	// CAS retries can wait for the next second-resolution heartbeat under the
+	// race detector, so leave room for the full retry window.
+	waitCtx, waitCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer waitCancel()
 	require.NoError(t, rm.WaitReady(waitCtx), "node should reach ACTIVE after MarkReady")
 	assert.Equal(t, ring.ACTIVE, rm.GetState())

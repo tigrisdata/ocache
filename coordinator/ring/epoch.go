@@ -8,25 +8,28 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/grafana/dskit/ring"
 )
 
-// Epoch tracks the ring version using content-addressable hashing.
-// Nodes with identical ring views will have identical epochs, enabling
-// reliable cross-node comparisons and eliminating unnecessary topology refreshes.
+// Epoch tracks the ring version using the content-addressable hash that is
+// already sent by the coordinator. Keeping this representation stable lets old
+// and new binaries agree on an epoch during a rolling upgrade.
 //
-// The epoch is computed as a deterministic hash of the ring state:
-// - Sorted node IDs (for determinism)
-// - Node states (JOINING, ACTIVE, LEAVING, etc.)
-// - Token counts (not full tokens - too expensive, and tokens are immutable)
-//
-// This is an O(1) atomic load operation for reading - safe for hot paths.
-// Computing the epoch is O(N) where N = number of nodes, but this only
-// happens during heartbeat callbacks when ring state changes.
+// The node table is kept so timestamp-only deltas can avoid changing the epoch.
+// A state delta rebuilds the compatible digest from that table; state changes are
+// infrequent compared with heartbeat timestamp updates. Reads remain O(1).
+type epochNode struct {
+	state      ring.InstanceState
+	tokenCount int
+}
+
 type Epoch struct {
 	version atomic.Uint64
+	mu      sync.Mutex
+	nodes   map[string]epochNode
 }
 
 // NewEpoch creates a new Epoch tracker initialized to 0.
@@ -43,59 +46,98 @@ func (e *Epoch) Get() uint64 {
 // Set computes epoch from ring membership state and stores it.
 // Nodes with identical ring views will compute identical epochs.
 //
-// This is O(N) where N = number of nodes, but is only called during
-// heartbeat callbacks when ring state may have changed.
+// This is O(N) where N = number of nodes and is reserved for full snapshots.
 //
 // Returns the new epoch value.
 func (e *Epoch) Set(ringDesc *ring.Desc) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if ringDesc == nil {
+		e.nodes = nil
+		e.version.Store(0)
 		return 0
 	}
 
-	newEpoch := ComputeRingEpoch(ringDesc)
+	e.nodes = make(map[string]epochNode, len(ringDesc.Ingesters))
+	for id, instance := range ringDesc.Ingesters {
+		e.nodes[id] = epochNode{state: instance.State, tokenCount: len(instance.Tokens)}
+	}
+	newEpoch := computeEpochNodes(e.nodes)
 	e.version.Store(newEpoch)
 	return newEpoch
 }
 
-// ComputeRingEpoch creates a deterministic hash of ring state.
-// This function is exported for testing purposes.
+// ApplyLivenessDelta updates the epoch for state-only changes. Timestamp-only
+// updates leave the epoch unchanged. State changes rebuild the compatible
+// sorted-string digest from the locally maintained node table.
+func (e *Epoch) ApplyLivenessDelta(changes map[string]ring.InstanceDesc) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if len(changes) == 0 || e.nodes == nil {
+		return e.version.Load()
+	}
+
+	stateChanged := false
+	for id, instance := range changes {
+		previous, ok := e.nodes[id]
+		if !ok || previous.state == instance.State {
+			continue
+		}
+		previous.state = instance.State
+		e.nodes[id] = previous
+		stateChanged = true
+	}
+	if stateChanged {
+		e.version.Store(computeEpochNodes(e.nodes))
+	}
+	return e.version.Load()
+}
+
+// ComputeRingEpoch creates the deterministic, rolling-upgrade-compatible hash
+// of ring state. This function is exported for testing purposes.
 //
-// The hash includes:
-// - Node IDs (sorted for determinism)
-// - Node states (to detect JOINING→ACTIVE transitions)
-// - Token counts (to detect if tokens were modified)
-//
-// We intentionally do NOT include full tokens because:
-// - Tokens are assigned once and persisted (dskit's token persistence)
-// - Hashing 512 tokens × N nodes would be expensive
-// - Token count is sufficient to detect "has tokens been modified"
+// The hash includes node IDs, states, and token counts. It intentionally omits
+// token values because tokens are persisted and immutable between topology
+// rebuilds. The sorted representation must remain stable because clients use
+// this value to compare epochs across coordinator versions.
 func ComputeRingEpoch(ringDesc *ring.Desc) uint64 {
 	if ringDesc == nil || len(ringDesc.Ingesters) == 0 {
 		return 0
 	}
 
-	// Sort node IDs for determinism - map iteration order is not guaranteed
-	ids := make([]string, 0, len(ringDesc.Ingesters))
-	for id := range ringDesc.Ingesters {
+	nodes := make(map[string]epochNode, len(ringDesc.Ingesters))
+	for id, instance := range ringDesc.Ingesters {
+		nodes[id] = epochNode{state: instance.State, tokenCount: len(instance.Tokens)}
+	}
+	return computeEpochNodes(nodes)
+}
+
+func computeEpochNodes(nodes map[string]epochNode) uint64 {
+	if len(nodes) == 0 {
+		return 0
+	}
+
+	ids := make([]string, 0, len(nodes))
+	for id := range nodes {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 
-	// Build canonical representation: "nodeID:state:tokenCount;..."
 	var sb strings.Builder
 	for _, id := range ids {
-		inst := ringDesc.Ingesters[id]
+		node := nodes[id]
 		sb.WriteString(id)
 		sb.WriteByte(':')
-		sb.WriteString(strconv.Itoa(int(inst.State)))
+		sb.WriteString(strconv.Itoa(int(node.state)))
 		sb.WriteByte(':')
-		sb.WriteString(strconv.Itoa(len(inst.Tokens)))
+		sb.WriteString(strconv.Itoa(node.tokenCount))
 		sb.WriteByte(';')
 	}
 
-	// Hash using FNV-64a for fast, reasonable distribution
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(sb.String())) // Write never returns an error for fnv
+	_, _ = h.Write([]byte(sb.String()))
 	return h.Sum64()
 }
 
