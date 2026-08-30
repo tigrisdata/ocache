@@ -158,21 +158,41 @@ type instanceInfo struct {
 }
 
 type instanceLiveness struct {
+	// sequence is a seqlock for the two fields below. Readers retry if a
+	// delta writer crosses their pair of loads, so a cached subring cannot
+	// observe a state from one heartbeat with a timestamp from another.
+	sequence  atomic.Uint64
 	state     atomic.Int32
 	timestamp atomic.Int64
 }
 
 func newInstanceLiveness(instance InstanceDesc) *instanceLiveness {
 	live := &instanceLiveness{}
-	live.state.Store(int32(instance.State))
-	live.timestamp.Store(instance.Timestamp)
+	live.store(instance.State, instance.Timestamp)
 	return live
 }
 
+func (l *instanceLiveness) store(state InstanceState, timestamp int64) {
+	l.sequence.Add(1)
+	l.state.Store(int32(state))
+	l.timestamp.Store(timestamp)
+	l.sequence.Add(1)
+}
+
 func (l *instanceLiveness) snapshot(instance InstanceDesc) InstanceDesc {
-	instance.State = InstanceState(l.state.Load())
-	instance.Timestamp = l.timestamp.Load()
-	return instance
+	for {
+		sequence := l.sequence.Load()
+		if sequence&1 != 0 {
+			continue
+		}
+		state := l.state.Load()
+		timestamp := l.timestamp.Load()
+		if sequence == l.sequence.Load() {
+			instance.State = InstanceState(state)
+			instance.Timestamp = timestamp
+			return instance
+		}
+	}
 }
 
 type livenessMap map[string]*instanceLiveness
@@ -569,8 +589,7 @@ func (r *Ring) applyRingDelta(delta *Desc, changedIDs []string, sequence uint64,
 			return false
 		}
 
-		slot.state.Store(int32(incoming.State))
-		slot.timestamp.Store(incoming.Timestamp)
+		slot.store(incoming.State, incoming.Timestamp)
 		updated := static
 		updated.State = incoming.State
 		updated.Timestamp = incoming.Timestamp
@@ -692,8 +711,7 @@ func (r *Ring) updateLivenessSnapshotLocked(desc *Desc) {
 	for id, instance := range desc.Ingesters {
 		if old != nil && (*old)[id] != nil {
 			slots[id] = (*old)[id]
-			slots[id].state.Store(int32(instance.State))
-			slots[id].timestamp.Store(instance.Timestamp)
+			slots[id].store(instance.State, instance.Timestamp)
 		} else {
 			slots[id] = newInstanceLiveness(instance)
 		}

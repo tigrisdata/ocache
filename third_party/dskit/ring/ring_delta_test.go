@@ -3,6 +3,8 @@ package ring
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -169,6 +171,106 @@ func TestRingLivenessDeltaChangesRoutingAndHealthyReaders(t *testing.T) {
 	}
 	if len(healthy.Instances) != 1 || healthy.Instances[0].Addr != "b:1" {
 		t.Fatalf("got healthy routes %#v, want only b:1", healthy.Instances)
+	}
+}
+
+func TestSharedLivenessSnapshotIsConsistent(t *testing.T) {
+	baseTimestamp := time.Now().Unix()
+	if baseTimestamp%2 != 0 {
+		baseTimestamp++
+	}
+	initial := NewDesc()
+	initial.AddIngester("a", "a:1", "", []uint32{10}, ACTIVE, time.Unix(baseTimestamp, 0))
+	initial.AddIngester("b", "b:1", "", []uint32{20}, ACTIVE, time.Unix(baseTimestamp, 0))
+	r := newDeltaTestRing(t, &deltaTestClient{snapshot: initial, version: 1})
+	r.updateRingStateWithSequence(initial, 1)
+
+	// A cached subring has its own read lock but shares the parent's liveness
+	// slots. This is the concurrent path that must see a single pair.
+	subring := &Ring{
+		cfg:      r.cfg,
+		strategy: r.strategy,
+		ringDesc: &Desc{Ingesters: map[string]InstanceDesc{"a": initial.Ingesters["a"]}},
+		liveness: r.liveness,
+	}
+	op := NewOp([]InstanceState{ACTIVE, LEAVING}, nil)
+	const (
+		readerCount = 8
+		updateCount = 100000
+	)
+	stop := make(chan struct{})
+	failures := make(chan error, 1)
+	var (
+		stopOnce sync.Once
+		failOnce sync.Once
+	)
+	stopAll := func() { stopOnce.Do(func() { close(stop) }) }
+	reportFailure := func(err error) {
+		failOnce.Do(func() {
+			failures <- err
+			stopAll()
+		})
+	}
+
+	var readers sync.WaitGroup
+	readers.Add(readerCount)
+	for reader := 0; reader < readerCount; reader++ {
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				set, err := subring.GetAllHealthy(op)
+				if err != nil {
+					reportFailure(err)
+					return
+				}
+				if len(set.Instances) != 1 {
+					reportFailure(fmt.Errorf("got %d cached instances, want 1", len(set.Instances)))
+					return
+				}
+				instance := set.Instances[0]
+				if instance.Timestamp%2 == 0 && instance.State != ACTIVE {
+					reportFailure(fmt.Errorf("got %s with even timestamp %d", instance.State, instance.Timestamp))
+					return
+				}
+				if instance.Timestamp%2 != 0 && instance.State != LEAVING {
+					reportFailure(fmt.Errorf("got %s with odd timestamp %d", instance.State, instance.Timestamp))
+					return
+				}
+			}
+		}()
+	}
+
+	for update := 0; update < updateCount; update++ {
+		timestamp := baseTimestamp + int64(update+1)
+		state := ACTIVE
+		if timestamp%2 != 0 {
+			state = LEAVING
+		}
+		delta := NewDesc()
+		delta.Ingesters["a"] = InstanceDesc{
+			Addr:                "a:1",
+			Timestamp:           timestamp,
+			State:               state,
+			Tokens:              []uint32{10},
+			RegisteredTimestamp: initial.Ingesters["a"].RegisteredTimestamp,
+			Id:                  "a",
+		}
+		if !r.applyRingDelta(delta, []string{"a"}, uint64(update+2), false) {
+			reportFailure(fmt.Errorf("update %d was rejected", update))
+			break
+		}
+	}
+	stopAll()
+	readers.Wait()
+	select {
+	case err := <-failures:
+		t.Fatal(err)
+	default:
 	}
 }
 
