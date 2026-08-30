@@ -237,6 +237,36 @@ func TestRingRejectsMixedDeltaWithoutPartialApply(t *testing.T) {
 	}
 }
 
+func TestRingLivenessDeltaKeepsMetricTimestampHeapBounded(t *testing.T) {
+	now := time.Now().Unix()
+	initial := NewDesc()
+	initial.Ingesters["a"] = InstanceDesc{Addr: "a:1", Timestamp: now, State: ACTIVE, Tokens: []uint32{10}, RegisteredTimestamp: 1, Id: "a"}
+	initial.Ingesters["b"] = InstanceDesc{Addr: "b:1", Timestamp: now, State: ACTIVE, Tokens: []uint32{20}, RegisteredTimestamp: 1, Id: "b"}
+	registry := prometheus.NewRegistry()
+	r, err := NewWithStoreClientAndStrategy(
+		Config{HeartbeatTimeout: 0, ReplicationFactor: 1},
+		"bounded-metrics", "ring", nil, NewDefaultReplicationStrategy(), registry, log.NewNopLogger(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.updateRingStateWithSequence(initial, 1)
+
+	for i := int64(1); i <= 100; i++ {
+		delta := NewDesc()
+		instance := initial.Ingesters["b"]
+		instance.Timestamp = now + i
+		delta.Ingesters["b"] = instance
+		if !r.applyRingDelta(delta, []string{"b"}, uint64(i+1), false) {
+			t.Fatalf("heartbeat delta %d was rejected", i)
+		}
+	}
+
+	if got := r.metricTimestampHeap[ACTIVE.String()].Len(); got != 2 {
+		t.Fatalf("got %d metric timestamp entries, want one per member", got)
+	}
+}
+
 func TestRingLivenessDeltaChangesRoutingAndHealthyReaders(t *testing.T) {
 	now := time.Now().Unix()
 	initial := NewDesc()

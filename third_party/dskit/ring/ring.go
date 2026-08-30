@@ -216,9 +216,10 @@ type metricTimestamp struct {
 	id         string
 	timestamp  int64
 	generation uint64
+	index      int
 }
 
-type metricTimestampHeap []metricTimestamp
+type metricTimestampHeap []*metricTimestamp
 
 func (h metricTimestampHeap) Len() int { return len(h) }
 func (h metricTimestampHeap) Less(i, j int) bool {
@@ -227,14 +228,22 @@ func (h metricTimestampHeap) Less(i, j int) bool {
 	}
 	return h[i].timestamp < h[j].timestamp
 }
-func (h metricTimestampHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h metricTimestampHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index = i
+	h[j].index = j
+}
 func (h *metricTimestampHeap) Push(x interface{}) {
-	*h = append(*h, x.(metricTimestamp))
+	item := x.(*metricTimestamp)
+	item.index = len(*h)
+	*h = append(*h, item)
 }
 func (h *metricTimestampHeap) Pop() interface{} {
 	old := *h
 	n := len(old)
 	item := old[n-1]
+	old[n-1] = nil
+	item.index = -1
 	*h = old[:n-1]
 	return item
 }
@@ -285,12 +294,13 @@ type Ring struct {
 	totalTokensGauge        prometheus.Gauge
 	oldestTimestampGaugeVec *prometheus.GaugeVec
 
-	metricsMu           sync.Mutex
-	metricBuckets       map[string]string
-	metricTimestamps    map[string]int64
-	metricGenerations   map[string]uint64
-	metricCounts        map[string]int
-	metricTimestampHeap map[string]*metricTimestampHeap
+	metricsMu              sync.Mutex
+	metricBuckets          map[string]string
+	metricTimestamps       map[string]int64
+	metricGenerations      map[string]uint64
+	metricCounts           map[string]int
+	metricTimestampEntries map[string]*metricTimestamp
+	metricTimestampHeap    map[string]*metricTimestampHeap
 
 	expiryMu   sync.Mutex
 	nextExpiry time.Time
@@ -344,6 +354,7 @@ func NewWithStoreClientAndStrategy(cfg Config, name, key string, store kv.Client
 		metricTimestamps:                 make(map[string]int64),
 		metricGenerations:                make(map[string]uint64),
 		metricCounts:                     make(map[string]int),
+		metricTimestampEntries:           make(map[string]*metricTimestamp),
 		metricTimestampHeap:              make(map[string]*metricTimestampHeap),
 		expiryWake:                       make(chan struct{}, 1),
 		shuffledSubringCache:             map[subringCacheKey]*Ring{},
@@ -980,6 +991,9 @@ func (r *Ring) updateMetricInstanceLocked(id string, instance InstanceDesc, now 
 		r.metricCounts = make(map[string]int)
 		r.metricTimestampHeap = make(map[string]*metricTimestampHeap)
 	}
+	if r.metricTimestampEntries == nil {
+		r.metricTimestampEntries = make(map[string]*metricTimestamp)
+	}
 
 	bucket := r.metricState(instance, now)
 	oldBucket, hadBucket := r.metricBuckets[id]
@@ -991,18 +1005,29 @@ func (r *Ring) updateMetricInstanceLocked(id string, instance InstanceDesc, now 
 		r.metricCounts[oldBucket]--
 	}
 
+	entry := r.metricTimestampEntries[id]
+	if entry == nil {
+		entry = &metricTimestamp{id: id, index: -1}
+		r.metricTimestampEntries[id] = entry
+	}
+	if hadBucket && oldBucket != bucket && entry.index >= 0 {
+		heap.Remove(r.metricTimestampHeap[oldBucket], entry.index)
+	}
+
 	r.metricBuckets[id] = bucket
 	r.metricTimestamps[id] = instance.Timestamp
 	r.metricGenerations[id]++
 	r.metricCounts[bucket]++
+	entry.timestamp = instance.Timestamp
+	entry.generation = r.metricGenerations[id]
+	if hadBucket && oldBucket == bucket && entry.index >= 0 {
+		heap.Fix(r.metricTimestampHeap[bucket], entry.index)
+		return
+	}
 	if r.metricTimestampHeap[bucket] == nil {
 		r.metricTimestampHeap[bucket] = &metricTimestampHeap{}
 	}
-	heap.Push(r.metricTimestampHeap[bucket], metricTimestamp{
-		id:         id,
-		timestamp:  instance.Timestamp,
-		generation: r.metricGenerations[id],
-	})
+	heap.Push(r.metricTimestampHeap[bucket], entry)
 }
 
 func (r *Ring) metricOldestTimestampLocked(state string) int64 {
@@ -1011,6 +1036,9 @@ func (r *Ring) metricOldestTimestampLocked(state string) int64 {
 		entry := (*h)[0]
 		if r.metricBuckets[entry.id] != state || r.metricTimestamps[entry.id] != entry.timestamp || r.metricGenerations[entry.id] != entry.generation {
 			heap.Pop(h)
+			if r.metricTimestampEntries[entry.id] == entry {
+				delete(r.metricTimestampEntries, entry.id)
+			}
 			continue
 		}
 		return entry.timestamp
@@ -1039,6 +1067,7 @@ func (r *Ring) rebuildMetricsLocked(now time.Time) {
 	r.metricTimestamps = make(map[string]int64, len(r.ringDesc.Ingesters))
 	r.metricGenerations = make(map[string]uint64, len(r.ringDesc.Ingesters))
 	r.metricCounts = make(map[string]int, len(metricStates))
+	r.metricTimestampEntries = make(map[string]*metricTimestamp, len(r.ringDesc.Ingesters))
 	r.metricTimestampHeap = make(map[string]*metricTimestampHeap, len(metricStates))
 	for id := range r.ringDesc.Ingesters {
 		r.updateMetricInstanceLocked(id, r.instanceDescLocked(id), now)
