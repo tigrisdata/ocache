@@ -15,6 +15,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/kv/memberlist"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
@@ -133,6 +134,7 @@ type RingManager struct {
 	stateMu        sync.Mutex
 	lastEpoch      uint64
 	lastKnownNodes map[string]ring.InstanceState // Track previous node states for delta logging
+	activeNodes    int                           // Active-node metric maintained by full snapshots and deltas
 
 	// Pre-allocated operation for GetPrimaryNode (includes all states except LEFT)
 	allStatesOp ring.Operation
@@ -325,88 +327,166 @@ func (rm *RingManager) AnnounceLeaving(ctx context.Context) error {
 }
 
 // startRingWatcher starts a goroutine that watches for ring changes via the KV store.
-// This ensures we detect membership changes immediately when they happen via gossip,
-// rather than waiting for the next heartbeat callback.
+// Memberlist clients expose the applied merge through WatchKeyWithChanges, so the
+// coordinator observes the same delta stream as the ring reader instead of causing
+// another full descriptor clone for every heartbeat. Other KV backends retain the
+// ordinary full-snapshot watcher.
 func (rm *RingManager) startRingWatcher(ctx context.Context) {
+	if watcher, ok := rm.kvClient.(interface {
+		WatchKeyWithChanges(context.Context, string, func(memberlist.WatchKeyChange) bool)
+	}); ok {
+		go watcher.WatchKeyWithChanges(ctx, RingKey, func(change memberlist.WatchKeyChange) bool {
+			if ctx.Err() != nil {
+				return false
+			}
+			if change.FullSnapshot {
+				return rm.handleRingSnapshot(change.Value)
+			}
+
+			delta, ok := change.Value.(*ring.Desc)
+			if !ok || delta == nil || change.Sequence == 0 || change.TopologyChanged || len(change.ChangedKeys) == 0 || len(change.ChangedKeys) != len(delta.Ingesters) {
+				return rm.refreshRingSnapshot(ctx)
+			}
+			var seen map[string]struct{}
+			if len(change.ChangedKeys) > 1 {
+				seen = make(map[string]struct{}, len(change.ChangedKeys))
+			}
+			for _, id := range change.ChangedKeys {
+				if _, ok := delta.Ingesters[id]; !ok {
+					return rm.refreshRingSnapshot(ctx)
+				}
+				if seen != nil {
+					if _, duplicate := seen[id]; duplicate {
+						return rm.refreshRingSnapshot(ctx)
+					}
+					seen[id] = struct{}{}
+				}
+			}
+			rm.stateMu.Lock()
+			for _, id := range change.ChangedKeys {
+				if _, existed := rm.lastKnownNodes[id]; !existed {
+					rm.stateMu.Unlock()
+					return rm.refreshRingSnapshot(ctx)
+				}
+			}
+			newEpoch := rm.epoch.ApplyLivenessDelta(delta.Ingesters)
+			oldEpoch := rm.lastEpoch
+			for id, instance := range delta.Ingesters {
+				oldState := rm.lastKnownNodes[id]
+				if oldState != instance.State {
+					level.Info(rm.logger).Log(
+						"msg", "node state changed",
+						"node_id", id,
+						"old_state", oldState.String(),
+						"new_state", instance.State.String(),
+					)
+					rm.adjustActiveNodeMetric(oldState, instance.State)
+				}
+				rm.lastKnownNodes[id] = instance.State
+			}
+			rm.lastEpoch = newEpoch
+			if newEpoch != oldEpoch {
+				level.Info(rm.logger).Log("msg", "ring epoch updated", "epoch", newEpoch, "node_count", len(rm.lastKnownNodes))
+			}
+			rm.setClusterNodeMetricsLocked()
+			rm.stateMu.Unlock()
+			return true
+		})
+		return
+	}
+
 	go func() {
 		rm.kvClient.WatchKey(ctx, RingKey, func(value interface{}) bool {
-			// Check if context is cancelled
 			if ctx.Err() != nil {
-				return false // stop watching
+				return false
 			}
-
-			ringDesc, ok := value.(*ring.Desc)
-			if !ok || ringDesc == nil {
-				return true // continue watching
-			}
-
-			// Compute new epoch from ring state
-			newEpoch := rm.epoch.Set(ringDesc)
-
-			// Log if epoch changed
-			rm.stateMu.Lock()
-			if newEpoch != rm.lastEpoch {
-				rm.logMembershipChange(ringDesc, newEpoch)
-				rm.lastEpoch = newEpoch
-			}
-			rm.stateMu.Unlock()
-
-			return true // continue watching
+			return rm.handleRingSnapshot(value)
 		})
 	}()
+}
+
+func (rm *RingManager) handleRingSnapshot(value interface{}) bool {
+	if value == nil {
+		return true
+	}
+	ringDesc, ok := value.(*ring.Desc)
+	if !ok || ringDesc == nil {
+		return true
+	}
+	newEpoch := rm.epoch.Set(ringDesc)
+	rm.stateMu.Lock()
+	defer rm.stateMu.Unlock()
+	membershipChanged := len(rm.lastKnownNodes) != len(ringDesc.Ingesters)
+	if !membershipChanged {
+		for id, instance := range ringDesc.Ingesters {
+			if state, ok := rm.lastKnownNodes[id]; !ok || state != instance.State {
+				membershipChanged = true
+				break
+			}
+		}
+	}
+	if newEpoch != rm.lastEpoch || membershipChanged {
+		rm.logMembershipChange(ringDesc, newEpoch)
+		rm.lastEpoch = newEpoch
+	}
+	return true
+}
+
+func (rm *RingManager) refreshRingSnapshot(ctx context.Context) bool {
+	value, err := rm.kvClient.Get(ctx, RingKey)
+	if err != nil {
+		level.Warn(rm.logger).Log("msg", "failed to recover ring snapshot for coordinator watcher", "err", err)
+		return true
+	}
+	return rm.handleRingSnapshot(value)
 }
 
 // logMembershipChange logs detailed membership changes including which nodes joined/left.
 // MUST be called with stateMu held.
 func (rm *RingManager) logMembershipChange(ringDesc *ring.Desc, newEpoch uint64) {
-	// Build current node state map
-	currentNodes := make(map[string]ring.InstanceState)
+	currentNodes := make(map[string]ring.InstanceState, len(ringDesc.Ingesters))
+	activeCount := 0
 	for id, inst := range ringDesc.Ingesters {
 		currentNodes[id] = inst.State
+		if inst.State == ring.ACTIVE {
+			activeCount++
+		}
 	}
 
-	// Detect new nodes (joined)
 	for id, state := range currentNodes {
 		if _, existed := rm.lastKnownNodes[id]; !existed {
-			level.Info(rm.logger).Log(
-				"msg", "node joined",
-				"node_id", id,
-				"state", state.String(),
-			)
+			level.Info(rm.logger).Log("msg", "node joined", "node_id", id, "state", state.String())
 		}
 	}
-
-	// Detect removed nodes (left)
 	for id := range rm.lastKnownNodes {
 		if _, exists := currentNodes[id]; !exists {
-			level.Info(rm.logger).Log(
-				"msg", "node left",
-				"node_id", id,
-			)
+			level.Info(rm.logger).Log("msg", "node left", "node_id", id)
 		}
 	}
-
-	// Detect state changes for existing nodes
 	for id, newState := range currentNodes {
 		if oldState, existed := rm.lastKnownNodes[id]; existed && oldState != newState {
-			level.Info(rm.logger).Log(
-				"msg", "node state changed",
-				"node_id", id,
-				"old_state", oldState.String(),
-				"new_state", newState.String(),
-			)
+			level.Info(rm.logger).Log("msg", "node state changed", "node_id", id, "old_state", oldState.String(), "new_state", newState.String())
 		}
 	}
 
-	// Update tracked state
 	rm.lastKnownNodes = currentNodes
+	rm.activeNodes = activeCount
+	rm.setClusterNodeMetricsLocked()
+	level.Info(rm.logger).Log("msg", "ring epoch updated", "epoch", newEpoch, "node_count", len(currentNodes))
+}
 
-	// Log the epoch update summary
-	level.Info(rm.logger).Log(
-		"msg", "ring epoch updated",
-		"epoch", newEpoch,
-		"node_count", len(currentNodes),
-	)
+func (rm *RingManager) adjustActiveNodeMetric(oldState, newState ring.InstanceState) {
+	if oldState == ring.ACTIVE {
+		rm.activeNodes--
+	}
+	if newState == ring.ACTIVE {
+		rm.activeNodes++
+	}
+}
+
+func (rm *RingManager) setClusterNodeMetricsLocked() {
+	metrics.ClusterNodes.WithLabelValues("active").Set(float64(rm.activeNodes))
+	metrics.ClusterNodes.WithLabelValues("total").Set(float64(len(rm.lastKnownNodes)))
 }
 
 // tokenForKey computes a 32-bit token for the given key using FNV-1a.
@@ -757,23 +837,12 @@ func (d *ringDelegate) OnRingInstanceStopping(lifecycler *ring.BasicLifecycler) 
 	level.Info(d.rm.logger).Log("msg", "instance stopping")
 }
 
-// OnRingInstanceHeartbeat is called on each heartbeat.
-// Ring membership changes are detected via the KV watcher (startRingWatcher),
-// so this callback only updates metrics.
-func (d *ringDelegate) OnRingInstanceHeartbeat(lifecycler *ring.BasicLifecycler, ringDesc *ring.Desc, instanceDesc *ring.InstanceDesc) {
-	if ringDesc == nil {
-		return
-	}
-
-	// Update metrics
-	activeCount := 0
-	for _, inst := range ringDesc.Ingesters {
-		if inst.State == ring.ACTIVE {
-			activeCount++
-		}
-	}
-	metrics.ClusterNodes.WithLabelValues("active").Set(float64(activeCount))
-	metrics.ClusterNodes.WithLabelValues("total").Set(float64(len(ringDesc.Ingesters)))
+// OnRingInstanceHeartbeat is called on each heartbeat. Membership metrics and
+// epoch changes are maintained by startRingWatcher, which receives the same
+// memberlist delta stream as the ring reader. Keep this callback constant-time:
+// the lifecycler already has the merged descriptor, but scanning it here would
+// put the discarded full-ring work back on the ordinary heartbeat path.
+func (d *ringDelegate) OnRingInstanceHeartbeat(_ *ring.BasicLifecycler, _ *ring.Desc, _ *ring.InstanceDesc) {
 }
 
 // GetNodeTokens returns token assignments for all active nodes in the ring.

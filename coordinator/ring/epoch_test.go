@@ -180,6 +180,28 @@ func TestEpoch_SetFromRingState(t *testing.T) {
 	assert.Equal(t, epoch, epoch2)
 }
 
+func TestEpoch_ApplyLivenessDelta(t *testing.T) {
+	e := NewEpoch()
+	desc := &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+		"node-1": {State: ring.ACTIVE, Tokens: []uint32{100, 200}},
+		"node-2": {State: ring.ACTIVE, Tokens: []uint32{300, 400}},
+	}}
+	initial := e.Set(desc)
+
+	assert.Equal(t, initial, e.ApplyLivenessDelta(map[string]ring.InstanceDesc{
+		"node-1": {State: ring.ACTIVE, Timestamp: 42},
+	}), "timestamps must not change the epoch")
+
+	changed := e.ApplyLivenessDelta(map[string]ring.InstanceDesc{
+		"node-1": {State: ring.JOINING, Timestamp: 43},
+	})
+	assert.NotEqual(t, initial, changed, "state changes must change the epoch")
+
+	assert.Equal(t, initial, e.ApplyLivenessDelta(map[string]ring.InstanceDesc{
+		"node-1": {State: ring.ACTIVE, Timestamp: 44},
+	}), "replacing the state back should restore the epoch")
+}
+
 func TestEpoch_ConcurrentSetFromRingState(t *testing.T) {
 	e := NewEpoch()
 	const numGoroutines = 100

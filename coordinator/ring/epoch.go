@@ -5,9 +5,8 @@ package ring
 
 import (
 	"hash/fnv"
-	"sort"
 	"strconv"
-	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/grafana/dskit/ring"
@@ -17,16 +16,21 @@ import (
 // Nodes with identical ring views will have identical epochs, enabling
 // reliable cross-node comparisons and eliminating unnecessary topology refreshes.
 //
-// The epoch is computed as a deterministic hash of the ring state:
-// - Sorted node IDs (for determinism)
-// - Node states (JOINING, ACTIVE, LEAVING, etc.)
-// - Token counts (not full tokens - too expensive, and tokens are immutable)
+// The epoch is the XOR of deterministic per-node fingerprints. Each fingerprint
+// includes the node ID, state, and token count (not full tokens). The commutative
+// digest lets a liveness delta replace one node's contribution without scanning
+// the other nodes. Full snapshots rebuild the node table and digest.
 //
 // This is an O(1) atomic load operation for reading - safe for hot paths.
-// Computing the epoch is O(N) where N = number of nodes, but this only
-// happens during heartbeat callbacks when ring state changes.
+type epochNode struct {
+	state      ring.InstanceState
+	tokenCount int
+}
+
 type Epoch struct {
 	version atomic.Uint64
+	mu      sync.Mutex
+	nodes   map[string]epochNode
 }
 
 // NewEpoch creates a new Epoch tracker initialized to 0.
@@ -43,25 +47,68 @@ func (e *Epoch) Get() uint64 {
 // Set computes epoch from ring membership state and stores it.
 // Nodes with identical ring views will compute identical epochs.
 //
-// This is O(N) where N = number of nodes, but is only called during
-// heartbeat callbacks when ring state may have changed.
+// This is O(N) where N = number of nodes and is reserved for full snapshots.
 //
 // Returns the new epoch value.
 func (e *Epoch) Set(ringDesc *ring.Desc) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if ringDesc == nil {
+		e.nodes = nil
+		e.version.Store(0)
 		return 0
 	}
 
+	e.nodes = make(map[string]epochNode, len(ringDesc.Ingesters))
+	for id, instance := range ringDesc.Ingesters {
+		e.nodes[id] = epochNode{state: instance.State, tokenCount: len(instance.Tokens)}
+	}
 	newEpoch := ComputeRingEpoch(ringDesc)
 	e.version.Store(newEpoch)
 	return newEpoch
+}
+
+// ApplyLivenessDelta updates the epoch for state-only changes without scanning
+// the complete ring. Timestamp-only updates leave the epoch unchanged.
+func (e *Epoch) ApplyLivenessDelta(changes map[string]ring.InstanceDesc) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if len(changes) == 0 || e.nodes == nil {
+		return e.version.Load()
+	}
+
+	newEpoch := e.version.Load()
+	for id, instance := range changes {
+		previous, ok := e.nodes[id]
+		if !ok || previous.state == instance.State {
+			continue
+		}
+		newEpoch ^= epochNodeFingerprint(id, previous.state, previous.tokenCount)
+		newEpoch ^= epochNodeFingerprint(id, instance.State, previous.tokenCount)
+		previous.state = instance.State
+		e.nodes[id] = previous
+	}
+	e.version.Store(newEpoch)
+	return newEpoch
+}
+
+func epochNodeFingerprint(id string, state ring.InstanceState, tokenCount int) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(id))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(strconv.Itoa(int(state))))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(strconv.Itoa(tokenCount)))
+	return h.Sum64()
 }
 
 // ComputeRingEpoch creates a deterministic hash of ring state.
 // This function is exported for testing purposes.
 //
 // The hash includes:
-// - Node IDs (sorted for determinism)
+// - Node IDs (to identify each per-node fingerprint)
 // - Node states (to detect JOINING→ACTIVE transitions)
 // - Token counts (to detect if tokens were modified)
 //
@@ -74,29 +121,11 @@ func ComputeRingEpoch(ringDesc *ring.Desc) uint64 {
 		return 0
 	}
 
-	// Sort node IDs for determinism - map iteration order is not guaranteed
-	ids := make([]string, 0, len(ringDesc.Ingesters))
-	for id := range ringDesc.Ingesters {
-		ids = append(ids, id)
+	var epoch uint64
+	for id, instance := range ringDesc.Ingesters {
+		epoch ^= epochNodeFingerprint(id, instance.State, len(instance.Tokens))
 	}
-	sort.Strings(ids)
-
-	// Build canonical representation: "nodeID:state:tokenCount;..."
-	var sb strings.Builder
-	for _, id := range ids {
-		inst := ringDesc.Ingesters[id]
-		sb.WriteString(id)
-		sb.WriteByte(':')
-		sb.WriteString(strconv.Itoa(int(inst.State)))
-		sb.WriteByte(':')
-		sb.WriteString(strconv.Itoa(len(inst.Tokens)))
-		sb.WriteByte(';')
-	}
-
-	// Hash using FNV-64a for fast, reasonable distribution
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(sb.String())) // Write never returns an error for fnv
-	return h.Sum64()
+	return epoch
 }
 
 // GetEpochFromRing is a convenience function to safely get epoch from a potentially nil RingManager.
