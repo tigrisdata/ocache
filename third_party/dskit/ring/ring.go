@@ -157,13 +157,15 @@ type instanceInfo struct {
 	Zone       string
 }
 
+type livenessValue struct {
+	state     InstanceState
+	timestamp int64
+}
+
 type instanceLiveness struct {
-	// sequence is a seqlock for the two fields below. Readers retry if a
-	// delta writer crosses their pair of loads, so a cached subring cannot
-	// observe a state from one heartbeat with a timestamp from another.
-	sequence  atomic.Uint64
-	state     atomic.Int32
-	timestamp atomic.Int64
+	// value points to an immutable pair so cached subrings can load state and
+	// timestamp consistently without taking the parent ring's lock.
+	value atomic.Pointer[livenessValue]
 }
 
 func newInstanceLiveness(instance InstanceDesc) *instanceLiveness {
@@ -173,26 +175,14 @@ func newInstanceLiveness(instance InstanceDesc) *instanceLiveness {
 }
 
 func (l *instanceLiveness) store(state InstanceState, timestamp int64) {
-	l.sequence.Add(1)
-	l.state.Store(int32(state))
-	l.timestamp.Store(timestamp)
-	l.sequence.Add(1)
+	l.value.Store(&livenessValue{state: state, timestamp: timestamp})
 }
 
 func (l *instanceLiveness) snapshot(instance InstanceDesc) InstanceDesc {
-	for {
-		sequence := l.sequence.Load()
-		if sequence&1 != 0 {
-			continue
-		}
-		state := l.state.Load()
-		timestamp := l.timestamp.Load()
-		if sequence == l.sequence.Load() {
-			instance.State = InstanceState(state)
-			instance.Timestamp = timestamp
-			return instance
-		}
-	}
+	value := l.value.Load()
+	instance.State = value.state
+	instance.Timestamp = value.timestamp
+	return instance
 }
 
 type livenessMap map[string]*instanceLiveness
@@ -266,8 +256,9 @@ type Ring struct {
 	// liveness contains the mutable state and heartbeat timestamp for each
 	// instance. The topology descriptor and all token indexes remain immutable
 	// between full ring replacements.
-	liveness      *livenessStore
-	deltaSequence uint64
+	liveness           *livenessStore
+	livenessReadAtomic bool
+	deltaSequence      uint64
 
 	// Oldest value of RegisteredTimestamp from all instances. If any instance had RegisteredTimestamp == 0,
 	// then this value will be 0.
@@ -583,8 +574,7 @@ func (r *Ring) applyRingDelta(delta *Desc, changedIDs []string, sequence uint64,
 	for _, id := range changedIDs {
 		incoming := delta.Ingesters[id]
 		static := r.ringDesc.Ingesters[id]
-		slot := r.liveness.load(id)
-		if incoming.Timestamp < slot.snapshot(static).Timestamp {
+		if incoming.Timestamp < static.Timestamp {
 			r.mtx.Unlock()
 			return false
 		}
@@ -600,6 +590,7 @@ func (r *Ring) applyRingDelta(delta *Desc, changedIDs []string, sequence uint64,
 		updated := static
 		updated.State = incoming.State
 		updated.Timestamp = incoming.Timestamp
+		r.ringDesc.Ingesters[id] = updated
 		r.updateMetricInstanceLocked(id, updated, now)
 	}
 	r.emitMetricsLocked()
@@ -615,6 +606,9 @@ func (r *Ring) applyRingDelta(delta *Desc, changedIDs []string, sequence uint64,
 
 func (r *Ring) instanceDescLocked(id string) InstanceDesc {
 	instance := r.ringDesc.Ingesters[id]
+	if !r.livenessReadAtomic {
+		return instance
+	}
 	if slot := r.liveness.load(id); slot != nil {
 		return slot.snapshot(instance)
 	}
@@ -792,7 +786,12 @@ func (r *Ring) findInstancesForKey(key uint32, op Operation, bufDescs []Instance
 		}
 
 		distinctHosts = append(distinctHosts, info.InstanceID)
-		instance := r.instanceDescLocked(info.InstanceID)
+		instance := r.ringDesc.Ingesters[info.InstanceID]
+		if r.livenessReadAtomic {
+			if slot := r.liveness.load(info.InstanceID); slot != nil {
+				instance = slot.snapshot(instance)
+			}
+		}
 
 		// Check whether the replica set should be extended given we're including
 		// this instance.
@@ -1332,13 +1331,14 @@ func (r *Ring) shuffleShard(identifier string, size int, lookbackPeriod time.Dur
 	shardTokens := mergeTokenGroups(shardTokensByZone)
 
 	return &Ring{
-		cfg:              r.cfg,
-		strategy:         r.strategy,
-		ringDesc:         shardDesc,
-		liveness:         r.liveness,
-		ringTokens:       shardTokens,
-		ringTokensByZone: shardTokensByZone,
-		ringZones:        getZones(shardTokensByZone),
+		cfg:                r.cfg,
+		strategy:           r.strategy,
+		ringDesc:           shardDesc,
+		liveness:           r.liveness,
+		livenessReadAtomic: true,
+		ringTokens:         shardTokens,
+		ringTokensByZone:   shardTokensByZone,
+		ringZones:          getZones(shardTokensByZone),
 
 		oldestRegisteredTimestamp: shardDesc.getOldestRegisteredTimestamp(),
 

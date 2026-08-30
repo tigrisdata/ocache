@@ -249,10 +249,11 @@ func TestSharedLivenessSnapshotIsConsistent(t *testing.T) {
 	// A cached subring has its own read lock but shares the parent's liveness
 	// slots. This is the concurrent path that must see a single pair.
 	subring := &Ring{
-		cfg:      r.cfg,
-		strategy: r.strategy,
-		ringDesc: &Desc{Ingesters: map[string]InstanceDesc{"a": initial.Ingesters["a"]}},
-		liveness: r.liveness,
+		cfg:                r.cfg,
+		strategy:           r.strategy,
+		ringDesc:           &Desc{Ingesters: map[string]InstanceDesc{"a": initial.Ingesters["a"]}},
+		liveness:           r.liveness,
+		livenessReadAtomic: true,
 	}
 	op := NewOp([]InstanceState{ACTIVE, LEAVING}, nil)
 	const (
