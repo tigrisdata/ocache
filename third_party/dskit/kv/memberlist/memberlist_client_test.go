@@ -121,6 +121,27 @@ func TestNotifyDeltaWatchersReplacesCoalescedEvent(t *testing.T) {
 	}
 }
 
+func TestNotifyDeltaWatchersKeepsNewerPendingEvent(t *testing.T) {
+	key := "ring"
+	watcher := make(chan WatchKeyChange, 1)
+	m := &KV{deltaWatchers: map[string][]chan WatchKeyChange{key: {watcher}}}
+
+	m.notifyDeltaWatchers(key, &deltaNotificationValue{content: "new"}, 2)
+	m.notifyDeltaWatchers(key, &deltaNotificationValue{content: "old"}, 1)
+
+	select {
+	case change := <-watcher:
+		if change.Sequence != 2 {
+			t.Fatalf("got stale coalesced sequence %d, want newer sequence 2", change.Sequence)
+		}
+		if got := change.ChangedKeys; len(got) != 1 || got[0] != "new" {
+			t.Fatalf("got stale coalesced keys %v, want [new]", got)
+		}
+	default:
+		t.Fatal("delta notification was not queued")
+	}
+}
+
 // This method deliberately ignores zero limit, so that tests can observe LEFT state as well.
 func (d *data) RemoveTombstones(limit time.Time) (total, removed int) {
 	for n, m := range d.Members {

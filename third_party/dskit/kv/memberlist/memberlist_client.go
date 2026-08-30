@@ -1060,18 +1060,22 @@ func (m *KV) notifyDeltaWatchers(key string, change Mergeable, version uint) {
 	defer m.watchersMu.Unlock()
 
 	for _, watcher := range watchers {
+		newest := event
 		select {
-		case watcher <- event:
+		case watcher <- newest:
 		default:
-			// Keep the newest event rather than the oldest pending event. If
-			// an update was coalesced, the sequence jump is visible to the
-			// reader and it recovers from a full snapshot.
+			// Keep the newest event rather than the oldest pending event. The
+			// merge lock serializes versions, but notifications are sent after
+			// that lock is released and can arrive here out of order.
 			select {
-			case <-watcher:
+			case pending := <-watcher:
+				if pending.Sequence > newest.Sequence {
+					newest = pending
+				}
 			default:
 			}
 			select {
-			case watcher <- event:
+			case watcher <- newest:
 			default:
 			}
 		}
