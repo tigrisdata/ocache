@@ -24,6 +24,11 @@ type ringManagerBenchmarkUpdate struct {
 	timestamp int64
 }
 
+type ringManagerBenchmarkHeartbeat struct {
+	proceed chan struct{}
+	done    chan struct{}
+}
+
 type ringManagerBenchmarkKV struct {
 	mu      sync.Mutex
 	current *dskitring.Desc
@@ -33,11 +38,7 @@ type ringManagerBenchmarkKV struct {
 	delta   []func(memberlist.WatchKeyChange) bool
 
 	measuring        bool
-	completed        uint64
-	consumed         uint64
-	heartbeatSignal  chan struct{}
-	heartbeatStarted chan struct{}
-	heartbeatProceed chan struct{}
+	heartbeatStarted chan *ringManagerBenchmarkHeartbeat
 }
 
 func newRingManagerBenchmarkKV(members, tokensPerMember int) *ringManagerBenchmarkKV {
@@ -55,9 +56,7 @@ func newRingManagerBenchmarkKV(members, tokensPerMember int) *ringManagerBenchma
 		current:          desc,
 		version:          1,
 		ready:            make(chan struct{}, 2),
-		heartbeatSignal:  make(chan struct{}, 1),
-		heartbeatStarted: make(chan struct{}),
-		heartbeatProceed: make(chan struct{}),
+		heartbeatStarted: make(chan *ringManagerBenchmarkHeartbeat),
 	}
 }
 
@@ -81,13 +80,22 @@ func (c *ringManagerBenchmarkKV) Delete(context.Context, string) error {
 
 func (c *ringManagerBenchmarkKV) CAS(_ context.Context, _ string, f func(interface{}) (interface{}, bool, error)) error {
 	c.mu.Lock()
-	measuring := c.measuring
+	var heartbeat *ringManagerBenchmarkHeartbeat
+	if c.measuring {
+		heartbeat = &ringManagerBenchmarkHeartbeat{
+			proceed: make(chan struct{}),
+			done:    make(chan struct{}),
+		}
+	}
 	c.mu.Unlock()
-	if measuring {
+	if heartbeat != nil {
 		// Keep the idle interval between ticker events outside the timed operation,
 		// while the handshake starts timing before the CAS clones the descriptor.
-		c.heartbeatStarted <- struct{}{}
-		<-c.heartbeatProceed
+		// The per-CAS token prevents a completion from a CAS that began before
+		// measurement from satisfying the current iteration.
+		c.heartbeatStarted <- heartbeat
+		<-heartbeat.proceed
+		defer c.recordHeartbeat(heartbeat)
 	}
 
 	c.mu.Lock()
@@ -130,36 +138,23 @@ func (c *ringManagerBenchmarkKV) CAS(_ context.Context, _ string, f func(interfa
 			continue
 		}
 	}
-	c.recordHeartbeat()
 	return nil
 }
 
-func (c *ringManagerBenchmarkKV) waitForHeartbeatStart() {
-	<-c.heartbeatStarted
+func (c *ringManagerBenchmarkKV) waitForHeartbeatStart() *ringManagerBenchmarkHeartbeat {
+	return <-c.heartbeatStarted
 }
 
-func (c *ringManagerBenchmarkKV) proceedHeartbeat() {
-	c.heartbeatProceed <- struct{}{}
+func (c *ringManagerBenchmarkKV) proceedHeartbeat(heartbeat *ringManagerBenchmarkHeartbeat) {
+	heartbeat.proceed <- struct{}{}
 }
 
-func (c *ringManagerBenchmarkKV) recordHeartbeat() {
-	c.mu.Lock()
-	if !c.measuring {
-		c.mu.Unlock()
-		return
-	}
-	c.completed++
-	c.mu.Unlock()
-	select {
-	case c.heartbeatSignal <- struct{}{}:
-	default:
-	}
+func (c *ringManagerBenchmarkKV) recordHeartbeat(heartbeat *ringManagerBenchmarkHeartbeat) {
+	close(heartbeat.done)
 }
 
 func (c *ringManagerBenchmarkKV) beginMeasurement() {
 	c.mu.Lock()
-	c.completed = 0
-	c.consumed = 0
 	c.measuring = true
 	c.mu.Unlock()
 }
@@ -170,17 +165,8 @@ func (c *ringManagerBenchmarkKV) endMeasurement() {
 	c.mu.Unlock()
 }
 
-func (c *ringManagerBenchmarkKV) waitForHeartbeat() {
-	for {
-		c.mu.Lock()
-		if c.consumed < c.completed {
-			c.consumed++
-			c.mu.Unlock()
-			return
-		}
-		c.mu.Unlock()
-		<-c.heartbeatSignal
-	}
+func (c *ringManagerBenchmarkKV) waitForHeartbeat(heartbeat *ringManagerBenchmarkHeartbeat) {
+	<-heartbeat.done
 }
 
 func (c *ringManagerBenchmarkKV) WatchKey(ctx context.Context, _ string, f func(interface{}) bool) {
@@ -277,10 +263,10 @@ func BenchmarkRingManagerHeartbeatUpdate(b *testing.B) {
 			b.ResetTimer()
 			for heartbeat := 0; heartbeat < b.N; heartbeat++ {
 				b.StopTimer()
-				client.waitForHeartbeatStart()
+				run := client.waitForHeartbeatStart()
 				b.StartTimer()
-				client.proceedHeartbeat()
-				client.waitForHeartbeat()
+				client.proceedHeartbeat(run)
+				client.waitForHeartbeat(run)
 			}
 			b.StopTimer()
 			client.endMeasurement()
