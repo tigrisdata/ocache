@@ -88,6 +88,39 @@ func (d *data) MergeContent() []string {
 	return out
 }
 
+type deltaNotificationValue struct {
+	content string
+}
+
+func (d *deltaNotificationValue) Merge(Mergeable, bool) (Mergeable, error) { return nil, nil }
+func (d *deltaNotificationValue) MergeContent() []string                   { return []string{d.content} }
+func (d *deltaNotificationValue) RemoveTombstones(time.Time) (int, int)    { return 0, 0 }
+func (d *deltaNotificationValue) Clone() Mergeable {
+	return &deltaNotificationValue{content: d.content}
+}
+
+func TestNotifyDeltaWatchersReplacesCoalescedEvent(t *testing.T) {
+	key := "ring"
+	watcher := make(chan WatchKeyChange, 1)
+	m := &KV{deltaWatchers: map[string][]chan WatchKeyChange{key: {watcher}}}
+
+	for sequence := uint(1); sequence <= 3; sequence++ {
+		m.notifyDeltaWatchers(key, &deltaNotificationValue{content: fmt.Sprint(sequence)}, sequence)
+	}
+
+	select {
+	case change := <-watcher:
+		if change.Sequence != 3 {
+			t.Fatalf("got coalesced sequence %d, want newest sequence 3", change.Sequence)
+		}
+		if got := change.ChangedKeys; len(got) != 1 || got[0] != "3" {
+			t.Fatalf("got coalesced keys %v, want [3]", got)
+		}
+	default:
+		t.Fatal("delta notification was not queued")
+	}
+}
+
 // This method deliberately ignores zero limit, so that tests can observe LEFT state as well.
 func (d *data) RemoveTombstones(limit time.Time) (total, removed int) {
 	for n, m := range d.Members {

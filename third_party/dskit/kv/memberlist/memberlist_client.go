@@ -38,13 +38,16 @@ type Client struct {
 	codec codec.Codec
 }
 
-// WatchKeyChange is the optional memberlist delta-watch payload. The ring
-// reader uses this type when a backend exposes a narrow change stream.
+// WatchKeyChange is the result of one applied memberlist merge. Value is the
+// merged change, not the complete value stored for the key. FullSnapshot is
+// set for the initial value delivered to a watcher. Sequence is local to the
+// KV key and increases for every applied change.
 type WatchKeyChange struct {
-	Value        Mergeable
-	ChangedKeys  []string
-	Sequence     uint64
-	FullSnapshot bool
+	Value           Mergeable
+	ChangedKeys     []string
+	Sequence        uint64
+	FullSnapshot    bool
+	TopologyChanged bool
 }
 
 // NewClient creates new client instance. Supplied codec must already be registered in KV.
@@ -80,6 +83,18 @@ func (c *Client) Get(ctx context.Context, key string) (interface{}, error) {
 	return c.kv.Get(key, c.codec)
 }
 
+// GetWithVersion returns a cloned value and the local sequence for the key.
+// It is an optional memberlist-only extension used to recover a dropped delta.
+func (c *Client) GetWithVersion(ctx context.Context, key string) (interface{}, uint64, error) {
+	err := c.awaitKVRunningOrStopping(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	value, version, err := c.kv.get(key, c.codec)
+	return value, uint64(version), err
+}
+
 // Delete is part of kv.Client interface.
 func (c *Client) Delete(_ context.Context, _ string) error {
 	return errors.New("memberlist does not support Delete")
@@ -103,6 +118,18 @@ func (c *Client) WatchKey(ctx context.Context, key string, f func(interface{}) b
 	}
 
 	c.kv.WatchKey(ctx, key, c.codec, f)
+}
+
+// WatchKeyWithChanges delivers the narrow result of each applied merge. It is
+// intentionally an optional memberlist-only API; other KV backends continue
+// to use WatchKey and full snapshots.
+func (c *Client) WatchKeyWithChanges(ctx context.Context, key string, f func(WatchKeyChange) bool) {
+	err := c.awaitKVRunningOrStopping(ctx)
+	if err != nil {
+		return
+	}
+
+	c.kv.WatchKeyWithChanges(ctx, key, c.codec, f)
 }
 
 // WatchPrefix calls f whenever any value stored under prefix changes.
@@ -255,6 +282,7 @@ type KV struct {
 	// Key watchers
 	watchersMu     sync.Mutex
 	watchers       map[string][]chan string
+	deltaWatchers  map[string][]chan WatchKeyChange
 	prefixWatchers map[string][]chan string
 
 	// Buffers with sent and received messages. Used for troubleshooting only.
@@ -371,6 +399,7 @@ func NewKV(cfg KVConfig, logger log.Logger, dnsProvider DNSProvider, registerer 
 		store:           make(map[string]ValueDesc),
 		codecs:          make(map[string]codec.Codec),
 		watchers:        make(map[string][]chan string),
+		deltaWatchers:   make(map[string][]chan WatchKeyChange),
 		prefixWatchers:  make(map[string][]chan string),
 		workersChannels: make(map[string]chan valueUpdate),
 		shutdown:        make(chan struct{}),
@@ -840,6 +869,64 @@ func (m *KV) WatchKey(ctx context.Context, key string, codec codec.Codec, f func
 	}
 }
 
+// WatchKeyWithChanges watches a key without cloning the complete value for
+// each notification. The initial callback is a full snapshot; subsequent
+// callbacks carry the narrow Mergeable returned by the applied merge.
+func (m *KV) WatchKeyWithChanges(ctx context.Context, key string, codec codec.Codec, f func(WatchKeyChange) bool) {
+	w := make(chan WatchKeyChange, 1)
+
+	m.watchersMu.Lock()
+	m.deltaWatchers[key] = append(m.deltaWatchers[key], w)
+	m.watchersMu.Unlock()
+
+	defer func() {
+		m.watchersMu.Lock()
+		defer m.watchersMu.Unlock()
+
+		removeDeltaWatcherChannel(key, w, m.deltaWatchers)
+	}()
+
+	// Deliver one snapshot after registration. Registering first ensures any
+	// update racing with the snapshot remains queued and is detected by its
+	// sequence number.
+	value, version, err := m.get(key, codec)
+	if err != nil {
+		level.Warn(m.logger).Log("msg", "failed to decode value while starting change watcher", "key", key, "err", err)
+		return
+	}
+	var mergeable Mergeable
+	if value != nil {
+		var ok bool
+		mergeable, ok = value.(Mergeable)
+		if !ok {
+			level.Warn(m.logger).Log("msg", "failed to start change watcher because value is not mergeable", "key", key, "type", fmt.Sprintf("%T", value))
+			return
+		}
+	}
+	if !f(WatchKeyChange{
+		Value:        mergeable,
+		Sequence:     uint64(version),
+		FullSnapshot: true,
+	}) {
+		return
+	}
+
+	for {
+		select {
+		case change := <-w:
+			if !f(change) {
+				return
+			}
+
+		case <-m.shutdown:
+			return
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // WatchPrefix watches for any change of values stored under keys with given prefix. When change occurs,
 // function 'f' is called with key and current value.
 // Each change of the key results in one notification. If there are too many pending notifications ('f' is slow),
@@ -902,6 +989,22 @@ func removeWatcherChannel(k string, w chan string, watchers map[string][]chan st
 	}
 }
 
+func removeDeltaWatcherChannel(k string, w chan WatchKeyChange, watchers map[string][]chan WatchKeyChange) {
+	ws := watchers[k]
+	for ix, kw := range ws {
+		if kw == w {
+			ws = append(ws[:ix], ws[ix+1:]...)
+			break
+		}
+	}
+
+	if len(ws) > 0 {
+		watchers[k] = ws
+	} else {
+		delete(watchers, k)
+	}
+}
+
 func (m *KV) notifyWatchers(key string) {
 	m.watchersMu.Lock()
 	defer m.watchersMu.Unlock()
@@ -933,6 +1036,62 @@ func (m *KV) notifyWatchers(key string) {
 				}
 			}
 		}
+	}
+}
+
+func (m *KV) notifyDeltaWatchers(key string, change Mergeable, version uint) {
+	if change == nil {
+		return
+	}
+
+	m.watchersMu.Lock()
+	watchers := m.deltaWatchers[key]
+	if len(watchers) == 0 {
+		m.watchersMu.Unlock()
+		return
+	}
+
+	event := WatchKeyChange{
+		Value:           change,
+		ChangedKeys:     change.MergeContent(),
+		Sequence:        uint64(version),
+		TopologyChanged: topologyChanged(change),
+	}
+	defer m.watchersMu.Unlock()
+
+	for _, watcher := range watchers {
+		select {
+		case watcher <- event:
+		default:
+			// Keep the newest event rather than the oldest pending event. If
+			// an update was coalesced, the sequence jump is visible to the
+			// reader and it recovers from a full snapshot.
+			select {
+			case <-watcher:
+			default:
+			}
+			select {
+			case watcher <- event:
+			default:
+			}
+		}
+	}
+}
+
+func topologyChanged(change Mergeable) bool {
+	if metadata, ok := change.(interface{ TopologyChanged() bool }); ok {
+		return metadata.TopologyChanged()
+	}
+	return false
+}
+
+// notifyValueWatchers preserves the existing key notifications and also
+// exposes the narrow merge result to memberlist delta watchers.
+func (m *KV) notifyValueWatchers(key string, change Mergeable, version uint) {
+	m.notifyWatchers(key)
+	m.notifyDeltaWatchers(key, change, version)
+	if metadata, ok := change.(interface{ ClearTopologyChanged() }); ok {
+		metadata.ClearTopologyChanged()
 	}
 }
 
@@ -979,7 +1138,7 @@ outer:
 
 		if change != nil {
 			m.casSuccesses.Inc()
-			m.notifyWatchers(key)
+			m.notifyValueWatchers(key, change, newver)
 
 			if m.State() == services.Running {
 				m.broadcastNewValue(key, change, newver, codec)
@@ -1159,7 +1318,7 @@ func (m *KV) processValueUpdate(workerCh <-chan valueUpdate, key string) {
 			if err != nil {
 				level.Error(m.logger).Log("msg", "failed to store received value", "key", key, "err", err)
 			} else if version > 0 {
-				m.notifyWatchers(key)
+				m.notifyValueWatchers(key, mod, version)
 
 				// Don't resend original message, but only changes.
 				m.broadcastNewValue(key, mod, version, update.codec)
@@ -1343,7 +1502,7 @@ func (m *KV) MergeRemoteState(data []byte, _ bool) {
 		if err != nil {
 			level.Error(m.logger).Log("msg", "failed to store received value", "key", kvPair.Key, "err", err)
 		} else if newver > 0 {
-			m.notifyWatchers(kvPair.Key)
+			m.notifyValueWatchers(kvPair.Key, change, newver)
 			m.broadcastNewValue(kvPair.Key, change, newver, codec)
 		}
 	}
@@ -1385,11 +1544,13 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 	}
 	result, change, err := computeNewValue(incomingValue, curr.value, casVersion > 0)
 	if err != nil {
+		clearMergeMetadata(change)
 		return nil, 0, err
 	}
 
 	// No change, don't store it.
 	if change == nil || len(change.MergeContent()) == 0 {
+		clearMergeMetadata(change)
 		return nil, 0, nil
 	}
 
@@ -1407,6 +1568,7 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 		// RemoveTombstones twice with same limit should be noop.
 		change.RemoveTombstones(limit)
 		if len(change.MergeContent()) == 0 {
+			clearMergeMetadata(change)
 			return nil, 0, nil
 		}
 	}
@@ -1420,9 +1582,17 @@ func (m *KV) mergeValueForKey(key string, incomingValue Mergeable, casVersion ui
 
 	// The "changes" returned by Merge() can contain references to the "result"
 	// state. Therefore, make sure we clone it before releasing the lock.
+	originalChange := change
 	change = change.Clone()
+	clearMergeMetadata(originalChange)
 
 	return change, newVersion, nil
+}
+
+func clearMergeMetadata(change Mergeable) {
+	if metadata, ok := change.(interface{ ClearTopologyChanged() }); ok {
+		metadata.ClearTopologyChanged()
+	}
 }
 
 // returns [result, change, error]

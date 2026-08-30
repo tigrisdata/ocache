@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/grafana/dskit/kv/memberlist"
 )
 
 type prefixedKVClient struct {
@@ -45,6 +47,28 @@ func (c *prefixedKVClient) WatchKey(ctx context.Context, key string, f func(inte
 	c.client.WatchKey(ctx, c.prefix+key, f)
 }
 
+// WatchKeyWithChanges watches a key while preserving the prefix wrapper.
+func (c *prefixedKVClient) WatchKeyWithChanges(ctx context.Context, key string, f func(memberlist.WatchKeyChange) bool) {
+	if watcher, ok := c.client.(interface {
+		WatchKeyWithChanges(context.Context, string, func(memberlist.WatchKeyChange) bool)
+	}); ok {
+		watcher.WatchKeyWithChanges(ctx, c.prefix+key, f)
+		return
+	}
+
+	c.client.WatchKey(ctx, c.prefix+key, func(value interface{}) bool {
+		var mergeable memberlist.Mergeable
+		if value != nil {
+			var ok bool
+			mergeable, ok = value.(memberlist.Mergeable)
+			if !ok {
+				return true
+			}
+		}
+		return f(memberlist.WatchKeyChange{Value: mergeable, FullSnapshot: true})
+	})
+}
+
 // WatchPrefix watches a prefix. For a prefix client it appends the prefix argument to the clients prefix.
 func (c *prefixedKVClient) WatchPrefix(ctx context.Context, prefix string, f func(string, interface{}) bool) {
 	c.client.WatchPrefix(ctx, fmt.Sprintf("%s%s", c.prefix, prefix), func(k string, i interface{}) bool {
@@ -55,6 +79,17 @@ func (c *prefixedKVClient) WatchPrefix(ctx context.Context, prefix string, f fun
 // Get looks up a given object from its key.
 func (c *prefixedKVClient) Get(ctx context.Context, key string) (interface{}, error) {
 	return c.client.Get(ctx, c.prefix+key)
+}
+
+// GetWithVersion forwards the optional memberlist sequence through the prefix.
+func (c *prefixedKVClient) GetWithVersion(ctx context.Context, key string) (interface{}, uint64, error) {
+	if versioned, ok := c.client.(interface {
+		GetWithVersion(context.Context, string) (interface{}, uint64, error)
+	}); ok {
+		return versioned.GetWithVersion(ctx, c.prefix+key)
+	}
+	value, err := c.Get(ctx, key)
+	return value, 0, err
 }
 
 // Delete removes a given object from its key.

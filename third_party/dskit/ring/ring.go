@@ -3,6 +3,7 @@ package ring
 // Based on https://raw.githubusercontent.com/stathat/consistent/master/consistent.go
 
 import (
+	"container/heap"
 	"context"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-kit/log"
@@ -23,6 +25,7 @@ import (
 	dsmath "github.com/grafana/dskit/internal/math"
 	"github.com/grafana/dskit/internal/slices"
 	"github.com/grafana/dskit/kv"
+	"github.com/grafana/dskit/kv/memberlist"
 	shardUtil "github.com/grafana/dskit/ring/shard"
 	"github.com/grafana/dskit/services"
 )
@@ -154,6 +157,78 @@ type instanceInfo struct {
 	Zone       string
 }
 
+type instanceLiveness struct {
+	state     atomic.Int32
+	timestamp atomic.Int64
+}
+
+func newInstanceLiveness(instance InstanceDesc) *instanceLiveness {
+	live := &instanceLiveness{}
+	live.state.Store(int32(instance.State))
+	live.timestamp.Store(instance.Timestamp)
+	return live
+}
+
+func (l *instanceLiveness) snapshot(instance InstanceDesc) InstanceDesc {
+	instance.State = InstanceState(l.state.Load())
+	instance.Timestamp = l.timestamp.Load()
+	return instance
+}
+
+type livenessMap map[string]*instanceLiveness
+
+type livenessStore struct {
+	slots atomic.Pointer[livenessMap]
+}
+
+func newLivenessStore(slots livenessMap) *livenessStore {
+	store := &livenessStore{}
+	store.slots.Store(&slots)
+	return store
+}
+
+func (s *livenessStore) load(id string) *instanceLiveness {
+	if s == nil {
+		return nil
+	}
+	slots := s.slots.Load()
+	if slots == nil {
+		return nil
+	}
+	return (*slots)[id]
+}
+
+func (s *livenessStore) replace(slots livenessMap) {
+	s.slots.Store(&slots)
+}
+
+type metricTimestamp struct {
+	id         string
+	timestamp  int64
+	generation uint64
+}
+
+type metricTimestampHeap []metricTimestamp
+
+func (h metricTimestampHeap) Len() int { return len(h) }
+func (h metricTimestampHeap) Less(i, j int) bool {
+	if h[i].timestamp == h[j].timestamp {
+		return h[i].id < h[j].id
+	}
+	return h[i].timestamp < h[j].timestamp
+}
+func (h metricTimestampHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *metricTimestampHeap) Push(x interface{}) {
+	*h = append(*h, x.(metricTimestamp))
+}
+func (h *metricTimestampHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
 // Ring is a Service that maintains an in-memory copy of a ring and watches for changes.
 type Ring struct {
 	services.Service
@@ -167,6 +242,12 @@ type Ring struct {
 	ringDesc         *Desc
 	ringTokens       []uint32
 	ringTokensByZone map[string][]uint32
+
+	// liveness contains the mutable state and heartbeat timestamp for each
+	// instance. The topology descriptor and all token indexes remain immutable
+	// between full ring replacements.
+	liveness      *livenessStore
+	deltaSequence uint64
 
 	// Oldest value of RegisteredTimestamp from all instances. If any instance had RegisteredTimestamp == 0,
 	// then this value will be 0.
@@ -192,6 +273,17 @@ type Ring struct {
 	numMembersGaugeVec      *prometheus.GaugeVec
 	totalTokensGauge        prometheus.Gauge
 	oldestTimestampGaugeVec *prometheus.GaugeVec
+
+	metricsMu           sync.Mutex
+	metricBuckets       map[string]string
+	metricTimestamps    map[string]int64
+	metricGenerations   map[string]uint64
+	metricCounts        map[string]int
+	metricTimestampHeap map[string]*metricTimestampHeap
+
+	expiryMu   sync.Mutex
+	nextExpiry time.Time
+	expiryWake chan struct{}
 
 	logger log.Logger
 }
@@ -236,6 +328,13 @@ func NewWithStoreClientAndStrategy(cfg Config, name, key string, store kv.Client
 		KVClient:                         store,
 		strategy:                         strategy,
 		ringDesc:                         &Desc{},
+		liveness:                         newLivenessStore(make(livenessMap)),
+		metricBuckets:                    make(map[string]string),
+		metricTimestamps:                 make(map[string]int64),
+		metricGenerations:                make(map[string]uint64),
+		metricCounts:                     make(map[string]int),
+		metricTimestampHeap:              make(map[string]*metricTimestampHeap),
+		expiryWake:                       make(chan struct{}, 1),
 		shuffledSubringCache:             map[subringCacheKey]*Ring{},
 		shuffledSubringWithLookbackCache: map[subringCacheKey]cachedSubringWithLookback{},
 		numMembersGaugeVec: promauto.With(reg).NewGaugeVec(prometheus.GaugeOpts{
@@ -271,7 +370,11 @@ func (r *Ring) starting(ctx context.Context) error {
 		return errors.Wrap(err, "unable to initialise ring state")
 	}
 	if value != nil {
-		r.updateRingState(value.(*Desc))
+		desc, ok := value.(*Desc)
+		if !ok {
+			return fmt.Errorf("unable to initialise ring state: expected *ring.Desc, got %T", value)
+		}
+		r.updateRingState(desc)
 	} else {
 		level.Info(r.logger).Log("msg", "ring doesn't exist in KV store yet")
 	}
@@ -284,21 +387,235 @@ func (r *Ring) loop(ctx context.Context) error {
 	r.updateRingMetrics(Different)
 	r.mtx.Unlock()
 
+	go r.expiryLoop(ctx)
+
+	if watcher, ok := r.KVClient.(interface {
+		WatchKeyWithChanges(context.Context, string, func(memberlist.WatchKeyChange) bool)
+	}); ok {
+		watcher.WatchKeyWithChanges(ctx, r.key, func(change memberlist.WatchKeyChange) bool {
+			return r.updateRingChange(ctx, change)
+		})
+		return nil
+	}
+
 	r.KVClient.WatchKey(ctx, r.key, func(value interface{}) bool {
 		if value == nil {
 			level.Info(r.logger).Log("msg", "ring doesn't exist in KV store yet")
 			return true
 		}
 
-		r.updateRingState(value.(*Desc))
+		desc, ok := value.(*Desc)
+		if !ok {
+			level.Warn(r.logger).Log("msg", "ignoring invalid ring value", "type", fmt.Sprintf("%T", value))
+			return true
+		}
+		r.updateRingState(desc)
 		return true
 	})
 	return nil
 }
 
+func (r *Ring) updateRingStateWithSequence(ringDesc *Desc, sequence uint64) {
+	r.updateRingState(ringDesc)
+	if sequence == 0 {
+		return
+	}
+
+	r.mtx.Lock()
+	if sequence > r.deltaSequence {
+		r.deltaSequence = sequence
+	}
+	r.mtx.Unlock()
+	r.recomputeNextExpiry()
+}
+
+func (r *Ring) updateRingChange(ctx context.Context, change memberlist.WatchKeyChange) bool {
+	if change.FullSnapshot {
+		if change.Value == nil {
+			r.updateRingStateWithSequence(NewDesc(), change.Sequence)
+			return true
+		}
+
+		desc, ok := change.Value.(*Desc)
+		if !ok {
+			level.Warn(r.logger).Log("msg", "ignoring invalid ring snapshot", "type", fmt.Sprintf("%T", change.Value))
+			return true
+		}
+		r.updateRingStateWithSequence(desc, change.Sequence)
+		return true
+	}
+
+	delta, ok := change.Value.(*Desc)
+	if !ok || delta == nil || change.Sequence == 0 || len(change.ChangedKeys) == 0 {
+		return r.recoverRingState(ctx, change.Sequence)
+	}
+
+	if r.applyRingDelta(delta, change.ChangedKeys, change.Sequence, change.TopologyChanged) {
+		return true
+	}
+
+	return r.recoverRingState(ctx, change.Sequence)
+}
+
+func (r *Ring) recoverRingState(ctx context.Context, sequence uint64) bool {
+	var (
+		value   interface{}
+		version uint64
+		err     error
+	)
+
+	if versioned, ok := r.KVClient.(interface {
+		GetWithVersion(context.Context, string) (interface{}, uint64, error)
+	}); ok {
+		value, version, err = versioned.GetWithVersion(ctx, r.key)
+	} else {
+		value, err = r.KVClient.Get(ctx, r.key)
+		version = sequence
+	}
+	if err != nil {
+		level.Warn(r.logger).Log("msg", "unable to recover ring snapshot after a memberlist delta gap", "err", err)
+		return true
+	}
+	if value == nil {
+		r.updateRingStateWithSequence(NewDesc(), version)
+		return true
+	}
+
+	desc, ok := value.(*Desc)
+	if !ok {
+		level.Warn(r.logger).Log("msg", "ignoring invalid recovered ring snapshot", "type", fmt.Sprintf("%T", value))
+		return true
+	}
+	r.updateRingStateWithSequence(desc, version)
+	return true
+}
+
+func (r *Ring) applyRingDelta(delta *Desc, changedIDs []string, sequence uint64, topologyChanged bool) bool {
+	if topologyChanged {
+		return false
+	}
+
+	// Delta application updates the sequence and the shared liveness slots as
+	// one unit. Use the write lock so a recovery or another watcher cannot
+	// interleave a sequence check with the patch.
+	r.mtx.Lock()
+	if sequence <= r.deltaSequence {
+		r.mtx.Unlock()
+		return true
+	}
+	if r.deltaSequence == 0 {
+		if sequence != 1 {
+			r.mtx.Unlock()
+			return false
+		}
+	} else if sequence != r.deltaSequence+1 {
+		r.mtx.Unlock()
+		return false
+	}
+	if r.ringDesc == nil || len(changedIDs) == 0 || len(changedIDs) != len(delta.Ingesters) {
+		r.mtx.Unlock()
+		return false
+	}
+
+	var seen map[string]struct{}
+	if len(changedIDs) > 1 {
+		seen = make(map[string]struct{}, len(changedIDs))
+	}
+	for _, id := range changedIDs {
+		if seen != nil {
+			if _, duplicate := seen[id]; duplicate {
+				r.mtx.Unlock()
+				return false
+			}
+			seen[id] = struct{}{}
+		}
+
+		incoming, ok := delta.Ingesters[id]
+		static, present := r.ringDesc.Ingesters[id]
+		if !ok || !present || r.liveness.load(id) == nil {
+			r.mtx.Unlock()
+			return false
+		}
+		if incoming.Id != "" && (incoming.Id != static.Id || incoming.Id != id) {
+			r.mtx.Unlock()
+			return false
+		}
+		// TopologyChanged is set by Desc.Merge before the change reaches this
+		// path. These immutable-field checks also protect the reader from
+		// applying a change produced by another implementation of the optional API.
+		if incoming.Addr != static.Addr || incoming.Zone != static.Zone || incoming.RegisteredTimestamp != static.RegisteredTimestamp || !tokensEqual(incoming.Tokens, static.Tokens) {
+			r.mtx.Unlock()
+			return false
+		}
+	}
+	if seen != nil {
+		for id := range delta.Ingesters {
+			if _, ok := seen[id]; !ok {
+				r.mtx.Unlock()
+				return false
+			}
+		}
+	}
+
+	now := time.Now()
+	r.metricsMu.Lock()
+	for id, incoming := range delta.Ingesters {
+		static := r.ringDesc.Ingesters[id]
+		slot := r.liveness.load(id)
+		old := slot.snapshot(static)
+		if incoming.Timestamp < old.Timestamp {
+			r.metricsMu.Unlock()
+			r.mtx.Unlock()
+			return false
+		}
+
+		slot.state.Store(int32(incoming.State))
+		slot.timestamp.Store(incoming.Timestamp)
+		updated := static
+		updated.State = incoming.State
+		updated.Timestamp = incoming.Timestamp
+		r.updateMetricInstanceLocked(id, updated, now)
+	}
+	r.emitMetricsLocked()
+	r.metricsMu.Unlock()
+	r.deltaSequence = sequence
+	r.mtx.Unlock()
+
+	for _, incoming := range delta.Ingesters {
+		r.scheduleExpiry(incoming.Timestamp)
+	}
+	return true
+}
+
+func (r *Ring) instanceDescLocked(id string) InstanceDesc {
+	instance := r.ringDesc.Ingesters[id]
+	if slot := r.liveness.load(id); slot != nil {
+		return slot.snapshot(instance)
+	}
+	return instance
+}
+
+func newLivenessMap(desc *Desc) livenessMap {
+	slots := make(livenessMap, len(desc.Ingesters))
+	for id, instance := range desc.Ingesters {
+		slots[id] = newInstanceLiveness(instance)
+	}
+	return slots
+}
+
 func (r *Ring) updateRingState(ringDesc *Desc) {
+	if ringDesc == nil {
+		ringDesc = NewDesc()
+	}
+	if ringDesc.Ingesters == nil {
+		ringDesc.Ingesters = make(map[string]InstanceDesc)
+	}
+
 	r.mtx.RLock()
 	prevRing := r.ringDesc
+	if prevRing == nil {
+		prevRing = NewDesc()
+	}
 	r.mtx.RUnlock()
 
 	// Filter out all instances belonging to excluded zones.
@@ -322,8 +639,10 @@ func (r *Ring) updateRingState(ringDesc *Desc) {
 		// when watching the ring for updates).
 		r.mtx.Lock()
 		r.ringDesc = ringDesc
+		r.updateLivenessSnapshotLocked(ringDesc)
 		r.updateRingMetrics(rc)
 		r.mtx.Unlock()
+		r.recomputeNextExpiry()
 		return
 	}
 
@@ -333,9 +652,9 @@ func (r *Ring) updateRingState(ringDesc *Desc) {
 	ringInstanceByToken := ringDesc.getTokensInfo()
 	ringZones := getZones(ringTokensByZone)
 	oldestRegisteredTimestamp := ringDesc.getOldestRegisteredTimestamp()
+	slots := newLivenessMap(ringDesc)
 
 	r.mtx.Lock()
-	defer r.mtx.Unlock()
 	r.ringDesc = ringDesc
 	r.ringTokens = ringTokens
 	r.ringTokensByZone = ringTokensByZone
@@ -343,6 +662,11 @@ func (r *Ring) updateRingState(ringDesc *Desc) {
 	r.ringZones = ringZones
 	r.oldestRegisteredTimestamp = oldestRegisteredTimestamp
 	r.lastTopologyChange = now
+	if r.liveness == nil {
+		r.liveness = newLivenessStore(slots)
+	} else {
+		r.liveness.replace(slots)
+	}
 
 	// Invalidate all cached subrings.
 	if r.shuffledSubringCache != nil {
@@ -353,6 +677,28 @@ func (r *Ring) updateRingState(ringDesc *Desc) {
 	}
 
 	r.updateRingMetrics(rc)
+	r.mtx.Unlock()
+	r.recomputeNextExpiry()
+}
+
+func (r *Ring) updateLivenessSnapshotLocked(desc *Desc) {
+	if r.liveness == nil {
+		r.liveness = newLivenessStore(newLivenessMap(desc))
+		return
+	}
+
+	old := r.liveness.slots.Load()
+	slots := make(livenessMap, len(desc.Ingesters))
+	for id, instance := range desc.Ingesters {
+		if old != nil && (*old)[id] != nil {
+			slots[id] = (*old)[id]
+			slots[id].state.Store(int32(instance.State))
+			slots[id].timestamp.Store(instance.Timestamp)
+		} else {
+			slots[id] = newInstanceLiveness(instance)
+		}
+	}
+	r.liveness.replace(slots)
 }
 
 // Get returns n (or more) instances which form the replicas for the given key.
@@ -421,7 +767,7 @@ func (r *Ring) findInstancesForKey(key uint32, op Operation, bufDescs []Instance
 		}
 
 		distinctHosts = append(distinctHosts, info.InstanceID)
-		instance := r.ringDesc.Ingesters[info.InstanceID]
+		instance := r.instanceDescLocked(info.InstanceID)
 
 		// Check whether the replica set should be extended given we're including
 		// this instance.
@@ -458,7 +804,8 @@ func (r *Ring) GetAllHealthy(op Operation) (ReplicationSet, error) {
 
 	now := time.Now()
 	instances := make([]InstanceDesc, 0, len(r.ringDesc.Ingesters))
-	for _, instance := range r.ringDesc.Ingesters {
+	for id := range r.ringDesc.Ingesters {
+		instance := r.instanceDescLocked(id)
 		if r.IsHealthy(&instance, op, now) {
 			instances = append(instances, instance)
 		}
@@ -484,7 +831,8 @@ func (r *Ring) GetReplicationSetForOperation(op Operation) (ReplicationSet, erro
 	zoneFailures := make(map[string]struct{})
 	now := time.Now()
 
-	for _, instance := range r.ringDesc.Ingesters {
+	for id := range r.ringDesc.Ingesters {
+		instance := r.instanceDescLocked(id)
 		if r.IsHealthy(&instance, op, now) {
 			healthyInstances = append(healthyInstances, instance)
 		} else {
@@ -591,44 +939,206 @@ func (r *Desc) CountTokens() map[string]int64 {
 	return owned
 }
 
+var metricStates = []string{unhealthy, ACTIVE.String(), LEAVING.String(), PENDING.String(), JOINING.String()}
+
+func (r *Ring) metricState(instance InstanceDesc, now time.Time) string {
+	if !instance.IsHealthy(Reporting, r.cfg.HeartbeatTimeout, now) {
+		return unhealthy
+	}
+	return instance.State.String()
+}
+
+func (r *Ring) updateMetricInstanceLocked(id string, instance InstanceDesc, now time.Time) {
+	if r.metricBuckets == nil {
+		r.metricBuckets = make(map[string]string)
+		r.metricTimestamps = make(map[string]int64)
+		r.metricGenerations = make(map[string]uint64)
+		r.metricCounts = make(map[string]int)
+		r.metricTimestampHeap = make(map[string]*metricTimestampHeap)
+	}
+
+	bucket := r.metricState(instance, now)
+	oldBucket, hadBucket := r.metricBuckets[id]
+	oldTimestamp := r.metricTimestamps[id]
+	if hadBucket && oldBucket == bucket && oldTimestamp == instance.Timestamp {
+		return
+	}
+	if hadBucket {
+		r.metricCounts[oldBucket]--
+	}
+
+	r.metricBuckets[id] = bucket
+	r.metricTimestamps[id] = instance.Timestamp
+	r.metricGenerations[id]++
+	r.metricCounts[bucket]++
+	if r.metricTimestampHeap[bucket] == nil {
+		r.metricTimestampHeap[bucket] = &metricTimestampHeap{}
+	}
+	heap.Push(r.metricTimestampHeap[bucket], metricTimestamp{
+		id:         id,
+		timestamp:  instance.Timestamp,
+		generation: r.metricGenerations[id],
+	})
+}
+
+func (r *Ring) metricOldestTimestampLocked(state string) int64 {
+	h := r.metricTimestampHeap[state]
+	for h != nil && h.Len() > 0 {
+		entry := (*h)[0]
+		if r.metricBuckets[entry.id] != state || r.metricTimestamps[entry.id] != entry.timestamp || r.metricGenerations[entry.id] != entry.generation {
+			heap.Pop(h)
+			continue
+		}
+		return entry.timestamp
+	}
+	return 0
+}
+
+func (r *Ring) emitMetricsLocked() {
+	for _, state := range metricStates {
+		r.numMembersGaugeVec.WithLabelValues(state).Set(float64(r.metricCounts[state]))
+		r.oldestTimestampGaugeVec.WithLabelValues(state).Set(float64(r.metricOldestTimestampLocked(state)))
+	}
+}
+
+func (r *Ring) rebuildMetricsLocked(now time.Time) {
+	r.metricsMu.Lock()
+	r.metricBuckets = make(map[string]string, len(r.ringDesc.Ingesters))
+	r.metricTimestamps = make(map[string]int64, len(r.ringDesc.Ingesters))
+	r.metricGenerations = make(map[string]uint64, len(r.ringDesc.Ingesters))
+	r.metricCounts = make(map[string]int, len(metricStates))
+	r.metricTimestampHeap = make(map[string]*metricTimestampHeap, len(metricStates))
+	for id := range r.ringDesc.Ingesters {
+		r.updateMetricInstanceLocked(id, r.instanceDescLocked(id), now)
+	}
+	r.emitMetricsLocked()
+	r.metricsMu.Unlock()
+}
+
 // updateRingMetrics updates ring metrics. Caller must be holding the Write lock!
 func (r *Ring) updateRingMetrics(compareResult CompareResult) {
 	if compareResult == Equal {
 		return
 	}
 
-	numByState := map[string]int{}
-	oldestTimestampByState := map[string]int64{}
-
-	// Initialized to zero so we emit zero-metrics (instead of not emitting anything)
-	for _, s := range []string{unhealthy, ACTIVE.String(), LEAVING.String(), PENDING.String(), JOINING.String()} {
-		numByState[s] = 0
-		oldestTimestampByState[s] = 0
+	r.rebuildMetricsLocked(time.Now())
+	if compareResult != EqualButStatesAndTimestamps {
+		r.totalTokensGauge.Set(float64(len(r.ringTokens)))
 	}
+}
 
-	for _, instance := range r.ringDesc.Ingesters {
-		s := instance.State.String()
-		if !r.IsHealthy(&instance, Reporting, time.Now()) {
-			s = unhealthy
-		}
-		numByState[s]++
-		if oldestTimestampByState[s] == 0 || instance.Timestamp < oldestTimestampByState[s] {
-			oldestTimestampByState[s] = instance.Timestamp
-		}
+func (r *Ring) scheduleExpiry(timestamp int64) {
+	if r.cfg.HeartbeatTimeout == 0 {
+		return
 	}
-
-	for state, count := range numByState {
-		r.numMembersGaugeVec.WithLabelValues(state).Set(float64(count))
-	}
-	for state, timestamp := range oldestTimestampByState {
-		r.oldestTimestampGaugeVec.WithLabelValues(state).Set(float64(timestamp))
-	}
-
-	if compareResult == EqualButStatesAndTimestamps {
+	deadline := time.Unix(timestamp, 0).Add(r.cfg.HeartbeatTimeout)
+	if !deadline.After(time.Now()) {
 		return
 	}
 
-	r.totalTokensGauge.Set(float64(len(r.ringTokens)))
+	r.expiryMu.Lock()
+	changed := r.nextExpiry.IsZero() || deadline.Before(r.nextExpiry)
+	if changed {
+		r.nextExpiry = deadline
+	}
+	r.expiryMu.Unlock()
+	if changed {
+		select {
+		case r.expiryWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (r *Ring) recomputeNextExpiry() {
+	if r.cfg.HeartbeatTimeout == 0 {
+		return
+	}
+
+	now := time.Now()
+	var next time.Time
+	r.mtx.RLock()
+	if r.ringDesc != nil {
+		for id := range r.ringDesc.Ingesters {
+			instance := r.instanceDescLocked(id)
+			deadline := time.Unix(instance.Timestamp, 0).Add(r.cfg.HeartbeatTimeout)
+			if deadline.After(now) && (next.IsZero() || deadline.Before(next)) {
+				next = deadline
+			}
+		}
+	}
+	r.mtx.RUnlock()
+
+	r.expiryMu.Lock()
+	r.nextExpiry = next
+	r.expiryMu.Unlock()
+	select {
+	case r.expiryWake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Ring) expireMetrics(now time.Time) {
+	r.mtx.RLock()
+	if r.ringDesc == nil {
+		r.mtx.RUnlock()
+		return
+	}
+	r.metricsMu.Lock()
+	for id := range r.ringDesc.Ingesters {
+		r.updateMetricInstanceLocked(id, r.instanceDescLocked(id), now)
+	}
+	r.emitMetricsLocked()
+	r.metricsMu.Unlock()
+	r.mtx.RUnlock()
+}
+
+func (r *Ring) expiryLoop(ctx context.Context) {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	for {
+		r.expiryMu.Lock()
+		next := r.nextExpiry
+		r.expiryMu.Unlock()
+		if next.IsZero() {
+			select {
+			case <-r.expiryWake:
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		wait := time.Until(next)
+		if wait < 0 {
+			wait = 0
+		}
+		timer.Reset(wait)
+		select {
+		case <-timer.C:
+			r.expireMetrics(time.Now())
+			r.recomputeNextExpiry()
+		case <-r.expiryWake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
 }
 
 // ShuffleShard returns a subring for the provided identifier (eg. a tenant ID)
@@ -769,7 +1279,7 @@ func (r *Ring) shuffleShard(identifier string, size int, lookbackPeriod time.Dur
 				}
 
 				instanceID := info.InstanceID
-				instance := r.ringDesc.Ingesters[instanceID]
+				instance := r.instanceDescLocked(instanceID)
 				shard[instanceID] = instance
 
 				// If the lookback is enabled and this instance has been registered within the lookback period
@@ -800,6 +1310,7 @@ func (r *Ring) shuffleShard(identifier string, size int, lookbackPeriod time.Dur
 		cfg:              r.cfg,
 		strategy:         r.strategy,
 		ringDesc:         shardDesc,
+		liveness:         r.liveness,
 		ringTokens:       shardTokens,
 		ringTokensByZone: shardTokensByZone,
 		ringZones:        getZones(shardTokensByZone),
@@ -877,7 +1388,7 @@ func (r *Ring) GetInstanceState(instanceID string) (InstanceState, error) {
 	if !ok {
 		return PENDING, ErrInstanceNotFound
 	}
-
+	instance = r.instanceDescLocked(instanceID)
 	return instance.GetState(), nil
 }
 
@@ -910,17 +1421,8 @@ func (r *Ring) getCachedShuffledSubring(identifier string, size int) *Ring {
 		return cached
 	}
 
-	cached.mtx.Lock()
-	defer cached.mtx.Unlock()
-
-	// Update instance states and timestamps. We know that the topology is the same,
-	// so zones and tokens are equal.
-	for name, cachedIng := range cached.ringDesc.Ingesters {
-		ing := r.ringDesc.Ingesters[name]
-		cachedIng.State = ing.State
-		cachedIng.Timestamp = ing.Timestamp
-		cached.ringDesc.Ingesters[name] = cachedIng
-	}
+	// The cached subring shares the parent's atomic liveness slots, so a
+	// heartbeat does not require copying state through the cached descriptor.
 	return cached
 }
 
@@ -966,18 +1468,8 @@ func (r *Ring) getCachedShuffledSubringWithLookback(identifier string, size int,
 		return cachedSubring
 	}
 
-	cachedSubring.mtx.Lock()
-	defer cachedSubring.mtx.Unlock()
-
-	// Update instance states and timestamps. We know that the topology is the same,
-	// so zones and tokens are equal.
-	for name, cachedIng := range cachedSubring.ringDesc.Ingesters {
-		ing := r.ringDesc.Ingesters[name]
-		cachedIng.State = ing.State
-		cachedIng.Timestamp = ing.Timestamp
-		cachedSubring.ringDesc.Ingesters[name] = cachedIng
-	}
-
+	// The cached subring shares the parent's atomic liveness slots, so a
+	// heartbeat does not require copying state through the cached descriptor.
 	return cachedSubring
 }
 
@@ -1055,6 +1547,9 @@ func (r *Ring) getRing(_ context.Context) (*Desc, error) {
 	defer r.mtx.RUnlock()
 
 	ringDesc := proto.Clone(r.ringDesc).(*Desc)
+	for id := range ringDesc.Ingesters {
+		ringDesc.Ingesters[id] = r.instanceDescLocked(id)
+	}
 
 	return ringDesc, nil
 }

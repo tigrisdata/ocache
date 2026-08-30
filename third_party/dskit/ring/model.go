@@ -38,6 +38,42 @@ func NewDesc() *Desc {
 	}
 }
 
+// Desc merge results need one bit of local metadata to distinguish liveness
+// changes from topology changes. Keep it out of the generated protobuf type:
+// descriptors are compared as values throughout dskit, and this bit is not
+// part of the ring state. The marker lives only until the memberlist watcher
+// turns the merge result into a WatchKeyChange.
+var descTopologyChanges sync.Map // map[*Desc]struct{}
+
+func markDescTopologyChanged(desc *Desc, changed bool) {
+	if desc != nil && changed {
+		descTopologyChanges.Store(desc, struct{}{})
+	}
+}
+
+func clearDescTopologyChanged(desc *Desc) {
+	if desc != nil {
+		descTopologyChanges.Delete(desc)
+	}
+}
+
+// TopologyChanged reports whether the most recent merge result changed an
+// instance's immutable placement or membership fields. It is local merge
+// metadata and is not serialized in the ring descriptor.
+func (d *Desc) TopologyChanged() bool {
+	if d == nil {
+		return false
+	}
+	_, ok := descTopologyChanges.Load(d)
+	return ok
+}
+
+// ClearTopologyChanged releases local merge metadata after a watcher has
+// copied it into its event payload.
+func (d *Desc) ClearTopologyChanged() {
+	clearDescTopologyChanged(d)
+}
+
 // AddIngester adds the given ingester to the ring. Ingester will only use supplied tokens,
 // any other tokens are removed.
 func (d *Desc) AddIngester(id, addr, zone string, tokens []uint32, state InstanceState, registeredAt time.Time) InstanceDesc {
@@ -210,11 +246,15 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 
 	var updated []string
 	tokensChanged := false
+	topologyChanged := false
 
 	for name, oing := range otherIngesterMap {
-		ting := thisIngesterMap[name]
+		ting, exists := thisIngesterMap[name]
 		// ting.Timestamp will be 0, if there was no such ingester in our version
 		if oing.Timestamp > ting.Timestamp {
+			if !exists || ting.Addr != oing.Addr || ting.Zone != oing.Zone || ting.RegisteredTimestamp != oing.RegisteredTimestamp || !tokensEqual(ting.Tokens, oing.Tokens) {
+				topologyChanged = true
+			}
 			if !tokensEqual(ting.Tokens, oing.Tokens) {
 				tokensChanged = true
 			}
@@ -223,6 +263,7 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 			updated = append(updated, name)
 		} else if oing.Timestamp == ting.Timestamp && ting.State != LEFT && oing.State == LEFT {
 			// we accept LEFT even if timestamp hasn't changed
+			topologyChanged = true
 			thisIngesterMap[name] = oing // has no tokens already
 			updated = append(updated, name)
 		}
@@ -233,6 +274,7 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		for name, ting := range thisIngesterMap {
 			if _, ok := otherIngesterMap[name]; !ok && ting.State != LEFT {
 				// missing, let's mark our ingester as LEFT
+				topologyChanged = true
 				ting.State = LEFT
 				ting.Tokens = nil
 				// We are deleting entry "now", and should not keep old timestamp, because there may already be pending
@@ -258,6 +300,7 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 
 	// Let's build a "change" for returning
 	out := NewDesc()
+	markDescTopologyChanged(out, topologyChanged)
 	for _, u := range updated {
 		ing := thisIngesterMap[u]
 		out.Ingesters[u] = ing
@@ -437,7 +480,11 @@ func (d *Desc) RemoveTombstones(limit time.Time) (total, removed int) {
 
 // Clone returns a deep copy of the ring state.
 func (d *Desc) Clone() memberlist.Mergeable {
-	return proto.Clone(d).(*Desc)
+	clone := proto.Clone(d).(*Desc)
+	if d.TopologyChanged() {
+		markDescTopologyChanged(clone, true)
+	}
+	return clone
 }
 
 func (d *Desc) getTokensInfo() map[uint32]instanceInfo {

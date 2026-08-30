@@ -64,7 +64,7 @@ type Desc struct {
 	Ingesters map[string]InstanceDesc `protobuf:"bytes,1,rep,name=ingesters,proto3" json:"ingesters" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
 }
 
-func (m *Desc) Reset()      { *m = Desc{} }
+func (m *Desc) Reset()      { clearDescTopologyChanged(m); *m = Desc{} }
 func (*Desc) ProtoMessage() {}
 func (*Desc) Descriptor() ([]byte, []int) {
 	return fileDescriptor_26381ed67e202a6e, []int{0}

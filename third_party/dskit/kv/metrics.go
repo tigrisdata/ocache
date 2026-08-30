@@ -9,6 +9,7 @@ import (
 
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/instrument"
+	"github.com/grafana/dskit/kv/memberlist"
 )
 
 // RegistererWithKVName wraps the provided Registerer with the KV name label. If a nil reg
@@ -81,6 +82,18 @@ func (m metrics) Get(ctx context.Context, key string) (interface{}, error) {
 	return result, err
 }
 
+// GetWithVersion forwards the optional memberlist sequence used for delta
+// recovery. Other backends return their ordinary snapshot with no sequence.
+func (m metrics) GetWithVersion(ctx context.Context, key string) (interface{}, uint64, error) {
+	if versioned, ok := m.c.(interface {
+		GetWithVersion(context.Context, string) (interface{}, uint64, error)
+	}); ok {
+		return versioned.GetWithVersion(ctx, key)
+	}
+	value, err := m.Get(ctx, key)
+	return value, 0, err
+}
+
 func (m metrics) Delete(ctx context.Context, key string) error {
 	err := instrument.CollectedRequest(ctx, "Delete", m.requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		return m.c.Delete(ctx, key)
@@ -98,6 +111,30 @@ func (m metrics) WatchKey(ctx context.Context, key string, f func(interface{}) b
 	_ = instrument.CollectedRequest(ctx, "WatchKey", m.requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		m.c.WatchKey(ctx, key, f)
 		return nil
+	})
+}
+
+// WatchKeyWithChanges forwards the optional memberlist delta stream through
+// the metrics wrapper. Backends without that extension retain full-snapshot
+// WatchKey semantics.
+func (m metrics) WatchKeyWithChanges(ctx context.Context, key string, f func(memberlist.WatchKeyChange) bool) {
+	if watcher, ok := m.c.(interface {
+		WatchKeyWithChanges(context.Context, string, func(memberlist.WatchKeyChange) bool)
+	}); ok {
+		watcher.WatchKeyWithChanges(ctx, key, f)
+		return
+	}
+
+	m.WatchKey(ctx, key, func(value interface{}) bool {
+		var mergeable memberlist.Mergeable
+		if value != nil {
+			var ok bool
+			mergeable, ok = value.(memberlist.Mergeable)
+			if !ok {
+				return true
+			}
+		}
+		return f(memberlist.WatchKeyChange{Value: mergeable, FullSnapshot: true})
 	})
 }
 
