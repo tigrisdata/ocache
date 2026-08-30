@@ -136,6 +136,46 @@ func TestRingAppliesLivenessDeltaWithoutReplacingTopology(t *testing.T) {
 	}
 }
 
+func TestRingLivenessDeltaEmitsLeftMetrics(t *testing.T) {
+	now := time.Now().Unix()
+	initial := deltaTestDesc("a:1", now, []uint32{10}, ACTIVE)
+	registry := prometheus.NewRegistry()
+	r, err := NewWithStoreClientAndStrategy(
+		Config{HeartbeatTimeout: 0, ReplicationFactor: 1},
+		"left-metrics", "ring", nil, NewDefaultReplicationStrategy(), registry, log.NewNopLogger(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.updateRingStateWithSequence(initial, 1)
+
+	delta := deltaTestDesc("a:1", now+1, []uint32{10}, LEFT)
+	if !r.applyRingDelta(delta, []string{"a"}, 2, false) {
+		t.Fatal("left liveness delta was rejected")
+	}
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, family := range families {
+		if family.GetName() != "ring_members" && family.GetName() != "ring_oldest_member_timestamp" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "state" && label.GetValue() == LEFT.String() {
+					found[family.GetName()] = true
+				}
+			}
+		}
+	}
+	if !found["ring_members"] || !found["ring_oldest_member_timestamp"] {
+		t.Fatalf("LEFT metrics were not emitted: %v", found)
+	}
+}
+
 func TestRingRejectsMixedDeltaWithoutPartialApply(t *testing.T) {
 	now := time.Now().Unix()
 	initial := NewDesc()

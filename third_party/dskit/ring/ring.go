@@ -1023,6 +1023,14 @@ func (r *Ring) emitMetricsLocked() {
 		r.numMembersGaugeVec.WithLabelValues(state).Set(float64(r.metricCounts[state]))
 		r.oldestTimestampGaugeVec.WithLabelValues(state).Set(float64(r.metricOldestTimestampLocked(state)))
 	}
+
+	// LEFT is a tombstone state and is emitted only while the ring contains
+	// one, matching the original map-based metric rebuild behavior.
+	if _, ok := r.metricCounts[LEFT.String()]; ok {
+		state := LEFT.String()
+		r.numMembersGaugeVec.WithLabelValues(state).Set(float64(r.metricCounts[state]))
+		r.oldestTimestampGaugeVec.WithLabelValues(state).Set(float64(r.metricOldestTimestampLocked(state)))
+	}
 }
 
 func (r *Ring) rebuildMetricsLocked(now time.Time) {
