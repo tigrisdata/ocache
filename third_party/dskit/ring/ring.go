@@ -577,18 +577,25 @@ func (r *Ring) applyRingDelta(delta *Desc, changedIDs []string, sequence uint64,
 		}
 	}
 
-	now := time.Now()
-	r.metricsMu.Lock()
-	for id, incoming := range delta.Ingesters {
+	// Validate every timestamp before publishing any slot. A rejected delta must
+	// leave the overlay and its metrics unchanged so snapshot recovery cannot
+	// expose a partially applied update if it is temporarily unavailable.
+	for _, id := range changedIDs {
+		incoming := delta.Ingesters[id]
 		static := r.ringDesc.Ingesters[id]
 		slot := r.liveness.load(id)
-		old := slot.snapshot(static)
-		if incoming.Timestamp < old.Timestamp {
-			r.metricsMu.Unlock()
+		if incoming.Timestamp < slot.snapshot(static).Timestamp {
 			r.mtx.Unlock()
 			return false
 		}
+	}
 
+	now := time.Now()
+	r.metricsMu.Lock()
+	for _, id := range changedIDs {
+		incoming := delta.Ingesters[id]
+		static := r.ringDesc.Ingesters[id]
+		slot := r.liveness.load(id)
 		slot.store(incoming.State, incoming.Timestamp)
 		updated := static
 		updated.State = incoming.State

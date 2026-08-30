@@ -136,6 +136,67 @@ func TestRingAppliesLivenessDeltaWithoutReplacingTopology(t *testing.T) {
 	}
 }
 
+func TestRingRejectsMixedDeltaWithoutPartialApply(t *testing.T) {
+	now := time.Now().Unix()
+	initial := NewDesc()
+	initial.Ingesters["a"] = InstanceDesc{
+		Addr:                "a:1",
+		Timestamp:           now,
+		State:               ACTIVE,
+		Tokens:              []uint32{10},
+		RegisteredTimestamp: 1,
+		Id:                  "a",
+	}
+	initial.Ingesters["b"] = InstanceDesc{
+		Addr:                "b:1",
+		Timestamp:           now + 10,
+		State:               ACTIVE,
+		Tokens:              []uint32{20},
+		RegisteredTimestamp: 1,
+		Id:                  "b",
+	}
+	r := newDeltaTestRing(t, &deltaTestClient{snapshot: initial, version: 1})
+	r.updateRingStateWithSequence(initial, 1)
+
+	delta := NewDesc()
+	delta.Ingesters["a"] = InstanceDesc{
+		Addr:                "a:1",
+		Timestamp:           now + 1,
+		State:               LEAVING,
+		Tokens:              []uint32{10},
+		RegisteredTimestamp: 1,
+		Id:                  "a",
+	}
+	delta.Ingesters["b"] = InstanceDesc{
+		Addr:                "b:1",
+		Timestamp:           now + 1,
+		State:               LEAVING,
+		Tokens:              []uint32{20},
+		RegisteredTimestamp: 1,
+		Id:                  "b",
+	}
+	if r.applyRingDelta(delta, []string{"a", "b"}, 2, false) {
+		t.Fatal("delta with an older member timestamp was accepted")
+	}
+
+	if r.deltaSequence != 1 {
+		t.Fatalf("delta sequence advanced to %d, want 1", r.deltaSequence)
+	}
+	for id, wantTimestamp := range map[string]int64{"a": now, "b": now + 10} {
+		got, err := r.getRing(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance := got.Ingesters[id]
+		if instance.State != ACTIVE || instance.Timestamp != wantTimestamp {
+			t.Fatalf("member %s became %s at %d, want ACTIVE at %d", id, instance.State, instance.Timestamp, wantTimestamp)
+		}
+	}
+	if r.metricCounts[ACTIVE.String()] != 2 || r.metricCounts[LEAVING.String()] != 0 {
+		t.Fatalf("metrics changed after rejected delta: active=%d leaving=%d", r.metricCounts[ACTIVE.String()], r.metricCounts[LEAVING.String()])
+	}
+}
+
 func TestRingLivenessDeltaChangesRoutingAndHealthyReaders(t *testing.T) {
 	now := time.Now().Unix()
 	initial := NewDesc()

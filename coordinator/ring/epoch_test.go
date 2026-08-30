@@ -35,7 +35,7 @@ func TestComputeRingEpoch_SingleNode(t *testing.T) {
 	}
 
 	epoch := ComputeRingEpoch(ringDesc)
-	assert.NotEqual(t, uint64(0), epoch)
+	assert.Equal(t, uint64(2336755368678153959), epoch, "epoch must remain compatible with the pre-delta coordinator")
 
 	// Same input should produce same epoch (deterministic)
 	epoch2 := ComputeRingEpoch(ringDesc)
@@ -200,6 +200,24 @@ func TestEpoch_ApplyLivenessDelta(t *testing.T) {
 	assert.Equal(t, initial, e.ApplyLivenessDelta(map[string]ring.InstanceDesc{
 		"node-1": {State: ring.ACTIVE, Timestamp: 44},
 	}), "replacing the state back should restore the epoch")
+}
+
+func TestEpoch_ApplyLivenessDeltaPreservesWireEpoch(t *testing.T) {
+	desc := &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+		"node-1": {State: ring.ACTIVE, Tokens: []uint32{100, 200}},
+		"node-2": {State: ring.ACTIVE, Tokens: []uint32{300, 400}},
+	}}
+	e := NewEpoch()
+	e.Set(desc)
+
+	updated := &ring.Desc{Ingesters: map[string]ring.InstanceDesc{
+		"node-1": {State: ring.JOINING, Tokens: []uint32{100, 200}},
+		"node-2": {State: ring.ACTIVE, Tokens: []uint32{300, 400}},
+	}}
+	got := e.ApplyLivenessDelta(map[string]ring.InstanceDesc{
+		"node-1": updated.Ingesters["node-1"],
+	})
+	assert.Equal(t, ComputeRingEpoch(updated), got, "delta epoch must match a full snapshot epoch")
 }
 
 func TestEpoch_ConcurrentSetFromRingState(t *testing.T) {
