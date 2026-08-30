@@ -130,11 +130,12 @@ type RingManager struct {
 	// Used by clients to detect stale topology information.
 	epoch *Epoch
 
-	// stateMu protects lastEpoch and lastKnownNodes for tracking membership changes.
-	stateMu        sync.Mutex
-	lastEpoch      uint64
-	lastKnownNodes map[string]ring.InstanceState // Track previous node states for delta logging
-	activeNodes    int                           // Active-node metric maintained by full snapshots and deltas
+	// stateMu protects watcher sequencing, epochs, metrics, and membership tracking.
+	stateMu           sync.Mutex
+	lastEpoch         uint64
+	lastDeltaSequence uint64
+	lastKnownNodes    map[string]ring.InstanceState // Track previous node states for delta logging
+	activeNodes       int                           // Active-node metric maintained by full snapshots and deltas
 
 	// Pre-allocated operation for GetPrimaryNode (includes all states except LEFT)
 	allStatesOp ring.Operation
@@ -340,7 +341,7 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 				return false
 			}
 			if change.FullSnapshot {
-				return rm.handleRingSnapshot(change.Value)
+				return rm.handleRingSnapshotWithSequence(change.Value, change.Sequence)
 			}
 
 			delta, ok := change.Value.(*ring.Desc)
@@ -363,6 +364,10 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 				}
 			}
 			rm.stateMu.Lock()
+			if (rm.lastDeltaSequence == 0 && change.Sequence != 1) || (rm.lastDeltaSequence != 0 && change.Sequence != rm.lastDeltaSequence+1) {
+				rm.stateMu.Unlock()
+				return rm.refreshRingSnapshot(ctx)
+			}
 			for _, id := range change.ChangedKeys {
 				if _, existed := rm.lastKnownNodes[id]; !existed {
 					rm.stateMu.Unlock()
@@ -384,6 +389,7 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 				}
 				rm.lastKnownNodes[id] = instance.State
 			}
+			rm.lastDeltaSequence = change.Sequence
 			rm.lastEpoch = newEpoch
 			if newEpoch != oldEpoch {
 				level.Info(rm.logger).Log("msg", "ring epoch updated", "epoch", newEpoch, "node_count", len(rm.lastKnownNodes))
@@ -406,6 +412,10 @@ func (rm *RingManager) startRingWatcher(ctx context.Context) {
 }
 
 func (rm *RingManager) handleRingSnapshot(value interface{}) bool {
+	return rm.handleRingSnapshotWithSequence(value, 0)
+}
+
+func (rm *RingManager) handleRingSnapshotWithSequence(value interface{}, sequence uint64) bool {
 	if value == nil {
 		return true
 	}
@@ -413,9 +423,12 @@ func (rm *RingManager) handleRingSnapshot(value interface{}) bool {
 	if !ok || ringDesc == nil {
 		return true
 	}
-	newEpoch := rm.epoch.Set(ringDesc)
 	rm.stateMu.Lock()
 	defer rm.stateMu.Unlock()
+	if sequence > 0 && rm.lastDeltaSequence > 0 && sequence < rm.lastDeltaSequence {
+		return true
+	}
+	newEpoch := rm.epoch.Set(ringDesc)
 	membershipChanged := len(rm.lastKnownNodes) != len(ringDesc.Ingesters)
 	if !membershipChanged {
 		for id, instance := range ringDesc.Ingesters {
@@ -429,16 +442,30 @@ func (rm *RingManager) handleRingSnapshot(value interface{}) bool {
 		rm.logMembershipChange(ringDesc, newEpoch)
 		rm.lastEpoch = newEpoch
 	}
+	if sequence > 0 {
+		rm.lastDeltaSequence = sequence
+	}
 	return true
 }
 
 func (rm *RingManager) refreshRingSnapshot(ctx context.Context) bool {
-	value, err := rm.kvClient.Get(ctx, RingKey)
+	var (
+		value    interface{}
+		sequence uint64
+		err      error
+	)
+	if versioned, ok := rm.kvClient.(interface {
+		GetWithVersion(context.Context, string) (interface{}, uint64, error)
+	}); ok {
+		value, sequence, err = versioned.GetWithVersion(ctx, RingKey)
+	} else {
+		value, err = rm.kvClient.Get(ctx, RingKey)
+	}
 	if err != nil {
 		level.Warn(rm.logger).Log("msg", "failed to recover ring snapshot for coordinator watcher", "err", err)
 		return true
 	}
-	return rm.handleRingSnapshot(value)
+	return rm.handleRingSnapshotWithSequence(value, sequence)
 }
 
 // logMembershipChange logs detailed membership changes including which nodes joined/left.
