@@ -94,6 +94,70 @@ func TestDescMergeMarksTopologyChangesWithoutChangingDescriptorValues(t *testing
 	}
 }
 
+func TestDescMergeMarksTokenlessLeftTombstoneAsTopologyChange(t *testing.T) {
+	now := time.Now().Unix()
+	current := NewDesc()
+	current.Ingesters["a"] = InstanceDesc{Addr: "a:1", Timestamp: now, State: ACTIVE, Tokens: []uint32{10}, RegisteredTimestamp: 1, Id: "a"}
+	current.Ingesters["b"] = InstanceDesc{Addr: "b:1", Timestamp: now, State: ACTIVE, Tokens: []uint32{20}, RegisteredTimestamp: 1, Id: "b"}
+
+	// A token conflict can leave an otherwise ACTIVE member tokenless.
+	conflict := NewDesc()
+	conflict.Ingesters["b"] = InstanceDesc{Addr: "b:1", Timestamp: now + 1, State: ACTIVE, Tokens: []uint32{10}, RegisteredTimestamp: 1, Id: "b"}
+	if _, err := current.Merge(conflict, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := current.Ingesters["b"].Tokens; len(got) != 0 {
+		t.Fatalf("conflict winner left b with tokens %v, want no tokens", got)
+	}
+
+	left := NewDesc()
+	left.Ingesters["b"] = InstanceDesc{Addr: "b:1", Timestamp: now + 2, State: LEFT, RegisteredTimestamp: 1, Id: "b"}
+	change, err := current.Merge(left, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !change.(*Desc).TopologyChanged() {
+		t.Fatal("tokenless LEFT tombstone was not marked as a topology change")
+	}
+}
+
+func TestRingRecoversSnapshotForTokenlessLeftTombstone(t *testing.T) {
+	now := time.Now().Unix()
+	initial := NewDesc()
+	initial.Ingesters["a"] = InstanceDesc{Addr: "a:1", Timestamp: now, State: ACTIVE, Tokens: []uint32{10}, RegisteredTimestamp: 1, Id: "a"}
+	initial.Ingesters["b"] = InstanceDesc{Addr: "b:1", Timestamp: now, State: ACTIVE, RegisteredTimestamp: 1, Id: "b"}
+	client := &deltaTestClient{snapshot: initial, version: 1}
+	r := newDeltaTestRing(t, client)
+	r.updateRingStateWithSequence(initial, 1)
+
+	merged := initial.Clone().(*Desc)
+	left := NewDesc()
+	left.Ingesters["b"] = InstanceDesc{Addr: "b:1", Timestamp: now + 1, State: LEFT, RegisteredTimestamp: 1, Id: "b"}
+	change, err := merged.Merge(left, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !change.(*Desc).TopologyChanged() {
+		t.Fatal("tokenless LEFT tombstone was not marked as a topology change")
+	}
+
+	recovered := NewDesc()
+	recovered.Ingesters["a"] = initial.Ingesters["a"]
+	client.snapshot = recovered
+	client.version = 2
+	if !r.updateRingChange(context.Background(), memberlist.WatchKeyChange{
+		Value:           change,
+		ChangedKeys:     []string{"b"},
+		Sequence:        2,
+		TopologyChanged: true,
+	}) {
+		t.Fatal("snapshot recovery stopped the watcher")
+	}
+	if _, ok := r.ringDesc.Ingesters["b"]; ok {
+		t.Fatal("recovered ring retained tokenless LEFT tombstone")
+	}
+}
+
 func TestRingAppliesLivenessDeltaWithoutReplacingTopology(t *testing.T) {
 	now := time.Now().Unix()
 	initial := deltaTestDesc("a:1", now, []uint32{10, 20}, ACTIVE)

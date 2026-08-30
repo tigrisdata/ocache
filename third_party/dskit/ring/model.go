@@ -252,7 +252,10 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		ting, exists := thisIngesterMap[name]
 		// ting.Timestamp will be 0, if there was no such ingester in our version
 		if oing.Timestamp > ting.Timestamp {
-			if !exists || ting.Addr != oing.Addr || ting.Zone != oing.Zone || ting.RegisteredTimestamp != oing.RegisteredTimestamp || !tokensEqual(ting.Tokens, oing.Tokens) {
+			// LEFT is a tombstone, not just a liveness state. Full snapshot reads
+			// remove LEFT entries, so route this merge through snapshot recovery even
+			// when conflict resolution previously left the member with no tokens.
+			if oing.State == LEFT || !exists || ting.Addr != oing.Addr || ting.Zone != oing.Zone || ting.RegisteredTimestamp != oing.RegisteredTimestamp || !tokensEqual(ting.Tokens, oing.Tokens) {
 				topologyChanged = true
 			}
 			if !tokensEqual(ting.Tokens, oing.Tokens) {
