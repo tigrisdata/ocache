@@ -16,7 +16,6 @@ import (
 	"github.com/grafana/dskit/kv"
 	"github.com/grafana/dskit/kv/memberlist"
 	dskitring "github.com/grafana/dskit/ring"
-	"github.com/grafana/dskit/services"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -32,6 +31,13 @@ type ringManagerBenchmarkKV struct {
 	ready   chan struct{}
 	full    []func(interface{}) bool
 	delta   []func(memberlist.WatchKeyChange) bool
+
+	measuring        bool
+	completed        uint64
+	consumed         uint64
+	heartbeatSignal  chan struct{}
+	heartbeatStarted chan struct{}
+	heartbeatProceed chan struct{}
 }
 
 func newRingManagerBenchmarkKV(members, tokensPerMember int) *ringManagerBenchmarkKV {
@@ -46,9 +52,12 @@ func newRingManagerBenchmarkKV(members, tokensPerMember int) *ringManagerBenchma
 		desc.AddIngester(id, id, "", tokens, dskitring.ACTIVE, time.Unix(now, 0))
 	}
 	return &ringManagerBenchmarkKV{
-		current: desc,
-		version: 1,
-		ready:   make(chan struct{}, 2),
+		current:          desc,
+		version:          1,
+		ready:            make(chan struct{}, 2),
+		heartbeatSignal:  make(chan struct{}, 1),
+		heartbeatStarted: make(chan struct{}),
+		heartbeatProceed: make(chan struct{}),
 	}
 }
 
@@ -70,8 +79,108 @@ func (c *ringManagerBenchmarkKV) Delete(context.Context, string) error {
 	return errors.New("benchmark KV does not support Delete")
 }
 
-func (c *ringManagerBenchmarkKV) CAS(context.Context, string, func(interface{}) (interface{}, bool, error)) error {
-	return errors.New("benchmark KV does not support CAS")
+func (c *ringManagerBenchmarkKV) CAS(_ context.Context, _ string, f func(interface{}) (interface{}, bool, error)) error {
+	c.mu.Lock()
+	measuring := c.measuring
+	c.mu.Unlock()
+	if measuring {
+		// Keep the idle interval between ticker events outside the timed operation,
+		// while the handshake starts timing before the CAS clones the descriptor.
+		c.heartbeatStarted <- struct{}{}
+		<-c.heartbeatProceed
+	}
+
+	c.mu.Lock()
+	in := proto.Clone(c.current)
+	c.mu.Unlock()
+
+	out, retry, err := f(in)
+	if err != nil || !retry || out == nil {
+		return err
+	}
+	desc, ok := out.(*dskitring.Desc)
+	if !ok {
+		return fmt.Errorf("benchmark CAS returned %T, want *ring.Desc", out)
+	}
+
+	c.mu.Lock()
+	c.current = desc
+	c.version++
+	version := c.version
+	fullWatchers := append([]func(interface{}) bool(nil), c.full...)
+	deltaWatchers := append([]func(memberlist.WatchKeyChange) bool(nil), c.delta...)
+	instance := desc.Ingesters["member-0"]
+	fullValue := proto.Clone(desc)
+	delta := dskitring.NewDesc()
+	delta.Ingesters["member-0"] = instance
+	c.mu.Unlock()
+
+	for _, watcher := range fullWatchers {
+		if !watcher(proto.Clone(fullValue)) {
+			continue
+		}
+	}
+	change := memberlist.WatchKeyChange{
+		Value:       delta,
+		ChangedKeys: []string{"member-0"},
+		Sequence:    version,
+	}
+	for _, watcher := range deltaWatchers {
+		if !watcher(change) {
+			continue
+		}
+	}
+	c.recordHeartbeat()
+	return nil
+}
+
+func (c *ringManagerBenchmarkKV) waitForHeartbeatStart() {
+	<-c.heartbeatStarted
+}
+
+func (c *ringManagerBenchmarkKV) proceedHeartbeat() {
+	c.heartbeatProceed <- struct{}{}
+}
+
+func (c *ringManagerBenchmarkKV) recordHeartbeat() {
+	c.mu.Lock()
+	if !c.measuring {
+		c.mu.Unlock()
+		return
+	}
+	c.completed++
+	c.mu.Unlock()
+	select {
+	case c.heartbeatSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (c *ringManagerBenchmarkKV) beginMeasurement() {
+	c.mu.Lock()
+	c.completed = 0
+	c.consumed = 0
+	c.measuring = true
+	c.mu.Unlock()
+}
+
+func (c *ringManagerBenchmarkKV) endMeasurement() {
+	c.mu.Lock()
+	c.measuring = false
+	c.mu.Unlock()
+}
+
+func (c *ringManagerBenchmarkKV) waitForHeartbeat() {
+	for {
+		c.mu.Lock()
+		if c.consumed < c.completed {
+			c.consumed++
+			c.mu.Unlock()
+			return
+		}
+		c.mu.Unlock()
+		<-c.heartbeatSignal
+	}
 }
 
 func (c *ringManagerBenchmarkKV) WatchKey(ctx context.Context, _ string, f func(interface{}) bool) {
@@ -134,55 +243,47 @@ func BenchmarkRingManagerHeartbeatUpdate(b *testing.B) {
 			client := newRingManagerBenchmarkKV(members, 512)
 			manager, err := NewRingManager(LifecyclerConfig{
 				RingConfig: Config{
+					HeartbeatPeriod:   DefaultHeartbeatPeriod,
 					HeartbeatTimeout:  time.Hour,
 					ReplicationFactor: 1,
 				},
-				InstanceID:   "benchmark-node",
-				InstanceAddr: "127.0.0.1",
+				InstanceID:   "member-0",
+				InstanceAddr: "member-0",
+				NumTokens:    512,
 			}, client, log.NewNopLogger(), prometheus.NewRegistry())
 			if err != nil {
 				b.Fatal(err)
 			}
 
-			ctx, cancel := context.WithCancel(context.Background())
-			if err := services.StartAndAwaitRunning(ctx, manager.ring); err != nil {
-				cancel()
+			ctx := context.Background()
+			if err := manager.Start(ctx); err != nil {
 				b.Fatal(err)
 			}
-			manager.lastKnownNodes = make(map[string]dskitring.InstanceState, members)
-			manager.startRingWatcher(ctx)
-			for range 2 {
-				select {
-				case <-client.ready:
-				case <-time.After(10 * time.Second):
-					cancel()
-					b.Fatal("ring watchers did not register")
-				}
-			}
 			b.Cleanup(func() {
-				cancel()
-				if err := services.StopAndAwaitTerminated(context.Background(), manager.ring); err != nil {
+				if err := manager.Stop(context.Background()); err != nil {
 					b.Error(err)
 				}
 			})
-
-			updates := make([]ringManagerBenchmarkUpdate, 0, members)
-			for member := 0; member < members; member++ {
-				updates = append(updates, ringManagerBenchmarkUpdate{
-					memberID:  fmt.Sprintf("member-%d", member),
-					timestamp: time.Now().Unix() + int64(member) + 1,
-				})
+			for watcher := 0; watcher < 2; watcher++ {
+				select {
+				case <-client.ready:
+				case <-time.After(10 * time.Second):
+					b.Fatal("ring watchers did not register")
+				}
 			}
-			delegate := &ringDelegate{rm: manager}
+
+			client.beginMeasurement()
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				update := updates[i%len(updates)]
-				update.timestamp += int64(i / len(updates))
-				client.publish(update)
-				instance := client.current.Ingesters[update.memberID]
-				delegate.OnRingInstanceHeartbeat(nil, client.current, &instance)
+			for heartbeat := 0; heartbeat < b.N; heartbeat++ {
+				b.StopTimer()
+				client.waitForHeartbeatStart()
+				b.StartTimer()
+				client.proceedHeartbeat()
+				client.waitForHeartbeat()
 			}
+			b.StopTimer()
+			client.endMeasurement()
 		})
 	}
 }
