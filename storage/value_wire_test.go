@@ -181,7 +181,7 @@ func TestDecodeValueMessageCleanupFields(t *testing.T) {
 			ValueType: pb.ValueType_RAW_FILE, RawFilePath: "/disk/files/abc.dat", ValueLength: 8 << 20,
 		},
 		"segment": {
-			ValueType: pb.ValueType_SEGMENT, SegmentPath: "/disk/segments/seg_1.seg", ValueLength: 262144,
+			ValueType: pb.ValueType_SEGMENT, SegmentPath: "/disk/segments/seg_1.seg", SegmentOffset: 4096, ValueLength: 262144,
 		},
 		"all retained fields": {
 			ValueType: pb.ValueType_SEGMENT, RawFilePath: "/raw", SegmentPath: "/segment", ValueLength: 9,
@@ -232,10 +232,11 @@ func TestDecodeValueMessageCleanupFields(t *testing.T) {
 				return
 			}
 			require.Equal(t, valueMessageCleanupFields{
-				valueType:   full.ValueType,
-				valueLength: full.ValueLength,
-				rawFilePath: full.RawFilePath,
-				segmentPath: full.SegmentPath,
+				valueType:     full.ValueType,
+				valueLength:   full.ValueLength,
+				rawFilePath:   full.RawFilePath,
+				segmentPath:   full.SegmentPath,
+				segmentOffset: full.SegmentOffset,
 			}, got)
 		})
 	}

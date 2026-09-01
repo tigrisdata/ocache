@@ -11,12 +11,13 @@ import (
 
 // ValueMessage protobuf field numbers used by the wire-level extractors below.
 const (
-	valueTypeField    protowire.Number = 1
-	valueDataField    protowire.Number = 2 // bytes data — the large payload we skip
-	valueExpiryField  protowire.Number = 3
-	valueRawPathField protowire.Number = 4
-	valueSegPathField protowire.Number = 5
-	valueLengthField  protowire.Number = 7
+	valueTypeField      protowire.Number = 1
+	valueDataField      protowire.Number = 2 // bytes data — the large payload we skip
+	valueExpiryField    protowire.Number = 3
+	valueRawPathField   protowire.Number = 4
+	valueSegPathField   protowire.Number = 5
+	valueSegOffsetField protowire.Number = 6
+	valueLengthField    protowire.Number = 7
 )
 
 // valueMessageVarintField extracts a varint-typed scalar field (identified by
@@ -135,10 +136,11 @@ func valueMessageExpiry(buf []byte) (expiry int64, ok bool) {
 // deleted or replaced. Paths are owned strings because callers may retain this
 // value after releasing the RocksDB slice that supplied the wire data.
 type valueMessageCleanupFields struct {
-	valueType   pb.ValueType
-	valueLength int64
-	rawFilePath string
-	segmentPath string
+	valueType     pb.ValueType
+	valueLength   int64
+	rawFilePath   string
+	segmentPath   string
+	segmentOffset int64
 }
 
 // decodeValueMessageCleanupFields extracts the control fields used to account
@@ -169,6 +171,14 @@ func decodeValueMessageCleanupFields(buf []byte) (fields valueMessageCleanupFiel
 				return valueMessageCleanupFields{}, false
 			}
 			fields.valueLength = int64(value)
+			buf = buf[vn:]
+			continue
+		case num == valueSegOffsetField && typ == protowire.VarintType:
+			value, vn := protowire.ConsumeVarint(buf)
+			if vn < 0 {
+				return valueMessageCleanupFields{}, false
+			}
+			fields.segmentOffset = int64(value)
 			buf = buf[vn:]
 			continue
 		case num == valueRawPathField && typ == protowire.BytesType:

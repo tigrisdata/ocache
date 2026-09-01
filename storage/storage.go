@@ -281,6 +281,13 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		return nil, storageErrors.NewInternalError("Init", err)
 	}
 
+	// Build live-location rows for legacy closed segments before background
+	// workers start. A failed backfill is non-fatal: without a coverage marker,
+	// recompaction and liveness admission retain their historical scan fallback.
+	if err := compaction.BackfillSegmentLiveIndex(meta, segmentManager); err != nil {
+		zlog.Warn().Err(err).Msg("storage: segment live index backfill failed; retaining scan fallback")
+	}
+
 	// Initialize and start the centralized deletion queue
 	deletionQueue := deletion.NewQueue(meta, deletion.Config{
 		BatchSize:       config.DeleteBatchSize,
@@ -732,21 +739,13 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	return entries, lastKey, hasMore, nil
 }
 
-// stageFileDeletion reclaims the backing file(s) for a value that is being
-// evicted or deleted. Raw files are queued for asynchronous deletion rather than
-// removed inline: fileManager.Remove's non-blocking TryLock skips a file being
-// read, and callers drop the metadata in the same batch, so a skipped file would
-// be orphaned permanently (no metadata, no compaction entry, no queue entry);
-// the queue retries until the reader releases the lock. Segment references are
-// recorded in the delete index for the segment GC. Inline values have no backing
-// file. Shared by DeleteKey, the TTL cleaner, and disk-limit eviction so all four
-// reclaim paths stay in lockstep.
+// stageFileDeletion queues a raw backing file after its metadata delete has
+// committed. Segment cleanup is staged directly in the same RocksDB batch by
+// each caller: its live-location row and delete-index credit must commit
+// atomically with the metadata mutation. Inline values have no backing file.
 func (s *Storage) stageFileDeletion(valueMsg *pb.ValueMessage) {
-	switch valueMsg.ValueType {
-	case pb.ValueType_RAW_FILE:
+	if valueMsg != nil && valueMsg.ValueType == pb.ValueType_RAW_FILE {
 		s.stageRawFileDeletion(valueMsg.RawFilePath)
-	case pb.ValueType_SEGMENT:
-		s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
 	}
 }
 
@@ -810,6 +809,9 @@ func (s *Storage) DeleteKey(key string) error {
 	// queueing could delete data a live row still references.
 	if decoded && valueMsg.valueType == pb.ValueType_SEGMENT && valueMsg.segmentPath != "" {
 		batch.Merge(keys.MakeDeleteIndexKey(valueMsg.segmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.valueLength))
+		if valueMsg.segmentOffset >= 0 {
+			batch.Delete(keys.MakeSegmentLiveIndexKey(valueMsg.segmentPath, valueMsg.segmentOffset))
+		}
 	}
 
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
@@ -1268,6 +1270,9 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// still find.
 	if hasPrev && prev.valueType == pb.ValueType_SEGMENT && prev.segmentPath != "" {
 		batch.Merge(keys.MakeDeleteIndexKey(prev.segmentPath), merge.MakeDeleteIndexOperand(1, prev.valueLength))
+		if prev.segmentOffset >= 0 {
+			batch.Delete(keys.MakeSegmentLiveIndexKey(prev.segmentPath, prev.segmentOffset))
+		}
 	}
 
 	// Index the key for eviction only if a disk cap is set. Each policy maintains

@@ -5,6 +5,8 @@ package keys
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"time"
@@ -42,6 +44,20 @@ const (
 
 	// DeleteIndexPrefix is the prefix for segment deletion tracking entries in RocksDB
 	DeleteIndexPrefix = "!delete:segment/"
+
+	// SegmentLiveIndexPrefix is the prefix for durable segment live-location rows.
+	// The row key is !segment-live/<base64url segment path>/<big-endian offset>.
+	// Raw binary offsets sort in source-file order after the encoded path.
+	SegmentLiveIndexPrefix = "!segment-live/"
+
+	// SegmentLiveCoveragePrefix stores a footer fingerprint proving that all
+	// records in a finalized segment have a corresponding live-location row (or
+	// an intentionally absent row because the record is already dead).
+	SegmentLiveCoveragePrefix = "!segment-live-covered/"
+
+	// SegmentLiveIndexVersion versions the live-location row and coverage value
+	// encodings. A mismatch makes a segment fall back to the historical scan.
+	SegmentLiveIndexVersion = byte(1)
 
 	// FifoIndexPrefix is the prefix for the FIFO eviction index. Entries embed the
 	// write time in the key so the eviction scan can walk them oldest-written
@@ -201,6 +217,190 @@ func ExtractSegmentPath(deleteIndexKey []byte) string {
 // IsDeleteIndexKey checks if a key is a delete index entry
 func IsDeleteIndexKey(key []byte) bool {
 	return bytes.HasPrefix(key, []byte(DeleteIndexPrefix))
+}
+
+// SegmentLiveIndexEntry is the immutable information needed to reconstruct a
+// segment record without reading its source header. Key is the user key; the
+// remaining fields mirror the record header and are validated against metadata
+// before a row is copied.
+type SegmentLiveIndexEntry struct {
+	Key           string
+	ValueLength   int64
+	HeaderSize    int64
+	Checksum      uint32
+	HeaderVersion uint16
+}
+
+// SegmentLiveIndexCoverage fingerprints a finalized segment footer and data
+// length. A coverage row is trusted only when all fields still match the
+// manager's segment, which preserves the historical scan fallback for legacy,
+// damaged, or partially indexed segments.
+type SegmentLiveIndexCoverage struct {
+	Entries   uint32
+	DataBytes int64
+	Size      int64
+}
+
+// MakeSegmentLiveIndexPrefix returns the prefix for all live rows belonging to
+// segmentPath. Base64 raw URL encoding keeps the filesystem path out of the
+// RocksDB delimiter namespace while preserving an exact round trip.
+func MakeSegmentLiveIndexPrefix(segmentPath string) []byte {
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(segmentPath))
+	return []byte(SegmentLiveIndexPrefix + encoded + "/")
+}
+
+// MakeSegmentLiveIndexKey creates an offset-ordered live-location row key.
+// Negative offsets are invalid and return nil rather than wrapping into a
+// future-sorting uint64.
+func MakeSegmentLiveIndexKey(segmentPath string, offset int64) []byte {
+	if segmentPath == "" || offset < 0 {
+		return nil
+	}
+	prefix := MakeSegmentLiveIndexPrefix(segmentPath)
+	key := make([]byte, len(prefix)+8)
+	copy(key, prefix)
+	binary.BigEndian.PutUint64(key[len(key)-8:], uint64(offset))
+	return key
+}
+
+// ParseSegmentLiveIndexKey extracts a segment path and source-record offset.
+func ParseSegmentLiveIndexKey(key []byte) (segmentPath string, offset int64, ok bool) {
+	prefix := []byte(SegmentLiveIndexPrefix)
+	if !bytes.HasPrefix(key, prefix) || len(key) < len(prefix)+1+8 {
+		return "", 0, false
+	}
+	rest := key[len(prefix):]
+	encodedLen := len(rest) - 1 - 8
+	if encodedLen <= 0 || rest[encodedLen] != '/' {
+		return "", 0, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(string(rest[:encodedLen]))
+	if err != nil || len(decoded) == 0 {
+		return "", 0, false
+	}
+	rawOffset := binary.BigEndian.Uint64(rest[len(rest)-8:])
+	if rawOffset > uint64(^uint64(0)>>1) {
+		return "", 0, false
+	}
+	return string(decoded), int64(rawOffset), true
+}
+
+// IsSegmentLiveIndexKey reports whether key belongs to the offset row
+// namespace. Coverage rows use a distinct prefix and are not included.
+func IsSegmentLiveIndexKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(SegmentLiveIndexPrefix))
+}
+
+// MakeSegmentLiveCoverageKey creates the marker key for a segment.
+func MakeSegmentLiveCoverageKey(segmentPath string) []byte {
+	if segmentPath == "" {
+		return nil
+	}
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(segmentPath))
+	return []byte(SegmentLiveCoveragePrefix + encoded)
+}
+
+// ParseSegmentLiveCoverageKey extracts a segment path from a marker key.
+func ParseSegmentLiveCoverageKey(key []byte) (string, bool) {
+	prefix := []byte(SegmentLiveCoveragePrefix)
+	if !bytes.HasPrefix(key, prefix) || len(key) == len(prefix) {
+		return "", false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(string(key[len(prefix):]))
+	if err != nil || len(decoded) == 0 {
+		return "", false
+	}
+	return string(decoded), true
+}
+
+// IsSegmentLiveCoverageKey reports whether key belongs to the coverage marker
+// namespace.
+func IsSegmentLiveCoverageKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(SegmentLiveCoveragePrefix))
+}
+
+// EncodeSegmentLiveIndexEntry serializes a versioned live-location row value.
+// The fixed fields avoid a protobuf/Data allocation for every index lookup.
+func EncodeSegmentLiveIndexEntry(entry SegmentLiveIndexEntry) ([]byte, error) {
+	if entry.Key == "" || entry.ValueLength <= 0 || entry.HeaderSize <= 0 || entry.HeaderVersion == 0 {
+		return nil, fmt.Errorf("invalid segment live index entry")
+	}
+	if uint64(len(entry.Key)) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("segment live index key is too large")
+	}
+	const fixed = 1 + 4 + 8 + 8 + 4 + 2
+	row := make([]byte, fixed+len(entry.Key))
+	row[0] = SegmentLiveIndexVersion
+	binary.BigEndian.PutUint32(row[1:5], uint32(len(entry.Key)))
+	pos := 5
+	copy(row[pos:], entry.Key)
+	pos += len(entry.Key)
+	binary.BigEndian.PutUint64(row[pos:pos+8], uint64(entry.ValueLength))
+	pos += 8
+	binary.BigEndian.PutUint64(row[pos:pos+8], uint64(entry.HeaderSize))
+	pos += 8
+	binary.BigEndian.PutUint32(row[pos:pos+4], entry.Checksum)
+	pos += 4
+	binary.BigEndian.PutUint16(row[pos:pos+2], entry.HeaderVersion)
+	return row, nil
+}
+
+// DecodeSegmentLiveIndexEntry decodes and validates a versioned row value.
+func DecodeSegmentLiveIndexEntry(row []byte) (SegmentLiveIndexEntry, error) {
+	const fixed = 1 + 4 + 8 + 8 + 4 + 2
+	if len(row) < fixed || row[0] != SegmentLiveIndexVersion {
+		return SegmentLiveIndexEntry{}, fmt.Errorf("invalid segment live index row version or length")
+	}
+	keyLen := int(binary.BigEndian.Uint32(row[1:5]))
+	if keyLen <= 0 || fixed+keyLen != len(row) {
+		return SegmentLiveIndexEntry{}, fmt.Errorf("invalid segment live index row key length")
+	}
+	pos := 5
+	entry := SegmentLiveIndexEntry{Key: string(row[pos : pos+keyLen])}
+	pos += keyLen
+	valueLength := binary.BigEndian.Uint64(row[pos : pos+8])
+	pos += 8
+	headerSize := binary.BigEndian.Uint64(row[pos : pos+8])
+	pos += 8
+	entry.Checksum = binary.BigEndian.Uint32(row[pos : pos+4])
+	pos += 4
+	entry.HeaderVersion = binary.BigEndian.Uint16(row[pos : pos+2])
+	if valueLength == 0 || valueLength > uint64(^uint64(0)>>1) || headerSize == 0 || headerSize > uint64(^uint64(0)>>1) || entry.HeaderVersion == 0 {
+		return SegmentLiveIndexEntry{}, fmt.Errorf("invalid segment live index row facts")
+	}
+	entry.ValueLength = int64(valueLength)
+	entry.HeaderSize = int64(headerSize)
+	return entry, nil
+}
+
+// EncodeSegmentLiveIndexCoverage serializes the marker fingerprint.
+func EncodeSegmentLiveIndexCoverage(coverage SegmentLiveIndexCoverage) ([]byte, error) {
+	if coverage.DataBytes < 0 || coverage.Size < 0 {
+		return nil, fmt.Errorf("invalid segment live index coverage")
+	}
+	value := make([]byte, 1+4+8+8)
+	value[0] = SegmentLiveIndexVersion
+	binary.BigEndian.PutUint32(value[1:5], coverage.Entries)
+	binary.BigEndian.PutUint64(value[5:13], uint64(coverage.DataBytes))
+	binary.BigEndian.PutUint64(value[13:21], uint64(coverage.Size))
+	return value, nil
+}
+
+// DecodeSegmentLiveIndexCoverage decodes a marker fingerprint.
+func DecodeSegmentLiveIndexCoverage(value []byte) (SegmentLiveIndexCoverage, error) {
+	if len(value) != 1+4+8+8 || value[0] != SegmentLiveIndexVersion {
+		return SegmentLiveIndexCoverage{}, fmt.Errorf("invalid segment live index coverage")
+	}
+	dataBytes := binary.BigEndian.Uint64(value[5:13])
+	size := binary.BigEndian.Uint64(value[13:21])
+	if dataBytes > uint64(^uint64(0)>>1) || size > uint64(^uint64(0)>>1) {
+		return SegmentLiveIndexCoverage{}, fmt.Errorf("segment live index coverage is too large")
+	}
+	return SegmentLiveIndexCoverage{
+		Entries:   binary.BigEndian.Uint32(value[1:5]),
+		DataBytes: int64(dataBytes),
+		Size:      int64(size),
+	}, nil
 }
 
 // ------------------------------
