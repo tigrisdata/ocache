@@ -82,7 +82,12 @@ func benchmarkSegmentCoveredValue(entries uint32, dataBytes, size int64) []byte 
 func BenchmarkRecompactFragmentedSegment(b *testing.B) {
 	for _, dead := range []int{8, 64, 512} {
 		b.Run(fmt.Sprintf("dead-%d", dead), func(b *testing.B) {
-			for b.Loop() {
+			for {
+				b.StartTimer()
+				if !b.Loop() {
+					b.StopTimer()
+					break
+				}
 				b.StopTimer()
 				recompactor, sm, meta, _, cleanup := setupTestRecompactor(b)
 				seg, err := createBenchmarkRecompactionSegment(b, sm, meta, dead)
