@@ -25,7 +25,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func setupTestRecompactor(t *testing.T) (*SegmentRecompactor, *segment.Manager, *metadata.MetaDB, string, func()) {
+func setupTestRecompactor(t testing.TB) (*SegmentRecompactor, *segment.Manager, *metadata.MetaDB, string, func()) {
 	tmpDir, err := os.MkdirTemp("", "recompactor_test_*")
 	require.NoError(t, err)
 
