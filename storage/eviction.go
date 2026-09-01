@@ -11,6 +11,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"google.golang.org/protobuf/proto"
@@ -255,6 +256,12 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 		batch.Delete(metaKey)
 		batch.Delete(keyBytes)
 		batch.Delete(backref)
+		if valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
+			batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+			if valueMsg.SegmentOffset >= 0 {
+				batch.Delete(keys.MakeSegmentLiveIndexKey(valueMsg.SegmentPath, valueMsg.SegmentOffset))
+			}
+		}
 
 		pendingBytes += valueMsg.ValueLength
 		pendingCount++

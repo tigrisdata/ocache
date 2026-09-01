@@ -126,16 +126,20 @@ func (m *MultiplexOperator) mergeDeleteIndex(key, existingValue []byte, operands
 //
 //   - The operand is a marshalled ValueMessage with ValueType == SEGMENT.
 //   - On an operand, RawFilePath is overloaded to carry the CAS precondition:
-//     the raw-file path the compactor observed when it started migrating this
-//     entry. This is the only context in which a SEGMENT-typed ValueMessage
-//     carries RawFilePath; stored SEGMENT values never do.
+//     the raw-file or old segment path the compactor observed when it started
+//     migrating this entry. This is the only context in which a SEGMENT-typed
+//     ValueMessage carries RawFilePath; stored SEGMENT values never do.
+//   - A segment-to-segment operand also carries the source offset as eight
+//     big-endian bytes in Data. MakeSegmentCASOperand always supplies it, so
+//     two records for one segment cannot cross-apply. Older path-only operands
+//     remain readable for rolling upgrades.
 //
 // CAS semantics: for each operand we apply the rewrite only when the current
-// base is a RAW_FILE entry whose RawFilePath equals the operand's precondition.
-// Otherwise a concurrent Put replaced the raw file between the compactor's read
-// and this merge; we drop the operand and keep the existing base so the newer
-// write wins. The segment bytes the compactor already wrote become dead space,
-// reclaimable by the segment recompactor.
+// base is a RAW_FILE entry whose RawFilePath equals the operand's precondition,
+// or a SEGMENT entry whose path and (when supplied) offset match. Otherwise a
+// concurrent Put or migration replaced the value; we drop the operand and keep
+// the existing base so the newer write wins. The segment bytes the compactor
+// already wrote become dead space, reclaimable by the segment recompactor.
 //
 // Multiple operands are applied in order so that stacked compactor passes
 // resolve correctly; an operand that fails its precondition is skipped without
@@ -195,8 +199,13 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 		if !hadBase || op.ValueType != pb.ValueType_SEGMENT || op.RawFilePath == "" {
 			continue
 		}
-		rawMatch := base.ValueType == pb.ValueType_RAW_FILE && base.RawFilePath == op.RawFilePath
-		segMatch := base.ValueType == pb.ValueType_SEGMENT && base.SegmentPath == op.RawFilePath
+		expectedOffset, offsetSpecified, offsetValid := decodeSegmentCASOffset(op.Data)
+		if !offsetValid {
+			continue
+		}
+		rawMatch := base.ValueType == pb.ValueType_RAW_FILE && base.RawFilePath == op.RawFilePath && !offsetSpecified
+		segMatch := base.ValueType == pb.ValueType_SEGMENT && base.SegmentPath == op.RawFilePath &&
+			(!offsetSpecified || base.SegmentOffset == expectedOffset)
 		if !rawMatch && !segMatch {
 			continue
 		}
@@ -208,14 +217,13 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 		// lock.
 		base = pb.ValueMessage{
 			ValueType:     op.ValueType,
-			Data:          op.Data,
 			Expiry:        op.Expiry,
 			SegmentPath:   op.SegmentPath,
 			SegmentOffset: op.SegmentOffset,
 			ValueLength:   op.ValueLength,
 			Checksum:      op.Checksum,
-			// RawFilePath intentionally omitted (CAS precondition, not a
-			// live file reference).
+			// RawFilePath and Data intentionally omitted. They carry the
+			// transient CAS path and source offset, not live value data.
 		}
 		hadBase = true
 	}
@@ -254,6 +262,23 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 		return nil, false
 	}
 	return result, true
+}
+
+// decodeSegmentCASOffset recognizes the transient source-offset payload used by
+// segment-to-segment CAS operands. An empty Data field denotes a legacy
+// path-only operand; a non-empty field must be exactly one big-endian uint64.
+func decodeSegmentCASOffset(data []byte) (offset int64, specified, valid bool) {
+	if len(data) == 0 {
+		return 0, false, true
+	}
+	if len(data) != 8 {
+		return 0, true, false
+	}
+	raw := binary.BigEndian.Uint64(data)
+	if raw > uint64(^uint64(0)>>1) {
+		return 0, true, false
+	}
+	return int64(raw), true, true
 }
 
 // Future merge strategies can be added as methods here:

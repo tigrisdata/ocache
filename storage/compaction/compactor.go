@@ -645,9 +645,15 @@ func (c *Compactor) compactEntry(ctx context.Context, entry *compactionEntry, se
 	// mismatch the operand is dropped and the concurrent Put wins, with
 	// the segment bytes we wrote becoming dead space reclaimable by the
 	// segment recompactor.
-	operandBytes, _ := proto.Marshal(entry.metadata)
+	operandBytes, err := proto.Marshal(entry.metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
 	metaKey := keys.MakeMetadataKey(entry.userKey)
 	wb.Merge(metaKey, operandBytes)
+	if err := stageSegmentLiveIndexRow(wb, entry.userKey, entry.metadata.SegmentPath, entry.metadata.SegmentOffset, entry.metadata.ValueLength, entry.metadata.Checksum); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -773,6 +779,12 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 		return err
 	}
 	advice.dropSyncedOutput(*seg)
+	// All rows for this segment were committed before finalization. Publishing
+	// coverage now lets recompaction use offset rows; a marker failure is safe
+	// and leaves the historical scan fallback in place.
+	if err := MarkSegmentLiveIndexComplete(c.meta, *seg); err != nil {
+		zlog.Warn().Err(err).Str("segment", (*seg).Path()).Msg("compactor: failed to mark segment live index coverage; retaining scan fallback")
+	}
 
 	// Now safe to release since it's finalized
 	if err := (*seg).Release(callerID); err != nil {

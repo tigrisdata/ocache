@@ -265,6 +265,45 @@ func TestMergeMetadataCAS_PurgeNonRawFileBase_KeepsBase(t *testing.T) {
 	assert.Equal(t, "segments/seg_0.seg", got.SegmentPath)
 }
 
+func TestMergeMetadataCAS_SegmentToSegmentMatchesOffset(t *testing.T) {
+	op := NewMultiplexOperator()
+	metaKey := keys.MakeMetadataKey("k")
+	operandMessage := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		SegmentPath:   "/segments/new.seg",
+		SegmentOffset: 4096,
+		ValueLength:   100,
+		RawFilePath:   "/segments/old.seg",
+	}
+	operand, err := MakeSegmentCASOperand(operandMessage, 512)
+	require.NoError(t, err)
+	baseMessage := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		SegmentPath:   "/segments/old.seg",
+		SegmentOffset: 512,
+		ValueLength:   100,
+	}
+	base, err := proto.Marshal(baseMessage)
+	require.NoError(t, err)
+
+	out, ok := op.FullMerge(metaKey, base, [][]byte{operand})
+	require.True(t, ok)
+	var got pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(out, &got))
+	require.Equal(t, "/segments/new.seg", got.SegmentPath)
+	require.Empty(t, got.Data, "the transient source offset must not persist")
+
+	wrongBase := proto.Clone(baseMessage).(*pb.ValueMessage)
+	wrongBase.SegmentOffset = 513
+	wrongBaseBytes, err := proto.Marshal(wrongBase)
+	require.NoError(t, err)
+	out, ok = op.FullMerge(metaKey, wrongBaseBytes, [][]byte{operand})
+	require.True(t, ok)
+	require.NoError(t, proto.Unmarshal(out, &got))
+	require.Equal(t, "/segments/old.seg", got.SegmentPath)
+	require.EqualValues(t, 513, got.SegmentOffset)
+}
+
 // Routing smoke: delete-index keys must still go through mergeDeleteIndex and
 // not be mis-dispatched to mergeMetadataCAS.
 func TestFullMerge_RoutingPreserved_DeleteIndex(t *testing.T) {

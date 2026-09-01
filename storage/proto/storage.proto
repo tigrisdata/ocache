@@ -29,8 +29,11 @@ message ValueMessage {
   //     this entry). The merge operator (mergeMetadataCAS) compares it
   //     against the current base's raw_file_path to decide whether to
   //     apply the rewrite, and clears it before persisting the result.
-  //     This overload is confined to transient merge operands — stored
-  //     SEGMENT values never carry raw_file_path.
+  //   - For a segment-to-segment merge operand only, data carries the
+  //     eight-byte big-endian source offset for an exact path+offset CAS.
+  //     The merge operator clears it before persisting the result.
+  //     These overloads are confined to transient merge operands — stored
+  //     SEGMENT values never carry raw_file_path or data.
   string raw_file_path = 4;
   string segment_path = 5; // Optional: segment file storing the value for large objects (if used)
   int64 segment_offset = 6; // Byte offset within the segment where the value starts

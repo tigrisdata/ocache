@@ -175,7 +175,7 @@ func createBenchmarkRecompactionSegment(tb testing.TB, sm *segment.Manager, meta
 	if err := meta.Handle().Write(writeOptions, deleteBatch); err != nil {
 		return nil, err
 	}
-	coverage := benchmarkSegmentCoveredValue(seg.GetNumEntries(), seg.GetDataBytes(), seg.GetSize())
+	coverage := benchmarkSegmentCoveredValue(seg.GetNumEntries(), seg.GetDataBytes(), seg.GetSize()-int64(segment.SegmentFooterSize))
 	if err := meta.Handle().Put(writeOptions, benchmarkSegmentCoveredKey(seg.Path()), coverage); err != nil {
 		return nil, err
 	}
