@@ -191,7 +191,7 @@ Planned improvements:
 
 Each node monitors others via the gossip protocol:
 
-- Regular heartbeat messages (default: every 5 seconds)
+- Regular ring heartbeat messages (default: every 1 second; sub-second configured values are coalesced)
 - Configurable heartbeat timeout (default: 60 seconds)
 - Automatic topology updates propagated via memberlist
 - Epoch tracking for efficient client topology cache invalidation
