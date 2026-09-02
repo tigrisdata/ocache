@@ -5,7 +5,6 @@ package ycsb
 
 import (
 	"context"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
