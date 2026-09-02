@@ -26,6 +26,18 @@ func TestConfig_ApplyDefaults(t *testing.T) {
 			},
 		},
 		{
+			name: "sub-second heartbeat is floored",
+			input: Config{
+				HeartbeatPeriod:  500 * time.Millisecond,
+				HeartbeatTimeout: 5 * time.Second,
+			},
+			expected: Config{
+				HeartbeatPeriod:   MinHeartbeatPeriod,
+				HeartbeatTimeout:  MinHeartbeatTimeout,
+				ReplicationFactor: 1,
+			},
+		},
+		{
 			name: "short timeout is upgraded to minimum",
 			input: Config{
 				HeartbeatPeriod:  10 * time.Second,
@@ -197,4 +209,18 @@ func TestLifecyclerConfig_ToBasicLifecyclerConfig(t *testing.T) {
 			assert.Equal(t, tt.cfg.RingConfig.HeartbeatTimeout, basicCfg.HeartbeatTimeout)
 		})
 	}
+}
+
+func TestLifecyclerConfig_ToBasicLifecyclerConfig_FloorsSubSecondHeartbeat(t *testing.T) {
+	cfg := LifecyclerConfig{
+		RingConfig: Config{
+			HeartbeatPeriod: 500 * time.Millisecond,
+		},
+	}
+
+	basicCfg := cfg.ToBasicLifecyclerConfig()
+
+	assert.Equal(t, MinHeartbeatPeriod, basicCfg.HeartbeatPeriod)
+	assert.Equal(t, 500*time.Millisecond, cfg.RingConfig.HeartbeatPeriod,
+		"conversion should not mutate an unnormalised config")
 }

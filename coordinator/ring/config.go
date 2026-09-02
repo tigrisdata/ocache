@@ -13,8 +13,12 @@ import (
 )
 
 const (
-	// DefaultHeartbeatPeriod is the default interval for heartbeat updates
-	DefaultHeartbeatPeriod = 500 * time.Millisecond
+	// DefaultHeartbeatPeriod is the default interval for heartbeat updates.
+	// Ring timestamps have one-second precision, so sub-second periods are coalesced.
+	DefaultHeartbeatPeriod = time.Second
+
+	// MinHeartbeatPeriod is the smallest effective interval for ring heartbeats.
+	MinHeartbeatPeriod = time.Second
 
 	// MinHeartbeatTimeout is the default timeout before marking a node unhealthy.
 	// Set long enough to handle rolling updates (60s allows for typical pod restarts).
@@ -53,9 +57,8 @@ type Config struct {
 // ApplyDefaults applies default values for any unset or invalid configuration fields.
 // This should be called before using the configuration.
 func (c *Config) ApplyDefaults() {
-	if c.HeartbeatPeriod <= 0 {
-		c.HeartbeatPeriod = DefaultHeartbeatPeriod
-	}
+	c.HeartbeatPeriod = effectiveHeartbeatPeriod(c.HeartbeatPeriod)
+
 	// HeartbeatTimeout must be at least the maximum of:
 	// - The configured value
 	// - MinHeartbeatTimeout (60s) to prevent flaky health checks
@@ -156,7 +159,19 @@ func (c *LifecyclerConfig) ApplyDefaults() {
 	}
 }
 
-// ToBasicLifecyclerConfig converts to dskit ring.BasicLifecyclerConfig
+func effectiveHeartbeatPeriod(period time.Duration) time.Duration {
+	if period <= 0 {
+		return DefaultHeartbeatPeriod
+	}
+	if period < MinHeartbeatPeriod {
+		return MinHeartbeatPeriod
+	}
+	return period
+}
+
+// ToBasicLifecyclerConfig converts to dskit ring.BasicLifecyclerConfig.
+// The heartbeat floor is applied here as well as in ApplyDefaults so direct
+// callers cannot pass a sub-second period to dskit's ticker.
 func (c *LifecyclerConfig) ToBasicLifecyclerConfig() ring.BasicLifecyclerConfig {
 	addr := c.InstanceAddr
 	if c.InstancePort > 0 {
@@ -166,7 +181,7 @@ func (c *LifecyclerConfig) ToBasicLifecyclerConfig() ring.BasicLifecyclerConfig 
 	return ring.BasicLifecyclerConfig{
 		ID:                              c.InstanceID,
 		Addr:                            addr,
-		HeartbeatPeriod:                 c.RingConfig.HeartbeatPeriod,
+		HeartbeatPeriod:                 effectiveHeartbeatPeriod(c.RingConfig.HeartbeatPeriod),
 		HeartbeatTimeout:                c.RingConfig.HeartbeatTimeout,
 		TokensObservePeriod:             c.ObservePeriod,
 		NumTokens:                       c.NumTokens,

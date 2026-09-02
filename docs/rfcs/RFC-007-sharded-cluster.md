@@ -231,7 +231,7 @@ dskit BasicLifecycler manages instance state transitions:
 
 #### 4.3.3 Ring Heartbeats
 
-- **Heartbeat Period**: 500ms (DefaultHeartbeatPeriod)
+- **Heartbeat Period**: 1s minimum (DefaultHeartbeatPeriod); sub-second values are coalesced because ring timestamps use Unix-second precision
 - **Heartbeat Timeout**: 60s minimum (MinHeartbeatTimeout)
 - Ring heartbeats update instance state in the KV store
 - Other nodes receive updates via memberlist gossip (not direct peer-to-peer)
@@ -263,7 +263,7 @@ Ring state is stored in a distributed KV backed by memberlist:
 | ------------------- | -------------------------------------- | --------------------------------- |
 | **Gossip Messages** | Propagate state changes between nodes  | 200ms interval, 3 nodes per cycle |
 | **Push/Pull Sync**  | Full state reconciliation              | Every 30 seconds                  |
-| **Ring Heartbeats** | Update instance liveness in KV         | Every 500ms                       |
+| **Ring Heartbeats** | Update instance liveness in KV         | Every 1s minimum; sub-second values are coalesced |
 | **KV Watcher**      | Immediate notification of ring changes | Event-driven                      |
 
 #### 4.4.2 Gossip Configuration
