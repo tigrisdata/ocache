@@ -4,11 +4,16 @@
 package ycsb
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pterm/pterm"
 	cacheclient "github.com/tigrisdata/ocache/client"
@@ -29,6 +34,7 @@ type ycsbReadServer struct {
 
 	mu            sync.RWMutex
 	values        map[string][]byte
+	putDelay      time.Duration
 	getCalls      atomic.Int64
 	responseBytes atomic.Int64
 }
@@ -37,7 +43,17 @@ func newYCSBReadServer() *ycsbReadServer {
 	return &ycsbReadServer{values: make(map[string][]byte)}
 }
 
-func (s *ycsbReadServer) PutObject(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (s *ycsbReadServer) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	if s.putDelay > 0 {
+		timer := time.NewTimer(s.putDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	data := append([]byte(nil), req.Data...)
 
 	s.mu.Lock()
@@ -92,6 +108,59 @@ func startYCSBReadServer(tb testing.TB) (*ycsbReadServer, string) {
 	return cacheServer, listener.Addr().String()
 }
 
+type preloadTestServer struct {
+	*ycsbReadServer
+
+	putFailures       map[string]error
+	putCalls          atomic.Int64
+	activePuts        atomic.Int64
+	maxPutConcurrency atomic.Int64
+}
+
+func (s *preloadTestServer) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	s.putCalls.Add(1)
+	active := s.activePuts.Add(1)
+	defer s.activePuts.Add(-1)
+	for {
+		maxActive := s.maxPutConcurrency.Load()
+		if active <= maxActive || s.maxPutConcurrency.CompareAndSwap(maxActive, active) {
+			break
+		}
+	}
+
+	if err, ok := s.putFailures[req.Key]; ok {
+		return nil, err
+	}
+	return s.ycsbReadServer.PutObject(ctx, req)
+}
+
+func startPreloadTestServer(tb testing.TB, putDelay time.Duration, putFailures map[string]error) (*preloadTestServer, string) {
+	tb.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	grpcServer := grpc.NewServer()
+	cacheServer := &preloadTestServer{
+		ycsbReadServer: newYCSBReadServer(),
+		putFailures:    putFailures,
+	}
+	cacheServer.ycsbReadServer.putDelay = putDelay
+	pb.RegisterCacheServiceServer(grpcServer, cacheServer)
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	tb.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+	})
+
+	return cacheServer, listener.Addr().String()
+}
+
 func readOnlyYCSBConfig(addr string, valueSize int) YCSBConfig {
 	return YCSBConfig{
 		Addr:               addr,
@@ -116,6 +185,176 @@ func disablePtermOutput(tb testing.TB) {
 	tb.Cleanup(func() {
 		pterm.Output = output
 	})
+}
+
+func BenchmarkPreloadYCSBKeys(b *testing.B) {
+	disablePtermOutput(b)
+	cacheServer, addr := startYCSBReadServer(b)
+	cacheServer.putDelay = time.Millisecond
+	cfg := YCSBConfig{
+		Addr:               addr,
+		ConnMode:           string(cacheclient.ModeSimple),
+		ConnectionPoolSize: 8,
+		NumKeys:            64,
+		ValueSize:          100,
+		NumOps:             64,
+		Concurrency:        8,
+		Workload:           "C",
+		Seed:               1,
+		NoProgress:         true,
+	}
+
+	for b.Loop() {
+		result, err := RunYCSBWithContext(context.Background(), cfg)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if result.Errors != 0 {
+			b.Fatalf("RunYCSBWithContext reported %d errors", result.Errors)
+		}
+	}
+}
+
+func TestPreloadKeysPreservesValuesAndRNG(t *testing.T) {
+	disablePtermOutput(t)
+	const (
+		seed        = int64(42)
+		numKeys     = 16
+		valueSize   = 32
+		concurrency = 4
+	)
+	cacheServer, addr := startPreloadTestServer(t, 5*time.Millisecond, nil)
+	cfg := YCSBConfig{
+		Addr:               addr,
+		ConnMode:           string(cacheclient.ModeSimple),
+		ConnectionPoolSize: concurrency,
+		NumKeys:            numKeys,
+		ValueSize:          valueSize,
+		Concurrency:        concurrency,
+		NoProgress:         true,
+	}
+
+	wantRNG := rand.New(rand.NewSource(seed))
+	wantValues := make(map[string][]byte, numKeys)
+	for i := range numKeys {
+		wantValues[hashKey(i)] = generateValue(wantRNG, valueSize)
+	}
+	wantNextSeed := wantRNG.Int63()
+
+	gotRNG := rand.New(rand.NewSource(seed))
+	if err := preloadKeys(context.Background(), cfg, gotRNG); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := cacheServer.maxPutConcurrency.Load(); got < 2 {
+		t.Fatalf("maximum concurrent puts = %d, want at least 2", got)
+	}
+	if got := cacheServer.maxPutConcurrency.Load(); got > concurrency {
+		t.Fatalf("maximum concurrent puts = %d, want at most %d", got, concurrency)
+	}
+	cacheServer.mu.RLock()
+	defer cacheServer.mu.RUnlock()
+	if got, want := len(cacheServer.values), numKeys; got != want {
+		t.Fatalf("preloaded values = %d, want %d", got, want)
+	}
+	for key, want := range wantValues {
+		if got := cacheServer.values[key]; !bytes.Equal(got, want) {
+			t.Errorf("value for %q changed", key)
+		}
+	}
+	if got := gotRNG.Int63(); got != wantNextSeed {
+		t.Errorf("RNG state after preload = %d, want %d", got, wantNextSeed)
+	}
+}
+
+func TestPreloadKeysPreservesErrorThreshold(t *testing.T) {
+	disablePtermOutput(t)
+	for _, tc := range []struct {
+		name        string
+		failedKeys  []int
+		wantFailure bool
+	}{
+		{name: "at threshold", failedKeys: []int{0}, wantFailure: false},
+		{name: "over threshold", failedKeys: []int{0, 1}, wantFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failures := make(map[string]error, len(tc.failedKeys))
+			for _, keyNum := range tc.failedKeys {
+				failures[hashKey(keyNum)] = errors.New("injected preload failure")
+			}
+			cacheServer, addr := startPreloadTestServer(t, 0, failures)
+			cfg := YCSBConfig{
+				Addr:               addr,
+				ConnMode:           string(cacheclient.ModeSimple),
+				ConnectionPoolSize: 4,
+				NumKeys:            10,
+				ValueSize:          8,
+				Concurrency:        4,
+				NoProgress:         true,
+			}
+
+			err := preloadKeys(context.Background(), cfg, rand.New(rand.NewSource(1)))
+			if tc.wantFailure {
+				if err == nil {
+					t.Fatal("preload succeeded, want threshold error")
+				}
+				if !strings.Contains(err.Error(), "key "+hashKey(tc.failedKeys[0])) {
+					t.Errorf("error = %v, want first failed key %q", err, hashKey(tc.failedKeys[0]))
+				}
+			} else if err != nil {
+				t.Fatalf("preload failed at threshold: %v", err)
+			}
+			if got := cacheServer.putCalls.Load(); got != int64(cfg.NumKeys) {
+				t.Errorf("put calls = %d, want %d", got, cfg.NumKeys)
+			}
+		})
+	}
+}
+
+func TestPreloadKeysWaitsForWorkersOnCancellation(t *testing.T) {
+	disablePtermOutput(t)
+	cacheServer, addr := startPreloadTestServer(t, 100*time.Millisecond, nil)
+	cfg := YCSBConfig{
+		Addr:               addr,
+		ConnMode:           string(cacheclient.ModeSimple),
+		ConnectionPoolSize: 4,
+		NumKeys:            100,
+		ValueSize:          8,
+		Concurrency:        4,
+		NoProgress:         true,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		resultCh <- preloadKeys(ctx, cfg, rand.New(rand.NewSource(1)))
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for cacheServer.activePuts.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if cacheServer.activePuts.Load() == 0 {
+		t.Fatal("preload did not start a put")
+	}
+	cancel()
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("preload error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("preload did not return after cancellation")
+	}
+	if got := cacheServer.activePuts.Load(); got != 0 {
+		t.Fatalf("active puts after preload returned = %d, want 0", got)
+	}
+	calls := cacheServer.putCalls.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := cacheServer.putCalls.Load(); got != calls {
+		t.Fatalf("put calls continued after preload returned: started at %d, now %d", calls, got)
+	}
 }
 
 func TestRunYCSBReadOnlyDrainsResponses(t *testing.T) {

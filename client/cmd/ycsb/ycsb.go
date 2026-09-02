@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pterm/pterm"
@@ -167,67 +166,129 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 			Start()
 	}
 
-	var preloadErrors int32
-	var successCount int32
-	errorCh := make(chan error, 100)
+	useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+	workerCount := max(1, min(cfg.Concurrency, max(cfg.NumKeys, 1)))
 
+	type preloadJob struct {
+		index int
+		key   string
+		value []byte
+	}
+	type preloadResult struct {
+		index int
+		key   string
+		err   error
+	}
+
+	// Keep the queue bounded so values are released after their synchronous write
+	// completes instead of retaining the entire preload corpus in memory.
+	jobs := make(chan preloadJob, workerCount)
+	results := make(chan preloadResult, workerCount)
+
+	var workerWg sync.WaitGroup
+	workerWg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+
+					var err error
+					if useStreaming {
+						err = client.PutStream(ctx, job.key, bytes.NewReader(job.value), 0)
+					} else {
+						err = client.Put(ctx, job.key, job.value, 0)
+					}
+					results <- preloadResult{index: job.index, key: job.key, err: err}
+				}
+			}
+		}()
+	}
+
+	// One collector owns preload accounting and spinner output. Completion order
+	// is independent of generation order, so retain the lowest-index error for
+	// the same first-error message the serial loop produced.
+	var collectWg sync.WaitGroup
+	collectWg.Add(1)
+	var successCount int
+	var totalErrors int
+	firstErrorIndex := cfg.NumKeys
+	var firstError error
+	completedCount := 0
+	go func() {
+		defer collectWg.Done()
+		for result := range results {
+			completedCount++
+			if result.err != nil {
+				totalErrors++
+				if result.index < firstErrorIndex {
+					firstErrorIndex = result.index
+					firstError = fmt.Errorf("key %s: %w", result.key, result.err)
+				}
+			} else {
+				successCount++
+			}
+
+			if spinner != nil && (completedCount == 1 || completedCount%100 == 0) {
+				spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)",
+					completedCount, cfg.NumKeys, totalErrors))
+			}
+		}
+	}()
+
+	cancelled := false
 	for i := range cfg.NumKeys {
-		// Check for context cancellation
+		// Check for context cancellation before generating the next owned value.
 		select {
 		case <-ctx.Done():
-			if spinner != nil {
-				spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d keys", i, cfg.NumKeys))
-			}
-			return ctx.Err()
+			cancelled = true
 		default:
+		}
+		if cancelled {
+			break
 		}
 
 		k := hashKey(i)
 		val := generateValue(rng, cfg.ValueSize)
-
-		var err error
-		useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
-		if useStreaming {
-			err = client.PutStream(ctx, k, bytes.NewReader(val), 0)
-		} else {
-			err = client.Put(ctx, k, val, 0)
+		select {
+		case <-ctx.Done():
+			cancelled = true
+		case jobs <- preloadJob{index: i, key: k, value: val}:
 		}
-
-		if err != nil {
-			atomic.AddInt32(&preloadErrors, 1)
-			select {
-			case errorCh <- fmt.Errorf("key %s: %w", k, err):
-			default: // Don't block on error channel
-			}
-		} else {
-			atomic.AddInt32(&successCount, 1)
-		}
-
-		if spinner != nil && i%100 == 0 {
-			spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)",
-				i+1, cfg.NumKeys, atomic.LoadInt32(&preloadErrors)))
+		if cancelled {
+			break
 		}
 	}
 
-	close(errorCh)
+	close(jobs)
+	workerWg.Wait()
+	close(results)
+	collectWg.Wait()
 
-	// Collect sample of errors
-	var sampleErrors []error
-	for err := range errorCh {
-		if len(sampleErrors) < 5 {
-			sampleErrors = append(sampleErrors, err)
+	if cancelled || ctx.Err() != nil {
+		if spinner != nil {
+			spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d keys", completedCount, cfg.NumKeys))
 		}
+		return ctx.Err()
 	}
 
-	totalErrors := atomic.LoadInt32(&preloadErrors)
 	if totalErrors > 0 {
 		if spinner != nil {
 			spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)",
-				atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
+				successCount, cfg.NumKeys, totalErrors))
 		}
-		if int(totalErrors) > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
-			if len(sampleErrors) > 0 {
-				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, sampleErrors[0])
+		if totalErrors > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
+			if firstError != nil {
+				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, firstError)
 			}
 		}
 	} else {
