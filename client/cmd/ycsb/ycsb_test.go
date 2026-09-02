@@ -141,14 +141,20 @@ func BenchmarkPreloadYCSBKeys(b *testing.B) {
 		ConnectionPoolSize: 8,
 		NumKeys:            64,
 		ValueSize:          100,
+		NumOps:             64,
 		Concurrency:        8,
+		Workload:           "C",
+		Seed:               1,
 		NoProgress:         true,
 	}
 
 	for b.Loop() {
-		rng := rand.New(rand.NewSource(1))
-		if err := preloadKeys(context.Background(), cfg, rng); err != nil {
+		result, err := RunYCSBWithContext(context.Background(), cfg)
+		if err != nil {
 			b.Fatal(err)
+		}
+		if result.Errors != 0 {
+			b.Fatalf("RunYCSBWithContext reported %d errors", result.Errors)
 		}
 	}
 }
