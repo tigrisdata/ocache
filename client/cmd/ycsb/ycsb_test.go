@@ -5,10 +5,12 @@ package ycsb
 
 import (
 	"context"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pterm/pterm"
 	cacheclient "github.com/tigrisdata/ocache/client"
@@ -29,6 +31,7 @@ type ycsbReadServer struct {
 
 	mu            sync.RWMutex
 	values        map[string][]byte
+	putDelay      time.Duration
 	getCalls      atomic.Int64
 	responseBytes atomic.Int64
 }
@@ -37,7 +40,17 @@ func newYCSBReadServer() *ycsbReadServer {
 	return &ycsbReadServer{values: make(map[string][]byte)}
 }
 
-func (s *ycsbReadServer) PutObject(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+func (s *ycsbReadServer) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	if s.putDelay > 0 {
+		timer := time.NewTimer(s.putDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
 	data := append([]byte(nil), req.Data...)
 
 	s.mu.Lock()
@@ -116,6 +129,28 @@ func disablePtermOutput(tb testing.TB) {
 	tb.Cleanup(func() {
 		pterm.Output = output
 	})
+}
+
+func BenchmarkPreloadYCSBKeys(b *testing.B) {
+	disablePtermOutput(b)
+	cacheServer, addr := startYCSBReadServer(b)
+	cacheServer.putDelay = time.Millisecond
+	cfg := YCSBConfig{
+		Addr:               addr,
+		ConnMode:           string(cacheclient.ModeSimple),
+		ConnectionPoolSize: 8,
+		NumKeys:            64,
+		ValueSize:          100,
+		Concurrency:        8,
+		NoProgress:         true,
+	}
+
+	for b.Loop() {
+		rng := rand.New(rand.NewSource(1))
+		if err := preloadKeys(context.Background(), cfg, rng); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func TestRunYCSBReadOnlyDrainsResponses(t *testing.T) {
