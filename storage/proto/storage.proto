@@ -36,6 +36,30 @@ message ValueMessage {
   int64 segment_offset = 6; // Byte offset within the segment where the value starts
   int64 value_length = 7; // Length of the value in bytes within the segment
   uint32 checksum = 8; // CRC32 checksum of the value
+
+  // version: owner-assigned monotonic stamp, set on every successful write
+  // (issue #254). 0 on entries written by pre-versioning binaries; the API
+  // reports those as the legacy sentinel (merge.VersionLegacy) so 0 can keep
+  // meaning "absent" in CAS preconditions. Compaction/recompaction copy this
+  // field unchanged: storage migration is not a write.
+  uint64 version = 9;
+
+  // op_type / cas_expected_version: MERGE-OPERAND-ONLY fields (always zero on
+  // stored values, like raw_file_path on stored SEGMENT values). A CAS operand
+  // carries the full new value plus op_type and the expected version; the
+  // merge operator (mergeMetadataCAS) resolves it against the base
+  // deterministically and strips these fields from the persisted result.
+  MetaOp op_type = 10;
+  uint64 cas_expected_version = 11;
+}
+
+// MetaOp discriminates merge-operand kinds on metadata keys. The zero value
+// keeps every stored value and every pre-existing operand (the compactor's
+// path-preconditioned rewrites) well-formed with no migration.
+enum MetaOp {
+  META_OP_NONE = 0;       // plain value / legacy operand
+  META_OP_CAS_PUT = 1;    // apply operand iff base version matches cas_expected_version
+  META_OP_CAS_DELETE = 2; // tombstone base iff its version matches cas_expected_version
 }
 
 // SyncEntry tracks a file pending sync in the sync index

@@ -173,6 +173,7 @@ type Storage struct {
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
 	evictionPolicy   string                // "lru" or "fifo"; governs whether reads refresh access time
 	closed           atomic.Bool           // True when storage has been closed
+	lastVersion      atomic.Uint64         // Last issued version stamp (see nextVersion)
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -834,6 +835,23 @@ func (s *Storage) DeleteKey(key string) error {
 // Get retrieves the value for the given key from the database and returns an io.Reader for streaming
 // Supports byte-range requests via start and end parameters (0 means no limit)
 func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
+	r, _, found, err := s.getWithVersion(key, start, end)
+	return r, found, err
+}
+
+// GetWithVersion is Get plus the row's CAS token (issue #254). The data and
+// version come from a single row read, so the pairing is atomic by
+// construction. Version semantics track ROW STATE, not visibility: on an
+// expired-but-unswept row it returns (nil, rowVersion, false, nil) — the
+// caller can recreate over the tombstone with PutIfVersion(rowVersion) — and
+// 0 is returned only for a truly absent row, keeping expected==0 as
+// put-if-absent. Legacy (pre-versioning) rows report merge.VersionLegacy.
+func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
+	return s.getWithVersion(key, 0, 0)
+}
+
+// getWithVersion is the shared read path behind Get and GetWithVersion.
+func (s *Storage) getWithVersion(key string, start, end int64) (io.Reader, uint64, bool, error) {
 	storageType := "unknown"
 	startTime := time.Now()
 	defer func() {
@@ -849,13 +867,13 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		metrics.Errors.WithLabelValues("rocksdb", "get").Inc()
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: db.Get error")
 		// RocksDB errors are typically temporary
-		return nil, false, mapRocksDBError("Get", key, err)
+		return nil, 0, false, mapRocksDBError("Get", key, err)
 	}
 	defer slice.Free()
 	if !slice.Exists() {
 		metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
 		zlog.Debug().Str("key", key).Msg("storage.Get: not found in DB")
-		return nil, false, nil
+		return nil, 0, false, nil
 	}
 	v := slice.Data()
 
@@ -866,15 +884,20 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.Get: failed to unmarshal proto ValueMessage - corruption detected")
 		// Return corruption error without deleting the key
 		// This preserves the corrupted data for debugging/recovery
-		return nil, false, storageErrors.NewCorruptionError("Get", key, err)
+		return nil, 0, false, storageErrors.NewCorruptionError("Get", key, err)
 	}
 
 	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
 	if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
 		zlog.Debug().Str("key", key).Msg("storage.Get: key has expired, returning not found")
 		// Don't delete the key here - let the background cleaner handle it
-		// This avoids race conditions with the cleaner
-		return nil, false, nil
+		// This avoids race conditions with the cleaner.
+		//
+		// The version is still returned: CAS tokens track row STATE, not
+		// visibility (the merge operator is deterministic and cannot consult
+		// the clock), so recreating over an expired-but-unswept row requires
+		// this token rather than expected==0.
+		return nil, merge.EffectiveVersion(valueMsg.Version), false, nil
 	}
 
 	// Refresh access time for LRU tracking. The updater is only present when
@@ -896,11 +919,13 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			metrics.Errors.WithLabelValues(storageType, "get").Inc()
 			zlog.Error().Err(err).Str("key", key).Str("segment", valueMsg.SegmentPath).Msg("storage.Get: failed to read segment")
 			// File read errors are usually I/O errors, retryable for reads
-			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
+			return nil, 0, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
 		} else {
-			return nil, false, nil
+			// Row is live but the backing read produced nothing; hand out the
+			// row's token so a caller may CAS-replace the unreadable entry.
+			return nil, merge.EffectiveVersion(valueMsg.Version), false, nil
 		}
 	case pb.ValueType_RAW_FILE:
 		r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
@@ -925,7 +950,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 				zlog.Warn().Str("key", key).Str("file", valueMsg.RawFilePath).
 					Msg("storage.Get: raw file missing for large object, purging dangling key")
 				s.purgeDanglingRawFile(key, valueMsg.RawFilePath)
-				return nil, false, storageErrors.NewIORetryableError("Get", key, err)
+				return nil, 0, false, storageErrors.NewIORetryableError("Get", key, err)
 			}
 
 			metrics.StorageOperations.WithLabelValues("get", storageType, "error").Inc()
@@ -933,19 +958,21 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			zlog.Error().Err(err).Str("key", key).Str("file", valueMsg.RawFilePath).Msg("storage.Get: failed to read file")
 			// Check if it's a lock error from file manager
 			if err == files.ErrFileLocked {
-				return nil, false, storageErrors.NewLockError("Get", key, err)
+				return nil, 0, false, storageErrors.NewLockError("Get", key, err)
 			}
 			// File read errors are usually I/O errors, retryable for reads
-			return nil, false, storageErrors.NewIORetryableError("Get", key, err)
+			return nil, 0, false, storageErrors.NewIORetryableError("Get", key, err)
 		} else if r != nil {
 			reader = r
 		} else {
-			return nil, false, nil
+			// Row is live but the backing read produced nothing; hand out the
+			// row's token so a caller may CAS-replace the unreadable entry.
+			return nil, merge.EffectiveVersion(valueMsg.Version), false, nil
 		}
 	default:
 		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type - corruption detected")
 		// Return error for unknown value types
-		return nil, false, storageErrors.NewCorruptionError("Get", key, fmt.Errorf("unknown value type: %d", valueMsg.ValueType))
+		return nil, 0, false, storageErrors.NewCorruptionError("Get", key, fmt.Errorf("unknown value type: %d", valueMsg.ValueType))
 	}
 
 	metrics.StorageOperations.WithLabelValues("get", storageType, "success").Inc()
@@ -957,7 +984,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		reader = s.applyByteRange(reader, start, end)
 	}
 
-	return reader, true, nil
+	return reader, merge.EffectiveVersion(valueMsg.Version), true, nil
 }
 
 // applyByteRange wraps the reader to support byte-range requests
@@ -1168,6 +1195,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			ValueLength: bytesWritten,
 			Checksum:    checksum,
 			ValueType:   pb.ValueType_RAW_FILE,
+			Version:     s.nextVersion(),
 		}
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
@@ -1202,6 +1230,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		Expiry:      expiry,
 		ValueLength: int64(n),
 		ValueType:   pb.ValueType_INLINE,
+		Version:     s.nextVersion(),
 	}
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {

@@ -42,6 +42,25 @@ func init() {
 	}
 }
 
+// VersionLegacy is the version the API reports for entries written by
+// pre-versioning binaries (stored version field 0). It is reserved: real
+// stamps are nanosecond-scale (see Storage.nextVersion), CAS_PUT strips
+// operand fields, and no write path ever persists version 1 — so matching
+// expected == VersionLegacy against a stored 0 is unambiguous. 0 itself keeps
+// meaning "absent" in CAS preconditions (put-if-absent).
+const VersionLegacy uint64 = 1
+
+// EffectiveVersion maps a stored version field to the version the API (and
+// the CAS match rule) uses: 0 — a pre-versioning entry — reads as
+// VersionLegacy; anything else is itself. Shared by the merge operator and
+// the read path so the two can never disagree.
+func EffectiveVersion(stored uint64) uint64 {
+	if stored == 0 {
+		return VersionLegacy
+	}
+	return stored
+}
+
 // MultiplexOperator is a merge operator that routes to different merge strategies
 // based on key prefixes. This allows us to support multiple merge types in a single
 // RocksDB instance, since RocksDB only supports one merge operator per database.
@@ -157,6 +176,61 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			continue // malformed operand — skip, keep current base
 		}
 
+		// Version-CAS (issue #254): operands tagged with an explicit MetaOp
+		// carry a version precondition. Everything here is a pure function of
+		// (base, operand) — FullMerge re-runs at compaction time, so consulting
+		// the clock (or any external state) would make read-time and
+		// compaction-time resolution diverge. Consequently the match rule uses
+		// row STATE, not visibility: an expired-but-unswept row still has a
+		// definite version, and recreating over it requires that version (the
+		// read path hands it out as the recreate token); expected == 0 matches
+		// only a truly absent row. On mismatch the operand is dropped and the
+		// base kept, the same convention as the path-preconditioned CAS below.
+		switch op.OpType {
+		case pb.MetaOp_META_OP_CAS_PUT:
+			matched := (hadBase && EffectiveVersion(base.Version) == op.CasExpectedVersion) ||
+				(!hadBase && op.CasExpectedVersion == 0)
+			if matched {
+				// Adopt the operand as the new base, stripping the
+				// operand-only fields so stored values never carry them
+				// (the RawFilePath-clearing pattern). Field copy, not struct
+				// assignment (embedded proto lock).
+				base = pb.ValueMessage{
+					ValueType:     op.ValueType,
+					Data:          op.Data,
+					Expiry:        op.Expiry,
+					RawFilePath:   op.RawFilePath,
+					SegmentPath:   op.SegmentPath,
+					SegmentOffset: op.SegmentOffset,
+					ValueLength:   op.ValueLength,
+					Checksum:      op.Checksum,
+					Version:       op.Version,
+				}
+				hadBase = true
+			}
+			continue
+		case pb.MetaOp_META_OP_CAS_DELETE:
+			if hadBase && EffectiveVersion(base.Version) == op.CasExpectedVersion {
+				// Tombstone via the already-expired sentinel, KEEPING the
+				// base's file-reference fields so the TTL cleaner's existing
+				// sweep reclaims the backing raw file / segment bytes, and
+				// stamping the operand's fresh version so the row keeps a
+				// definite CAS token until it is swept. Data is dropped —
+				// inline payloads have nothing to reclaim.
+				base = pb.ValueMessage{
+					ValueType:     base.ValueType,
+					Expiry:        1,
+					RawFilePath:   base.RawFilePath,
+					SegmentPath:   base.SegmentPath,
+					SegmentOffset: base.SegmentOffset,
+					ValueLength:   base.ValueLength,
+					Checksum:      base.Checksum,
+					Version:       op.Version,
+				}
+			}
+			continue
+		}
+
 		// Purge-CAS: a RAW_FILE-typed operand carrying a RawFilePath
 		// precondition is a request from the read path (storage.Get) to
 		// tombstone a dangling raw-file reference whose backing file vanished
@@ -172,7 +246,10 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			if hadBase &&
 				base.ValueType == pb.ValueType_RAW_FILE &&
 				base.RawFilePath == op.RawFilePath {
-				base = pb.ValueMessage{Expiry: 1}
+				// Preserve the row's version through the tombstone: purging a
+				// dangling file is not a user write, and the surviving token
+				// keeps CAS semantics consistent until the cleaner sweeps.
+				base = pb.ValueMessage{Expiry: 1, Version: base.Version}
 			}
 			continue
 		}
@@ -214,6 +291,12 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			SegmentOffset: op.SegmentOffset,
 			ValueLength:   op.ValueLength,
 			Checksum:      op.Checksum,
+			// Version carried over from the BASE, not the operand: storage
+			// migration (raw -> segment, segment -> segment) is not a user
+			// write and must never change a row's CAS token (issue #254).
+			// The precondition match proves the base is the same row the
+			// migrator read, so its version is authoritative.
+			Version: base.Version,
 			// RawFilePath intentionally omitted (CAS precondition, not a
 			// live file reference).
 		}
