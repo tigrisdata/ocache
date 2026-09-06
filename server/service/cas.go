@@ -164,8 +164,10 @@ func (s *CacheService) handleLocalPutStreamIfVersion(stream pb.CacheService_PutS
 	// WITH the error rather than cleanly: a plain Close is EOF to storage, which
 	// would commit the partial body as a complete value and advance the version.
 	// CloseWithError makes storage's copy fail so nothing is committed (this is
-	// what the plain streaming Put does too).
-	pumpErr := pumpStreamToPipe(stream, first, pw)
+	// what the plain streaming Put does too). fromClient distinguishes a failed
+	// client upload from the storage reader closing the pipe (fast-fail mismatch
+	// or a storage error) so the two are not conflated below.
+	pumpErr, fromClient := pumpStreamToPipe(stream, first, pw)
 	if pumpErr != nil {
 		pw.CloseWithError(pumpErr)
 	} else {
@@ -180,9 +182,12 @@ func (s *CacheService) handleLocalPutStreamIfVersion(stream pb.CacheService_PutS
 		}
 		metrics.RPCRequests.WithLabelValues("PutStreamIfVersion", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "PutStreamIfVersion").Inc()
-		// An interrupted upload aborted the write (res.err is the copy failure);
-		// surface Aborted so the caller knows nothing was committed.
-		if pumpErr != nil {
+		// Only a genuinely interrupted client upload is Aborted (nothing was
+		// committed). If the pump stopped because storage closed the pipe, the
+		// storage error is authoritative: map it so its real code survives
+		// (ResourceExhausted for a full disk, Internal for corruption, ...)
+		// rather than masking every storage failure as Aborted.
+		if fromClient {
 			return status.Error(codes.Aborted, pumpErr.Error())
 		}
 		return mapStorageErrorToGRPC(res.err)
@@ -192,24 +197,28 @@ func (s *CacheService) handleLocalPutStreamIfVersion(stream pb.CacheService_PutS
 }
 
 // pumpStreamToPipe writes the first message's data and then every subsequent
-// chunk into pw, stopping at EOF or the first write/recv error.
-func pumpStreamToPipe(stream pb.CacheService_PutStreamIfVersionServer, first *pb.PutIfVersionRequest, pw *io.PipeWriter) error {
+// chunk into pw, stopping at EOF or the first error. fromClient reports whether
+// the error came from receiving on the gRPC stream (the client's upload failed,
+// so the RPC must abort with nothing committed) rather than from writing to the
+// pipe (the storage reader stopped consuming — a fast-fail mismatch or a storage
+// error — in which case the storage goroutine's result is authoritative).
+func pumpStreamToPipe(stream pb.CacheService_PutStreamIfVersionServer, first *pb.PutIfVersionRequest, pw *io.PipeWriter) (err error, fromClient bool) {
 	if len(first.Data) > 0 {
-		if _, err := pw.Write(first.Data); err != nil {
-			return err
+		if _, werr := pw.Write(first.Data); werr != nil {
+			return werr, false
 		}
 	}
 	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			return nil
+		chunk, rerr := stream.Recv()
+		if rerr == io.EOF {
+			return nil, false
 		}
-		if err != nil {
-			return err
+		if rerr != nil {
+			return rerr, true // client upload failed
 		}
 		if len(chunk.Data) > 0 {
-			if _, err := pw.Write(chunk.Data); err != nil {
-				return err
+			if _, werr := pw.Write(chunk.Data); werr != nil {
+				return werr, false // storage stopped reading the body
 			}
 			metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(chunk.Data)))
 		}

@@ -385,15 +385,36 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	// glitch so a losing spill is reclaimed below rather than leaked.
 	got, gotFound, err := s.readRowForCASRetry(metaKey)
 	if err != nil {
-		// The merge committed but the outcome is genuinely unreadable (a
-		// persistently unhealthy DB). We must NOT delete the spill here: if the
-		// CAS won, the committed row references it, and deleting it would leave a
-		// live row pointing at a missing file — silent data loss, worse than an
-		// orphan. Leave it as a bounded, recoverable orphan (the #156 class); the
-		// caller retries and re-resolves once the DB recovers.
+		// The merge committed but its outcome is unreadable right now (a transient
+		// read glitch, or a genuinely unhealthy DB). We must NOT delete the spill:
+		// if the CAS won, the committed row references it, and deleting it would
+		// leave a live row pointing at a missing file — silent data loss. Instead
+		// make the spill discoverable so its fate is resolved once the DB reads
+		// cleanly, reusing the SAME compaction-index machinery a plain Put and a
+		// won CAS put (finishWonCASPut) use for the medium band: the compactor
+		// validates each entry against current metadata and either migrates the
+		// file (we won) or drops the entry and queues the file for deletion (we
+		// lost). The merge just succeeded, so this write almost always lands even
+		// while the read glitches.
 		if spilledPath != "" {
-			zlog.Warn().Str("key", key).Str("file", spilledPath).
-				Msg("storage.PutIfVersion: read-back failed after commit; leaving spill in place to avoid deleting a possibly-committed value")
+			if operand.ValueLength > int64(s.inlineThreshold) && operand.ValueLength <= s.compactThreshold {
+				cIdxKey, cIdxVal := compaction.PrepareEntryForCompaction(key, spilledPath)
+				bwo := grocksdb.NewDefaultWriteOptions()
+				if perr := s.meta.Handle().Put(bwo, cIdxKey, cIdxVal); perr != nil {
+					zlog.Error().Err(perr).Str("key", key).Str("file", spilledPath).
+						Msg("storage.PutIfVersion: failed to record spill recovery breadcrumb after read-back failure")
+				}
+				bwo.Destroy()
+			} else {
+				// Large spill: no write path indexes large raw files (they stay
+				// raw, never compacted), so there is no existing machinery to
+				// reclaim one orphaned by a lost CAS whose read-back failed. This
+				// is the same orphaned-large-file class as a large plain Put that
+				// fails to commit — issue #156, reclaimed uniformly for every write
+				// path there, not with CAS-specific machinery here.
+				zlog.Warn().Str("key", key).Str("file", spilledPath).
+					Msg("storage.PutIfVersion: read-back failed after commit; large spill may orphan if the CAS lost (issue #156)")
+			}
 		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
@@ -571,12 +592,18 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	}
 	switch {
 	case !gotFound:
-		// The row is gone entirely: either our tombstone was already swept, or
-		// an independent delete removed the key in the read-back window. Both
-		// satisfy the delete intent (key absent), reported as success. Backing
-		// bytes were reclaimed by whoever removed the row.
-		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "success").Inc()
-		return nil
+		// The row is gone entirely, which is NOT proof our precondition held: the
+		// dominant cause is that a concurrent write moved the version (dropping our
+		// operand at the merge) and an independent delete then removed the row, so
+		// our guarded delete never applied. Report a mismatch (current version 0)
+		// rather than a false success — the caller re-reads and sees the key is
+		// already absent. (The inverse, a genuine win whose ref-less tombstone was
+		// swept by the cleaner in the microseconds before this read-back, is
+		// vanishingly rare; its only cost is a delayed reclaim of the replaced
+		// bytes, recovered by the recompactor / hourly size reconcile — far better
+		// than reporting success for a delete that did not happen.)
+		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
 	case got.Version == newStamp:
 		// Won: our stamp is on the tombstone. Reclaim the replaced value's
 		// backing bytes now (the tombstone is ref-less, so the cleaner will not)

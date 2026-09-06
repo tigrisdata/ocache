@@ -265,19 +265,22 @@ func TestMergeCAS_CompactionMigrationPreservesVersion(t *testing.T) {
 	assert.Equal(t, uint64(700), mustUnmarshal(t, out2).Version)
 }
 
-// TestMergeCAS_DeleteOnAbsentRowStampsSentinel: a CAS_DELETE whose base vanished
-// (an independent delete raced ahead) emits a tombstone stamped with the
-// operand's version, so the deleter's read-back sees its own stamp and reports
-// success. The tombstone still reads as absent, so put-if-absent recreates.
-func TestMergeCAS_DeleteOnAbsentRowStampsSentinel(t *testing.T) {
+// TestMergeCAS_DeleteOnAbsentRowEmitsUnstampedSentinel: a CAS_DELETE whose base
+// vanished (an independent delete raced ahead) did NOT match the caller's version
+// precondition against anything, so it must not fake a win. The operator emits a
+// version-0 tombstone (not the operand's stamp): DeleteIfVersion's read-back then
+// sees a stamp that is not its own and reports a mismatch, never a false success
+// for a precondition that never held. The tombstone still reads as absent, so
+// put-if-absent recreates over it.
+func TestMergeCAS_DeleteOnAbsentRowEmitsUnstampedSentinel(t *testing.T) {
 	op := NewMultiplexOperator()
 
 	out, ok := op.FullMerge(casMetaKey, nil, [][]byte{casDeleteOperand(t, 100, 200)})
 	require.True(t, ok)
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, int64(1), got.Expiry)
-	assert.Equal(t, uint64(200), got.Version, "no-base delete sentinel carries the operand's stamp for read-back")
-	assert.Zero(t, EffectiveRowVersion(got), "but reads as absent")
+	assert.Zero(t, got.Version, "no-base delete tombstone carries no stamp, so read-back cannot mistake it for a win")
+	assert.Zero(t, EffectiveRowVersion(got), "and it reads as absent")
 
 	// put-if-absent recreates over it; the stale stamp would not.
 	out2, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 0, 300, "recreated")})

@@ -228,12 +228,16 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			continue
 		case pb.MetaOp_META_OP_CAS_DELETE:
 			if !hadBase {
-				// The row vanished before the operand resolved. Emit a bare
-				// tombstone stamped with the operand's version: DeleteIfVersion's
-				// read-back sees its own stamp and reports success (the key is
-				// gone — the delete's intent), while EffectiveRowVersion still
-				// reports it as absent so put-if-absent can recreate.
-				base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
+				// The row vanished before the operand resolved: there was no base
+				// to match the precondition against, so this delete did NOT apply
+				// to the version the caller guarded on. Emit a version-0 tombstone
+				// (not the operand's stamp): DeleteIfVersion's read-back then sees a
+				// stamp that is not its own and reports a mismatch, never a false
+				// win for a precondition that never held. EffectiveRowVersion still
+				// reads it as absent (Expiry == tombstoneExpiry) so put-if-absent
+				// can recreate, and the ref-less tombstone still blocks a stale
+				// path-CAS from resurrecting the key.
+				base = pb.ValueMessage{Expiry: tombstoneExpiry}
 				hadBase = true
 				continue
 			}
