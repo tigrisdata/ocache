@@ -118,6 +118,20 @@ func (s *Storage) nextVersion() (uint64, error) {
 	}
 }
 
+// casStatus classifies a CAS operation's final outcome into the metrics `status`
+// label. Centralizing the success/mismatch/error decision here (called once from
+// each op's deferred recorder) keeps the classification out of the per-branch
+// worker code.
+func casStatus(err error) string {
+	if err == nil {
+		return "success"
+	}
+	if _, ok := storageErrors.IsVersionMismatch(err); ok {
+		return "mismatch"
+	}
+	return "error"
+}
+
 // readRowForCAS reads and decodes the key's full metadata row. found reports
 // whether the row exists at all (live or expired).
 func (s *Storage) readRowForCAS(metaKey []byte) (*pb.ValueMessage, bool, error) {
@@ -244,11 +258,12 @@ func casCurrentVersion(vm *pb.ValueMessage, found bool) uint64 {
 // lost race it returns *storageErrors.VersionMismatchError carrying the
 // current version. Plain writes keep last-write-wins semantics and are
 // unaffected.
-func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uint64) (uint64, error) {
+func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uint64) (newVersion uint64, retErr error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("cas_put", storageType).Observe(float64(time.Since(start).Milliseconds()))
+		metrics.StorageOperations.WithLabelValues("cas_put", storageType, casStatus(retErr)).Inc()
 	}()
 
 	metaKey := keys.MakeMetadataKey(key)
@@ -388,33 +403,16 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		// The merge committed but its outcome is unreadable right now (a transient
 		// read glitch, or a genuinely unhealthy DB). We must NOT delete the spill:
 		// if the CAS won, the committed row references it, and deleting it would
-		// leave a live row pointing at a missing file — silent data loss. Instead
-		// make the spill discoverable so its fate is resolved once the DB reads
-		// cleanly, reusing the SAME compaction-index machinery a plain Put and a
-		// won CAS put (finishWonCASPut) use for the medium band: the compactor
-		// validates each entry against current metadata and either migrates the
-		// file (we won) or drops the entry and queues the file for deletion (we
-		// lost). The merge just succeeded, so this write almost always lands even
-		// while the read glitches.
+		// leave a live row pointing at a missing file — silent data loss. Nor may
+		// we leave it: if the CAS lost, no index reaches it and it leaks forever
+		// (#156). Stage it for a REFERENCE-GUARDED deletion (works for both the
+		// medium and large bands): the deletion worker keeps the file if the
+		// committed row still references it (we won) and deletes it otherwise (we
+		// lost), resolving whenever the DB reads cleanly. The merge just
+		// succeeded, so this write almost always lands even while the read
+		// glitches.
 		if spilledPath != "" {
-			if operand.ValueLength > int64(s.inlineThreshold) && operand.ValueLength <= s.compactThreshold {
-				cIdxKey, cIdxVal := compaction.PrepareEntryForCompaction(key, spilledPath)
-				bwo := grocksdb.NewDefaultWriteOptions()
-				if perr := s.meta.Handle().Put(bwo, cIdxKey, cIdxVal); perr != nil {
-					zlog.Error().Err(perr).Str("key", key).Str("file", spilledPath).
-						Msg("storage.PutIfVersion: failed to record spill recovery breadcrumb after read-back failure")
-				}
-				bwo.Destroy()
-			} else {
-				// Large spill: no write path indexes large raw files (they stay
-				// raw, never compacted), so there is no existing machinery to
-				// reclaim one orphaned by a lost CAS whose read-back failed. This
-				// is the same orphaned-large-file class as a large plain Put that
-				// fails to commit — issue #156, reclaimed uniformly for every write
-				// path there, not with CAS-specific machinery here.
-				zlog.Warn().Str("key", key).Str("file", spilledPath).
-					Msg("storage.PutIfVersion: read-back failed after commit; large spill may orphan if the CAS lost (issue #156)")
-			}
+			s.stageRawFileDeletionIfUnreferenced(spilledPath, key)
 		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
@@ -430,7 +428,6 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		if spilledPath != "" {
 			s.stageRawFileDeletion(spilledPath)
 		}
-		metrics.StorageOperations.WithLabelValues("cas_put", storageType, "mismatch").Inc()
 		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, currentVersionOf(got, gotFound))
 	}
 
@@ -442,7 +439,8 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	// only delays raw→segment migration.
 	s.finishWonCASPut(key, metaKey, operand, prev, hasPrev)
 
-	metrics.StorageOperations.WithLabelValues("cas_put", storageType, "success").Inc()
+	// Outcome (success/mismatch/error) is recorded centrally by the deferred
+	// recorder; only the bytes-written gauge is specific to the success path.
 	metrics.StorageBytes.WithLabelValues("cas_put", storageType).Add(float64(operand.ValueLength))
 	return newStamp, nil
 }
@@ -525,10 +523,11 @@ func (s *Storage) finishWonCASPut(key string, metaKey []byte, newVM *pb.ValueMes
 // cleaner only removes the tiny leftover row on its next sweep. This frees the
 // (potentially 256 MB) backing file immediately rather than one cleanup
 // interval later.
-func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
+func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 	start := time.Now()
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("cas_delete", "unknown").Observe(float64(time.Since(start).Milliseconds()))
+		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", casStatus(retErr)).Inc()
 	}()
 
 	metaKey := keys.MakeMetadataKey(key)
@@ -554,10 +553,8 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	cur := casCurrentVersion(prev, hasPrev)
 	if cur == 0 {
 		if expected == 0 {
-			metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "success").Inc()
 			return nil
 		}
-		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
 	}
 	// Live row: match its version (cur == the physical version, since it is not
@@ -602,7 +599,6 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 		// vanishingly rare; its only cost is a delayed reclaim of the replaced
 		// bytes, recovered by the recompactor / hourly size reconcile — far better
 		// than reporting success for a delete that did not happen.)
-		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
 	case got.Version == newStamp:
 		// Won: our stamp is on the tombstone. Reclaim the replaced value's
@@ -618,10 +614,8 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 			s.reclaimReplacedValue(prev)
 			s.notifyDelete(prev.ValueLength)
 		}
-		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "success").Inc()
 		return nil
 	default:
-		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
 	}
 }

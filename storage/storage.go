@@ -772,6 +772,19 @@ func (s *Storage) stageRawFileDeletion(rawFilePath string) {
 	}
 }
 
+// stageRawFileDeletionIfUnreferenced queues rawFilePath for deletion only if
+// userKey's metadata row no longer references it. Used when the caller cannot
+// yet tell whether the file is live — a CAS spill whose win/lose outcome could
+// not be read back after the merge committed (issue #254). The deletion worker
+// resolves it once the DB reads cleanly: kept if the row references it (the CAS
+// won), deleted otherwise (it lost), instead of leaking permanently (#156).
+func (s *Storage) stageRawFileDeletionIfUnreferenced(rawFilePath, userKey string) {
+	if err := s.deletionQueue.AddIfUnreferenced(rawFilePath, userKey); err != nil {
+		zlog.Error().Err(err).Str("path", rawFilePath).Str("key", userKey).
+			Msg("storage: failed to queue raw file for reference-guarded deletion")
+	}
+}
+
 // DeleteKey removes metadata and spills for a key
 func (s *Storage) DeleteKey(key string) error {
 	storageType := "unknown"

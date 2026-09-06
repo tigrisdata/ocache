@@ -36,6 +36,13 @@ type ClusterClient struct {
 	stopCh        chan struct{}
 	refreshCancel context.CancelFunc
 
+	// bgCtx is cancelled by refreshCancel on Close; ad-hoc background refreshes
+	// (scheduleTopologyRefresh) run under it so they abort on shutdown instead of
+	// outliving the client. bgWG tracks those goroutines so Close can wait for
+	// them to finish.
+	bgCtx context.Context
+	bgWG  sync.WaitGroup
+
 	// lastRefresh tracks when the last topology refresh was triggered.
 	// Used to rate-limit epoch mismatch refresh triggers.
 	lastRefresh atomic.Int64
@@ -79,6 +86,7 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 	// Start topology refresh goroutine
 	refreshCtx, cancel := context.WithCancel(context.Background())
 	client.refreshCancel = cancel
+	client.bgCtx = refreshCtx
 	go client.topology.TopologyRefreshLoop(refreshCtx, func() {
 		// Update connections when topology changes
 		client.updateConnections()
@@ -159,7 +167,13 @@ func (c *ClusterClient) scheduleTopologyRefresh() {
 	if !c.lastRefresh.CompareAndSwap(lastRefresh, now) {
 		return
 	}
-	go c.forceRefreshTopology(context.Background())
+	// Run under bgCtx (cancelled on Close) and track it in bgWG so a refresh
+	// cannot outlive the client; Close cancels bgCtx and waits for it.
+	c.bgWG.Add(1)
+	go func() {
+		defer c.bgWG.Done()
+		c.forceRefreshTopology(c.bgCtx)
+	}()
 }
 
 // Route determines which connection to use for a given key
@@ -456,6 +470,11 @@ func (c *ClusterClient) Close() error {
 	if c.refreshCancel != nil {
 		c.refreshCancel()
 	}
+
+	// Wait for any in-flight ad-hoc topology refreshes to observe the cancelled
+	// bgCtx and return. Done before taking c.mu (a refresh may take c.mu via
+	// updateConnections) to avoid a deadlock.
+	c.bgWG.Wait()
 
 	// Close stop channel
 	select {

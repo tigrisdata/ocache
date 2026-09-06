@@ -11,10 +11,13 @@ import (
 	"testing"
 	"time"
 
+	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
+	pb "github.com/tigrisdata/ocache/storage/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 func setupTestQueue(t *testing.T) (*Queue, func()) {
@@ -69,6 +72,55 @@ func TestQueue_AddAndProcess(t *testing.T) {
 		_, err := os.Stat(file)
 		require.True(t, os.IsNotExist(err), "file should be deleted: %s", file)
 	}
+}
+
+// writeRawFileMeta writes a RAW_FILE metadata row for userKey pointing at
+// rawPath, so a reference-guarded deletion can observe the reference.
+func writeRawFileMeta(t *testing.T, meta *metadata.MetaDB, userKey, rawPath string) {
+	t.Helper()
+	vm := &pb.ValueMessage{ValueType: pb.ValueType_RAW_FILE, RawFilePath: rawPath, ValueLength: 4}
+	b, err := proto.Marshal(vm)
+	require.NoError(t, err)
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, meta.Handle().Put(wo, keys.MakeMetadataKey(userKey), b))
+}
+
+// TestQueue_AddIfUnreferenced verifies the reference-guarded deletion used to
+// resolve a CAS spill whose outcome could not be read back (issue #254): the
+// file is kept when the owning row still references it (the CAS won) and deleted
+// when no row does (the CAS lost, or the key is gone).
+func TestQueue_AddIfUnreferenced(t *testing.T) {
+	queue, cleanup := setupTestQueue(t)
+	defer cleanup()
+
+	tmpDir := t.TempDir()
+
+	// Won: the owning row still references the spill -> keep it.
+	wonFile := filepath.Join(tmpDir, "won.bin")
+	require.NoError(t, os.WriteFile(wonFile, []byte("live"), 0o644))
+	writeRawFileMeta(t, queue.meta, "won-key", wonFile)
+	require.NoError(t, queue.AddIfUnreferenced(wonFile, "won-key"))
+
+	// Lost (no row at all): orphan -> delete it.
+	lostFile := filepath.Join(tmpDir, "lost.bin")
+	require.NoError(t, os.WriteFile(lostFile, []byte("orphan"), 0o644))
+	require.NoError(t, queue.AddIfUnreferenced(lostFile, "lost-key"))
+
+	// Lost (row references a different, winning file): the spill is an orphan.
+	staleFile := filepath.Join(tmpDir, "stale.bin")
+	require.NoError(t, os.WriteFile(staleFile, []byte("orph2"), 0o644))
+	writeRawFileMeta(t, queue.meta, "stale-key", filepath.Join(tmpDir, "winner.bin"))
+	require.NoError(t, queue.AddIfUnreferenced(staleFile, "stale-key"))
+
+	queue.ProcessBatch()
+
+	_, err := os.Stat(wonFile)
+	require.NoError(t, err, "referenced file (CAS won) must be kept")
+	_, err = os.Stat(lostFile)
+	require.True(t, os.IsNotExist(err), "unreferenced orphan (CAS lost) must be deleted")
+	_, err = os.Stat(staleFile)
+	require.True(t, os.IsNotExist(err), "spill whose row references another file must be deleted")
 }
 
 func TestQueue_Deduplication(t *testing.T) {
