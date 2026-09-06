@@ -4,7 +4,9 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/compaction"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
+	"github.com/tigrisdata/ocache/storage/files"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/merge"
 	pb "github.com/tigrisdata/ocache/storage/proto"
@@ -134,9 +137,10 @@ func (s *Storage) readRowForCAS(metaKey []byte) (*pb.ValueMessage, bool, error) 
 }
 
 // GetWithVersion returns the value reader together with the key's current CAS
-// version (issue #254). It is a CAS-path operation and deliberately does not
-// touch the plain Get read path: the version is read from the metadata row and
-// the reader is obtained from the untouched Get. An absent, expired, or deleted
+// version (issue #254). It is a CAS-path operation that does not touch the plain
+// Get read path. The value reader and the version come from a SINGLE metadata
+// read, so the pair is one atomic snapshot (a second read via Get could pair one
+// generation's data with another's version). An absent, expired, or deleted
 // (tombstoned) key reports version 0 and found == false — recreate over it with
 // PutIfVersion(expected == 0). A live pre-versioning (plain-written) row reports
 // merge.VersionLegacy; mixing plain writes and CAS on one key is unsupported.
@@ -145,19 +149,43 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 	if err != nil {
 		return nil, 0, false, mapRocksDBError("GetWithVersion", key, err)
 	}
-	// Absent, or expired/tombstoned (the read path's clock check treats both as
-	// gone) → absent for CAS purposes.
+	// Absent, or expired/tombstoned (both are logically gone) → absent.
 	if !hasPrev || (vm.Expiry > 0 && time.Now().Unix() >= vm.Expiry) {
 		return nil, 0, false, nil
 	}
 	version := merge.EffectiveRowVersion(vm)
 
-	// The reader comes from the untouched Get. A benign TOCTOU between the two
-	// reads is acceptable: GetWithVersion is advisory, and the following CAS
-	// re-reads and resolves the version authoritatively at merge time.
-	reader, found, err := s.Get(key, 0, 0)
-	if err != nil || !found {
-		return nil, 0, found, err
+	// Build the reader from the SAME ValueMessage the version came from. This
+	// deliberately does not reuse plain Get (a second, divergent metadata read);
+	// it also forgoes Get's dangling-raw-file self-heal — a CAS caller instead
+	// gets a retryable error and re-reads.
+	var reader io.Reader
+	switch vm.ValueType {
+	case pb.ValueType_INLINE:
+		reader = bytes.NewReader(vm.Data)
+	case pb.ValueType_SEGMENT:
+		r, rerr := s.segmentManager.ReadEntry(key, vm.SegmentPath, vm.SegmentOffset, vm.ValueLength)
+		if rerr != nil {
+			return nil, 0, false, storageErrors.NewIORetryableError("GetWithVersion", key, rerr)
+		}
+		if r == nil {
+			return nil, 0, false, nil
+		}
+		reader = r
+	case pb.ValueType_RAW_FILE:
+		r, rerr := s.fileManager.Read(vm.RawFilePath, vm.ValueLength)
+		if rerr != nil {
+			if rerr == files.ErrFileLocked {
+				return nil, 0, false, storageErrors.NewLockError("GetWithVersion", key, rerr)
+			}
+			return nil, 0, false, storageErrors.NewIORetryableError("GetWithVersion", key, rerr)
+		}
+		if r == nil {
+			return nil, 0, false, nil
+		}
+		reader = r
+	default:
+		return nil, 0, false, storageErrors.NewCorruptionError("GetWithVersion", key, fmt.Errorf("unknown value type: %d", vm.ValueType))
 	}
 	return reader, version, true, nil
 }
@@ -166,6 +194,22 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 // 0 for absent or a tombstone, the effective version otherwise.
 func currentVersionOf(vm *pb.ValueMessage, found bool) uint64 {
 	if !found {
+		return 0
+	}
+	return merge.EffectiveRowVersion(vm)
+}
+
+// casCurrentVersion is currentVersionOf plus a clock check: a TTL-expired but
+// unswept row is logically absent (Get reports not-found), so it reports 0 —
+// letting put-if-absent (expected == 0) recreate over it, matching what
+// GetWithVersion returns for the same row. The merge operator is clock-blind, so
+// PutIfVersion additionally translates the operand's precondition to the row's
+// real stored version when it recreates over such a row (see PutIfVersion).
+func casCurrentVersion(vm *pb.ValueMessage, found bool) uint64 {
+	if !found {
+		return 0
+	}
+	if vm.Expiry > 0 && time.Now().Unix() >= vm.Expiry {
 		return 0
 	}
 	return merge.EffectiveRowVersion(vm)
@@ -195,11 +239,12 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	if err != nil {
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
-	// currentVersionOf reports 0 for an absent row AND for a tombstone, so a
-	// single check covers both put-if-absent (expected == 0, matching a missing
-	// or deleted key) and a guarded update (expected == a live version).
-	if currentVersionOf(prev, hasPrev) != expected {
-		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, currentVersionOf(prev, hasPrev))
+	// casCurrentVersion reports 0 for an absent row, a tombstone, AND a
+	// TTL-expired-but-unswept row, so a single check covers put-if-absent
+	// (expected == 0, matching any logically-absent key) and a guarded update
+	// (expected == a live version).
+	if casCurrentVersion(prev, hasPrev) != expected {
+		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, casCurrentVersion(prev, hasPrev))
 	}
 
 	// Read the body exactly as Put does: up to threshold+1 bytes decides
@@ -276,11 +321,22 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
-	if currentVersionOf(prev, hasPrev) != expected {
+	if casCurrentVersion(prev, hasPrev) != expected {
 		if spilledPath != "" {
 			s.stageRawFileDeletion(spilledPath)
 		}
-		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, currentVersionOf(prev, hasPrev))
+		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, casCurrentVersion(prev, hasPrev))
+	}
+
+	// Recreating over a TTL-expired-but-unswept row: casCurrentVersion reported
+	// it as absent (0), but the merge operator is clock-blind and sees the row's
+	// real stored version. Match that version so the operand is not dropped.
+	// (Tombstones need no translation — the operator already reads Expiry == 1 as
+	// absent, so expected == 0 matches them directly.)
+	if expected == 0 && hasPrev {
+		if realVer := merge.EffectiveRowVersion(prev); realVer != 0 {
+			operand.CasExpectedVersion = realVer
+		}
 	}
 
 	operandBytes, err := proto.Marshal(operand)
@@ -304,13 +360,16 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	// Read-your-writes tells us who won.
 	got, gotFound, err := s.readRowForCAS(metaKey)
 	if err != nil {
-		// The merge already committed but we cannot read the outcome. Our spill
-		// is unreferenced unless we won, and we cannot tell — reclaim it rather
-		// than orphan a (possibly 256 MB) file. If we did win, the value is lost
-		// and the caller must retry; that is the correct outcome to surface for
-		// an indeterminate read-back, and it never orphans.
+		// The merge already committed but we cannot read the outcome. We must NOT
+		// delete the spilled file here: if the CAS won, the committed row
+		// references it, and deleting it would leave a live row pointing at a
+		// missing file — silent data loss (worse than an orphan). If the CAS
+		// lost, the spill is orphaned instead; that is bounded and recoverable
+		// (the #156 orphan class), the correct trade for an indeterminate
+		// read-back. The caller retries and re-resolves.
 		if spilledPath != "" {
-			s.stageRawFileDeletion(spilledPath)
+			zlog.Warn().Str("key", key).Str("file", spilledPath).
+				Msg("storage.PutIfVersion: read-back failed after commit; leaving spill in place to avoid deleting a possibly-committed value")
 		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
@@ -438,8 +497,8 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	if err != nil {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
-	if currentVersionOf(prev, hasPrev) != expected {
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(prev, hasPrev))
+	if casCurrentVersion(prev, hasPrev) != expected {
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, casCurrentVersion(prev, hasPrev))
 	}
 
 	newStamp, err := s.nextVersion()
@@ -477,9 +536,13 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	case got.Version == newStamp:
 		// Won: our stamp is on the tombstone. Reclaim the replaced value's
 		// backing bytes now (the tombstone is ref-less, so the cleaner will not)
-		// and account for the freed bytes. A crash between the merge and this
-		// reclaim leaks the backing file — a rare, self-healing orphan (the #156
-		// class), the price of keeping compaction from resurrecting the row.
+		// and account for the freed bytes. Two bounded, self-healing residuals:
+		// a crash between the merge and this reclaim leaks the backing file (the
+		// #156 orphan class); and if compaction migrated prev in the microsecond
+		// between the pre-merge read and the merge, we reclaim the pre-migration
+		// location — a stale raw-file delete is a no-op, and the migrated
+		// segment's dead bytes are recovered by the walk-gated recompactor. Both
+		// are the price of the ref-less tombstone that stops resurrection.
 		if hasPrev {
 			s.reclaimReplacedValue(prev)
 			s.notifyDelete(prev.ValueLength)
@@ -488,6 +551,6 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 		return nil
 	default:
 		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, casCurrentVersion(got, gotFound))
 	}
 }

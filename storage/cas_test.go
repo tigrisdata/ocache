@@ -328,6 +328,46 @@ func TestCAS_DeleteReclaimsImmediately(t *testing.T) {
 		"the backing raw file must be queued for deletion immediately, not left to the sweep")
 }
 
+// TestCAS_RecreateOverTTLExpiredRow: a naturally TTL-expired (not tombstone)
+// but unswept row reads as absent from GetWithVersion, and put-if-absent
+// (expected == 0) recreates over it — even though the clock-blind merge operator
+// still sees the row's real stored version. PutIfVersion bridges the two by
+// translating the precondition. Regression for the "expired rows reject
+// put-if-absent" finding.
+func TestCAS_RecreateOverTTLExpiredRow(t *testing.T) {
+	s, cleanup := createCASTestStorage(t)
+	defer cleanup()
+
+	// Hand-write a clock-expired row: Expiry = 2 (>1 so NOT the tombstone
+	// sentinel, and in the past), with a real stored version.
+	expired, err := proto.Marshal(&pb.ValueMessage{
+		ValueType: pb.ValueType_INLINE, Data: []byte("stale"), ValueLength: 5,
+		Expiry: 2, Version: 12345,
+	})
+	require.NoError(t, err)
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("exp"), expired))
+
+	// Reads as absent, version 0 — the documented contract.
+	_, ver, found, err := s.GetWithVersion("exp")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Zero(t, ver)
+
+	// put-if-absent recreates over it (the fix: previously mismatched forever
+	// until the cleaner swept).
+	v2, err := s.PutIfVersion("exp", bytes.NewReader([]byte("fresh")), 0, 0)
+	require.NoError(t, err)
+	assert.Greater(t, v2, uint64(12345))
+
+	r, ver, found, err := s.GetWithVersion("exp")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, v2, ver)
+	assert.Equal(t, "fresh", readAllString(t, r))
+}
+
 // TestCAS_VersionsMonotonicAcrossRestart pins the durable-reservation
 // guarantee: even if the wall clock at next startup is far behind previously
 // issued stamps, no stamp is ever reused. Simulated by forcing the in-memory
