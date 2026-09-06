@@ -18,6 +18,7 @@ TEST_MIXED_TTL_AND_NON_TTL_KEYS=""
 TEST_CONCURRENT_TTL_OPERATIONS=""
 TEST_TTL_PRECISION_TEST=""
 TEST_TTL_WITH_DELETE_OPERATIONS=""
+TEST_CAS_RECREATE_AFTER_TTL=""
 
 # Start the server with TTL cleanup enabled
 echo "Starting OCache server with TTL cleanup:"
@@ -276,6 +277,24 @@ else
 fi
 
 echo
+echo "=== Test 9: CAS recreate after TTL expiry (via the cleaner) ==="
+echo "A CAS key that TTL-expires and is swept must read as absent (version 0)"
+echo "and be recreatable with put-if-absent."
+# Cleanup interval is 5s; use a 3s TTL and wait past a sweep.
+./ocachecli put-if-version "cas-ttl-key" "temporary" --expected 0 --ttl 3 >/dev/null 2>&1
+echo "Waiting for TTL expiry + cleaner sweep..."
+sleep 9
+cas_ttl_found=$(./ocachecli get-with-version "cas-ttl-key" 2>/dev/null | grep -oE 'found=(true|false)' | cut -d= -f2)
+cas_ttl_ver=$(./ocachecli get-with-version "cas-ttl-key" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+cas_ttl_out=$(./ocachecli put-if-version "cas-ttl-key" "reborn" --expected 0 2>/dev/null); cas_ttl_rc=$?
+cas_ttl_val=$(./ocachecli get "cas-ttl-key" 2>/dev/null)
+if [ "$cas_ttl_found" = "false" ] && [ "$cas_ttl_ver" = "0" ] && [ "$cas_ttl_rc" -eq 0 ] && [ "$cas_ttl_val" = "reborn" ]; then
+    pass_test "TEST_CAS_RECREATE_AFTER_TTL" "expired CAS key read absent and was recreated via put-if-absent"
+else
+    fail_test "TEST_CAS_RECREATE_AFTER_TTL" "expected absent/0 then recreate, got found=$cas_ttl_found ver=$cas_ttl_ver rc=$cas_ttl_rc val=$cas_ttl_val"
+fi
+
+echo
 echo "=== Test Results Summary ==="
 echo
 echo "Individual Test Results:"
@@ -289,6 +308,7 @@ print_test_result "Mixed TTL and Non-TTL Keys" "$TEST_MIXED_TTL_AND_NON_TTL_KEYS
 print_test_result "Concurrent TTL Operations" "$TEST_CONCURRENT_TTL_OPERATIONS"
 print_test_result "TTL Precision Test" "$TEST_TTL_PRECISION_TEST"
 print_test_result "TTL with Delete Operations" "$TEST_TTL_WITH_DELETE_OPERATIONS"
+print_test_result "CAS Recreate After TTL" "$TEST_CAS_RECREATE_AFTER_TTL"
 
 print_overall_result
 

@@ -16,6 +16,7 @@ TEST_MIXED_OPS_COUNT=""
 TEST_MIXED_OPS_VALUES=""
 TEST_READ_AFTER_WRITE=""
 TEST_CONCURRENT_DELETES=""
+TEST_CONCURRENT_CAS=""
 
 # Start the server
 echo "Starting OCache server..."
@@ -436,6 +437,37 @@ else
 fi
 
 echo
+echo "=== Test: Concurrent CAS — exactly one winner, consistent final state ==="
+echo "Many concurrent guarded updates against one key: exactly one must win each"
+echo "round, and the final value must be a winner's value."
+CAS_CONC_ERRORS=0
+./ocachecli put-if-version "conc-cas" "seed" --expected 0 >/dev/null 2>&1
+conc_ver=$(./ocachecli get-with-version "conc-cas" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+conc_dir=$(mktemp -d)
+conc_n=12
+for i in $(seq 1 $conc_n); do
+    (
+        ./ocachecli put-if-version "conc-cas" "val-$i" --expected "$conc_ver" >/dev/null 2>&1
+        echo "$?" > "$conc_dir/rc-$i"
+    ) &
+done
+wait
+conc_wins=0
+for i in $(seq 1 $conc_n); do
+    [ "$(cat "$conc_dir/rc-$i" 2>/dev/null)" = "0" ] && conc_wins=$((conc_wins+1))
+done
+rm -rf "$conc_dir"
+# The winning value must be readable and the version must have advanced exactly
+# once beyond the seed (only one writer succeeded).
+conc_final_ver=$(./ocachecli get-with-version "conc-cas" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+conc_final_val=$(./ocachecli get "conc-cas" 2>/dev/null)
+if [ "$conc_wins" -eq 1 ] && [ "$conc_final_ver" != "$conc_ver" ] && [[ "$conc_final_val" == val-* ]]; then
+    pass_test "TEST_CONCURRENT_CAS" "one of $conc_n concurrent CAS updates won; final value=$conc_final_val"
+else
+    fail_test "TEST_CONCURRENT_CAS" "expected 1 winner + advanced version, got wins=$conc_wins ver=$conc_ver->$conc_final_ver val=$conc_final_val"
+fi
+
+echo
 echo "=== Test Results Summary ==="
 echo
 echo "Individual Test Results:"
@@ -447,6 +479,7 @@ print_test_result "Mixed Operations - Key Count" "$TEST_MIXED_OPS_COUNT"
 print_test_result "Mixed Operations - Value Updates" "$TEST_MIXED_OPS_VALUES"
 print_test_result "Read-After-Write Consistency" "$TEST_READ_AFTER_WRITE"
 print_test_result "Concurrent Deletes" "$TEST_CONCURRENT_DELETES"
+print_test_result "Concurrent CAS Single Winner" "$TEST_CONCURRENT_CAS"
 
 print_overall_result
 

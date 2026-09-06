@@ -386,6 +386,7 @@ test-e2e: build build-cli
 	@$(MAKE) test-e2e-storage-layers
 	@$(MAKE) test-e2e-ttl
 	@$(MAKE) test-e2e-eviction
+	@$(MAKE) test-e2e-cas
 	@$(MAKE) test-e2e-compaction
 	@$(MAKE) test-e2e-recompaction
 	@$(MAKE) test-e2e-data-validation
@@ -410,6 +411,11 @@ test-e2e-ttl: build build-cli
 test-e2e-eviction: build build-cli
 	@echo "Running eviction E2E test (LRU + FIFO)..."
 	./tests/e2e/eviction_test.sh
+
+.PHONY: test-e2e-cas
+test-e2e-cas: build build-cli
+	@echo "Running CAS (conditional-ops) E2E test..."
+	./tests/e2e/cas_test.sh
 
 .PHONY: test-e2e-compaction
 test-e2e-compaction: build build-cli
