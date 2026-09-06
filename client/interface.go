@@ -35,6 +35,12 @@ type CacheClient interface {
 	GetWithVersion(ctx context.Context, key string) (data []byte, version uint64, found bool, err error)
 	PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (newVersion uint64, err error)
 	DeleteIfVersion(ctx context.Context, key string, expected uint64) error
+
+	// Streaming CAS for values larger than the unary message cap (issue #258).
+	// Same semantics as PutIfVersion/GetWithVersion; the value is streamed
+	// rather than buffered.
+	PutStreamIfVersion(ctx context.Context, key string, r io.Reader, ttlSeconds int64, expected uint64) (newVersion uint64, err error)
+	GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (version uint64, found bool, err error)
 	List(ctx context.Context, prefix string) ([]string, error)
 	ListPage(ctx context.Context, prefix string, limit int, continuationToken string) (keys []string, nextToken string, hasMore bool, err error)
 	ListPageWithValues(ctx context.Context, prefix string, limit int, continuationToken string) (entries []KeyValue, nextToken string, hasMore bool, err error)

@@ -550,3 +550,16 @@ func (c *Client) GetGRPCServer() *grpc.Server {
 
 // Compile-time check that Client implements CacheClient
 var _ cacheclient.CacheClient = (*Client)(nil)
+
+// PutStreamIfVersion is the streaming form of PutIfVersion for large objects
+// (issue #258): the value is streamed to storage without buffering.
+func (c *Client) PutStreamIfVersion(ctx context.Context, key string, r io.Reader, ttlSeconds int64, expected uint64) (uint64, error) {
+	v, err := c.ops.PutStreamIfVersion(ctx, key, r, int(ttlSeconds), expected)
+	return v, casClientError(key, err)
+}
+
+// GetStreamWithVersion is the streaming form of GetWithVersion: the value is
+// written to w without buffering, and its version/presence returned.
+func (c *Client) GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (uint64, bool, error) {
+	return c.ops.GetStreamWithVersion(ctx, key, w)
+}

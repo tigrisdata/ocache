@@ -448,3 +448,28 @@ func (m *MemoryCache) GetMode() ConnectionMode {
 func (m *MemoryCache) GetConnectedNodes() []string {
 	return []string{"memory"}
 }
+
+// PutStreamIfVersion buffers the stream and delegates to PutIfVersion (this test
+// double keeps everything in memory).
+func (m *MemoryCache) PutStreamIfVersion(ctx context.Context, key string, r io.Reader, ttlSeconds int64, expected uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	return m.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+}
+
+// GetStreamWithVersion writes the value to w and returns its version/presence.
+func (m *MemoryCache) GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (uint64, bool, error) {
+	data, version, found, err := m.GetWithVersion(ctx, key)
+	if err != nil || !found {
+		return version, found, err
+	}
+	if _, err := w.Write(data); err != nil {
+		return 0, false, err
+	}
+	return version, true, nil
+}

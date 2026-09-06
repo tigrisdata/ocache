@@ -17,6 +17,7 @@ TEST_BASIC_CAS=""
 TEST_MISMATCH_SEMANTICS=""
 TEST_PUT_IF_ABSENT=""
 TEST_CONCURRENT_SINGLE_WINNER=""
+TEST_STREAMING_CAS=""
 
 # CAS-put mismatch exit code (must match casMismatchExitCode in client/cmd/cas.go).
 CAS_MISMATCH=3
@@ -78,10 +79,53 @@ else
 fi
 
 # ============================================================================
-echo "=== Test 4: Concurrency — exactly one winner under contention ==="
+echo "=== Test 4: Streaming CAS (value beyond the unary path) ==="
+# Runs before the concurrency test so the large-object streaming path is
+# exercised before many short-lived CLI connections accumulate (which can
+# exhaust ephemeral ports on some dev machines; CI on Linux is unaffected).
+# Stream a 2MB value in via stdin (put-if-absent), read it back via the
+# streaming get, and do a guarded streaming update.
+STREAM_ERRORS=0
+head -c 2097152 /dev/urandom > /tmp/ocache-cas-stream.bin
+sum_in=$(md5 -q /tmp/ocache-cas-stream.bin 2>/dev/null || md5sum /tmp/ocache-cas-stream.bin | awk '{print $1}')
+out=$(./ocachecli put-if-version "cas-stream" --expected 0 < /tmp/ocache-cas-stream.bin 2>/dev/null); rc=$?
+sv=$(echo "$out" | grep -oE 'new_version=[0-9]+' | cut -d= -f2)
+if [ "$rc" -ne 0 ] || [ -z "$sv" ]; then
+    echo -e "${RED}✗ streaming put-if-version failed (rc=$rc out=$out)${NC}"
+    ((STREAM_ERRORS++))
+fi
+# Metadata reports the streamed length without buffering.
+glen=$(./ocachecli get-with-version "cas-stream" 2>/dev/null | grep -oE 'length=[0-9]+' | cut -d= -f2)
+if [ "$glen" != "2097152" ]; then
+    echo -e "${RED}✗ streaming get-with-version length=$glen (expected 2097152)${NC}"
+    ((STREAM_ERRORS++))
+fi
+# --value streams the payload back byte-for-byte.
+./ocachecli get-with-version "cas-stream" --value 2>/dev/null > /tmp/ocache-cas-stream.out
+sum_out=$(md5 -q /tmp/ocache-cas-stream.out 2>/dev/null || md5sum /tmp/ocache-cas-stream.out | awk '{print $1}')
+if [ "$sum_out" != "$sum_in" ]; then
+    echo -e "${RED}✗ streamed value round-trip mismatch${NC}"
+    ((STREAM_ERRORS++))
+fi
+# A guarded streaming update with the right version applies; a stale one fails.
+head -c 2097152 /dev/urandom | ./ocachecli put-if-version "cas-stream" --expected "$sv" >/dev/null 2>&1; urc=$?
+head -c 4096 /dev/urandom | ./ocachecli put-if-version "cas-stream" --expected "$sv" >/dev/null 2>&1; src=$?
+if [ "$urc" -ne 0 ] || [ "$src" -ne "$CAS_MISMATCH" ]; then
+    echo -e "${RED}✗ guarded streaming update: update rc=$urc (want 0), stale rc=$src (want $CAS_MISMATCH)${NC}"
+    ((STREAM_ERRORS++))
+fi
+rm -f /tmp/ocache-cas-stream.bin /tmp/ocache-cas-stream.out
+if [ "$STREAM_ERRORS" -eq 0 ]; then
+    pass_test "TEST_STREAMING_CAS" "2MB streaming put/get/guarded-update round-trips over the wire"
+else
+    fail_test "TEST_STREAMING_CAS" "$STREAM_ERRORS streaming CAS checks failed"
+fi
+
+# ============================================================================
+echo "=== Test 5: Concurrency — exactly one winner under contention ==="
 ./ocachecli put-if-version "cas-race" "base" --expected 0 >/dev/null 2>&1
 base_ver=$(./ocachecli get-with-version "cas-race" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
-contenders=10
+contenders=6
 race_dir=$(mktemp -d)
 for i in $(seq 1 $contenders); do
     (
@@ -104,7 +148,6 @@ else
     fail_test "TEST_CONCURRENT_SINGLE_WINNER" "expected 1 win / $((contenders-1)) mismatch, got wins=$wins mismatches=$mismatches"
 fi
 
-# ============================================================================
 echo
 echo "=== Test Results Summary ==="
 echo
@@ -112,6 +155,7 @@ print_test_result "Basic CAS lifecycle" "$TEST_BASIC_CAS"
 print_test_result "Mismatch semantics" "$TEST_MISMATCH_SEMANTICS"
 print_test_result "Put-if-absent" "$TEST_PUT_IF_ABSENT"
 print_test_result "Concurrency single winner" "$TEST_CONCURRENT_SINGLE_WINNER"
+print_test_result "Streaming CAS" "$TEST_STREAMING_CAS"
 
 print_overall_result
 

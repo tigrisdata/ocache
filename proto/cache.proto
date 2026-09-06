@@ -33,6 +33,13 @@ service CacheService {
   rpc GetObjectWithVersion (GetRequest) returns (GetWithVersionResponse);
   rpc PutObjectIfVersion (PutIfVersionRequest) returns (PutIfVersionResponse);
   rpc DeleteIfVersion (DeleteIfVersionRequest) returns (DeleteIfVersionResponse);
+
+  // Streaming variants for values larger than the unary message cap (issue
+  // #258). PutStreamIfVersion carries key/ttl/expected_version in the first
+  // message and value bytes in the rest (like Put). GetStreamWithVersion sends
+  // version+found in the first message and value bytes in the rest (like Get).
+  rpc PutStreamIfVersion (stream PutIfVersionRequest) returns (PutIfVersionResponse);
+  rpc GetStreamWithVersion (GetRequest) returns (stream GetWithVersionResponse);
   rpc List (ListRequest) returns (ListResponse) {
     option (google.api.http) = {
       get: "/v1/cache"
