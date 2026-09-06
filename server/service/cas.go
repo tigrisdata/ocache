@@ -160,10 +160,17 @@ func (s *CacheService) handleLocalPutStreamIfVersion(stream pb.CacheService_PutS
 		resCh <- casPutResult{version: v, err: err}
 	}()
 
-	// Pump the stream into the pipe. A write error means storage stopped reading
-	// (its result — mismatch or error — is authoritative and read below).
+	// Pump the stream into the pipe. On a recv/write failure, close the pipe
+	// WITH the error rather than cleanly: a plain Close is EOF to storage, which
+	// would commit the partial body as a complete value and advance the version.
+	// CloseWithError makes storage's copy fail so nothing is committed (this is
+	// what the plain streaming Put does too).
 	pumpErr := pumpStreamToPipe(stream, first, pw)
-	pw.Close()
+	if pumpErr != nil {
+		pw.CloseWithError(pumpErr)
+	} else {
+		pw.Close()
+	}
 	res := <-resCh
 
 	if res.err != nil {
@@ -173,13 +180,12 @@ func (s *CacheService) handleLocalPutStreamIfVersion(stream pb.CacheService_PutS
 		}
 		metrics.RPCRequests.WithLabelValues("PutStreamIfVersion", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "PutStreamIfVersion").Inc()
+		// An interrupted upload aborted the write (res.err is the copy failure);
+		// surface Aborted so the caller knows nothing was committed.
+		if pumpErr != nil {
+			return status.Error(codes.Aborted, pumpErr.Error())
+		}
 		return mapStorageErrorToGRPC(res.err)
-	}
-	// Storage succeeded; a late stream-recv error (client aborted after storage
-	// already committed) is still surfaced as a transport error.
-	if pumpErr != nil {
-		metrics.RPCRequests.WithLabelValues("PutStreamIfVersion", "error").Inc()
-		return status.Error(codes.Aborted, pumpErr.Error())
 	}
 	metrics.RPCRequests.WithLabelValues("PutStreamIfVersion", "success").Inc()
 	return stream.SendAndClose(&pb.PutIfVersionResponse{Success: true, NewVersion: res.version})
@@ -285,20 +291,29 @@ func (s *CacheService) forwardStreamingPutIfVersion(localStream pb.CacheService_
 	if err != nil {
 		return status.Error(codes.Unavailable, fmt.Sprintf("failed to connect to owner: %v", err))
 	}
-	if err := remote.Send(first); err != nil {
-		return err
+	// A Send to the owner returning io.EOF means it ended the RPC early —
+	// typically a mismatch it resolved before consuming the body. Stop
+	// forwarding and let CloseAndRecv retrieve the in-band outcome so it can be
+	// relayed to the caller, rather than returning the send error and hiding the
+	// mismatch.
+	sendErr := remote.Send(first)
+	if sendErr == nil {
+		for {
+			chunk, err := localStream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err // caller's upload failed — nothing to relay
+			}
+			if err := remote.Send(chunk); err != nil {
+				sendErr = err
+				break
+			}
+		}
 	}
-	for {
-		chunk, err := localStream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if err := remote.Send(chunk); err != nil {
-			return err
-		}
+	if sendErr != nil && sendErr != io.EOF {
+		return sendErr
 	}
 	resp, err := remote.CloseAndRecv()
 	if err != nil {

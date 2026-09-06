@@ -127,13 +127,18 @@ echo "=== Test 5: Concurrency — exactly one winner under contention ==="
 base_ver=$(./ocachecli get-with-version "cas-race" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
 contenders=6
 race_dir=$(mktemp -d)
+race_pids=()
 for i in $(seq 1 $contenders); do
     (
         ./ocachecli put-if-version "cas-race" "winner-$i" --expected "$base_ver" >/dev/null 2>&1
         echo "$?" > "$race_dir/rc-$i"
     ) &
+    race_pids+=($!)
 done
-wait
+# Wait only for the contenders by PID: a bare `wait` would also block on the
+# backgrounded server that start_server launched, which never exits (the other
+# concurrent e2e suites track PIDs for the same reason).
+wait "${race_pids[@]}"
 wins=0
 mismatches=0
 for i in $(seq 1 $contenders); do

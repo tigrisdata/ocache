@@ -110,23 +110,31 @@ func (o *Operations) putStreamIfVersionRemote(ctx context.Context, key string, r
 	if err != nil {
 		return 0, err
 	}
-	if err := stream.Send(&pb.PutIfVersionRequest{Key: key, TtlSeconds: int64(ttl), ExpectedVersion: expected}); err != nil {
-		return 0, err
-	}
-	buf := make([]byte, 1<<20)
-	for {
-		n, rerr := r.Read(buf)
-		if n > 0 {
-			if err := stream.Send(&pb.PutIfVersionRequest{Data: buf[:n]}); err != nil {
-				return 0, err
+	// A Send returning io.EOF means the owner ended the RPC early — typically a
+	// mismatch it resolved before consuming the body. Stop sending and let
+	// CloseAndRecv surface the in-band outcome instead of returning the send
+	// error, which would hide the mismatch the caller must retry against.
+	sendErr := stream.Send(&pb.PutIfVersionRequest{Key: key, TtlSeconds: int64(ttl), ExpectedVersion: expected})
+	if sendErr == nil {
+		buf := make([]byte, 1<<20)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				if err := stream.Send(&pb.PutIfVersionRequest{Data: buf[:n]}); err != nil {
+					sendErr = err
+					break
+				}
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return 0, rerr // local read failure — not a stream/server issue
 			}
 		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return 0, rerr
-		}
+	}
+	if sendErr != nil && sendErr != io.EOF {
+		return 0, sendErr
 	}
 	resp, err := stream.CloseAndRecv()
 	if err != nil {

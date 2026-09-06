@@ -140,21 +140,25 @@ func (c *ClusterClient) onEpochMismatch(clientEpoch, serverEpoch uint64) {
 	if serverEpoch == clientEpoch {
 		return
 	}
+	c.scheduleTopologyRefresh()
+}
 
-	// Rate limit: check if enough time has passed since last refresh
+// scheduleTopologyRefresh triggers at most one background topology refresh per
+// minRefreshInterval, so a burst of mismatches (or failed CAS writes) cannot
+// launch many concurrent refreshes. It is used both by the epoch-mismatch
+// handler and by the CAS write paths, which need the ring to heal for a
+// caller's retry but must not re-execute the (non-idempotent) write themselves.
+func (c *ClusterClient) scheduleTopologyRefresh() {
 	now := time.Now().UnixNano()
 	lastRefresh := c.lastRefresh.Load()
 	if now-lastRefresh < int64(minRefreshInterval) {
-		// Too soon since last refresh, skip
+		// Too soon since last refresh, skip.
 		return
 	}
-
-	// Try to claim the refresh slot using CAS to prevent concurrent refreshes
+	// Claim the refresh slot with CAS to prevent concurrent refreshes.
 	if !c.lastRefresh.CompareAndSwap(lastRefresh, now) {
-		// Another goroutine already claimed it, skip
 		return
 	}
-
 	go c.forceRefreshTopology(context.Background())
 }
 
@@ -377,6 +381,9 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 }
 
 // GetWithVersion reads a key's value and CAS version with routing-error retry.
+// A read is idempotent, so on a routing error we refresh topology and retry
+// once — the same treatment plain Get gets. A version mismatch is not a routing
+// error and never occurs on a read.
 func (c *ClusterClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
 	data, version, found, err := c.Operations.GetWithVersion(ctx, key)
 	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
@@ -385,29 +392,63 @@ func (c *ClusterClient) GetWithVersion(ctx context.Context, key string) ([]byte,
 	return data, version, found, err
 }
 
-// PutIfVersion conditionally writes with routing-error retry. Retrying on a
-// routing error is safe even for this non-idempotent op: a routing error means
-// the request never reached a node, so the CAS did not execute. A version
-// mismatch is not a routing error and is returned to the caller unchanged.
+// GetStreamWithVersion streams a value and its CAS version with routing-error
+// retry, mirroring plain GetStream: the read is idempotent, but a routing error
+// after partial output cannot be retried without corrupting w, so we retry only
+// when nothing has been written yet.
+func (c *ClusterClient) GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (uint64, bool, error) {
+	cw := &casCountingWriter{w: w}
+	version, found, err := c.Operations.GetStreamWithVersion(ctx, key, cw)
+	if isRoutingError(err) && cw.n == 0 && c.forceRefreshTopology(ctx) {
+		return c.Operations.GetStreamWithVersion(ctx, key, cw)
+	}
+	return version, found, err
+}
+
+// PutIfVersion conditionally writes. Unlike the plain Put it is NOT retried on a
+// routing error: a conditional write is not idempotent, and NotFound/Unavailable
+// can be returned after the merge committed but its read-back failed — re-running
+// would issue a fresh stamp against the now-committed value and report a false
+// mismatch. Instead we heal the ring in the background (so the caller's own
+// retry routes correctly) and return the error. A version mismatch is not a
+// routing error and is returned to the caller unchanged.
 func (c *ClusterClient) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
 	v, err := c.Operations.PutIfVersion(ctx, key, data, ttlSeconds, expected)
-	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
-		return c.Operations.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+	if isRoutingError(err) {
+		c.scheduleTopologyRefresh()
 	}
 	return v, err
 }
 
-// DeleteIfVersion conditionally deletes with routing-error retry (safe for the
-// same reason as PutIfVersion).
+// DeleteIfVersion conditionally deletes. Not retried on a routing error for the
+// same reason as PutIfVersion (non-idempotent write); the ring is healed in the
+// background for the caller's retry.
 func (c *ClusterClient) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
 	err := c.Operations.DeleteIfVersion(ctx, key, expected)
-	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
-		return c.Operations.DeleteIfVersion(ctx, key, expected)
+	if isRoutingError(err) {
+		c.scheduleTopologyRefresh()
 	}
 	return err
 }
 
-// PutStream, List, ListPage and ListPageWithValues are inherited from Operations
+// PutStreamIfVersion is inherited from Operations with no retry override — a
+// streamed conditional write is neither idempotent nor replayable, exactly like
+// the plain PutStream. PutStream, List, ListPage and ListPageWithValues are
+// likewise inherited from Operations.
+
+// casCountingWriter counts bytes forwarded to the wrapped writer so a streaming
+// CAS read can tell whether any output has been emitted (and thus whether a
+// routing-error retry is still safe).
+type casCountingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *casCountingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
 
 // Close closes all connections and stops background goroutines
 func (c *ClusterClient) Close() error {

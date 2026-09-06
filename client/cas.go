@@ -127,24 +127,32 @@ func (o *Operations) PutStreamIfVersion(ctx context.Context, key string, r io.Re
 	if err != nil {
 		return 0, err
 	}
-	// First message carries key/ttl/expected; subsequent messages carry data.
-	if err := stream.Send(&pb.PutIfVersionRequest{Key: key, TtlSeconds: ttlSeconds, ExpectedVersion: expected}); err != nil {
-		return 0, err
-	}
-	buf := make([]byte, casStreamChunk)
-	for {
-		n, rerr := r.Read(buf)
-		if n > 0 {
-			if err := stream.Send(&pb.PutIfVersionRequest{Data: buf[:n]}); err != nil {
-				return 0, err
+	// Send key/ttl/expected first, then data chunks. A Send returning io.EOF
+	// means the server ended the RPC early — typically a mismatch it resolved
+	// before consuming the whole body — so stop sending and let CloseAndRecv
+	// surface the in-band outcome instead of returning the send error (which
+	// would hide the mismatch the caller needs to retry against).
+	sendErr := stream.Send(&pb.PutIfVersionRequest{Key: key, TtlSeconds: ttlSeconds, ExpectedVersion: expected})
+	if sendErr == nil {
+		buf := make([]byte, casStreamChunk)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				if err := stream.Send(&pb.PutIfVersionRequest{Data: buf[:n]}); err != nil {
+					sendErr = err
+					break
+				}
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return 0, rerr // local read failure — not a stream/server issue
 			}
 		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return 0, rerr
-		}
+	}
+	if sendErr != nil && sendErr != io.EOF {
+		return 0, sendErr
 	}
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
