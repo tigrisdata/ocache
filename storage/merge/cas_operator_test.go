@@ -115,7 +115,11 @@ func TestMergeCAS_LegacyBaseMatchesVersionLegacy(t *testing.T) {
 	assert.Equal(t, []byte("legacy"), mustUnmarshal(t, out).Data)
 }
 
-func TestMergeCAS_DeleteTombstonesWithFileRefsAndNewStamp(t *testing.T) {
+// TestMergeCAS_DeleteEmitsRefLessTombstone: a matched CAS_DELETE drops the
+// base's backing references (so an in-flight compactor path-CAS cannot
+// resurrect it) and reads as absent, while retaining the operand's raw stamp so
+// the deleter's read-back can confirm its win.
+func TestMergeCAS_DeleteEmitsRefLessTombstone(t *testing.T) {
 	op := NewMultiplexOperator()
 	base := mustMarshal(t, &pb.ValueMessage{
 		ValueType:   pb.ValueType_RAW_FILE,
@@ -128,10 +132,12 @@ func TestMergeCAS_DeleteTombstonesWithFileRefsAndNewStamp(t *testing.T) {
 	require.True(t, ok)
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, int64(1), got.Expiry, "CAS delete must tombstone via the expired sentinel")
-	assert.Equal(t, "/disk/files/abc.dat", got.RawFilePath, "file refs must survive for the cleaner's reclamation")
-	assert.Equal(t, int64(1<<20), got.ValueLength)
-	assert.Equal(t, uint64(200), got.Version, "tombstone keeps a definite CAS token until swept")
-	assert.Empty(t, got.Data)
+	assert.Empty(t, got.RawFilePath, "tombstone must be ref-less (no resurrection via path-CAS)")
+	assert.Empty(t, got.SegmentPath)
+	assert.Zero(t, got.ValueLength)
+	assert.Equal(t, pb.ValueType_INLINE, got.ValueType)
+	assert.Equal(t, uint64(200), got.Version, "raw stamp retained for the deleter's read-back")
+	assert.Zero(t, EffectiveRowVersion(got), "a tombstone reads as absent")
 
 	// Mismatch leaves the base untouched.
 	out, ok = op.FullMerge(casMetaKey, base, [][]byte{casDeleteOperand(t, 999, 200)})
@@ -139,24 +145,24 @@ func TestMergeCAS_DeleteTombstonesWithFileRefsAndNewStamp(t *testing.T) {
 	assert.Zero(t, mustUnmarshal(t, out).Expiry)
 }
 
-// TestMergeCAS_ExpiredBaseStillMatchesByVersion encodes the row-state (not
-// visibility) rule: an expired-but-unswept row has a definite version and a
-// CAS against that token succeeds — the operator is deterministic and cannot
-// consult the clock.
-func TestMergeCAS_ExpiredBaseStillMatchesByVersion(t *testing.T) {
+// TestMergeCAS_RecreateOverTombstoneViaPutIfAbsent: a tombstone reads as absent,
+// so only put-if-absent (expected == 0) recreates over it — a pre-delete token
+// (the tombstone's own stamp) must NOT match.
+func TestMergeCAS_RecreateOverTombstoneViaPutIfAbsent(t *testing.T) {
 	op := NewMultiplexOperator()
-	base := mustMarshal(t, &pb.ValueMessage{ValueType: pb.ValueType_INLINE, Expiry: 1, Version: 100})
+	tombstone := mustMarshal(t, &pb.ValueMessage{Expiry: 1, Version: 100})
 
-	out, ok := op.FullMerge(casMetaKey, base, [][]byte{casPutOperand(t, 100, 200, "recreated")})
+	// A stale token (the tombstone's stamp, or any prior generation) does NOT match.
+	out, ok := op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 100, 300, "stale")})
+	require.True(t, ok)
+	assert.Equal(t, int64(1), mustUnmarshal(t, out).Expiry, "stale token must not recreate over a tombstone")
+
+	// put-if-absent recreates.
+	out, ok = op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 0, 200, "recreated")})
 	require.True(t, ok)
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, []byte("recreated"), got.Data)
 	assert.Equal(t, uint64(200), got.Version)
-
-	// expected == 0 does not match a tombstoned row: it still has state.
-	out, ok = op.FullMerge(casMetaKey, base, [][]byte{casPutOperand(t, 0, 300, "wrong")})
-	require.True(t, ok)
-	assert.Equal(t, uint64(100), mustUnmarshal(t, out).Version)
 }
 
 // TestMergeCAS_Determinism asserts read-time and compaction-time resolution
@@ -168,9 +174,9 @@ func TestMergeCAS_Determinism(t *testing.T) {
 	operands := [][]byte{
 		casPutOperand(t, 100, 200, "v1"),  // wins
 		casPutOperand(t, 100, 300, "v2"),  // loses (version moved on)
-		casDeleteOperand(t, 200, 400),     // wins against v1's stamp
-		casPutOperand(t, 400, 500, "v3"),  // wins: recreate over the tombstone token
-		casPutOperand(t, 0, 600, "never"), // loses: row has state
+		casDeleteOperand(t, 200, 400),     // wins against v1's stamp -> ref-less tombstone
+		casPutOperand(t, 0, 500, "v3"),    // wins: put-if-absent recreates over the tombstone
+		casPutOperand(t, 0, 600, "never"), // loses: row is live again
 	}
 
 	allAtOnce, ok := op.FullMerge(casMetaKey, base, operands)
@@ -188,6 +194,42 @@ func TestMergeCAS_Determinism(t *testing.T) {
 	final := mustUnmarshal(t, allAtOnce)
 	assert.Equal(t, []byte("v3"), final.Data)
 	assert.Equal(t, uint64(500), final.Version)
+}
+
+// TestMergeCAS_TombstoneNotResurrectedByMigration is the regression for the
+// resurrection bug: an in-flight compactor migration operand (SEGMENT-typed,
+// RawFilePath overloaded as the precondition it read before the delete) must
+// NOT revive a CAS-deleted key. The ref-less tombstone has no ValueType/path,
+// so the path-CAS precondition can no longer match it.
+func TestMergeCAS_TombstoneNotResurrectedByMigration(t *testing.T) {
+	op := NewMultiplexOperator()
+	base := mustMarshal(t, &pb.ValueMessage{
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: "/disk/files/abc.dat",
+		ValueLength: 4096,
+		Version:     100,
+	})
+
+	// A client's CAS delete wins, leaving a ref-less tombstone.
+	tomb, ok := op.FullMerge(casMetaKey, base, [][]byte{casDeleteOperand(t, 100, 200)})
+	require.True(t, ok)
+
+	// The compactor (which read the raw file before the delete) now lands its
+	// migration operand. Pre-fix this matched the tombstone via rawMatch and
+	// resurrected the row as a live SEGMENT value.
+	migration := mustMarshal(t, &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		RawFilePath:   "/disk/files/abc.dat", // precondition
+		SegmentPath:   "/disk/segments/seg_1.seg",
+		SegmentOffset: 64,
+		ValueLength:   4096,
+	})
+	out, ok := op.FullMerge(casMetaKey, tomb, [][]byte{migration})
+	require.True(t, ok)
+	got := mustUnmarshal(t, out)
+	assert.Equal(t, int64(1), got.Expiry, "tombstone must survive the migration operand")
+	assert.NotEqual(t, pb.ValueType_SEGMENT, got.ValueType, "deleted key must not be resurrected as a live segment row")
+	assert.Zero(t, EffectiveRowVersion(got), "row stays absent")
 }
 
 // TestMergeCAS_CompactionMigrationPreservesVersion pins the invariant that
@@ -224,9 +266,9 @@ func TestMergeCAS_CompactionMigrationPreservesVersion(t *testing.T) {
 }
 
 // TestMergeCAS_DeleteOnAbsentRowStampsSentinel: a CAS_DELETE whose base vanished
-// (an independent delete raced ahead) must emit the sentinel stamped with the
+// (an independent delete raced ahead) emits a tombstone stamped with the
 // operand's version, so the deleter's read-back sees its own stamp and reports
-// success — not a mismatch against a phantom legacy row.
+// success. The tombstone still reads as absent, so put-if-absent recreates.
 func TestMergeCAS_DeleteOnAbsentRowStampsSentinel(t *testing.T) {
 	op := NewMultiplexOperator()
 
@@ -234,11 +276,11 @@ func TestMergeCAS_DeleteOnAbsentRowStampsSentinel(t *testing.T) {
 	require.True(t, ok)
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, int64(1), got.Expiry)
-	assert.Equal(t, uint64(200), got.Version, "no-base delete sentinel must carry the operand's stamp")
+	assert.Equal(t, uint64(200), got.Version, "no-base delete sentinel carries the operand's stamp for read-back")
+	assert.Zero(t, EffectiveRowVersion(got), "but reads as absent")
 
-	// And it participates in subsequent resolution deterministically: a CAS_PUT
-	// against the tombstone's token recreates.
-	out2, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 200, 300, "recreated")})
+	// put-if-absent recreates over it; the stale stamp would not.
+	out2, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 0, 300, "recreated")})
 	require.True(t, ok)
 	assert.Equal(t, uint64(300), mustUnmarshal(t, out2).Version)
 }

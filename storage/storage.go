@@ -292,8 +292,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		PruneAge:        DeletePruneAge,
 		RetryDelay:      DeleteRetryDelay,
 	})
-	deletionQueue.Start()
-
 	// Configure compactor with recompaction if enabled
 	compactorConfig := &compaction.CompactorConfig{
 		MetaDB:            meta,
@@ -335,7 +333,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	compactor := compaction.NewCompactorWithConfig(compactorConfig)
-	compactor.Start()
 
 	s := &Storage{
 		meta:             meta,
@@ -361,10 +358,17 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	// Restore the CAS stamp source's durable reservation so versions stay
 	// monotonic across restarts even under a backward clock step: every stamp
 	// ever issued is below the persisted high-water mark (see nextVersion).
+	// Done BEFORE any background goroutine starts, so a failed load returns a
+	// clean init error rather than leaking the compactor/deletion-queue threads
+	// against a Storage the caller believes never constructed.
 	if err := s.loadVersionReservation(); err != nil {
 		zlog.Error().Err(err).Msg("storage: failed to load version reservation")
 		return nil, storageErrors.NewInternalError("Init", err)
 	}
+
+	// All construction that can fail is done; now start the background workers.
+	deletionQueue.Start()
+	compactor.Start()
 
 	// The cleaner's initial pass recomputes size and, when a cap is set, backfills
 	// eviction-index coverage for keys written uncapped or under a prior policy so
@@ -901,14 +905,13 @@ func (s *Storage) getWithVersion(key string, start, end int64) (io.Reader, uint6
 	zlog.Debug().Str("key", key).Msg("storage.Get: decoded proto ValueMessage")
 	if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
 		zlog.Debug().Str("key", key).Msg("storage.Get: key has expired, returning not found")
-		// Don't delete the key here - let the background cleaner handle it
-		// This avoids race conditions with the cleaner.
-		//
-		// The version is still returned: CAS tokens track row STATE, not
-		// visibility (the merge operator is deterministic and cannot consult
-		// the clock), so recreating over an expired-but-unswept row requires
-		// this token rather than expected==0.
-		return nil, merge.EffectiveVersion(valueMsg.Version), false, nil
+		// Don't delete the key here - let the background cleaner handle it.
+		// An expired row reads as absent (version 0), not as a recreate token:
+		// CAS is self-contained and does not coordinate with the cleaner's
+		// unconditional sweep, so recreating over an expired/deleted key is
+		// put-if-absent (expected == 0), best-effort like a plain Put — see
+		// DeleteIfVersion and PutIfVersion.
+		return nil, 0, false, nil
 	}
 
 	// Refresh access time for LRU tracking. The updater is only present when
@@ -936,7 +939,7 @@ func (s *Storage) getWithVersion(key string, start, end int64) (io.Reader, uint6
 		} else {
 			// Row is live but the backing read produced nothing; hand out the
 			// row's token so a caller may CAS-replace the unreadable entry.
-			return nil, merge.EffectiveVersion(valueMsg.Version), false, nil
+			return nil, 0, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
 		r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
@@ -978,7 +981,7 @@ func (s *Storage) getWithVersion(key string, start, end int64) (io.Reader, uint6
 		} else {
 			// Row is live but the backing read produced nothing; hand out the
 			// row's token so a caller may CAS-replace the unreadable entry.
-			return nil, merge.EffectiveVersion(valueMsg.Version), false, nil
+			return nil, 0, false, nil
 		}
 	default:
 		zlog.Error().Str("key", key).Int("value_type", int(valueMsg.ValueType)).Msg("storage.Get: unknown value type - corruption detected")
@@ -995,7 +998,7 @@ func (s *Storage) getWithVersion(key string, start, end int64) (io.Reader, uint6
 		reader = s.applyByteRange(reader, start, end)
 	}
 
-	return reader, merge.EffectiveVersion(valueMsg.Version), true, nil
+	return reader, merge.EffectiveRowVersion(valueMsg), true, nil
 }
 
 // applyByteRange wraps the reader to support byte-range requests
@@ -1202,6 +1205,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 
 		version, verr := s.nextVersion()
 		if verr != nil {
+			// The body already spilled to filePath; a bare return here would
+			// orphan it (no row references it, nothing stages its deletion) —
+			// the #156 leak class, worst for the large-object workload. Reclaim
+			// it before surfacing the error.
+			s.stageRawFileDeletion(filePath)
 			zlog.Error().Err(verr).Str("key", key).Msg("storage.Put: failed to reserve version stamp")
 			return storageErrors.NewInternalError("Put", verr)
 		}

@@ -136,7 +136,8 @@ func TestCAS_DeleteIfVersion_TokenModelAndRecreate(t *testing.T) {
 	require.True(t, ok)
 	require.NoError(t, s.DeleteIfVersion("k", v1))
 
-	// Get sees a miss; GetWithVersion hands out the tombstone's recreate token.
+	// A deleted key reads as absent from both Get and GetWithVersion — CAS is
+	// self-contained, so the tombstone does not hand out a recreate token.
 	_, found, err := s.Get("k", 0, 0)
 	require.NoError(t, err)
 	assert.False(t, found)
@@ -144,18 +145,17 @@ func TestCAS_DeleteIfVersion_TokenModelAndRecreate(t *testing.T) {
 	_, tombVer, found, err := s.GetWithVersion("k")
 	require.NoError(t, err)
 	assert.False(t, found)
-	require.NotZero(t, tombVer, "an unswept tombstone must expose its CAS token")
-	assert.Greater(t, tombVer, v1)
+	assert.Zero(t, tombVer, "a deleted key reads as absent (version 0), not a recreate token")
 
-	// expected == 0 must NOT recreate over the tombstone (row has state)...
-	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("wrong")), 0, 0)
+	// A stale token must NOT recreate over the tombstone...
+	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("wrong")), 0, v1)
 	_, ok = storageErrors.IsVersionMismatch(err)
 	require.True(t, ok)
 
-	// ...but the tombstone token does.
-	v3, err := s.PutIfVersion("k", bytes.NewReader([]byte("reborn")), 0, tombVer)
+	// ...put-if-absent does.
+	v3, err := s.PutIfVersion("k", bytes.NewReader([]byte("reborn")), 0, 0)
 	require.NoError(t, err)
-	assert.Greater(t, v3, tombVer, "recreated keys always get a strictly higher version")
+	assert.Greater(t, v3, v1, "recreated keys always get a strictly higher version")
 
 	r, ver, found, err := s.GetWithVersion("k")
 	require.NoError(t, err)
@@ -276,38 +276,56 @@ func TestCAS_OverwriteAccountingStaysExact(t *testing.T) {
 	assert.Equal(t, int64(300), s.cleaner.totalSize.Load())
 }
 
-func TestCAS_ExpiredRowExposesRecreateToken(t *testing.T) {
+// TestCAS_TombstoneReadsAsAbsentAndRecreatesViaPutIfAbsent: a CAS-delete
+// tombstone (Expiry==1 sentinel) reads as absent from GetWithVersion, and
+// put-if-absent recreates over it. (Genuine TTL-expired rows behave the same
+// through the read path's clock check.)
+func TestCAS_TombstoneReadsAsAbsentAndRecreatesViaPutIfAbsent(t *testing.T) {
 	s, cleanup := createCASTestStorage(t)
 	defer cleanup()
 
-	// Hand-write an expired row with a definite version, as TTL expiry leaves
-	// behind until the cleaner sweeps.
-	expired, err := proto.Marshal(&pb.ValueMessage{
-		ValueType: pb.ValueType_INLINE, Data: []byte("gone"), ValueLength: 4,
-		Expiry: 1, Version: 12345,
-	})
+	// Hand-write a ref-less tombstone as a won CAS delete leaves behind.
+	tomb, err := proto.Marshal(&pb.ValueMessage{Expiry: 1, Version: 12345})
 	require.NoError(t, err)
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("exp"), expired))
+	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("exp"), tomb))
 
 	_, ver, found, err := s.GetWithVersion("exp")
 	require.NoError(t, err)
-	assert.False(t, found, "expired row reads as absent")
-	assert.Equal(t, uint64(12345), ver, "but exposes its row-state token")
+	assert.False(t, found, "a tombstone reads as absent")
+	assert.Zero(t, ver, "and exposes no recreate token")
 
-	_, err = s.PutIfVersion("exp", bytes.NewReader([]byte("fresh")), 0, 0)
-	_, ok := storageErrors.IsVersionMismatch(err)
-	require.True(t, ok, "expected==0 must not match an unswept row")
-
-	v2, err := s.PutIfVersion("exp", bytes.NewReader([]byte("fresh")), 0, 12345)
+	// put-if-absent recreates over it.
+	v2, err := s.PutIfVersion("exp", bytes.NewReader([]byte("fresh")), 0, 0)
 	require.NoError(t, err)
-	assert.Greater(t, v2, uint64(12345))
+	assert.Greater(t, v2, uint64(12345), "recreated key gets a strictly higher stamp")
 
 	r, _, found, err := s.GetWithVersion("exp")
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "fresh", readAllString(t, r))
+}
+
+// TestCAS_DeleteReclaimsImmediately: a won DeleteIfVersion frees the backing
+// bytes and size accounting right away (not one cleanup interval later), since
+// the ref-less tombstone leaves nothing for the cleaner to reclaim.
+func TestCAS_DeleteReclaimsImmediately(t *testing.T) {
+	s, cleanup := createCASTestStorage(t)
+	defer cleanup()
+
+	big := bytes.Repeat([]byte("z"), 2048) // > inlineThreshold -> raw file
+	v1, err := s.PutIfVersion("big", bytes.NewReader(big), 0, 0)
+	require.NoError(t, err)
+	require.Equal(t, int64(len(big)), s.cleaner.totalSize.Load())
+
+	depthBefore := s.deletionQueue.GetQueueDepth()
+	require.NoError(t, s.DeleteIfVersion("big", v1))
+
+	assert.Zero(t, s.cleaner.totalSize.Load(),
+		"a won CAS delete must decrement size immediately")
+	assert.Greater(t, s.deletionQueue.GetQueueDepth(), depthBefore,
+		"the backing raw file must be queued for deletion immediately, not left to the sweep")
 }
 
 // TestCAS_VersionsMonotonicAcrossRestart pins the durable-reservation

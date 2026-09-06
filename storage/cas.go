@@ -31,10 +31,14 @@ import (
 // The outcome is learned by reading the row back (read-your-writes): the winner
 // sees its own stamp, a loser sees whoever beat it.
 //
-// Version semantics track ROW STATE, not visibility (the operator cannot
-// consult the clock): an expired-but-unswept row keeps a definite version and
-// recreating over it requires that token; expected == 0 matches only a truly
-// absent row. Legacy (pre-versioning) rows match merge.VersionLegacy.
+// CAS is self-contained: it does not coordinate with the TTL cleaner's
+// unconditional sweep. An expired or deleted (tombstoned) row reads as absent
+// (version 0), so recreating over it is put-if-absent (expected == 0) — a
+// best-effort operation with the same cleaner-race semantics as a plain Put,
+// never an atomic recreate guarantee. Live legacy (pre-versioning) rows match
+// merge.VersionLegacy. A CAS_DELETE reclaims the replaced value's backing bytes
+// on its confirmed win, since the ref-less tombstone it leaves carries no
+// references for the cleaner to act on.
 
 // versionReservationBlock is how far past the current stamp each durable
 // reservation extends — one minute of nanosecond stamps. Reservations are
@@ -129,13 +133,13 @@ func (s *Storage) readRowForCAS(metaKey []byte) (*pb.ValueMessage, bool, error) 
 	return vm, true, nil
 }
 
-// currentVersionOf maps a read row to the version the API reports: 0 for
-// absent, merge.EffectiveVersion otherwise.
+// currentVersionOf maps a read row to the version the CAS match rule reports:
+// 0 for absent or a tombstone, the effective version otherwise.
 func currentVersionOf(vm *pb.ValueMessage, found bool) uint64 {
 	if !found {
 		return 0
 	}
-	return merge.EffectiveVersion(vm.Version)
+	return merge.EffectiveRowVersion(vm)
 }
 
 // PutIfVersion writes the value only if the key's current version equals
@@ -162,10 +166,10 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	if err != nil {
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
-	if currentVersionOf(prev, hasPrev) != expected && expected != 0 {
-		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, currentVersionOf(prev, hasPrev))
-	}
-	if expected == 0 && hasPrev {
+	// currentVersionOf reports 0 for an absent row AND for a tombstone, so a
+	// single check covers both put-if-absent (expected == 0, matching a missing
+	// or deleted key) and a guarded update (expected == a live version).
+	if currentVersionOf(prev, hasPrev) != expected {
 		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, currentVersionOf(prev, hasPrev))
 	}
 
@@ -271,33 +275,25 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	// Read-your-writes tells us who won.
 	got, gotFound, err := s.readRowForCAS(metaKey)
 	if err != nil {
+		// The merge already committed but we cannot read the outcome. Our spill
+		// is unreferenced unless we won, and we cannot tell — reclaim it rather
+		// than orphan a (possibly 256 MB) file. If we did win, the value is lost
+		// and the caller must retry; that is the correct outcome to surface for
+		// an indeterminate read-back, and it never orphans.
+		if spilledPath != "" {
+			s.stageRawFileDeletion(spilledPath)
+		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
 	if !gotFound || got.Version != newStamp {
-		// Not our stamp. Two distinguishable cases:
-		//
-		//  - Pure loss: the row still holds exactly the version we expected —
-		//    our operand was dropped and the base is untouched. Reclaim only
-		//    our spill.
-		//
-		//  - Superseded/ambiguous: the row moved past both us and our
-		//    expectation. Either we lost and the true winner already reclaimed
-		//    prev, or we WON and were immediately overwritten — in which case
-		//    the overwriter reclaimed OUR value and nobody reclaimed prev.
-		//    The two are indistinguishable from the row alone, so reclaim
-		//    prev's backing bytes here as well: if the winner already did, a
-		//    duplicate raw-file queue entry is a benign no-op and a duplicate
-		//    segment credit only advances recompaction eligibility (the walk
-		//    validates liveness before touching anything). The size counter is
-		//    left to the hourly reconcile, which recomputes from live rows.
-		//
-		// Either way the caller gets a mismatch, which is truthful in the
-		// linearized history: at read-back, the caller's value is not the
-		// current value.
-		pureLoss := gotFound && merge.EffectiveVersion(got.Version) == expected
-		if !pureLoss && hasPrev {
-			s.reclaimReplacedValue(prev)
-		}
+		// We did not win. Reclaim only our own spill — never prev. Attributing
+		// prev's reclamation to a loser is unsound under contention: N losers
+		// would each credit the same replaced segment N times (a delete-index
+		// counter, not an idempotent flag), inflating dead-byte accounting and
+		// triggering premature recompaction. prev belongs to whoever actually
+		// replaced it (the winner, in finishWonCASPut) or, in the rare
+		// won-then-immediately-overwritten case, to the walk-gated recompactor
+		// (segment dead space) and the hourly size reconcile.
 		if spilledPath != "" {
 			s.stageRawFileDeletion(spilledPath)
 		}
@@ -389,10 +385,13 @@ func (s *Storage) finishWonCASPut(key string, metaKey []byte, newVM *pb.ValueMes
 }
 
 // DeleteIfVersion deletes the key only if its current version equals expected.
-// The delete lands as an already-expired tombstone (the merge operator's
-// sentinel convention) carrying the value's backing references; the TTL
-// cleaner reclaims the row, its backing bytes, and its eviction-index entries
-// on its next sweep — exactly as it does for naturally expired rows.
+// The delete lands as a REF-LESS already-expired tombstone (the merge operator
+// drops the backing references so an in-flight compaction operand cannot
+// resurrect it). Because the tombstone carries no references, this method
+// reclaims the replaced value's backing bytes itself on a confirmed win — the
+// cleaner only removes the tiny leftover row on its next sweep. This frees the
+// (potentially 256 MB) backing file immediately rather than one cleanup
+// interval later.
 func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	start := time.Now()
 	defer func() {
@@ -401,16 +400,17 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 
 	metaKey := keys.MakeMetadataKey(key)
 
-	// Fast-fail: sound for the same reason as PutIfVersion (stamps are unique).
+	// Refresh immediately before the merge: this is both the fast-fail check and
+	// the source of the reclaim target. Reading here (rather than earlier)
+	// narrows the window in which a compaction could migrate the row between our
+	// read and the merge to microseconds; the ref-less tombstone means we, not
+	// the cleaner, must reclaim what this prev references.
 	prev, hasPrev, err := s.readRowForCAS(metaKey)
 	if err != nil {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
-	if !hasPrev {
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
-	}
-	if merge.EffectiveVersion(prev.Version) != expected {
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, merge.EffectiveVersion(prev.Version))
+	if currentVersionOf(prev, hasPrev) != expected {
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(prev, hasPrev))
 	}
 
 	newStamp, err := s.nextVersion()
@@ -440,17 +440,21 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	switch {
 	case !gotFound:
 		// The row is gone entirely: either our tombstone was already swept, or
-		// an independent delete removed the key in the read-back window. The
-		// two are indistinguishable from the row alone; in the second case our
-		// precondition may never have applied, but the end state — key absent —
-		// satisfies the delete intent, so this is deliberately reported as
-		// success rather than a mismatch the caller could do nothing with.
+		// an independent delete removed the key in the read-back window. Both
+		// satisfy the delete intent (key absent), reported as success. Backing
+		// bytes were reclaimed by whoever removed the row.
 		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "success").Inc()
 		return nil
 	case got.Version == newStamp:
-		// Won: the tombstone carries our stamp. Size accounting and backing-file
-		// reclamation are deliberately left to the TTL cleaner's sweep of the
-		// expired row — decrementing here too would double-count.
+		// Won: our stamp is on the tombstone. Reclaim the replaced value's
+		// backing bytes now (the tombstone is ref-less, so the cleaner will not)
+		// and account for the freed bytes. A crash between the merge and this
+		// reclaim leaks the backing file — a rare, self-healing orphan (the #156
+		// class), the price of keeping compaction from resurrecting the row.
+		if hasPrev {
+			s.reclaimReplacedValue(prev)
+			s.notifyDelete(prev.ValueLength)
+		}
 		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "success").Inc()
 		return nil
 	default:
