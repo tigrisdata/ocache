@@ -17,16 +17,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/keys"
 	"github.com/tigrisdata/ocache/storage/metadata"
-	pb "github.com/tigrisdata/ocache/storage/proto"
-	"google.golang.org/protobuf/proto"
 )
-
-// conditionalTag marks a deletion-queue entry whose file must be deleted only if
-// no metadata row still references it. The tag byte is followed by the owning
-// user key so the worker can do a cheap forward lookup before deleting. Plain
-// (unconditional) entries use the legacy single-byte value {0x01} and are
-// deleted on sight, exactly as before.
-const conditionalTag = 0x02
 
 // Config holds configuration for the deletion queue
 type Config struct {
@@ -114,34 +105,6 @@ func (q *Queue) Add(filepath string) error {
 	return nil
 }
 
-// AddIfUnreferenced enqueues filepath for deletion but, unlike Add, defers the
-// delete-or-keep decision to the worker: the file is removed only if userKey's
-// metadata row does not (still) reference it. It is for callers that cannot yet
-// tell whether the file is live — notably a CAS spill whose win/lose outcome
-// could not be read back after the merge committed (issue #254). Staging it
-// here makes the outcome durable and self-resolving (the worker retries until
-// the DB reads cleanly): if the CAS won, the row references the file and it is
-// kept; if it lost, the orphan is deleted — instead of leaking permanently
-// (issue #156).
-func (q *Queue) AddIfUnreferenced(filepath, userKey string) error {
-	if filepath == "" || userKey == "" {
-		return fmt.Errorf("empty filepath or key")
-	}
-
-	key := keys.MakeDeletionQueueKey(time.Now().UnixNano(), filepath)
-	val := append([]byte{conditionalTag}, []byte(userKey)...)
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-
-	if err := q.meta.Handle().Put(wo, key, val); err != nil {
-		zlog.Error().Str("filepath", filepath).Str("key", userKey).Err(err).
-			Msg("deletion queue: failed to add conditional entry")
-		return err
-	}
-	metrics.DeletionQueueAdded.Inc()
-	return nil
-}
-
 // processingLoop runs the background processing
 func (q *Queue) processingLoop() {
 	defer q.wg.Done()
@@ -178,7 +141,7 @@ func (q *Queue) ProcessBatch() {
 		// Record batch duration in milliseconds
 		metrics.DeletionQueueBatchDuration.Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
-	seen := make(map[string]seenEntry) // filepath -> earliest queue entry
+	seen := make(map[string][]byte) // filepath -> earliest queue key
 
 	// Scan and deduplicate
 	ro := metadata.CreateReadOptions(true, false)
@@ -225,16 +188,14 @@ func (q *Queue) ProcessBatch() {
 			break
 		}
 
-		// Keep only the earliest entry for each filepath, capturing its value so
-		// the worker can honor a conditional (reference-guarded) deletion and so a
-		// re-enqueue preserves the entry's type.
-		val := it.Value()
+		// Keep only earliest entry for each filepath
 		if _, exists := seen[filepath]; !exists {
-			seen[filepath] = seenEntry{queueKey: bytes.Clone(keyData), value: bytes.Clone(val.Data())}
+			seen[filepath] = bytes.Clone(keyData)
 			count++
 		}
-		val.Free()
+
 		key.Free()
+		it.Value().Free()
 	}
 
 	if len(seen) == 0 {
@@ -251,9 +212,9 @@ func (q *Queue) ProcessBatch() {
 	successful := 0
 	failed := 0
 
-	for filepath, se := range seen {
-		if q.resolveDeletion(filepath, se.value) {
-			batch.Delete(se.queueKey)
+	for filepath, queueKey := range seen {
+		if q.tryDelete(filepath) {
+			batch.Delete(queueKey)
 			successful++
 			q.processed++
 			// Increment processed counter
@@ -270,8 +231,8 @@ func (q *Queue) ProcessBatch() {
 			// reclaimed once a later attempt succeeds. tryDelete treats a missing
 			// file as success, so re-enqueued entries only reference files that
 			// still exist.
-			batch.Delete(se.queueKey)
-			batch.Put(keys.MakeDeletionQueueKey(time.Now().Add(q.config.RetryDelay).UnixNano(), filepath), se.value)
+			batch.Delete(queueKey)
+			batch.Put(keys.MakeDeletionQueueKey(time.Now().Add(q.config.RetryDelay).UnixNano(), filepath), []byte{0x01})
 			failed++
 			q.failed++
 			// Increment failed counter
@@ -295,58 +256,6 @@ func (q *Queue) ProcessBatch() {
 			Dur("duration_ms", time.Since(startTime)).
 			Msg("deletion queue: processed batch")
 	}
-}
-
-// seenEntry is the earliest queue entry observed for a given filepath in a
-// batch scan: its queue key (to delete/re-enqueue) and its value (to honor a
-// conditional deletion and to preserve the entry type across a re-enqueue).
-type seenEntry struct {
-	queueKey []byte
-	value    []byte
-}
-
-// resolveDeletion decides a single entry's fate. It returns true when the entry
-// is resolved and should be removed from the queue (the file was deleted, or a
-// conditional entry's file is still referenced and must be KEPT), and false when
-// it should be retried later. A conditional entry (see AddIfUnreferenced) is
-// deleted only when its owning metadata row no longer references the file; if
-// the reference check cannot be made (the DB read failed) the entry is retried
-// rather than risk deleting a live file.
-func (q *Queue) resolveDeletion(filepath string, value []byte) bool {
-	if len(value) > 0 && value[0] == conditionalTag {
-		userKey := string(value[1:])
-		referenced, err := q.fileStillReferenced(userKey, filepath)
-		if err != nil {
-			return false // unknown — never delete a possibly-referenced file
-		}
-		if referenced {
-			return true // the CAS won; keep the file, drop the entry
-		}
-		// Not referenced (the CAS lost, or the key is gone): delete the orphan.
-	}
-	return q.tryDelete(filepath)
-}
-
-// fileStillReferenced reports whether userKey's metadata row still points at
-// filepath as its raw-file backing store.
-func (q *Queue) fileStillReferenced(userKey, filepath string) (bool, error) {
-	ro := grocksdb.NewDefaultReadOptions()
-	defer ro.Destroy()
-	slice, err := q.meta.Handle().Get(ro, keys.MakeMetadataKey(userKey))
-	if err != nil {
-		return false, err
-	}
-	defer slice.Free()
-	if !slice.Exists() {
-		return false, nil
-	}
-	var vm pb.ValueMessage
-	if err := proto.Unmarshal(slice.Data(), &vm); err != nil {
-		// A corrupt row does not usefully reference this file; deleting the orphan
-		// is safe (the row itself is a separate concern).
-		return false, nil
-	}
-	return vm.ValueType == pb.ValueType_RAW_FILE && vm.RawFilePath == filepath, nil
 }
 
 // tryDelete attempts to delete a file

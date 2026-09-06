@@ -403,16 +403,33 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		// The merge committed but its outcome is unreadable right now (a transient
 		// read glitch, or a genuinely unhealthy DB). We must NOT delete the spill:
 		// if the CAS won, the committed row references it, and deleting it would
-		// leave a live row pointing at a missing file — silent data loss. Nor may
-		// we leave it: if the CAS lost, no index reaches it and it leaks forever
-		// (#156). Stage it for a REFERENCE-GUARDED deletion (works for both the
-		// medium and large bands): the deletion worker keeps the file if the
-		// committed row still references it (we won) and deletes it otherwise (we
-		// lost), resolving whenever the DB reads cleanly. The merge just
-		// succeeded, so this write almost always lands even while the read
-		// glitches.
+		// leave a live row pointing at a missing file — silent data loss. Instead
+		// make the spill discoverable so its fate is resolved once the DB reads
+		// cleanly, reusing the SAME compaction-index machinery a plain Put and a
+		// won CAS put (finishWonCASPut) use for the medium band: the compactor
+		// validates each entry against current metadata and either migrates the
+		// file (we won) or drops the entry and queues the file for deletion (we
+		// lost). The merge just succeeded, so this write almost always lands even
+		// while the read glitches.
 		if spilledPath != "" {
-			s.stageRawFileDeletionIfUnreferenced(spilledPath, key)
+			if operand.ValueLength > int64(s.inlineThreshold) && operand.ValueLength <= s.compactThreshold {
+				cIdxKey, cIdxVal := compaction.PrepareEntryForCompaction(key, spilledPath)
+				bwo := grocksdb.NewDefaultWriteOptions()
+				if perr := s.meta.Handle().Put(bwo, cIdxKey, cIdxVal); perr != nil {
+					zlog.Error().Err(perr).Str("key", key).Str("file", spilledPath).
+						Msg("storage.PutIfVersion: failed to record spill recovery breadcrumb after read-back failure")
+				}
+				bwo.Destroy()
+			} else {
+				// Large spill: no write path indexes large raw files (they stay
+				// raw, never compacted), so there is no existing machinery to
+				// reclaim one orphaned by a lost CAS whose read-back failed. This
+				// is the same orphaned-large-file class as a large plain Put that
+				// fails to commit — issue #156 (reference-safe reclaim built once
+				// for every write path), not CAS-specific machinery here.
+				zlog.Warn().Str("key", key).Str("file", spilledPath).
+					Msg("storage.PutIfVersion: read-back failed after commit; large spill may orphan if the CAS lost (issue #156)")
+			}
 		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}

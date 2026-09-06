@@ -36,13 +36,6 @@ type ClusterClient struct {
 	stopCh        chan struct{}
 	refreshCancel context.CancelFunc
 
-	// bgCtx is cancelled by refreshCancel on Close; ad-hoc background refreshes
-	// (scheduleTopologyRefresh) run under it so they abort on shutdown instead of
-	// outliving the client. bgWG tracks those goroutines so Close can wait for
-	// them to finish.
-	bgCtx context.Context
-	bgWG  sync.WaitGroup
-
 	// lastRefresh tracks when the last topology refresh was triggered.
 	// Used to rate-limit epoch mismatch refresh triggers.
 	lastRefresh atomic.Int64
@@ -86,7 +79,6 @@ func NewClusterClient(config *ClientConfig) (*ClusterClient, error) {
 	// Start topology refresh goroutine
 	refreshCtx, cancel := context.WithCancel(context.Background())
 	client.refreshCancel = cancel
-	client.bgCtx = refreshCtx
 	go client.topology.TopologyRefreshLoop(refreshCtx, func() {
 		// Update connections when topology changes
 		client.updateConnections()
@@ -148,32 +140,22 @@ func (c *ClusterClient) onEpochMismatch(clientEpoch, serverEpoch uint64) {
 	if serverEpoch == clientEpoch {
 		return
 	}
-	c.scheduleTopologyRefresh()
-}
 
-// scheduleTopologyRefresh triggers at most one background topology refresh per
-// minRefreshInterval, so a burst of mismatches (or failed CAS writes) cannot
-// launch many concurrent refreshes. It is used both by the epoch-mismatch
-// handler and by the CAS write paths, which need the ring to heal for a
-// caller's retry but must not re-execute the (non-idempotent) write themselves.
-func (c *ClusterClient) scheduleTopologyRefresh() {
+	// Rate limit: check if enough time has passed since last refresh
 	now := time.Now().UnixNano()
 	lastRefresh := c.lastRefresh.Load()
 	if now-lastRefresh < int64(minRefreshInterval) {
-		// Too soon since last refresh, skip.
+		// Too soon since last refresh, skip
 		return
 	}
-	// Claim the refresh slot with CAS to prevent concurrent refreshes.
+
+	// Try to claim the refresh slot using CAS to prevent concurrent refreshes
 	if !c.lastRefresh.CompareAndSwap(lastRefresh, now) {
+		// Another goroutine already claimed it, skip
 		return
 	}
-	// Run under bgCtx (cancelled on Close) and track it in bgWG so a refresh
-	// cannot outlive the client; Close cancels bgCtx and waits for it.
-	c.bgWG.Add(1)
-	go func() {
-		defer c.bgWG.Done()
-		c.forceRefreshTopology(c.bgCtx)
-	}()
+
+	go c.forceRefreshTopology(context.Background())
 }
 
 // Route determines which connection to use for a given key
@@ -419,36 +401,17 @@ func (c *ClusterClient) GetStreamWithVersion(ctx context.Context, key string, w 
 	return version, found, err
 }
 
-// PutIfVersion conditionally writes. Unlike the plain Put it is NOT retried on a
-// routing error: a conditional write is not idempotent, and NotFound/Unavailable
-// can be returned after the merge committed but its read-back failed — re-running
-// would issue a fresh stamp against the now-committed value and report a false
-// mismatch. Instead we heal the ring in the background (so the caller's own
-// retry routes correctly) and return the error. A version mismatch is not a
-// routing error and is returned to the caller unchanged.
-func (c *ClusterClient) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
-	v, err := c.Operations.PutIfVersion(ctx, key, data, ttlSeconds, expected)
-	if isRoutingError(err) {
-		c.scheduleTopologyRefresh()
-	}
-	return v, err
-}
-
-// DeleteIfVersion conditionally deletes. Not retried on a routing error for the
-// same reason as PutIfVersion (non-idempotent write); the ring is healed in the
-// background for the caller's retry.
-func (c *ClusterClient) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
-	err := c.Operations.DeleteIfVersion(ctx, key, expected)
-	if isRoutingError(err) {
-		c.scheduleTopologyRefresh()
-	}
-	return err
-}
-
-// PutStreamIfVersion is inherited from Operations with no retry override — a
-// streamed conditional write is neither idempotent nor replayable, exactly like
-// the plain PutStream. PutStream, List, ListPage and ListPageWithValues are
-// likewise inherited from Operations.
+// PutIfVersion, DeleteIfVersion and PutStreamIfVersion are inherited from
+// Operations with NO retry override, exactly like the plain PutStream: a
+// conditional write is not idempotent (and a stream is not replayable), and a
+// routing error such as NotFound/Unavailable can be returned after the merge
+// committed but its read-back failed — re-running would issue a fresh stamp
+// against the now-committed value and report a false mismatch. Topology heals
+// without any CAS-specific hook: the connection-level epoch-mismatch handler
+// (onEpochMismatch) and the periodic refresh loop already refresh the ring, and
+// the caller's own re-read (GetWithVersion, which does retry) routes correctly.
+// A version mismatch is not a routing error and is returned unchanged.
+// PutStream, List, ListPage and ListPageWithValues are likewise inherited.
 
 // casCountingWriter counts bytes forwarded to the wrapped writer so a streaming
 // CAS read can tell whether any output has been emitted (and thus whether a
@@ -470,11 +433,6 @@ func (c *ClusterClient) Close() error {
 	if c.refreshCancel != nil {
 		c.refreshCancel()
 	}
-
-	// Wait for any in-flight ad-hoc topology refreshes to observe the cancelled
-	// bgCtx and return. Done before taking c.mu (a refresh may take c.mu via
-	// updateConnections) to avoid a deadlock.
-	c.bgWG.Wait()
 
 	// Close stop channel
 	select {
