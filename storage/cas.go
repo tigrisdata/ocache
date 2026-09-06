@@ -133,6 +133,35 @@ func (s *Storage) readRowForCAS(metaKey []byte) (*pb.ValueMessage, bool, error) 
 	return vm, true, nil
 }
 
+// GetWithVersion returns the value reader together with the key's current CAS
+// version (issue #254). It is a CAS-path operation and deliberately does not
+// touch the plain Get read path: the version is read from the metadata row and
+// the reader is obtained from the untouched Get. An absent, expired, or deleted
+// (tombstoned) key reports version 0 and found == false — recreate over it with
+// PutIfVersion(expected == 0). A live pre-versioning (plain-written) row reports
+// merge.VersionLegacy; mixing plain writes and CAS on one key is unsupported.
+func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
+	vm, hasPrev, err := s.readRowForCAS(keys.MakeMetadataKey(key))
+	if err != nil {
+		return nil, 0, false, mapRocksDBError("GetWithVersion", key, err)
+	}
+	// Absent, or expired/tombstoned (the read path's clock check treats both as
+	// gone) → absent for CAS purposes.
+	if !hasPrev || (vm.Expiry > 0 && time.Now().Unix() >= vm.Expiry) {
+		return nil, 0, false, nil
+	}
+	version := merge.EffectiveRowVersion(vm)
+
+	// The reader comes from the untouched Get. A benign TOCTOU between the two
+	// reads is acceptable: GetWithVersion is advisory, and the following CAS
+	// re-reads and resolves the version authoritatively at merge time.
+	reader, found, err := s.Get(key, 0, 0)
+	if err != nil || !found {
+		return nil, 0, found, err
+	}
+	return reader, version, true, nil
+}
+
 // currentVersionOf maps a read row to the version the CAS match rule reports:
 // 0 for absent or a tombstone, the effective version otherwise.
 func currentVersionOf(vm *pb.ValueMessage, found bool) uint64 {

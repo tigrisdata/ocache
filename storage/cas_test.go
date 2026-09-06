@@ -45,27 +45,24 @@ func TestCAS_GetWithVersion_AbsentPutLegacy(t *testing.T) {
 	assert.False(t, found)
 	assert.Zero(t, ver)
 
-	// Plain Put stamps a real version.
+	// Plain Put does NOT stamp a version — versioning lives only in CAS ops.
+	// A plain-written row therefore reads as the legacy sentinel (mixing plain
+	// writes and CAS on one key is unsupported).
 	require.NoError(t, s.Put("k", bytes.NewReader([]byte("v1")), 0))
 	r, ver, found, err := s.GetWithVersion("k")
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.Greater(t, ver, merge.VersionLegacy)
+	assert.Equal(t, merge.VersionLegacy, ver)
 	assert.Equal(t, "v1", readAllString(t, r))
 
-	// A hand-written pre-versioning row reports the legacy sentinel.
-	legacy, err := proto.Marshal(&pb.ValueMessage{
-		ValueType: pb.ValueType_INLINE, Data: []byte("old"), ValueLength: 3,
-	})
+	// A CAS create, by contrast, stamps a real (nanosecond-scale) version.
+	cv, err := s.PutIfVersion("cas-k", bytes.NewReader([]byte("cv")), 0, 0)
 	require.NoError(t, err)
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("legacy-key"), legacy))
-
-	_, ver, found, err = s.GetWithVersion("legacy-key")
+	_, ver, found, err = s.GetWithVersion("cas-k")
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.Equal(t, merge.VersionLegacy, ver)
+	assert.Equal(t, cv, ver)
+	assert.Greater(t, ver, merge.VersionLegacy)
 }
 
 func TestCAS_PutIfVersion_IfAbsentAndGuardedUpdate(t *testing.T) {
@@ -109,12 +106,15 @@ func TestCAS_PlainPutShadowsAndInvalidatesTokens(t *testing.T) {
 	v1, err := s.PutIfVersion("k", bytes.NewReader([]byte("cas")), 0, 0)
 	require.NoError(t, err)
 
-	// A plain Put (last-write-wins) shadows the row and issues a new stamp.
+	// A plain Put (last-write-wins) shadows the row. It writes no version, so
+	// the row now reads as the legacy sentinel — mixing plain writes with CAS
+	// on a key is unsupported, but it stays SAFE: the plain value can never be
+	// mistaken for a specific CAS stamp.
 	require.NoError(t, s.Put("k", bytes.NewReader([]byte("plain")), 0))
 	_, ver, found, err := s.GetWithVersion("k")
 	require.NoError(t, err)
 	require.True(t, found)
-	assert.Greater(t, ver, v1)
+	assert.Equal(t, merge.VersionLegacy, ver)
 
 	// The pre-plain-put token is dead.
 	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("stale")), 0, v1)
