@@ -344,6 +344,25 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	return c.ops.Delete(ctx, key)
 }
 
+// GetWithVersion returns a key's value together with its current CAS version
+// (issue #254). found is false (version 0) for an absent, expired, or deleted
+// key.
+func (c *Client) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	return c.ops.GetWithVersion(ctx, key)
+}
+
+// PutIfVersion writes only if the key's current version equals expected (0 =
+// put-if-absent), returning the new version or a mismatch error carrying the
+// current version.
+func (c *Client) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	return c.ops.PutIfVersion(ctx, key, data, int(ttlSeconds), expected)
+}
+
+// DeleteIfVersion deletes only if the key's current version equals expected.
+func (c *Client) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	return c.ops.DeleteIfVersion(ctx, key, expected)
+}
+
 // List returns all keys matching the given prefix across the entire cluster.
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 	return c.ops.List(ctx, prefix)

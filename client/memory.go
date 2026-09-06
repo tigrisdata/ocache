@@ -20,6 +20,10 @@ import (
 type MemoryCache struct {
 	mu   sync.RWMutex
 	data map[string]cacheEntry
+	// versions and versionCounter back the conditional (CAS) operations. The
+	// counter is a monotonic stamp source mirroring the real storage layer.
+	versions       map[string]uint64
+	versionCounter uint64
 }
 
 // cacheEntry holds a cached value with optional expiration.
@@ -34,8 +38,90 @@ var _ CacheClient = (*MemoryCache)(nil)
 // NewMemoryCache creates a new in-memory cache.
 func NewMemoryCache() *MemoryCache {
 	return &MemoryCache{
-		data: make(map[string]cacheEntry),
+		data:     make(map[string]cacheEntry),
+		versions: make(map[string]uint64),
 	}
+}
+
+// liveLocked reports whether key currently holds a live (unexpired) value.
+// Caller must hold m.mu.
+func (m *MemoryCache) liveLocked(key string) bool {
+	entry, ok := m.data[key]
+	if !ok {
+		return false
+	}
+	return entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt)
+}
+
+// effectiveVersionLocked returns the CAS version for key: 0 when it is absent
+// or expired, else its stored version. Caller must hold m.mu.
+func (m *MemoryCache) effectiveVersionLocked(key string) uint64 {
+	if !m.liveLocked(key) {
+		return 0
+	}
+	return m.versions[key]
+}
+
+// GetWithVersion returns key's value and version; found is false (version 0)
+// for an absent or expired key.
+func (m *MemoryCache) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.liveLocked(key) {
+		return nil, 0, false, nil
+	}
+	entry := m.data[key]
+	out := make([]byte, len(entry.value))
+	copy(out, entry.value)
+	return out, m.versions[key], true, nil
+}
+
+// PutIfVersion writes only if key's current version equals expected (0 =
+// put-if-absent), returning the new version or a *VersionMismatchError.
+func (m *MemoryCache) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur := m.effectiveVersionLocked(key); cur != expected {
+		return 0, &VersionMismatchError{Key: key, CurrentVersion: cur}
+	}
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	entry := cacheEntry{value: dataCopy}
+	if ttlSeconds > 0 {
+		entry.expiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	}
+	m.versionCounter++
+	m.data[key] = entry
+	m.versions[key] = m.versionCounter
+	return m.versionCounter, nil
+}
+
+// DeleteIfVersion deletes only if key's current version equals expected.
+func (m *MemoryCache) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.effectiveVersionLocked(key)
+	if cur == 0 {
+		if expected == 0 {
+			return nil // already absent — delete-if-absent is a no-op success
+		}
+		return &VersionMismatchError{Key: key, CurrentVersion: 0}
+	}
+	if cur != expected {
+		return &VersionMismatchError{Key: key, CurrentVersion: cur}
+	}
+	delete(m.data, key)
+	delete(m.versions, key)
+	return nil
 }
 
 // Put stores data with an optional TTL (0 means no expiration).

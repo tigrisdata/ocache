@@ -25,6 +25,14 @@ service CacheService {
       delete: "/v1/cache/{key}"
     };
   }
+
+  // Conditional (compare-and-swap) operations — issue #254. Each carries a
+  // per-key version; a write applies only if the current version matches the
+  // caller's expectation. A lost race is reported as success=false with the
+  // current version, not a transport error.
+  rpc GetObjectWithVersion (GetRequest) returns (GetWithVersionResponse);
+  rpc PutObjectIfVersion (PutIfVersionRequest) returns (PutIfVersionResponse);
+  rpc DeleteIfVersion (DeleteIfVersionRequest) returns (DeleteIfVersionResponse);
   rpc List (ListRequest) returns (ListResponse) {
     option (google.api.http) = {
       get: "/v1/cache"
@@ -78,6 +86,40 @@ message DeleteRequest {
 message DeleteResponse {
   bool success = 1;
   string error  = 2;
+}
+
+// GetWithVersionResponse carries the value together with its current CAS
+// version (issue #254). found=false with version 0 means the key is absent,
+// expired, or deleted — recreate it with PutObjectIfVersion(expected_version=0).
+message GetWithVersionResponse {
+  bytes data = 1;
+  uint64 version = 2;
+  bool found = 3;
+}
+
+message PutIfVersionRequest {
+  string key = 1;
+  int64 ttl_seconds = 2;
+  bytes data = 3;
+  uint64 expected_version = 4; // 0 = put-if-absent
+}
+
+message PutIfVersionResponse {
+  bool success = 1;           // true iff the CAS applied
+  uint64 new_version = 2;     // the key's new version, set on success
+  uint64 current_version = 3; // the key's current version, set on a mismatch (success=false)
+  string error = 4;           // nonempty only on a real error (never for a plain mismatch)
+}
+
+message DeleteIfVersionRequest {
+  string key = 1;
+  uint64 expected_version = 2;
+}
+
+message DeleteIfVersionResponse {
+  bool success = 1;           // true iff the delete applied (or the key was already absent)
+  uint64 current_version = 2; // the key's current version, set on a mismatch (success=false)
+  string error = 3;           // nonempty only on a real error
 }
 
 message ListRequest {

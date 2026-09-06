@@ -19,15 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	CacheService_Put_FullMethodName                 = "/cache.CacheService/Put"
-	CacheService_PutObject_FullMethodName           = "/cache.CacheService/PutObject"
-	CacheService_Get_FullMethodName                 = "/cache.CacheService/Get"
-	CacheService_Delete_FullMethodName              = "/cache.CacheService/Delete"
-	CacheService_List_FullMethodName                = "/cache.CacheService/List"
-	CacheService_ListLocal_FullMethodName           = "/cache.CacheService/ListLocal"
-	CacheService_ListWithValues_FullMethodName      = "/cache.CacheService/ListWithValues"
-	CacheService_ListLocalWithValues_FullMethodName = "/cache.CacheService/ListLocalWithValues"
-	CacheService_GetTopology_FullMethodName         = "/cache.CacheService/GetTopology"
+	CacheService_Put_FullMethodName                  = "/cache.CacheService/Put"
+	CacheService_PutObject_FullMethodName            = "/cache.CacheService/PutObject"
+	CacheService_Get_FullMethodName                  = "/cache.CacheService/Get"
+	CacheService_Delete_FullMethodName               = "/cache.CacheService/Delete"
+	CacheService_GetObjectWithVersion_FullMethodName = "/cache.CacheService/GetObjectWithVersion"
+	CacheService_PutObjectIfVersion_FullMethodName   = "/cache.CacheService/PutObjectIfVersion"
+	CacheService_DeleteIfVersion_FullMethodName      = "/cache.CacheService/DeleteIfVersion"
+	CacheService_List_FullMethodName                 = "/cache.CacheService/List"
+	CacheService_ListLocal_FullMethodName            = "/cache.CacheService/ListLocal"
+	CacheService_ListWithValues_FullMethodName       = "/cache.CacheService/ListWithValues"
+	CacheService_ListLocalWithValues_FullMethodName  = "/cache.CacheService/ListLocalWithValues"
+	CacheService_GetTopology_FullMethodName          = "/cache.CacheService/GetTopology"
 )
 
 // CacheServiceClient is the client API for CacheService service.
@@ -38,6 +41,13 @@ type CacheServiceClient interface {
 	PutObject(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (CacheService_GetClient, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	// Conditional (compare-and-swap) operations — issue #254. Each carries a
+	// per-key version; a write applies only if the current version matches the
+	// caller's expectation. A lost race is reported as success=false with the
+	// current version, not a transport error.
+	GetObjectWithVersion(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetWithVersionResponse, error)
+	PutObjectIfVersion(ctx context.Context, in *PutIfVersionRequest, opts ...grpc.CallOption) (*PutIfVersionResponse, error)
+	DeleteIfVersion(ctx context.Context, in *DeleteIfVersionRequest, opts ...grpc.CallOption) (*DeleteIfVersionResponse, error)
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	// ListLocal is an internal RPC for cluster mode: queries local node only
 	// Returns sorted, paginated keys from this node's storage
@@ -141,6 +151,33 @@ func (c *cacheServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts
 	return out, nil
 }
 
+func (c *cacheServiceClient) GetObjectWithVersion(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetWithVersionResponse, error) {
+	out := new(GetWithVersionResponse)
+	err := c.cc.Invoke(ctx, CacheService_GetObjectWithVersion_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *cacheServiceClient) PutObjectIfVersion(ctx context.Context, in *PutIfVersionRequest, opts ...grpc.CallOption) (*PutIfVersionResponse, error) {
+	out := new(PutIfVersionResponse)
+	err := c.cc.Invoke(ctx, CacheService_PutObjectIfVersion_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *cacheServiceClient) DeleteIfVersion(ctx context.Context, in *DeleteIfVersionRequest, opts ...grpc.CallOption) (*DeleteIfVersionResponse, error) {
+	out := new(DeleteIfVersionResponse)
+	err := c.cc.Invoke(ctx, CacheService_DeleteIfVersion_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *cacheServiceClient) List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error) {
 	out := new(ListResponse)
 	err := c.cc.Invoke(ctx, CacheService_List_FullMethodName, in, out, opts...)
@@ -194,6 +231,13 @@ type CacheServiceServer interface {
 	PutObject(context.Context, *PutRequest) (*PutResponse, error)
 	Get(*GetRequest, CacheService_GetServer) error
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	// Conditional (compare-and-swap) operations — issue #254. Each carries a
+	// per-key version; a write applies only if the current version matches the
+	// caller's expectation. A lost race is reported as success=false with the
+	// current version, not a transport error.
+	GetObjectWithVersion(context.Context, *GetRequest) (*GetWithVersionResponse, error)
+	PutObjectIfVersion(context.Context, *PutIfVersionRequest) (*PutIfVersionResponse, error)
+	DeleteIfVersion(context.Context, *DeleteIfVersionRequest) (*DeleteIfVersionResponse, error)
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	// ListLocal is an internal RPC for cluster mode: queries local node only
 	// Returns sorted, paginated keys from this node's storage
@@ -221,6 +265,15 @@ func (UnimplementedCacheServiceServer) Get(*GetRequest, CacheService_GetServer) 
 }
 func (UnimplementedCacheServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedCacheServiceServer) GetObjectWithVersion(context.Context, *GetRequest) (*GetWithVersionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetObjectWithVersion not implemented")
+}
+func (UnimplementedCacheServiceServer) PutObjectIfVersion(context.Context, *PutIfVersionRequest) (*PutIfVersionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PutObjectIfVersion not implemented")
+}
+func (UnimplementedCacheServiceServer) DeleteIfVersion(context.Context, *DeleteIfVersionRequest) (*DeleteIfVersionResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DeleteIfVersion not implemented")
 }
 func (UnimplementedCacheServiceServer) List(context.Context, *ListRequest) (*ListResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method List not implemented")
@@ -333,6 +386,60 @@ func _CacheService_Delete_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CacheService_GetObjectWithVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CacheServiceServer).GetObjectWithVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CacheService_GetObjectWithVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CacheServiceServer).GetObjectWithVersion(ctx, req.(*GetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CacheService_PutObjectIfVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutIfVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CacheServiceServer).PutObjectIfVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CacheService_PutObjectIfVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CacheServiceServer).PutObjectIfVersion(ctx, req.(*PutIfVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _CacheService_DeleteIfVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteIfVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CacheServiceServer).DeleteIfVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: CacheService_DeleteIfVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CacheServiceServer).DeleteIfVersion(ctx, req.(*DeleteIfVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _CacheService_List_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListRequest)
 	if err := dec(in); err != nil {
@@ -437,6 +544,18 @@ var CacheService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Delete",
 			Handler:    _CacheService_Delete_Handler,
+		},
+		{
+			MethodName: "GetObjectWithVersion",
+			Handler:    _CacheService_GetObjectWithVersion_Handler,
+		},
+		{
+			MethodName: "PutObjectIfVersion",
+			Handler:    _CacheService_PutObjectIfVersion_Handler,
+		},
+		{
+			MethodName: "DeleteIfVersion",
+			Handler:    _CacheService_DeleteIfVersion_Handler,
 		},
 		{
 			MethodName: "List",
