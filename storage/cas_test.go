@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/stretchr/testify/assert"
@@ -307,4 +308,45 @@ func TestCAS_ExpiredRowExposesRecreateToken(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "fresh", readAllString(t, r))
+}
+
+// TestCAS_VersionsMonotonicAcrossRestart pins the durable-reservation
+// guarantee: even if the wall clock at next startup is far behind previously
+// issued stamps, no stamp is ever reused. Simulated by forcing the in-memory
+// stamp source far into the future (as a fast clock would), issuing a stamp
+// (which durably reserves past it), restarting, and asserting the next stamp
+// still lands above it.
+func TestCAS_VersionsMonotonicAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	cfg := func() *StorageConfig {
+		return &StorageConfig{
+			DiskPath:            dir,
+			InlineThreshold:     1024,
+			CompactThreshold:    4 * 1024,
+			SegmentSize:         16 * 1024 * 1024,
+			FdCacheSize:         1000,
+			DisableRecompaction: true,
+		}
+	}
+
+	s1, err := NewStorageWithConfig(cfg())
+	require.NoError(t, err)
+
+	farFuture := uint64(time.Now().Add(24 * time.Hour).UnixNano())
+	s1.lastVersion.Store(farFuture)
+	issued, err := s1.nextVersion()
+	require.NoError(t, err)
+	require.Greater(t, issued, farFuture)
+	s1.Close()
+
+	// Restart: the wall clock is ~24h behind the issued stamp, but the durable
+	// reservation must keep new stamps strictly above it.
+	s2, err := NewStorageWithConfig(cfg())
+	require.NoError(t, err)
+	defer s2.Close()
+
+	next, err := s2.nextVersion()
+	require.NoError(t, err)
+	assert.Greater(t, next, issued,
+		"stamps must stay monotonic across restarts regardless of the wall clock")
 }

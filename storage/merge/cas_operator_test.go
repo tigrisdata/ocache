@@ -222,3 +222,23 @@ func TestMergeCAS_CompactionMigrationPreservesVersion(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, uint64(700), mustUnmarshal(t, out2).Version)
 }
+
+// TestMergeCAS_DeleteOnAbsentRowStampsSentinel: a CAS_DELETE whose base vanished
+// (an independent delete raced ahead) must emit the sentinel stamped with the
+// operand's version, so the deleter's read-back sees its own stamp and reports
+// success — not a mismatch against a phantom legacy row.
+func TestMergeCAS_DeleteOnAbsentRowStampsSentinel(t *testing.T) {
+	op := NewMultiplexOperator()
+
+	out, ok := op.FullMerge(casMetaKey, nil, [][]byte{casDeleteOperand(t, 100, 200)})
+	require.True(t, ok)
+	got := mustUnmarshal(t, out)
+	assert.Equal(t, int64(1), got.Expiry)
+	assert.Equal(t, uint64(200), got.Version, "no-base delete sentinel must carry the operand's stamp")
+
+	// And it participates in subsequent resolution deterministically: a CAS_PUT
+	// against the tombstone's token recreates.
+	out2, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 200, 300, "recreated")})
+	require.True(t, ok)
+	assert.Equal(t, uint64(300), mustUnmarshal(t, out2).Version)
+}

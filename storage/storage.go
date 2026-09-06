@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -174,6 +175,8 @@ type Storage struct {
 	evictionPolicy   string                // "lru" or "fifo"; governs whether reads refresh access time
 	closed           atomic.Bool           // True when storage has been closed
 	lastVersion      atomic.Uint64         // Last issued version stamp (see nextVersion)
+	versionHi        atomic.Uint64         // Durably reserved stamp ceiling (see nextVersion)
+	versionMu        sync.Mutex            // Serializes reservation extension (rare)
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -354,6 +357,14 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		cleanupInterval = config.CleanupInterval
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
+
+	// Restore the CAS stamp source's durable reservation so versions stay
+	// monotonic across restarts even under a backward clock step: every stamp
+	// ever issued is below the persisted high-water mark (see nextVersion).
+	if err := s.loadVersionReservation(); err != nil {
+		zlog.Error().Err(err).Msg("storage: failed to load version reservation")
+		return nil, storageErrors.NewInternalError("Init", err)
+	}
 
 	// The cleaner's initial pass recomputes size and, when a cap is set, backfills
 	// eviction-index coverage for keys written uncapped or under a prior policy so
@@ -1189,13 +1200,18 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			}
 		}
 
+		version, verr := s.nextVersion()
+		if verr != nil {
+			zlog.Error().Err(verr).Str("key", key).Msg("storage.Put: failed to reserve version stamp")
+			return storageErrors.NewInternalError("Put", verr)
+		}
 		valueMsg := &pb.ValueMessage{
 			RawFilePath: filePath,
 			Expiry:      expiry,
 			ValueLength: bytesWritten,
 			Checksum:    checksum,
 			ValueType:   pb.ValueType_RAW_FILE,
-			Version:     s.nextVersion(),
+			Version:     version,
 		}
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
@@ -1225,12 +1241,17 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 
 	// We don't need to store the checksum for small values because
 	// we are relying on RocksDB to verify the integrity of the data.
+	version, verr := s.nextVersion()
+	if verr != nil {
+		zlog.Error().Err(verr).Str("key", key).Msg("storage.Put: failed to reserve version stamp")
+		return storageErrors.NewInternalError("Put", verr)
+	}
 	valueMsg := &pb.ValueMessage{
 		Data:        smallValue,
 		Expiry:      expiry,
 		ValueLength: int64(n),
 		ValueType:   pb.ValueType_INLINE,
-		Version:     s.nextVersion(),
+		Version:     version,
 	}
 	val, err := proto.Marshal(valueMsg)
 	if err != nil {

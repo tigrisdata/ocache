@@ -210,7 +210,19 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			}
 			continue
 		case pb.MetaOp_META_OP_CAS_DELETE:
-			if hadBase && EffectiveVersion(base.Version) == op.CasExpectedVersion {
+			if !hadBase {
+				// The row vanished before the operand resolved (an independent
+				// delete raced ahead, or the operand outlived a sweep). Emit
+				// the sentinel STAMPED WITH THE OPERAND'S VERSION rather than
+				// the bare one: the deleter's read-back then sees its own
+				// stamp and correctly reports success — the key is gone, which
+				// is the delete's intent — instead of a misleading mismatch
+				// against a phantom legacy row.
+				base = pb.ValueMessage{Expiry: 1, Version: op.Version}
+				hadBase = true
+				continue
+			}
+			if EffectiveVersion(base.Version) == op.CasExpectedVersion {
 				// Tombstone via the already-expired sentinel, KEEPING the
 				// base's file-reference fields so the TTL cleaner's existing
 				// sweep reclaims the backing raw file / segment bytes, and
