@@ -521,13 +521,28 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	if err != nil {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
-	// Delete matches the PHYSICAL row version (clock-blind, like the merge
-	// operator), NOT casCurrentVersion: a delete acts on the row that exists, so
-	// deleting a TTL-expired-but-unswept row with its real version tombstones it
-	// (cleanup), and the operator matches without any precondition translation.
-	// The clock-aware absence view belongs only to PutIfVersion's put-if-absent.
-	if currentVersionOf(prev, hasPrev) != expected {
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(prev, hasPrev))
+
+	// A logically-absent key — missing, tombstoned, or TTL-expired-but-unswept —
+	// reports version 0, consistent with GetWithVersion, and never runs the merge
+	// (a clock-blind CAS_DELETE against an expired row would loop). There is
+	// nothing live to delete:
+	//   - delete-if-absent (expected == 0) is already satisfied → success, no-op;
+	//   - any other expected mismatches against the current version 0.
+	// An unswept expired row's backing bytes are reclaimed by the TTL cleaner on
+	// its next sweep, so nothing leaks.
+	cur := casCurrentVersion(prev, hasPrev)
+	if cur == 0 {
+		if expected == 0 {
+			metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "success").Inc()
+			return nil
+		}
+		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
+	}
+	// Live row: match its version (cur == the physical version, since it is not
+	// expired). The merge below tombstones it on a match.
+	if cur != expected {
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, cur)
 	}
 
 	newStamp, err := s.nextVersion()

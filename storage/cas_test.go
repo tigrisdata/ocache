@@ -368,18 +368,18 @@ func TestCAS_RecreateOverTTLExpiredRow(t *testing.T) {
 	assert.Equal(t, "fresh", readAllString(t, r))
 }
 
-// TestCAS_DeleteMatchesPhysicalVersionOnExpiredRow: DeleteIfVersion matches the
-// row's physical version (clock-blind), so it can tombstone a TTL-expired-but-
-// unswept row with its real version, and rejects a put-if-absent-style
-// expected==0 against it with an immediate, consistent mismatch (no retry loop).
-func TestCAS_DeleteMatchesPhysicalVersionOnExpiredRow(t *testing.T) {
+// TestCAS_DeleteOnExpiredRowIsAbsent: a TTL-expired-but-unswept row is logically
+// absent for DeleteIfVersion (version 0), consistent with GetWithVersion — no
+// retry loop, and the row's hidden physical version is never exposed. delete-if-
+// absent (expected==0) is a no-op success; any held token mismatches against 0.
+func TestCAS_DeleteOnExpiredRowIsAbsent(t *testing.T) {
 	s, cleanup := createCASTestStorage(t)
 	defer cleanup()
 
 	write := func(k string) {
 		expired, err := proto.Marshal(&pb.ValueMessage{
 			ValueType: pb.ValueType_INLINE, Data: []byte("stale"), ValueLength: 5,
-			Expiry: 2, Version: 777,
+			Expiry: 2, Version: 777, // Expiry=2 (>1, in the past): clock-expired, not a tombstone
 		})
 		require.NoError(t, err)
 		wo := grocksdb.NewDefaultWriteOptions()
@@ -387,20 +387,17 @@ func TestCAS_DeleteMatchesPhysicalVersionOnExpiredRow(t *testing.T) {
 		require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey(k), expired))
 	}
 
-	// expected==0 on a clock-expired row: immediate mismatch reporting the real
-	// version, not a loop against a phantom 0.
+	// delete-if-absent over an expired row: success no-op (key already absent).
 	write("e1")
-	err := s.DeleteIfVersion("e1", 0)
+	require.NoError(t, s.DeleteIfVersion("e1", 0))
+
+	// A held token mismatches against current 0 — NOT the hidden physical 777,
+	// and with no loop. Consistent with GetWithVersion reporting the row absent.
+	write("e2")
+	err := s.DeleteIfVersion("e2", 777)
 	vmErr, ok := storageErrors.IsVersionMismatch(err)
 	require.True(t, ok)
-	assert.Equal(t, uint64(777), vmErr.CurrentVersion)
-
-	// expected==real version: tombstones the expired row.
-	write("e2")
-	require.NoError(t, s.DeleteIfVersion("e2", 777))
-	_, _, found, err := s.GetWithVersion("e2")
-	require.NoError(t, err)
-	assert.False(t, found)
+	assert.Zero(t, vmErr.CurrentVersion)
 }
 
 // TestCAS_VersionsMonotonicAcrossRestart pins the durable-reservation
