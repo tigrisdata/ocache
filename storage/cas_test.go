@@ -368,6 +368,41 @@ func TestCAS_RecreateOverTTLExpiredRow(t *testing.T) {
 	assert.Equal(t, "fresh", readAllString(t, r))
 }
 
+// TestCAS_DeleteMatchesPhysicalVersionOnExpiredRow: DeleteIfVersion matches the
+// row's physical version (clock-blind), so it can tombstone a TTL-expired-but-
+// unswept row with its real version, and rejects a put-if-absent-style
+// expected==0 against it with an immediate, consistent mismatch (no retry loop).
+func TestCAS_DeleteMatchesPhysicalVersionOnExpiredRow(t *testing.T) {
+	s, cleanup := createCASTestStorage(t)
+	defer cleanup()
+
+	write := func(k string) {
+		expired, err := proto.Marshal(&pb.ValueMessage{
+			ValueType: pb.ValueType_INLINE, Data: []byte("stale"), ValueLength: 5,
+			Expiry: 2, Version: 777,
+		})
+		require.NoError(t, err)
+		wo := grocksdb.NewDefaultWriteOptions()
+		defer wo.Destroy()
+		require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey(k), expired))
+	}
+
+	// expected==0 on a clock-expired row: immediate mismatch reporting the real
+	// version, not a loop against a phantom 0.
+	write("e1")
+	err := s.DeleteIfVersion("e1", 0)
+	vmErr, ok := storageErrors.IsVersionMismatch(err)
+	require.True(t, ok)
+	assert.Equal(t, uint64(777), vmErr.CurrentVersion)
+
+	// expected==real version: tombstones the expired row.
+	write("e2")
+	require.NoError(t, s.DeleteIfVersion("e2", 777))
+	_, _, found, err := s.GetWithVersion("e2")
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
 // TestCAS_VersionsMonotonicAcrossRestart pins the durable-reservation
 // guarantee: even if the wall clock at next startup is far behind previously
 // issued stamps, no stamp is ever reused. Simulated by forcing the in-memory

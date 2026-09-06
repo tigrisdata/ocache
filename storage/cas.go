@@ -136,6 +136,23 @@ func (s *Storage) readRowForCAS(metaKey []byte) (*pb.ValueMessage, bool, error) 
 	return vm, true, nil
 }
 
+// readRowForCASRetry re-reads a row a few times before giving up. It is used for
+// the post-merge read-back, where a transient read glitch (the merge already
+// committed) would otherwise force an indeterminate outcome — and, for a spilled
+// raw-file put, leak the spill. Resolving the outcome lets the caller reclaim a
+// losing spill; only a persistent read failure (a genuinely unhealthy DB) is
+// surfaced, leaving the spill as a bounded, recoverable orphan.
+func (s *Storage) readRowForCASRetry(metaKey []byte) (vm *pb.ValueMessage, found bool, err error) {
+	const attempts = 4
+	for i := 0; i < attempts; i++ {
+		vm, found, err = s.readRowForCAS(metaKey)
+		if err == nil {
+			return vm, found, nil
+		}
+	}
+	return nil, false, err
+}
+
 // GetWithVersion returns the value reader together with the key's current CAS
 // version (issue #254). It is a CAS-path operation that does not touch the plain
 // Get read path. The value reader and the version come from a SINGLE metadata
@@ -154,6 +171,13 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 		return nil, 0, false, nil
 	}
 	version := merge.EffectiveRowVersion(vm)
+
+	// Refresh LRU recency exactly as Get does — a CAS read is still a read, and
+	// a key read only via GetWithVersion must not be treated as cold and evicted
+	// while in active use. Only present under LRU with a disk cap; nil otherwise.
+	if s.accessUpdater != nil {
+		s.accessUpdater.UpdateNow(key)
+	}
 
 	// Build the reader from the SAME ValueMessage the version came from. This
 	// deliberately does not reuse plain Get (a second, divergent metadata read);
@@ -357,16 +381,16 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
 
-	// Read-your-writes tells us who won.
-	got, gotFound, err := s.readRowForCAS(metaKey)
+	// Read-your-writes tells us who won. A few retries resolve a transient read
+	// glitch so a losing spill is reclaimed below rather than leaked.
+	got, gotFound, err := s.readRowForCASRetry(metaKey)
 	if err != nil {
-		// The merge already committed but we cannot read the outcome. We must NOT
-		// delete the spilled file here: if the CAS won, the committed row
-		// references it, and deleting it would leave a live row pointing at a
-		// missing file — silent data loss (worse than an orphan). If the CAS
-		// lost, the spill is orphaned instead; that is bounded and recoverable
-		// (the #156 orphan class), the correct trade for an indeterminate
-		// read-back. The caller retries and re-resolves.
+		// The merge committed but the outcome is genuinely unreadable (a
+		// persistently unhealthy DB). We must NOT delete the spill here: if the
+		// CAS won, the committed row references it, and deleting it would leave a
+		// live row pointing at a missing file — silent data loss, worse than an
+		// orphan. Leave it as a bounded, recoverable orphan (the #156 class); the
+		// caller retries and re-resolves once the DB recovers.
 		if spilledPath != "" {
 			zlog.Warn().Str("key", key).Str("file", spilledPath).
 				Msg("storage.PutIfVersion: read-back failed after commit; leaving spill in place to avoid deleting a possibly-committed value")
@@ -497,8 +521,13 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 	if err != nil {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
-	if casCurrentVersion(prev, hasPrev) != expected {
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, casCurrentVersion(prev, hasPrev))
+	// Delete matches the PHYSICAL row version (clock-blind, like the merge
+	// operator), NOT casCurrentVersion: a delete acts on the row that exists, so
+	// deleting a TTL-expired-but-unswept row with its real version tombstones it
+	// (cleanup), and the operator matches without any precondition translation.
+	// The clock-aware absence view belongs only to PutIfVersion's put-if-absent.
+	if currentVersionOf(prev, hasPrev) != expected {
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(prev, hasPrev))
 	}
 
 	newStamp, err := s.nextVersion()
@@ -551,6 +580,6 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) error {
 		return nil
 	default:
 		metrics.StorageOperations.WithLabelValues("cas_delete", "unknown", "mismatch").Inc()
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, casCurrentVersion(got, gotFound))
+		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
 	}
 }
