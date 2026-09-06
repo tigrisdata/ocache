@@ -469,6 +469,12 @@ test-integration-compaction:
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Compaction) -timeout 300s ./...
 
+.PHONY: test-integration-cas
+test-integration-cas:
+	@echo "Running CAS integration tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_CAS) -timeout 300s ./...
+
 .PHONY: test-integration-cleaner
 test-integration-cleaner:
 	@echo "Running cleaner integration tests (TTL and LRU)..."
@@ -593,6 +599,7 @@ help:
 	@echo "  test-integration-short      - Run integration tests in short mode"
 	@echo "  test-integration-objects    - Run small, medium, and large objects integration tests"
 	@echo "  test-integration-compaction - Run compaction integration tests"
+	@echo "  test-integration-cas        - Run CAS (conditional-ops) integration tests"
 	@echo "  test-integration-cleaner    - Run cleaner integration tests (TTL and LRU)"
 	@echo "  test-integration-workflow   - Run cross-component integration tests"
 	@echo "  test-integration-coordinator - Run coordinator/cluster integration tests"

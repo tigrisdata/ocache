@@ -91,6 +91,30 @@ func (s *CleanerSuite) SetupTest() {
 	s.Harness = NewIntegrationTestHarness(s.T(), config)
 }
 
+// CASSuite tests conditional (compare-and-swap) operations against the full
+// running stack — compactor, cleaner, and deletion queue (issue #254).
+type CASSuite struct {
+	IntegrationTestSuite
+}
+
+// SetupTest sets up for CAS tests: small thresholds and fast background loops so
+// medium values compact to segments quickly and expired/deleted rows are swept
+// within the test window.
+func (s *CASSuite) SetupTest() {
+	InitTestLogging()
+
+	config := DefaultIntegrationTestConfig()
+	config.InlineThreshold = 1 * 1024         // 1KB: modest values spill to raw files
+	config.CompactThreshold = 1 * 1024 * 1024 // 1MB: >1MB stays a permanent raw file
+	config.SegmentSize = 4 * 1024 * 1024      // 4MB segments
+	config.RecompactionInterval = 300 * time.Millisecond
+	config.RecompactMinSegments = 1
+	config.RecompactMinSegmentAge = 0
+	config.CleanupInterval = 300 * time.Millisecond
+	s.Config = config
+	s.Harness = NewIntegrationTestHarness(s.T(), config)
+}
+
 // CompactionSuite tests compaction functionality
 type CompactionSuite struct {
 	IntegrationTestSuite
@@ -207,6 +231,11 @@ func TestIntegrationCompaction(t *testing.T) {
 	suite.Run(t, new(CompactionSuite))
 }
 
+// TestIntegrationCAS runs the conditional-operations (CAS) test suite
+func TestIntegrationCAS(t *testing.T) {
+	suite.Run(t, new(CASSuite))
+}
+
 // TestIntegrationWorkflow runs the workflow test suite
 func TestIntegrationWorkflow(t *testing.T) {
 	suite.Run(t, new(WorkflowSuite))
@@ -233,6 +262,7 @@ func RunAllIntegrationTests(t *testing.T) {
 	t.Run("Objects", TestIntegrationObjects)
 	t.Run("Cleaner", TestIntegrationCleaner)
 	t.Run("Compaction", TestIntegrationCompaction)
+	t.Run("CAS", TestIntegrationCAS)
 	t.Run("Workflows", TestIntegrationWorkflow)
 	if !testing.Short() {
 		t.Run("Coordinator", TestIntegrationCoordinator)
