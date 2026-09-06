@@ -24,6 +24,7 @@ import (
 	"github.com/tigrisdata/ocache/server/operations"
 	"github.com/tigrisdata/ocache/server/service"
 	stor "github.com/tigrisdata/ocache/storage"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"google.golang.org/grpc"
 )
 
@@ -355,12 +356,26 @@ func (c *Client) GetWithVersion(ctx context.Context, key string) ([]byte, uint64
 // put-if-absent), returning the new version or a mismatch error carrying the
 // current version.
 func (c *Client) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
-	return c.ops.PutIfVersion(ctx, key, data, int(ttlSeconds), expected)
+	v, err := c.ops.PutIfVersion(ctx, key, data, int(ttlSeconds), expected)
+	return v, casClientError(key, err)
 }
 
 // DeleteIfVersion deletes only if the key's current version equals expected.
 func (c *Client) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
-	return c.ops.DeleteIfVersion(ctx, key, expected)
+	return casClientError(key, c.ops.DeleteIfVersion(ctx, key, expected))
+}
+
+// casClientError normalizes a mismatch from the operations/storage layer
+// (*storageErrors.VersionMismatchError) into the client-facing
+// *cacheclient.VersionMismatchError, so a caller holding this Client through the
+// cacheclient.CacheClient interface can detect a lost race with
+// cacheclient.IsVersionMismatch — exactly as it can over the gRPC client. Real
+// errors pass through unchanged.
+func casClientError(key string, err error) error {
+	if vm, ok := storageErrors.IsVersionMismatch(err); ok {
+		return &cacheclient.VersionMismatchError{Key: key, CurrentVersion: vm.CurrentVersion}
+	}
+	return err
 }
 
 // List returns all keys matching the given prefix across the entire cluster.

@@ -61,12 +61,17 @@ func (s *CacheService) PutObjectIfVersion(ctx context.Context, req *pb.PutIfVers
 	newVersion, err := s.ops.PutIfVersion(ctx, req.Key, req.Data, int(req.TtlSeconds), req.ExpectedVersion)
 	if err != nil {
 		if vm, ok := storageErrors.IsVersionMismatch(err); ok {
+			// A mismatch is a normal outcome, carried in-band so the caller can
+			// read the current version and retry.
 			metrics.RPCRequests.WithLabelValues("PutObjectIfVersion", "mismatch").Inc()
 			return &pb.PutIfVersionResponse{Success: false, CurrentVersion: vm.CurrentVersion}, nil
 		}
+		// A real failure is returned as a gRPC status so its code survives (a
+		// caller distinguishes retryable ResourceExhausted/Unavailable from
+		// permanent Internal/Corruption). Consistent with GetObjectWithVersion.
 		metrics.RPCRequests.WithLabelValues("PutObjectIfVersion", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "PutObjectIfVersion").Inc()
-		return &pb.PutIfVersionResponse{Success: false, Error: mapStorageErrorToGRPC(err).Error()}, nil
+		return nil, mapStorageErrorToGRPC(err)
 	}
 	metrics.RPCRequests.WithLabelValues("PutObjectIfVersion", "success").Inc()
 	return &pb.PutIfVersionResponse{Success: true, NewVersion: newVersion}, nil
@@ -92,9 +97,11 @@ func (s *CacheService) DeleteIfVersion(ctx context.Context, req *pb.DeleteIfVers
 			metrics.RPCRequests.WithLabelValues("DeleteIfVersion", "mismatch").Inc()
 			return &pb.DeleteIfVersionResponse{Success: false, CurrentVersion: vm.CurrentVersion}, nil
 		}
+		// Real failure as a gRPC status (code preserved), consistent with the
+		// other CAS RPCs; the response is used only for the mismatch outcome.
 		metrics.RPCRequests.WithLabelValues("DeleteIfVersion", "error").Inc()
 		metrics.Errors.WithLabelValues("grpc", "DeleteIfVersion").Inc()
-		return &pb.DeleteIfVersionResponse{Success: false, Error: mapStorageErrorToGRPC(err).Error()}, nil
+		return nil, mapStorageErrorToGRPC(err)
 	}
 	metrics.RPCRequests.WithLabelValues("DeleteIfVersion", "success").Inc()
 	return &pb.DeleteIfVersionResponse{Success: true}, nil

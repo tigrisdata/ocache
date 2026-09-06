@@ -473,3 +473,46 @@ func TestMemoryCache_OverwriteKey(t *testing.T) {
 	result, _ = cache.Get(ctx, key)
 	assert.Equal(t, []byte("second"), result)
 }
+
+// TestMemoryCache_CAS_MatchesStorageSemantics locks in the storage-aligned CAS
+// behavior of the test double: a live plain-written key reports the legacy
+// version (not 0), so put-if-absent is rejected against it — mirroring real
+// storage, so a test using MemoryCache cannot pass on behavior production
+// rejects.
+func TestMemoryCache_CAS_MatchesStorageSemantics(t *testing.T) {
+	ctx := context.Background()
+	cache := NewMemoryCache()
+
+	// A plain-written live key reads as the legacy version, never 0.
+	require.NoError(t, cache.Put(ctx, "plain", []byte("v"), 0))
+	_, ver, found, err := cache.GetWithVersion(ctx, "plain")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, memoryLegacyVersion, ver)
+
+	// put-if-absent must be REJECTED against the live plain key (matches storage).
+	_, err = cache.PutIfVersion(ctx, "plain", []byte("clobber"), 0, 0)
+	vm, ok := IsVersionMismatch(err)
+	require.True(t, ok, "expected mismatch, got %v", err)
+	assert.Equal(t, memoryLegacyVersion, vm.CurrentVersion)
+
+	// A CAS create stamps a version strictly above the legacy sentinel.
+	v1, err := cache.PutIfVersion(ctx, "cas", []byte("a"), 0, 0)
+	require.NoError(t, err)
+	assert.Greater(t, v1, memoryLegacyVersion)
+
+	// Guarded update chain: right token wins and bumps; stale token loses.
+	v2, err := cache.PutIfVersion(ctx, "cas", []byte("b"), 0, v1)
+	require.NoError(t, err)
+	assert.Greater(t, v2, v1)
+	_, err = cache.PutIfVersion(ctx, "cas", []byte("c"), 0, v1)
+	_, ok = IsVersionMismatch(err)
+	require.True(t, ok)
+
+	// DeleteIfVersion: wrong token rejected, right token deletes; then absent.
+	require.Error(t, cache.DeleteIfVersion(ctx, "cas", v1))
+	require.NoError(t, cache.DeleteIfVersion(ctx, "cas", v2))
+	_, _, found, err = cache.GetWithVersion(ctx, "cas")
+	require.NoError(t, err)
+	assert.False(t, found)
+}

@@ -35,11 +35,20 @@ type cacheEntry struct {
 // Compile-time check that MemoryCache implements CacheClient.
 var _ CacheClient = (*MemoryCache)(nil)
 
+// memoryLegacyVersion mirrors the storage layer's merge.VersionLegacy: a live
+// key written by a plain Put (no CAS-assigned stamp) reports this version, and
+// CAS stamps are assigned strictly above it. Kept in sync by value so this test
+// double behaves like real storage (a mismatch here matches production).
+const memoryLegacyVersion uint64 = 1
+
 // NewMemoryCache creates a new in-memory cache.
 func NewMemoryCache() *MemoryCache {
 	return &MemoryCache{
 		data:     make(map[string]cacheEntry),
 		versions: make(map[string]uint64),
+		// Start above memoryLegacyVersion so the first CAS stamp (++counter) is 2
+		// and can never collide with the legacy sentinel a plain Put reports.
+		versionCounter: memoryLegacyVersion,
 	}
 }
 
@@ -53,13 +62,17 @@ func (m *MemoryCache) liveLocked(key string) bool {
 	return entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt)
 }
 
-// effectiveVersionLocked returns the CAS version for key: 0 when it is absent
-// or expired, else its stored version. Caller must hold m.mu.
+// effectiveVersionLocked returns the CAS version for key, mirroring storage's
+// EffectiveRowVersion: 0 when absent or expired; the legacy sentinel for a live
+// key with no CAS-assigned stamp (a plain Put); else its stamp. Caller holds m.mu.
 func (m *MemoryCache) effectiveVersionLocked(key string) uint64 {
 	if !m.liveLocked(key) {
 		return 0
 	}
-	return m.versions[key]
+	if v := m.versions[key]; v != 0 {
+		return v
+	}
+	return memoryLegacyVersion
 }
 
 // GetWithVersion returns key's value and version; found is false (version 0)
@@ -76,7 +89,7 @@ func (m *MemoryCache) GetWithVersion(ctx context.Context, key string) ([]byte, u
 	entry := m.data[key]
 	out := make([]byte, len(entry.value))
 	copy(out, entry.value)
-	return out, m.versions[key], true, nil
+	return out, m.effectiveVersionLocked(key), true, nil
 }
 
 // PutIfVersion writes only if key's current version equals expected (0 =

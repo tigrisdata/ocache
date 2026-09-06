@@ -376,6 +376,37 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 	return err
 }
 
+// GetWithVersion reads a key's value and CAS version with routing-error retry.
+func (c *ClusterClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	data, version, found, err := c.Operations.GetWithVersion(ctx, key)
+	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
+		return c.Operations.GetWithVersion(ctx, key)
+	}
+	return data, version, found, err
+}
+
+// PutIfVersion conditionally writes with routing-error retry. Retrying on a
+// routing error is safe even for this non-idempotent op: a routing error means
+// the request never reached a node, so the CAS did not execute. A version
+// mismatch is not a routing error and is returned to the caller unchanged.
+func (c *ClusterClient) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	v, err := c.Operations.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
+		return c.Operations.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+	}
+	return v, err
+}
+
+// DeleteIfVersion conditionally deletes with routing-error retry (safe for the
+// same reason as PutIfVersion).
+func (c *ClusterClient) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	err := c.Operations.DeleteIfVersion(ctx, key, expected)
+	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
+		return c.Operations.DeleteIfVersion(ctx, key, expected)
+	}
+	return err
+}
+
 // PutStream, List, ListPage and ListPageWithValues are inherited from Operations
 
 // Close closes all connections and stops background goroutines
