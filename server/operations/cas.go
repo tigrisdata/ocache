@@ -12,6 +12,7 @@ import (
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
+	"github.com/tigrisdata/ocache/storage/retry"
 )
 
 // Conditional (compare-and-swap) operations with automatic routing (issue #254).
@@ -22,19 +23,35 @@ import (
 // and could mismatch after an outcome it actually won). The storage layer's own
 // read-back retry already absorbs transient read glitches.
 
-// GetWithVersion returns key's value bytes and current CAS version.
+// GetWithVersion returns key's value bytes and current CAS version. A read is
+// idempotent, so the local open is wrapped in the same retry as GetLocal — the
+// storage read path returns retryable lock/IO errors (file locks, the brief
+// raw->segment compaction unlink window, a dangling-file self-heal) that a
+// re-read recovers from; without this a CAS read would spuriously miss a key a
+// plain Get would return. (The CAS *writes* still skip retry — they are not
+// idempotent.)
 func (o *Operations) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
 	if o.IsLocal(key) {
-		r, version, found, err := o.storage.GetWithVersion(key)
-		if err != nil || !found {
-			return nil, version, found, err
+		var r io.Reader
+		var version uint64
+		var found bool
+		err := retry.DoWithKey(ctx, retry.DefaultConfig(), "GetWithVersion", key, func() error {
+			var getErr error
+			r, version, found, getErr = o.storage.GetWithVersion(key)
+			return getErr
+		})
+		if err != nil {
+			return nil, 0, false, err
 		}
-		data, err := io.ReadAll(r)
+		if !found {
+			return nil, version, false, nil
+		}
+		data, readErr := io.ReadAll(r)
 		if rc, ok := r.(io.ReadCloser); ok {
 			_ = rc.Close()
 		}
-		if err != nil {
-			return nil, 0, false, err
+		if readErr != nil {
+			return nil, 0, false, readErr
 		}
 		return data, version, true, nil
 	}
