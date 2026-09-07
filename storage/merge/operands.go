@@ -5,6 +5,7 @@ package merge
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	pb "github.com/tigrisdata/ocache/storage/proto"
 
@@ -36,6 +37,22 @@ func MakeRawFilePurgeOperand(rawFilePath string) ([]byte, error) {
 		ValueType:   pb.ValueType_RAW_FILE,
 		RawFilePath: rawFilePath,
 	})
+}
+
+// MakeSegmentCASOperand serializes a segment migration operand with the source
+// offset encoded in ValueMessage.Data. Data is transient operand state here;
+// mergeMetadataCAS clears it before persisting the destination metadata. The
+// source offset is encoded directly (rather than using zero as "unset") so an
+// entry at offset zero receives the same exact CAS protection as every other
+// entry.
+func MakeSegmentCASOperand(meta *pb.ValueMessage, sourceOffset int64) ([]byte, error) {
+	if meta == nil || meta.ValueType != pb.ValueType_SEGMENT || sourceOffset < 0 {
+		return nil, fmt.Errorf("invalid segment CAS operand")
+	}
+	operand := proto.Clone(meta).(*pb.ValueMessage)
+	operand.Data = make([]byte, 8)
+	binary.BigEndian.PutUint64(operand.Data, uint64(sourceOffset))
+	return proto.Marshal(operand)
 }
 
 // Future operand creators can be added here:

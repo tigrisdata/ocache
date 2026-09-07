@@ -4,6 +4,7 @@
 package compaction
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -118,6 +119,7 @@ func createTestSegmentWithEntries(t *testing.T, sm *segment.Manager, meta *metad
 
 		metaKey := keys.MakeMetadataKey(key)
 		wb.Put(metaKey, metaBytes)
+		require.NoError(t, stageSegmentLiveIndexRow(wb, key, seg.Path(), offset, int64(len(value)), 0))
 	}
 
 	// Commit metadata
@@ -131,8 +133,120 @@ func createTestSegmentWithEntries(t *testing.T, sm *segment.Manager, meta *metad
 	if err := sm.FinalizeSegment(seg); err != nil {
 		return nil, err
 	}
+	if err := MarkSegmentLiveIndexComplete(meta, seg); err != nil {
+		return nil, err
+	}
 
 	return seg, nil
+}
+
+func TestBackfillSegmentLiveIndex_RebuildsLegacySegment(t *testing.T) {
+	_, sm, meta, _, cleanup := setupTestRecompactor(t)
+	defer cleanup()
+
+	entries := map[string][]byte{"legacy": []byte("legacy segment payload")}
+	seg, err := createTestSegmentWithEntries(t, sm, meta, entries)
+	require.NoError(t, err)
+	value, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("legacy")))
+	require.NoError(t, err)
+	wo := grocksdb.NewDefaultWriteOptions()
+	require.NoError(t, meta.Handle().Delete(wo, keys.MakeSegmentLiveIndexKey(seg.Path(), value.SegmentOffset)))
+	require.NoError(t, meta.Handle().Delete(wo, keys.MakeSegmentLiveCoverageKey(seg.Path())))
+	wo.Destroy()
+
+	require.NoError(t, backfillSegmentLiveIndex(meta, sm))
+	require.True(t, segmentLiveIndexRowExistsForTest(t, meta, seg.Path(), value.SegmentOffset))
+	covered, err := segmentLiveIndexCovered(meta, seg)
+	require.NoError(t, err)
+	require.True(t, covered)
+}
+
+func segmentLiveIndexRowExistsForTest(t *testing.T, meta *metadata.MetaDB, segmentPath string, offset int64) bool {
+	t.Helper()
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	slice, err := meta.Handle().Get(ro, keys.MakeSegmentLiveIndexKey(segmentPath, offset))
+	require.NoError(t, err)
+	exists := slice.Exists()
+	slice.Free()
+	return exists
+}
+
+func TestRecompactionRolloverPublishesBeforeFinalizing(t *testing.T) {
+	_, sm, meta, _, cleanup := setupTestRecompactor(t)
+	defer cleanup()
+
+	oldSeg, err := sm.AcquireOpenSegmentWithReservation("rollover-source", 0)
+	require.NoError(t, err)
+	payload := bytes.Repeat([]byte{'x'}, 600*1024)
+	entries := make([]*segment.EntryInfo, 2)
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	for i := range entries {
+		key := fmt.Sprintf("rollover-%d", i)
+		offset, writeErr := oldSeg.WriteEntry(key, bytes.NewReader(payload), &pb.ValueMessage{
+			ValueType:   pb.ValueType_SEGMENT,
+			ValueLength: int64(len(payload)),
+		})
+		require.NoError(t, writeErr)
+		entries[i] = &segment.EntryInfo{
+			Key:         key,
+			Offset:      offset,
+			HeaderSize:  segment.CalculateValueHeaderSize(key),
+			ValueLength: int64(len(payload)),
+			Version:     segment.CurrentValueHeaderVersion,
+		}
+		metaBytes, marshalErr := proto.Marshal(&pb.ValueMessage{
+			ValueType:     pb.ValueType_SEGMENT,
+			SegmentPath:   oldSeg.Path(),
+			SegmentOffset: offset,
+			ValueLength:   int64(len(payload)),
+		})
+		require.NoError(t, marshalErr)
+		batch.Put(keys.MakeMetadataKey(key), metaBytes)
+	}
+	wo := grocksdb.NewDefaultWriteOptions()
+	require.NoError(t, meta.Handle().Write(wo, batch))
+	wo.Destroy()
+	require.NoError(t, sm.FinalizeSegment(oldSeg))
+
+	oldFile, err := os.Open(oldSeg.Path())
+	require.NoError(t, err)
+	defer oldFile.Close()
+	newSeg, err := sm.AcquireOpenSegmentWithReservation("rollover-recompactor", 0)
+	require.NoError(t, err)
+	firstDestination := newSeg.Path()
+	wb := grocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	advice := newCacheAdvice()
+	finalized := make([]*segment.Segment, 0, 1)
+	recompactor := NewSegmentRecompactor(meta, sm, nil, 0, 0, 1)
+
+	firstMeta := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		SegmentPath:   oldSeg.Path(),
+		SegmentOffset: entries[0].Offset,
+		ValueLength:   entries[0].ValueLength,
+	}
+	require.NoError(t, recompactor.copyEntry(context.Background(), oldFile, &newSeg, "rollover-recompactor", entries[0], firstMeta, wb, advice, &finalized))
+	require.Equal(t, firstDestination, newSeg.Path())
+
+	secondMeta := &pb.ValueMessage{
+		ValueType:     pb.ValueType_SEGMENT,
+		SegmentPath:   oldSeg.Path(),
+		SegmentOffset: entries[1].Offset,
+		ValueLength:   entries[1].ValueLength,
+	}
+	require.NoError(t, recompactor.copyEntry(context.Background(), oldFile, &newSeg, "rollover-recompactor", entries[1], secondMeta, wb, advice, &finalized))
+	require.Len(t, finalized, 1)
+	require.NotEqual(t, firstDestination, newSeg.Path())
+
+	published, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey(entries[0].Key)))
+	require.NoError(t, err)
+	require.Equal(t, firstDestination, published.SegmentPath)
+	require.Equal(t, entries[0].ValueLength, published.ValueLength)
+	require.True(t, segmentLiveIndexRowExistsForTest(t, meta, published.SegmentPath, published.SegmentOffset))
+	require.NoError(t, newSeg.Release("rollover-recompactor"))
 }
 
 func TestSegmentRecompaction_NoFragmentation(t *testing.T) {
@@ -237,6 +351,42 @@ func TestSegmentRecompaction_WithFragmentation(t *testing.T) {
 	assert.False(t, slice.Exists())
 }
 
+func TestSegmentRecompaction_LegacySegmentFallsBackToSourceScan(t *testing.T) {
+	recompactor, sm, meta, _, cleanup := setupTestRecompactor(t)
+	defer cleanup()
+
+	entries := map[string][]byte{
+		"legacy-live": []byte("value that remains live"),
+		"legacy-dead": []byte("value that is deleted"),
+	}
+	seg, err := createTestSegmentWithEntries(t, sm, meta, entries)
+	require.NoError(t, err)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, meta.Handle().Delete(wo, keys.MakeSegmentLiveCoverageKey(seg.Path())))
+	require.NoError(t, meta.Handle().Delete(wo, keys.MakeMetadataKey("legacy-dead")))
+	deleteBytes, err := proto.Marshal(&pb.DeleteIndexEntry{DeletedEntries: 1, DeletedBytes: int64(len(entries["legacy-dead"]))})
+	require.NoError(t, err)
+	require.NoError(t, meta.Handle().Put(wo, keys.MakeDeleteIndexKey(seg.Path()), deleteBytes))
+
+	recompactor.minSegments = 1
+	recompactor.fragThreshold = 0.01
+	require.NoError(t, recompactor.RecompactFragmentedSegments(context.Background()))
+
+	segments := sm.GetSegments()
+	require.Len(t, segments, 1)
+	require.NotEqual(t, seg.Path(), segments[0].Path())
+	vm, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("legacy-live")))
+	require.NoError(t, err)
+	reader, err := sm.ReadEntry("legacy-live", vm.SegmentPath, vm.SegmentOffset, vm.ValueLength)
+	require.NoError(t, err)
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, entries["legacy-live"], got)
+}
+
 func TestSegmentRecompaction_AllEntriesDeleted(t *testing.T) {
 	recompactor, sm, meta, _, cleanup := setupTestRecompactor(t)
 	defer cleanup()
@@ -290,6 +440,55 @@ func TestSegmentRecompaction_AllEntriesDeleted(t *testing.T) {
 			assert.Fail(t, "Unexpected new segment created when all entries were deleted")
 		}
 	}
+}
+
+func TestSegmentRecompaction_MissingLiveRowRetainsSource(t *testing.T) {
+	recompactor, sm, meta, _, cleanup := setupTestRecompactor(t)
+	defer cleanup()
+
+	entries := map[string][]byte{
+		"missing-index": []byte("value-that-must-stay-readable"),
+		"live":          []byte("another-live-value"),
+		"dead":          []byte("dead-value-for-fragmentation"),
+	}
+	seg, err := createTestSegmentWithEntries(t, sm, meta, entries)
+	require.NoError(t, err)
+
+	missing, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("missing-index")))
+	require.NoError(t, err)
+	// Simulate a lost index row while leaving authoritative metadata intact.
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, meta.Handle().Delete(wo, keys.MakeSegmentLiveIndexKey(seg.Path(), missing.SegmentOffset)))
+	// Make the segment fragmented without deleting the missing-index metadata.
+	require.NoError(t, meta.Handle().Delete(wo, keys.MakeMetadataKey("dead")))
+	recompactor.minSegments = 1
+	recompactor.fragThreshold = 0.01
+
+	require.NoError(t, recompactor.RecompactFragmentedSegments(context.Background()))
+	paths := make(map[string]struct{})
+	for _, got := range sm.GetSegments() {
+		paths[got.Path()] = struct{}{}
+	}
+	require.Contains(t, paths, seg.Path(), "a missing live row must prevent source cleanup")
+
+	vm, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("missing-index")))
+	require.NoError(t, err)
+	require.Equal(t, seg.Path(), vm.SegmentPath)
+	reader, err := sm.ReadEntry("missing-index", vm.SegmentPath, vm.SegmentOffset, vm.ValueLength)
+	require.NoError(t, err)
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, entries["missing-index"], got)
+
+	// The repair makes the next indexed pass able to find the row.
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	slice, err := meta.Handle().Get(ro, keys.MakeSegmentLiveIndexKey(seg.Path(), missing.SegmentOffset))
+	require.NoError(t, err)
+	require.True(t, slice.Exists())
+	slice.Free()
 }
 
 func TestSegmentRecompaction_ContextCancellation(t *testing.T) {

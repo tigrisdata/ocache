@@ -18,6 +18,7 @@ import (
 	"github.com/tigrisdata/ocache/storage/benchio"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
@@ -224,21 +225,25 @@ func (sr *SegmentRecompactor) RecompactFragmentedSegments(ctx context.Context) e
 func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segment.Segment) error {
 	zlog.Info().Str("segment", oldSeg.Path()).Msg("recompactor: starting segment recompaction")
 
-	// Open the old segment for reading
+	covered, err := segmentLiveIndexCovered(sr.meta, oldSeg)
+	if err != nil {
+		return fmt.Errorf("failed to inspect segment live index coverage: %w", err)
+	}
+
+	// The source file is still needed for payload reads, but a covered index
+	// avoids constructing a source iterator and avoids parsing dead headers and
+	// keys. Legacy/uncovered segments use the complete historical walk.
 	oldFile, err := os.Open(oldSeg.Path())
 	if err != nil {
 		return fmt.Errorf("failed to open segment %s: %w", oldSeg.Path(), err)
 	}
 	defer oldFile.Close()
 
-	// Create a new segment for the live data with reservation
-	callerID := fmt.Sprintf("%s%s", recompactorCallerIDPrefix, oldSeg.Path()) // Unique ID per segment being recompacted
-	newSeg, err := sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
-	if err != nil {
-		return fmt.Errorf("failed to acquire new segment: %w", err)
-	}
-	// Release the segment so it can be used by others
-	// Use a pointer to ensure we release the final segment, not the initial one
+	callerID := fmt.Sprintf("%s%s", recompactorCallerIDPrefix, oldSeg.Path())
+	// Do not reserve or create a destination until the first validated live row
+	// is found. A fully dead segment can then be removed without manufacturing
+	// an empty destination segment.
+	var newSeg *segment.Segment
 	defer func() {
 		if newSeg != nil {
 			if err := newSeg.Release(callerID); err != nil {
@@ -247,174 +252,234 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 		}
 	}()
 
-	// Track metadata updates
 	wb := grocksdb.NewWriteBatch()
 	defer wb.Destroy()
 	advice := newCacheAdvice()
-
-	// Create an iterator to scan the old segment
-	iter, err := oldSeg.NewIterator(oldFile)
-	if err != nil {
-		return fmt.Errorf("failed to create segment iterator: %w", err)
+	var iter *segment.Iterator
+	if !covered {
+		iter, err = oldSeg.NewIterator(oldFile)
+		if err != nil {
+			return fmt.Errorf("failed to create segment iterator: %w", err)
+		}
 	}
 
+	// A destination segment can be finalized by copyEntry when it fills before
+	// the metadata batch is published. Mark those segments only after this batch
+	// commits, so coverage never gets ahead of metadata.
+	var finalizedSegments []*segment.Segment
 	copiedEntries := uint32(0)
 	copiedBytes := int64(0)
-	// failedEntries counts live entries this pass could not migrate (a copy
-	// failure, or a segment read error that hides everything beyond it). Any
-	// failure must keep the old segment alive: at least one live entry's
-	// metadata still points into it, and removing it would make that data
-	// permanently unreadable. Deleted/moved entries are skips, not failures.
 	failedEntries := 0
 
-	// Iterate through all entries in the segment
-	for {
-		// Check context cancellation
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		// Get the next entry
-		entry, err := iter.Next()
-		if err != nil {
-			if err == io.EOF {
-				break // End of segment
+	copyLive := func(entry *segment.EntryInfo, indexKey, indexValue []byte, indexed bool) error {
+		var meta *pb.ValueMessage
+		if indexed {
+			var live bool
+			var err error
+			meta, live, err = validateIndexedMetadata(sr.meta, entry, indexValue, oldSeg.Path())
+			if err != nil {
+				return err
 			}
-			// A read error can hide any number of live entries beyond it, so
-			// this pass is incomplete — the old segment must survive.
-			failedEntries++
-			zlog.Error().Err(err).Int64("offset", iter.CurrentPosition()).
-				Msg("recompactor: failed to read entry")
-			break
-		}
-
-		// Check if this entry is still live (not deleted)
-		metaKey := keys.MakeMetadataKey(entry.Key)
-		meta, err := utils.GetMetadata(sr.meta, string(metaKey))
-		if err != nil {
-			if errors.Is(err, utils.ErrMetadataNotFound) {
-				// Entry has been deleted, skip it
-				continue
+			if !live {
+				// Rows emitted beside a conditional migration are speculative.
+				// Once metadata no longer points at this source location, remove
+				// the row without treating the source segment as incomplete.
+				wb.Delete(indexKey)
+				return nil
 			}
-			// A transient lookup failure is NOT evidence of deletion: skipping
-			// a live entry here and then removing the old segment would make
-			// its data permanently unreadable. Count the pass incomplete so
-			// the old segment survives for a later retry.
+		} else {
+			var err error
+			meta, err = utils.GetMetadata(sr.meta, string(keys.MakeMetadataKey(entry.Key)))
+			if err != nil {
+				if errors.Is(err, utils.ErrMetadataNotFound) {
+					return nil
+				}
+				return err
+			}
+			if meta.ValueType != pb.ValueType_SEGMENT || meta.SegmentPath != oldSeg.Path() || meta.SegmentOffset != entry.Offset {
+				return nil
+			}
+		}
+
+		if newSeg == nil {
+			var err error
+			newSeg, err = sr.sm.AcquireOpenSegmentWithReservation(callerID, 0)
+			if err != nil {
+				return fmt.Errorf("failed to acquire new segment: %w", err)
+			}
+		}
+		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, entry, meta, wb, advice, &finalizedSegments); err != nil {
 			failedEntries++
-			zlog.Error().Err(err).Str("key", entry.Key).
-				Msg("recompactor: metadata lookup failed; keeping old segment")
-			continue
+			zlog.Error().Err(err).Str("key", entry.Key).Msg("recompactor: failed to copy entry")
+			return nil
 		}
-
-		// Verify this entry still points to this segment
-		if meta.ValueType != pb.ValueType_SEGMENT ||
-			meta.SegmentPath != oldSeg.Path() ||
-			meta.SegmentOffset != entry.Offset {
-			// Entry has been overwritten or moved, skip it
-			continue
-		}
-
-		// This is a live entry, copy it to the new segment
-		if err := sr.copyEntry(ctx, oldFile, &newSeg, callerID, entry, meta, wb, advice); err != nil {
-			failedEntries++
-			zlog.Error().Err(err).Str("key", entry.Key).
-				Msg("recompactor: failed to copy entry")
-			continue
-		}
-
 		copiedEntries++
 		copiedBytes += entry.ValueLength
-
-		// Update metrics
 		metrics.RecompactionEntriesCopied.Inc()
 		metrics.RecompactionBytesCopied.Add(float64(entry.ValueLength))
-	}
-
-	// If no live entries were copied, abandon the new segment but still delete the old one
-	if copiedEntries == 0 {
-		zlog.Info().Str("segment", oldSeg.Path()).
-			Msg("recompactor: no live entries found")
-	}
-
-	// Persist the copied range before publishing metadata that references it.
-	if wb.Count() > 0 {
-		if err := newSeg.Sync(); err != nil {
-			return fmt.Errorf("failed to sync new segment: %w", err)
-		}
-		advice.dropSyncedOutput(newSeg)
-
-		// Now commit metadata updates - readers will only see the new segment.
-		wo := grocksdb.NewDefaultWriteOptions()
-		defer wo.Destroy()
-		if err := sr.meta.Handle().Write(wo, wb); err != nil {
-			// If metadata commit fails, we need to restore the segment to the manager
-			// This is a critical error as we've already removed it from tracking
-			zlog.Error().Err(err).
-				Str("oldSegment", oldSeg.Path()).
-				Str("newSegment", newSeg.Path()).
-				Msg("recompactor: failed to commit metadata")
-			return fmt.Errorf("failed to commit metadata updates: %w", err)
-		}
-	}
-
-	// An incomplete pass must NOT remove the old segment: at least one live
-	// entry's metadata still points into it (a failed copy, or a read error that
-	// hid the rest of the segment), and deleting it would make that data
-	// permanently unreadable. The entries copied above were already committed
-	// and re-point at the new segment; the old segment stays tracked, keeps its
-	// delete index, and a later recompaction pass retries — copied entries are
-	// then skipped as moved. The all-entries-dead case (copiedEntries == 0 with
-	// no failures) still falls through to removal below.
-	if failedEntries > 0 {
-		zlog.Warn().
-			Str("segment", oldSeg.Path()).
-			Int("failed", failedEntries).
-			Uint32("copied", copiedEntries).
-			Msg("recompactor: incomplete pass; keeping old segment for a later retry")
 		return nil
 	}
 
-	// This ensures no new reads can start on the old segment after metadata points to new segment
+	if covered {
+		dataSize, _, err := segmentDataRegionSize(oldSeg)
+		if err != nil {
+			return err
+		}
+		indexErr := indexedSegmentRows(ctx, sr.meta, oldSeg.Path(), func(indexKey, indexValue []byte) error {
+			entry, err := indexedSegmentEntry(indexKey, indexValue, oldSeg, dataSize)
+			if err != nil {
+				return err
+			}
+			return copyLive(entry, indexKey, indexValue, true)
+		})
+		if indexErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			// A malformed row or lookup failure means this pass cannot prove
+			// that every live row was considered. Keep the source and force the
+			// next pass back through the historical scan.
+			failedEntries++
+			wb.Delete(keys.MakeSegmentLiveCoverageKey(oldSeg.Path()))
+			zlog.Error().Err(indexErr).Str("segment", oldSeg.Path()).Msg("recompactor: indexed walk incomplete")
+		}
+	} else {
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			entry, err := iter.Next()
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				failedEntries++
+				zlog.Error().Err(err).Int64("offset", iter.CurrentPosition()).Msg("recompactor: failed to read entry")
+				break
+			}
+			if err := copyLive(entry, nil, nil, false); err != nil {
+				failedEntries++
+				zlog.Error().Err(err).Str("key", entry.Key).Msg("recompactor: metadata lookup failed; keeping old segment")
+			}
+		}
+	}
+
+	if copiedEntries == 0 {
+		zlog.Info().Str("segment", oldSeg.Path()).Msg("recompactor: no live entries found")
+	}
+
+	// Persist the final open destination before publishing metadata. A batch
+	// containing only stale-index repairs does not require syncing an empty
+	// destination segment.
+	if copiedEntries > 0 {
+		if err := sr.commitRecompactionBatch(ctx, newSeg, wb, advice); err != nil {
+			newPath := ""
+			if newSeg != nil {
+				newPath = newSeg.Path()
+			}
+			zlog.Error().Err(err).Str("oldSegment", oldSeg.Path()).Str("newSegment", newPath).Msg("recompactor: failed to commit metadata")
+			return err
+		}
+	} else if wb.Count() > 0 {
+		wo := grocksdb.NewDefaultWriteOptions()
+		defer wo.Destroy()
+		if err := sr.meta.Handle().Write(wo, wb); err != nil {
+			zlog.Error().Err(err).Str("oldSegment", oldSeg.Path()).Msg("recompactor: failed to commit metadata")
+			return fmt.Errorf("failed to commit metadata updates: %w", err)
+		}
+		wb.Clear()
+	}
+	for _, finalized := range finalizedSegments {
+		if err := MarkSegmentLiveIndexComplete(sr.meta, finalized); err != nil {
+			zlog.Warn().Err(err).Str("segment", finalized.Path()).Msg("recompactor: failed to mark destination live index coverage; retaining scan fallback")
+		}
+	}
+
+	// An incomplete pass must not remove the old segment. Copied entries were
+	// conditionally published and their source rows were removed atomically; the
+	// remaining source rows keep the old segment reachable for a later retry.
+	if failedEntries > 0 {
+		zlog.Warn().Str("segment", oldSeg.Path()).Int("failed", failedEntries).Uint32("copied", copiedEntries).Msg("recompactor: incomplete pass; keeping old segment for a later retry")
+		return nil
+	}
+
+	complete, verifyErr := sr.verifySegmentLiveIndexComplete(oldSeg.Path(), oldSeg)
+	if verifyErr != nil {
+		// A metadata read or physical-boundary error is not evidence that the
+		// source is empty. Invalidate the marker so the next attempt uses the
+		// complete source scan.
+		wo := grocksdb.NewDefaultWriteOptions()
+		deleteErr := sr.meta.Handle().Delete(wo, keys.MakeSegmentLiveCoverageKey(oldSeg.Path()))
+		wo.Destroy()
+		if deleteErr != nil {
+			return deleteErr
+		}
+		return verifyErr
+	}
+	if !complete {
+		zlog.Warn().Str("segment", oldSeg.Path()).Msg("recompactor: repaired incomplete live index; keeping source for a later retry")
+		return nil
+	}
+
 	removedSeg := sr.sm.RemoveSegment(oldSeg.Path())
 	if removedSeg == nil {
-		// Segment was already removed, possibly by another process
-		zlog.Warn().Str("path", oldSeg.Path()).
-			Msg("recompactor: segment already removed from manager")
+		zlog.Warn().Str("path", oldSeg.Path()).Msg("recompactor: segment already removed from manager")
+	}
+	if err := sr.removeSegmentLiveIndex(oldSeg.Path()); err != nil {
+		zlog.Error().Err(err).Str("segment", oldSeg.Path()).Msg("recompactor: failed to remove segment live index")
 	}
 
-	// Queue old segment for deletion - it's safe now as no readers can access it
 	if err := sr.deletionQueue.Add(oldSeg.Path()); err != nil {
-		zlog.Error().Err(err).Str("path", oldSeg.Path()).
-			Msg("recompactor: failed to queue old segment for deletion")
+		zlog.Error().Err(err).Str("path", oldSeg.Path()).Msg("recompactor: failed to queue old segment for deletion")
 	}
-
-	// Remove delete index for old segment
 	if err := sr.removeDeleteIndex(oldSeg.Path()); err != nil {
-		zlog.Error().Err(err).Str("segment", oldSeg.Path()).
-			Msg("recompactor: failed to remove delete index")
+		zlog.Error().Err(err).Str("segment", oldSeg.Path()).Msg("recompactor: failed to remove delete index")
 	}
 
-	// Calculate bytes freed (assuming old segment will be deleted)
 	if oldSegInfo, err := os.Stat(oldSeg.Path()); err == nil {
 		bytesFreed := oldSegInfo.Size() - copiedBytes
 		if bytesFreed > 0 {
 			metrics.RecompactionBytesFreed.Add(float64(bytesFreed))
 		}
 	}
+	newPath := ""
+	if newSeg != nil {
+		newPath = newSeg.Path()
+	}
+	zlog.Info().Str("oldSegment", oldSeg.Path()).Str("newSegment", newPath).Uint32("copiedEntries", copiedEntries).Int64("copiedBytes", copiedBytes).Msg("recompactor: successfully recompacted segment")
+	return nil
+}
 
-	zlog.Info().
-		Str("oldSegment", oldSeg.Path()).
-		Str("newSegment", newSeg.Path()).
-		Uint32("copiedEntries", copiedEntries).
-		Int64("copiedBytes", copiedBytes).
-		Msg("recompactor: successfully recompacted segment")
-
+// commitRecompactionBatch syncs a destination before publishing the metadata
+// and live-index rows that point at it. The batch is cleared only after the
+// RocksDB write succeeds so a caller can retry a failed publication without
+// losing staged migrations.
+func (sr *SegmentRecompactor) commitRecompactionBatch(ctx context.Context, seg *segment.Segment, wb *grocksdb.WriteBatch, advice *cacheAdvice) error {
+	if seg == nil || wb == nil {
+		return fmt.Errorf("invalid recompaction batch arguments")
+	}
+	if wb.Count() == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := seg.Sync(); err != nil {
+		return fmt.Errorf("failed to sync new segment: %w", err)
+	}
+	advice.dropSyncedOutput(seg)
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	if err := sr.meta.Handle().Write(wo, wb); err != nil {
+		return fmt.Errorf("failed to commit metadata updates: %w", err)
+	}
+	wb.Clear()
 	return nil
 }
 
 // copyEntry copies a single entry from old segment to new segment
 func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, newSeg **segment.Segment, callerID string,
-	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch, advice *cacheAdvice,
+	entry *segment.EntryInfo, meta *pb.ValueMessage, wb *grocksdb.WriteBatch, advice *cacheAdvice, finalizedSegments *[]*segment.Segment,
 ) error {
 	// Create a section reader for the value data (no checksum verification per review).
 	// The wrapper charges the direct payload reads to the benchmark-only shared lane.
@@ -427,12 +492,19 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	// manager uses internal locking and reservations to coordinate between compactor and recompactor
 	totalNeeded := entry.HeaderSize + entry.ValueLength
 	if (*newSeg).Remaining() < totalNeeded {
-		// Finalize the segment first, then release it
-		// This prevents other threads from acquiring it while it's being finalized
+		// Publish the entries already written to this destination before
+		// closing it. Once finalized, another recompaction pass may treat the
+		// segment as eligible; exposing a closed segment whose metadata still
+		// points at the source would let that pass reclaim the destination.
+		if err := sr.commitRecompactionBatch(ctx, *newSeg, wb, advice); err != nil {
+			return err
+		}
 		if err := sr.sm.FinalizeSegment(*newSeg); err != nil {
 			return fmt.Errorf("failed to finalize segment: %w", err)
 		}
-		advice.dropSyncedOutput(*newSeg)
+		if finalizedSegments != nil {
+			*finalizedSegments = append(*finalizedSegments, *newSeg)
+		}
 
 		// Now safe to release since it's finalized
 		if err := (*newSeg).Release(callerID); err != nil {
@@ -468,27 +540,28 @@ func (sr *SegmentRecompactor) copyEntry(ctx context.Context, oldFile *os.File, n
 	dropFileCache(oldFile, entry.Offset, totalNeeded)
 
 	// Publish the new location via a compare-and-swap merge, never an
-	// unconditional Put: the batch commits only at the end of the whole
-	// (rate-limited) segment pass, and a concurrent Put may replace this key
-	// in that window — clobbering its row would make the newly written value
-	// unreachable and roll the key back to the recompacted copy of the old
-	// bytes. The operand overloads RawFilePath with the OLD segment path as
-	// the precondition (the convention the file compactor uses with raw
-	// paths, see merge.mergeMetadataCAS): the swap applies only while the row
-	// still points into the old segment, so a newer write always wins and
-	// this copy simply becomes dead space in the new segment.
+	// unconditional Put. The operand matches both the old segment path and
+	// source offset, so two records from one source cannot cross-apply after a
+	// concurrent overwrite. The transient source facts are cleared by the merge
+	// operator before the destination metadata is persisted.
 	oldPath := meta.SegmentPath
 	meta.SegmentPath = (*newSeg).Path()
 	meta.SegmentOffset = newOffset
 	meta.RawFilePath = oldPath
 
-	operand, err := proto.Marshal(meta)
+	operand, err := merge.MakeSegmentCASOperand(meta, entry.Offset)
 	if err != nil {
 		return fmt.Errorf("failed to marshal metadata: %w", err)
 	}
 
 	metaKey := keys.MakeMetadataKey(entry.Key)
 	wb.Merge(metaKey, operand)
+	if err := stageSegmentLiveIndexRow(wb, entry.Key, (*newSeg).Path(), newOffset, entry.ValueLength, entry.Checksum); err != nil {
+		return err
+	}
+	if err := stageSegmentLiveIndexDelete(wb, oldPath, entry.Offset); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -526,6 +599,22 @@ func (sr *SegmentRecompactor) isSegmentEligibleForRecompaction(seg *segment.Segm
 	}
 
 	return true, ""
+}
+
+// removeSegmentLiveIndex removes all durable live-location rows and the
+// coverage marker for a source segment after it is no longer tracked.
+func (sr *SegmentRecompactor) removeSegmentLiveIndex(segmentPath string) error {
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	if err := deleteSegmentLiveIndexRows(sr.meta, batch, segmentPath); err != nil {
+		return err
+	}
+	if batch.Count() == 0 {
+		return nil
+	}
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	return sr.meta.Handle().Write(wo, batch)
 }
 
 // getDeleteIndexStats retrieves delete index statistics for a segment

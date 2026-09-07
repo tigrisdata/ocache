@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	grocksdb "github.com/linxGnu/grocksdb"
 	"github.com/tigrisdata/ocache/storage/keys"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
@@ -43,11 +44,23 @@ import (
 // needs no count cap: reads are paced by the shared compaction I/O limiter.
 const DefaultSegmentWalkInterval = 1 * time.Hour
 
-// walkSegmentLiveness derives a closed segment's dead entries and bytes from
-// ground truth: footer totals minus the entries whose metadata rows still
-// point at this segment. Any read or lookup failure aborts the derivation —
-// deriving from partial knowledge would count unseen live entries dead.
+// walkSegmentLiveness chooses the durable offset index only after its marker
+// proves complete for this exact segment footer. Legacy and damaged segments
+// retain the source-header walk fallback.
 func (sr *SegmentRecompactor) walkSegmentLiveness(ctx context.Context, seg *segment.Segment) (deadEntries, deadBytes int64, err error) {
+	covered, err := segmentLiveIndexCovered(sr.meta, seg)
+	if err != nil {
+		return 0, 0, err
+	}
+	if covered {
+		return sr.walkIndexedSegmentLiveness(ctx, seg)
+	}
+	return sr.walkSegmentLivenessByScan(ctx, seg)
+}
+
+// walkSegmentLivenessByScan derives a closed segment's dead entries and bytes
+// from source headers. It remains the safe path for legacy or unproven indexes.
+func (sr *SegmentRecompactor) walkSegmentLivenessByScan(ctx context.Context, seg *segment.Segment) (deadEntries, deadBytes int64, err error) {
 	file, err := os.Open(seg.Path())
 	if err != nil {
 		return 0, 0, err
@@ -132,6 +145,76 @@ func (sr *SegmentRecompactor) walkSegmentLiveness(ctx context.Context, seg *segm
 		deadBytes = 0
 	}
 	return deadEntries, deadBytes, nil
+}
+
+// walkIndexedSegmentLiveness derives liveness from covered rows. It performs
+// metadata validation for every indexed candidate, but never opens the source
+// file or parses a historical header/key. Stale speculative rows are pruned;
+// malformed facts invalidate the marker and return the safe scan error path.
+func (sr *SegmentRecompactor) walkIndexedSegmentLiveness(ctx context.Context, seg *segment.Segment) (deadEntries, deadBytes int64, err error) {
+	entries, dataBytes := int64(seg.GetNumEntries()), seg.GetDataBytes()
+	if entries <= 0 || dataBytes <= 0 {
+		return 0, 0, nil
+	}
+	dataSize, _, err := segmentDataRegionSize(seg)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	var indexRows, liveEntries, liveBytes int64
+	walkErr := indexedSegmentRows(ctx, sr.meta, seg.Path(), func(indexKey, indexValue []byte) error {
+		indexRows++
+		entry, err := indexedSegmentEntry(indexKey, indexValue, seg, dataSize)
+		if err != nil {
+			return err
+		}
+		_, live, err := validateIndexedMetadata(sr.meta, entry, indexValue, seg.Path())
+		if err != nil {
+			return err
+		}
+		if !live {
+			batch.Delete(indexKey)
+			return nil
+		}
+		liveEntries++
+		liveBytes += entry.ValueLength
+		return nil
+	})
+
+	commitRepairs := func(invalidate bool) error {
+		if invalidate {
+			batch.Delete(keys.MakeSegmentLiveCoverageKey(seg.Path()))
+		}
+		if batch.Count() == 0 {
+			return nil
+		}
+		wo := grocksdb.NewDefaultWriteOptions()
+		defer wo.Destroy()
+		return sr.meta.Handle().Write(wo, batch)
+	}
+	if walkErr != nil {
+		// Cancellation is not evidence that the index is bad. Preserve the
+		// marker and all rows so a later pass can resume normally.
+		if ctx.Err() != nil {
+			return 0, 0, walkErr
+		}
+		if repairErr := commitRepairs(true); repairErr != nil {
+			return 0, 0, repairErr
+		}
+		return 0, 0, walkErr
+	}
+	if indexRows > entries || liveEntries > entries || liveBytes > dataBytes {
+		if repairErr := commitRepairs(true); repairErr != nil {
+			return 0, 0, repairErr
+		}
+		return 0, 0, fmt.Errorf("segment %s live index exceeds footer totals", seg.Path())
+	}
+	if err := commitRepairs(false); err != nil {
+		return 0, 0, err
+	}
+	return entries - liveEntries, dataBytes - liveBytes, nil
 }
 
 // pruneWalkStates drops walk recency for segments that no longer exist, so the

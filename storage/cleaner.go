@@ -352,6 +352,10 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			// are queued after the batch commits, in flush().
 			if valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
 				batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+				if valueMsg.SegmentOffset >= 0 {
+					batch.Delete(keys.MakeSegmentLiveIndexKey(valueMsg.SegmentPath, valueMsg.SegmentOffset))
+					batch.Delete(keys.MakeSegmentLiveIndexWitnessKey(valueMsg.SegmentPath, valueMsg.SegmentOffset))
+				}
 			} else {
 				pendingFiles = append(pendingFiles, valueMsg)
 			}
