@@ -6,13 +6,11 @@ package files
 import (
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/google/uuid"
-	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/storage/fd"
 	"github.com/tigrisdata/ocache/storage/utils"
 
@@ -95,20 +93,11 @@ func (fm *FileManager) Write(key string, reader io.Reader) (string, uint32, int6
 	}
 	defer file.Close()
 
-	// Stream payload directly from reader → file with pooled buffer
-	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
-	defer release()
-
-	hash := crc32.NewIEEE()
-	mw := io.MultiWriter(file, hash)
-
-	bytesWritten, err := io.CopyBuffer(mw, reader, buf)
+	checksum, bytesWritten, err := copyRawFilePayload(file, reader)
 	if err != nil {
 		os.Remove(filePath)
 		return "", 0, 0, utils.WrapError("copy payload", key, err)
 	}
-
-	checksum := hash.Sum32()
 
 	// Large files (>compactThreshold) are never compacted and remain as raw files permanently.
 	// These files must be fsynced immediately to ensure durability since they won't be

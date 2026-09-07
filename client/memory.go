@@ -20,6 +20,10 @@ import (
 type MemoryCache struct {
 	mu   sync.RWMutex
 	data map[string]cacheEntry
+	// versions and versionCounter back the conditional (CAS) operations. The
+	// counter is a monotonic stamp source mirroring the real storage layer.
+	versions       map[string]uint64
+	versionCounter uint64
 }
 
 // cacheEntry holds a cached value with optional expiration.
@@ -31,11 +35,114 @@ type cacheEntry struct {
 // Compile-time check that MemoryCache implements CacheClient.
 var _ CacheClient = (*MemoryCache)(nil)
 
+// memoryLegacyVersion mirrors the storage layer's merge.VersionLegacy: a live
+// key written by a plain Put (no CAS-assigned stamp) reports this version, and
+// CAS stamps are assigned strictly above it. Kept in sync by value so this test
+// double behaves like real storage (a mismatch here matches production).
+const memoryLegacyVersion uint64 = 1
+
 // NewMemoryCache creates a new in-memory cache.
 func NewMemoryCache() *MemoryCache {
 	return &MemoryCache{
-		data: make(map[string]cacheEntry),
+		data:     make(map[string]cacheEntry),
+		versions: make(map[string]uint64),
+		// Start above memoryLegacyVersion so the first CAS stamp (++counter) is 2
+		// and can never collide with the legacy sentinel a plain Put reports.
+		versionCounter: memoryLegacyVersion,
 	}
+}
+
+// liveLocked reports whether key currently holds a live (unexpired) value.
+// Caller must hold m.mu.
+func (m *MemoryCache) liveLocked(key string) bool {
+	entry, ok := m.data[key]
+	if !ok {
+		return false
+	}
+	return entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt)
+}
+
+// effectiveVersionLocked returns the CAS version for key, mirroring storage's
+// EffectiveRowVersion: 0 when absent or expired; the legacy sentinel for a live
+// key with no CAS-assigned stamp (a plain Put); else its stamp. Caller holds m.mu.
+func (m *MemoryCache) effectiveVersionLocked(key string) uint64 {
+	if !m.liveLocked(key) {
+		return 0
+	}
+	if v := m.versions[key]; v != 0 {
+		return v
+	}
+	return memoryLegacyVersion
+}
+
+// dropLocked removes key from the cache AND forgets its CAS stamp, so a later
+// plain re-create reads as the legacy version rather than resurfacing a stale
+// token. Used by plain Delete, lazy TTL expiry and Close. Caller holds m.mu.
+func (m *MemoryCache) dropLocked(key string) {
+	delete(m.data, key)
+	delete(m.versions, key)
+}
+
+// GetWithVersion returns key's value and version; found is false (version 0)
+// for an absent or expired key.
+func (m *MemoryCache) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, false, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if !m.liveLocked(key) {
+		return nil, 0, false, nil
+	}
+	entry := m.data[key]
+	out := make([]byte, len(entry.value))
+	copy(out, entry.value)
+	return out, m.effectiveVersionLocked(key), true, nil
+}
+
+// PutIfVersion writes only if key's current version equals expected (0 =
+// put-if-absent), returning the new version or a *VersionMismatchError.
+func (m *MemoryCache) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur := m.effectiveVersionLocked(key); cur != expected {
+		return 0, &VersionMismatchError{Key: key, CurrentVersion: cur}
+	}
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	entry := cacheEntry{value: dataCopy}
+	if ttlSeconds > 0 {
+		entry.expiresAt = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	}
+	m.versionCounter++
+	m.data[key] = entry
+	m.versions[key] = m.versionCounter
+	return m.versionCounter, nil
+}
+
+// DeleteIfVersion deletes only if key's current version equals expected.
+func (m *MemoryCache) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.effectiveVersionLocked(key)
+	if cur == 0 {
+		if expected == 0 {
+			return nil // already absent — delete-if-absent is a no-op success
+		}
+		return &VersionMismatchError{Key: key, CurrentVersion: 0}
+	}
+	if cur != expected {
+		return &VersionMismatchError{Key: key, CurrentVersion: cur}
+	}
+	delete(m.data, key)
+	delete(m.versions, key)
+	return nil
 }
 
 // Put stores data with an optional TTL (0 means no expiration).
@@ -57,6 +164,10 @@ func (m *MemoryCache) Put(ctx context.Context, key string, data []byte, ttlSecon
 	}
 
 	m.data[key] = entry
+	// A plain (non-CAS) write stores no stamp, exactly like storage: the row
+	// reads as the legacy version from here on and any older CAS token must be
+	// rejected, never silently accepted against a value it did not guard.
+	delete(m.versions, key)
 	return nil
 }
 
@@ -91,7 +202,7 @@ func (m *MemoryCache) Get(ctx context.Context, key string) ([]byte, error) {
 	// Check TTL expiration (lazy expiration)
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
 		m.mu.Lock()
-		delete(m.data, key)
+		m.dropLocked(key)
 		m.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "key not found")
 	}
@@ -130,7 +241,7 @@ func (m *MemoryCache) GetRange(ctx context.Context, key string, start, end int64
 	// Check TTL expiration
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
 		m.mu.Lock()
-		delete(m.data, key)
+		m.dropLocked(key)
 		m.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "key not found")
 	}
@@ -182,7 +293,7 @@ func (m *MemoryCache) Delete(ctx context.Context, key string) error {
 		return status.Error(codes.NotFound, "key not found")
 	}
 
-	delete(m.data, key)
+	m.dropLocked(key)
 	return nil
 }
 
@@ -337,6 +448,7 @@ func (m *MemoryCache) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.data = make(map[string]cacheEntry)
+	m.versions = make(map[string]uint64)
 	return nil
 }
 
@@ -348,4 +460,29 @@ func (m *MemoryCache) GetMode() ConnectionMode {
 // GetConnectedNodes returns a single "memory" node identifier.
 func (m *MemoryCache) GetConnectedNodes() []string {
 	return []string{"memory"}
+}
+
+// PutStreamIfVersion buffers the stream and delegates to PutIfVersion (this test
+// double keeps everything in memory).
+func (m *MemoryCache) PutStreamIfVersion(ctx context.Context, key string, r io.Reader, ttlSeconds int64, expected uint64) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	return m.PutIfVersion(ctx, key, data, ttlSeconds, expected)
+}
+
+// GetStreamWithVersion writes the value to w and returns its version/presence.
+func (m *MemoryCache) GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (uint64, bool, error) {
+	data, version, found, err := m.GetWithVersion(ctx, key)
+	if err != nil || !found {
+		return version, found, err
+	}
+	if _, err := w.Write(data); err != nil {
+		return 0, false, err
+	}
+	return version, true, nil
 }

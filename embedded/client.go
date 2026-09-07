@@ -24,6 +24,7 @@ import (
 	"github.com/tigrisdata/ocache/server/operations"
 	"github.com/tigrisdata/ocache/server/service"
 	stor "github.com/tigrisdata/ocache/storage"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"google.golang.org/grpc"
 )
 
@@ -344,6 +345,39 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	return c.ops.Delete(ctx, key)
 }
 
+// GetWithVersion returns a key's value together with its current CAS version
+// (issue #254). found is false (version 0) for an absent, expired, or deleted
+// key.
+func (c *Client) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	return c.ops.GetWithVersion(ctx, key)
+}
+
+// PutIfVersion writes only if the key's current version equals expected (0 =
+// put-if-absent), returning the new version or a mismatch error carrying the
+// current version.
+func (c *Client) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
+	v, err := c.ops.PutIfVersion(ctx, key, data, int(ttlSeconds), expected)
+	return v, casClientError(key, err)
+}
+
+// DeleteIfVersion deletes only if the key's current version equals expected.
+func (c *Client) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
+	return casClientError(key, c.ops.DeleteIfVersion(ctx, key, expected))
+}
+
+// casClientError normalizes a mismatch from the operations/storage layer
+// (*storageErrors.VersionMismatchError) into the client-facing
+// *cacheclient.VersionMismatchError, so a caller holding this Client through the
+// cacheclient.CacheClient interface can detect a lost race with
+// cacheclient.IsVersionMismatch — exactly as it can over the gRPC client. Real
+// errors pass through unchanged.
+func casClientError(key string, err error) error {
+	if vm, ok := storageErrors.IsVersionMismatch(err); ok {
+		return &cacheclient.VersionMismatchError{Key: key, CurrentVersion: vm.CurrentVersion}
+	}
+	return err
+}
+
 // List returns all keys matching the given prefix across the entire cluster.
 func (c *Client) List(ctx context.Context, prefix string) ([]string, error) {
 	return c.ops.List(ctx, prefix)
@@ -516,3 +550,16 @@ func (c *Client) GetGRPCServer() *grpc.Server {
 
 // Compile-time check that Client implements CacheClient
 var _ cacheclient.CacheClient = (*Client)(nil)
+
+// PutStreamIfVersion is the streaming form of PutIfVersion for large objects
+// (issue #258): the value is streamed to storage without buffering.
+func (c *Client) PutStreamIfVersion(ctx context.Context, key string, r io.Reader, ttlSeconds int64, expected uint64) (uint64, error) {
+	v, err := c.ops.PutStreamIfVersion(ctx, key, r, int(ttlSeconds), expected)
+	return v, casClientError(key, err)
+}
+
+// GetStreamWithVersion is the streaming form of GetWithVersion: the value is
+// written to w without buffering, and its version/presence returned.
+func (c *Client) GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (uint64, bool, error) {
+	return c.ops.GetStreamWithVersion(ctx, key, w)
+}

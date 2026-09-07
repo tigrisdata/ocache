@@ -42,6 +42,41 @@ func init() {
 	}
 }
 
+// VersionLegacy is the version the API reports for a LIVE entry written by a
+// pre-versioning binary (stored version field 0, not a tombstone). It is
+// reserved: real stamps are nanosecond-scale (see Storage.nextVersion), CAS_PUT
+// strips operand fields, and no live write path ever persists version 1 — so
+// matching expected == VersionLegacy against a live stored 0 is unambiguous. 0
+// itself keeps meaning "absent" in CAS preconditions (put-if-absent).
+const VersionLegacy uint64 = 1
+
+// tombstoneExpiry is the sentinel expiry value (Unix epoch + 1s, always in the
+// past) that marks a row as a tombstone rather than a live value — emitted by
+// every merge tombstone path (purge-CAS, CAS_DELETE, and the no-base fallback).
+// It can never collide with a real TTL, which is time.Now().Add(...).Unix().
+const tombstoneExpiry int64 = 1
+
+// EffectiveRowVersion maps a stored row to the version the CAS match rule and
+// the API report for it. A tombstone (Expiry == tombstoneExpiry) reads as 0 —
+// "effectively absent" — regardless of the stamp it carries, so a stale token
+// held before the delete can never match it and put-if-absent (expected == 0)
+// recreates over it; the raw stored stamp is used only by DeleteIfVersion's
+// read-back to confirm its own win. A live pre-versioning row (stored 0) reads
+// as VersionLegacy; any other live row reads as its stamp. Shared by the merge
+// operator and the read path so the two can never disagree.
+func EffectiveRowVersion(vm *pb.ValueMessage) uint64 {
+	if vm == nil {
+		return 0
+	}
+	if vm.Expiry == tombstoneExpiry {
+		return 0
+	}
+	if vm.Version == 0 {
+		return VersionLegacy
+	}
+	return vm.Version
+}
+
 // MultiplexOperator is a merge operator that routes to different merge strategies
 // based on key prefixes. This allows us to support multiple merge types in a single
 // RocksDB instance, since RocksDB only supports one merge operator per database.
@@ -157,6 +192,69 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			continue // malformed operand — skip, keep current base
 		}
 
+		// Version-CAS (issue #254): operands tagged with an explicit MetaOp
+		// carry a version precondition. Everything here is a pure function of
+		// (base, operand) — FullMerge re-runs at compaction time, so consulting
+		// the clock (or any external state) would make read-time and
+		// compaction-time resolution diverge. The match rule uses row STATE via
+		// EffectiveRowVersion: a tombstone reads as 0 ("absent"), so put-if-
+		// absent (expected == 0) recreates over it and no pre-delete token can.
+		// On mismatch the operand is dropped and the base kept, the same
+		// convention as the path-preconditioned CAS below.
+		switch op.OpType {
+		case pb.MetaOp_META_OP_CAS_PUT:
+			cur := uint64(0)
+			if hadBase {
+				cur = EffectiveRowVersion(&base)
+			}
+			if cur == op.CasExpectedVersion {
+				// Adopt the operand as the new base, stripping the
+				// operand-only fields so stored values never carry them
+				// (the RawFilePath-clearing pattern). Field copy, not struct
+				// assignment (embedded proto lock).
+				base = pb.ValueMessage{
+					ValueType:     op.ValueType,
+					Data:          op.Data,
+					Expiry:        op.Expiry,
+					RawFilePath:   op.RawFilePath,
+					SegmentPath:   op.SegmentPath,
+					SegmentOffset: op.SegmentOffset,
+					ValueLength:   op.ValueLength,
+					Checksum:      op.Checksum,
+					Version:       op.Version,
+				}
+				hadBase = true
+			}
+			continue
+		case pb.MetaOp_META_OP_CAS_DELETE:
+			if !hadBase {
+				// The row vanished before the operand resolved: there was no base
+				// to match the precondition against, so this delete did NOT apply
+				// to the version the caller guarded on. Emit a version-0 tombstone
+				// (not the operand's stamp): DeleteIfVersion's read-back then sees a
+				// stamp that is not its own and reports a mismatch, never a false
+				// win for a precondition that never held. EffectiveRowVersion still
+				// reads it as absent (Expiry == tombstoneExpiry) so put-if-absent
+				// can recreate, and the ref-less tombstone still blocks a stale
+				// path-CAS from resurrecting the key.
+				base = pb.ValueMessage{Expiry: tombstoneExpiry}
+				hadBase = true
+				continue
+			}
+			if EffectiveRowVersion(&base) == op.CasExpectedVersion {
+				// Tombstone via a REF-LESS sentinel: no ValueType/paths/length.
+				// Dropping the backing references is what prevents an in-flight
+				// compactor/recompactor path-CAS operand (which matches on
+				// ValueType + RawFilePath/SegmentPath) from resurrecting a
+				// deleted key. Reclamation of the backing bytes is therefore the
+				// caller's job (DeleteIfVersion reclaims on its confirmed win);
+				// the cleaner only needs to remove the tiny row. The operand's
+				// stamp lets the deleter confirm its win via read-back.
+				base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
+			}
+			continue
+		}
+
 		// Purge-CAS: a RAW_FILE-typed operand carrying a RawFilePath
 		// precondition is a request from the read path (storage.Get) to
 		// tombstone a dangling raw-file reference whose backing file vanished
@@ -172,7 +270,10 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			if hadBase &&
 				base.ValueType == pb.ValueType_RAW_FILE &&
 				base.RawFilePath == op.RawFilePath {
-				base = pb.ValueMessage{Expiry: 1}
+				// Preserve the row's version through the tombstone: purging a
+				// dangling file is not a user write, and the surviving token
+				// keeps CAS semantics consistent until the cleaner sweeps.
+				base = pb.ValueMessage{Expiry: 1, Version: base.Version}
 			}
 			continue
 		}
@@ -214,6 +315,12 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			SegmentOffset: op.SegmentOffset,
 			ValueLength:   op.ValueLength,
 			Checksum:      op.Checksum,
+			// Version carried over from the BASE, not the operand: storage
+			// migration (raw -> segment, segment -> segment) is not a user
+			// write and must never change a row's CAS token (issue #254).
+			// The precondition match proves the base is the same row the
+			// migrator read, so its version is authoritative.
+			Version: base.Version,
 			// RawFilePath intentionally omitted (CAS precondition, not a
 			// live file reference).
 		}

@@ -42,6 +42,13 @@ func TestIntegration_Compaction(t *testing.T) {
 	})
 }
 
+// TestIntegration_CAS runs the conditional-operations (CAS) test suite
+func TestIntegration_CAS(t *testing.T) {
+	t.Run("CASSuite", func(t *testing.T) {
+		TestIntegrationCAS(t)
+	})
+}
+
 // TestIntegration_Workflow runs the workflow test suite
 func TestIntegration_Workflow(t *testing.T) {
 	t.Run("WorkflowSuite", func(t *testing.T) {

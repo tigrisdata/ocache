@@ -81,8 +81,8 @@ OCache can be configured through command-line flags when starting the server.
 | Flag                            | Type     | Default  | Description                                                                 |
 | ------------------------------- | -------- | -------- | --------------------------------------------------------------------------- |
 | `-compaction-threads`           | int      | 1        | Number of concurrent file-compaction workers                               |
-| `-compaction-bytes-per-second`  | int64    | 16777216 | Shared file/recompaction payload-byte budget per second (16 MiB/s)         |
-| `-fragmentation-threshold`      | float64  | 0.5      | Segment fragmentation threshold for recompaction (0.0-1.0)                 |
+| `-compaction-bytes-per-second`  | int64    | 16777216 | Shared byte budget per second for background compaction: payload copies **and** the liveness walks that gate recompaction (16 MiB/s). `0` disables throttling. |
+| `-fragmentation-threshold`      | float64  | 0.5      | Dead-space ratio at which a segment is recompacted (0.0-1.0). Compared against dead bytes **derived by walking the segment**, not against delete-index credit ([RFC-009](rfcs/RFC-009-walk-gated-recompaction.md)) |
 | `-recompaction-min-segment-age` | duration | 2h       | Minimum age for a segment before recompaction                              |
 | `-recompaction-min-segments`    | int      | 2        | Minimum number of segments required before recompaction                    |
 | `-disable-recompaction`         | bool     | false    | Disable automatic segment recompaction                                     |

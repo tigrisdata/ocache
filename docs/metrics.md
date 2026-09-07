@@ -34,7 +34,7 @@ When the ring is degraded (a node down), the high-frequency failure-path log lin
 | ------------------------------------ | ----- | ------ | ----------------------------------------------------------------------------------------------------------------- |
 | `ocache_segments_total`              | Gauge | -      | Total number of segments currently in the system.                                                                 |
 | `ocache_segment_size_bytes`          | Gauge | -      | Total size of all segments in bytes.                                                                              |
-| `ocache_segment_fragmentation_ratio` | Gauge | -      | Segment fragmentation ratio (0-1). Higher values indicate more fragmentation and potential need for recompaction. |
+| `ocache_segment_fragmentation_ratio` | Gauge | -      | Segment fragmentation ratio (0-1), computed from delete-index credit. Since RFC-009 this is an observability signal and a recompaction *priority* hint, not the reclaim decision — a segment can be reclaimed with this reading zero if its entries are actually dead. |
 
 ### Compaction Metrics
 
@@ -49,6 +49,7 @@ When the ring is degraded (a node down), the high-frequency failure-path log lin
 
 | Metric Name                                | Type      | Labels | Description                                                |
 | ------------------------------------------ | --------- | ------ | ---------------------------------------------------------- |
+| `ocache_segment_walks_total`               | Counter   | -      | Segments walked to derive liveness for recompaction gating (RFC-009). Climbs continuously on a healthy node; flat at zero means recompaction is disabled or no segment is past the age gate. |
 | `ocache_recompaction_runs_total`           | Counter   | -      | Total number of recompaction runs to defragment segments.  |
 | `ocache_recompaction_segments_total`       | Counter   | -      | Total number of segments recompacted.                      |
 | `ocache_recompaction_duration_ms`          | Histogram | -      | Recompaction duration in milliseconds.                     |

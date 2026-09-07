@@ -203,6 +203,16 @@ var (
 		[]string{"type"},
 	)
 
+	// CleanerExpiryRaced counts expired rows the TTL sweep left alone because a
+	// write replaced the row between the scan and the pre-write re-check
+	// (issue #256); the fresh value was kept.
+	CleanerExpiryRaced = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cleaner_expiry_raced_total",
+			Help: "Expired rows skipped by the TTL sweep because a concurrent write replaced them",
+		},
+	)
+
 	// Disk Usage Metrics
 	DiskUsageBytes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -227,6 +237,37 @@ var (
 		prometheus.GaugeOpts{
 			Name: "ocache_filesystem_free_bytes",
 			Help: "Free space on the cache volume in bytes (statfs)",
+		},
+	)
+
+	// FilesDirBytes is the size of the raw-file directory, refreshed by the
+	// orphan sweep: payload bytes of referenced raw files (from metadata) plus
+	// the on-disk size of every unreferenced file. Compared with the logical
+	// DiskUsageBytes it shows how much of files/ is not accounted for
+	// (orphans, in-flight writes).
+	FilesDirBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_files_dir_bytes",
+			Help: "Size of the raw-file directory in bytes (referenced payload bytes plus unreferenced files on disk)",
+		},
+	)
+
+	// OrphanFilesQueued / OrphanBytesQueued count raw files the sweep found
+	// referenced by no metadata row and handed to the deletion queue (issue
+	// #156). They count queueing, not deletion: a file the queue cannot yet
+	// remove (held open by a reader, or a filesystem error) is queued again
+	// by the next sweep and counted again. Actual removals are
+	// ocache_deletion_queue_processed_total.
+	OrphanFilesQueued = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_orphan_files_queued_total",
+			Help: "Unreferenced raw files handed to the deletion queue by the orphan sweep (queued, not necessarily deleted yet)",
+		},
+	)
+	OrphanBytesQueued = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_orphan_bytes_queued_total",
+			Help: "Bytes of unreferenced raw files handed to the deletion queue by the orphan sweep",
 		},
 	)
 

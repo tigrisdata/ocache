@@ -16,6 +16,12 @@ on:
       - "LICENSE"
       - ".gitignore"
 
+# Non-PR runs get a run-unique group: a shared non-cancelling group keeps at most
+# one pending run, silently dropping the middle of three rapid pushes to main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 env:
   GO_VERSION: "1.24.2"
   ROCKSDB_VERSION: "10.4.2"
@@ -25,18 +31,18 @@ env:
 jobs:
   benchmark-single:
     strategy:
-      # Run both allocator variants so their throughput/latency can be compared
-      # (A/B for issue #176); don't cancel one variant if the other fails.
+      # jemalloc only: the plain/jemalloc A/B (issue #176) is concluded, and one
+      # leg halves the benchmark load every push places on the runner pool.
       fail-fast: false
       matrix:
         include:
           - os: namespace-profile-ubuntu-2404-medium
             arch: x86_64
-            variant: plain
-          - os: namespace-profile-ubuntu-2404-medium
-            arch: x86_64
             variant: jemalloc
     runs-on: ${{ matrix.os }}
+    # A hung step must not hold a runner for GitHub's 6-hour default; a normal
+    # run takes 4-10 min.
+    timeout-minutes: 30
 
     permissions:
       actions: write
@@ -68,8 +74,8 @@ jobs:
         run: |
           OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           echo "os_name=${OS_NAME}" >> $GITHUB_OUTPUT
-          # Pick the rocksdb-static variant (plain vs jemalloc) for this A/B leg.
-          # runner.os casing (Linux) matches the published asset names.
+          # Pick the rocksdb-static artifact for the matrix variant (a -jemalloc
+          # suffix). runner.os casing (Linux) matches the published asset names.
           SUFFIX=""
           if [ "${{ matrix.variant }}" = "jemalloc" ]; then SUFFIX="-jemalloc"; fi
           echo "art_name=rocksdb-static-${{ env.ROCKSDB_VERSION }}${SUFFIX}-${{ runner.os }}-${{ matrix.arch }}.tar.gz" >> $GITHUB_OUTPUT
@@ -134,7 +140,7 @@ jobs:
       - name: Start RSS sampler
         run: |
           # Record the server's RSS (VmRSS/RssAnon/VmData) across all benchmarks
-          # so plain vs jemalloc allocator footprint can be compared (issue #176).
+          # to track the jemalloc build's memory footprint over time (issue #176).
           nohup bash scripts/rss-sample.sh rss-samples.csv 1 "${SERVER_PID}" >/dev/null 2>&1 &
           echo "RSS_SAMPLER_PID=$!" >> $GITHUB_ENV
 
@@ -171,6 +177,31 @@ jobs:
           # with Put on the same keys throughout the run. This is the workload shape of issue #142
           # and serves as a performance-regression guard on the compactor commit path.
           ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee 256kb-compaction-churn.log
+
+      - name: Run CAS read-modify-write benchmark - 100 bytes, uncontended baseline
+        run: |
+          echo "=== 100-byte values at the plain benchmarks' defaults (8 workers, 1000 keys) → CAS cost isolated from contention ==="
+          # Same concurrency and keyspace as the plain 100-byte read/write benchmarks above, so the
+          # only difference is the op itself: this measures what one guarded read-modify-write costs
+          # over its two constituent RPCs (a versioned read + a conditional write) with almost no
+          # lost races. Compare against the contended run below to separate CAS cost from contention.
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 100000 --value-size 100 --workload "cas=100" --no-progress | tee cas-100-byte-uncontended.log
+
+      - name: Run CAS read-modify-write benchmark - 100 bytes, contended
+        run: |
+          echo "=== 100-byte values, narrow keyspace, 16 workers → contended guarded read-modify-write ==="
+          # Every op is GetWithVersion followed by PutIfVersion against the version just read: the
+          # write-coordination pattern CAS exists for (issue #254). 16 workers over 200 keys make
+          # workers race for the same key, so the reported mismatch rate is the contention signal —
+          # a mismatch is a lost race, not an error.
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --concurrency 16 --num-keys 200 --num-ops 100000 --value-size 100 --workload "cas=100" --no-progress | tee cas-100-byte-contended.log
+
+      - name: Run mixed read + CAS benchmark - 100 KB
+        run: |
+          echo "=== 100 KB values, 70% reads + 30% guarded read-modify-writes ==="
+          # Values land in the RAW_FILE tier (> InlineThreshold 64KB), so each CAS win spills a raw
+          # file and reclaims the one it replaced while the compactor migrates the keyspace underneath.
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 50000 --value-size 102400 --workload "read=70,cas=30" --no-progress | tee cas-100kb-read-70-cas-30.log
 
       - name: Stop RSS sampler and summarize
         if: always()

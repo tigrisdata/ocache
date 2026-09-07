@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -171,8 +172,21 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
-	evictionPolicy   string                // "lru" or "fifo"; governs whether reads refresh access time
-	closed           atomic.Bool           // True when storage has been closed
+	// inflightRaw holds the raw-file paths that have been written but whose
+	// metadata is not yet committed (or, on failure, not yet queued for
+	// reclaim). The orphan sweep never touches a path in it: the file lock
+	// covers a file only while it is being written, and this covers the gap
+	// from that unlock to the commit that makes the file referenced (#156).
+	inflightRaw sync.Map
+	// beforeMetaCommit is set only by package tests: it runs inside putLow just
+	// before the metadata batch is written, and a non-nil error stands in for a
+	// RocksDB write failure so the callers' failure paths can be exercised.
+	beforeMetaCommit func() error
+	evictionPolicy   string        // "lru" or "fifo"; governs whether reads refresh access time
+	closed           atomic.Bool   // True when storage has been closed
+	lastVersion      atomic.Uint64 // Last issued version stamp (see nextVersion)
+	versionHi        atomic.Uint64 // Durably reserved stamp ceiling (see nextVersion)
+	versionMu        sync.Mutex    // Serializes reservation extension (rare)
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -288,8 +302,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		PruneAge:        DeletePruneAge,
 		RetryDelay:      DeleteRetryDelay,
 	})
-	deletionQueue.Start()
-
 	// Configure compactor with recompaction if enabled
 	compactorConfig := &compaction.CompactorConfig{
 		MetaDB:            meta,
@@ -331,7 +343,6 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	}
 
 	compactor := compaction.NewCompactorWithConfig(compactorConfig)
-	compactor.Start()
 
 	s := &Storage{
 		meta:             meta,
@@ -353,6 +364,21 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		cleanupInterval = config.CleanupInterval
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
+
+	// Restore the CAS stamp source's durable reservation so versions stay
+	// monotonic across restarts even under a backward clock step: every stamp
+	// ever issued is below the persisted high-water mark (see nextVersion).
+	// Done BEFORE any background goroutine starts, so a failed load returns a
+	// clean init error rather than leaking the compactor/deletion-queue threads
+	// against a Storage the caller believes never constructed.
+	if err := s.loadVersionReservation(); err != nil {
+		zlog.Error().Err(err).Msg("storage: failed to load version reservation")
+		return nil, storageErrors.NewInternalError("Init", err)
+	}
+
+	// All construction that can fail is done; now start the background workers.
+	deletionQueue.Start()
+	compactor.Start()
 
 	// The cleaner's initial pass recomputes size and, when a cap is set, backfills
 	// eviction-index coverage for keys written uncapped or under a prior policy so
@@ -670,8 +696,8 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 			} else {
 				switch valueMsg.ValueType {
 				case pb.ValueType_INLINE:
-					data = make([]byte, len(valueMsg.Data))
-					copy(data, valueMsg.Data)
+					// proto.Unmarshal owns a copy separate from the iterator buffer.
+					data = valueMsg.Data
 				case pb.ValueType_SEGMENT:
 					r, readErr := s.segmentManager.ReadEntry(keys.ExtractUserKey(k), valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
 					if readErr == nil && r != nil {
@@ -744,11 +770,15 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 func (s *Storage) stageFileDeletion(valueMsg *pb.ValueMessage) {
 	switch valueMsg.ValueType {
 	case pb.ValueType_RAW_FILE:
-		if err := s.deletionQueue.Add(valueMsg.RawFilePath); err != nil {
-			zlog.Error().Err(err).Str("path", valueMsg.RawFilePath).Msg("storage: failed to queue raw file for deletion")
-		}
+		s.stageRawFileDeletion(valueMsg.RawFilePath)
 	case pb.ValueType_SEGMENT:
 		s.updateDeleteIndex(valueMsg.SegmentPath, valueMsg.ValueLength)
+	}
+}
+
+func (s *Storage) stageRawFileDeletion(rawFilePath string) {
+	if err := s.deletionQueue.Add(rawFilePath); err != nil {
+		zlog.Error().Err(err).Str("path", rawFilePath).Msg("storage: failed to queue raw file for deletion")
 	}
 }
 
@@ -781,14 +811,12 @@ func (s *Storage) DeleteKey(key string) error {
 	// length, backing paths) are needed, so decode skipping the inline Data
 	// payload to avoid copying it (up to 64 KiB) on every delete of an inline key.
 	dataSize := int64(0)
-	decoded := false
-	valueMsg := &pb.ValueMessage{}
-	if unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
-		decoded = true
-		storageType = pb.ValueType_name[int32(valueMsg.ValueType)]
-		dataSize = valueMsg.ValueLength
+	valueMsg, decoded := decodeValueMessageCleanupFields(slice.Data())
+	if decoded {
+		storageType = pb.ValueType_name[int32(valueMsg.valueType)]
+		dataSize = valueMsg.valueLength
 		// Notify cleaner about size reduction
-		s.notifyDelete(valueMsg.ValueLength)
+		s.notifyDelete(valueMsg.valueLength)
 	}
 
 	wo := grocksdb.NewDefaultWriteOptions()
@@ -806,8 +834,8 @@ func (s *Storage) DeleteKey(key string) error {
 	// is possible. Raw files are queued after the commit instead — a lost
 	// queue row is still recoverable by a directory scan, while premature
 	// queueing could delete data a live row still references.
-	if decoded && valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
-		batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+	if decoded && valueMsg.valueType == pb.ValueType_SEGMENT && valueMsg.segmentPath != "" {
+		batch.Merge(keys.MakeDeleteIndexKey(valueMsg.segmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.valueLength))
 	}
 
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
@@ -820,8 +848,8 @@ func (s *Storage) DeleteKey(key string) error {
 
 	// Queue raw-file reclaim only after the metadata delete is durable (the
 	// discipline evictByIndex and putLow use).
-	if decoded && valueMsg.ValueType == pb.ValueType_RAW_FILE {
-		s.stageFileDeletion(valueMsg)
+	if decoded && valueMsg.valueType == pb.ValueType_RAW_FILE {
+		s.stageRawFileDeletion(valueMsg.rawFilePath)
 	}
 
 	metrics.StorageOperations.WithLabelValues("delete", storageType, "success").Inc()
@@ -1036,6 +1064,64 @@ func (br *byteRangeReader) Close() error {
 	return nil
 }
 
+// prefixReader joins an already-read prefix with the remaining stream. It
+// returns the prefix before reading the stream and exposes no WriterTo method,
+// so io.CopyBuffer uses its supplied buffer for the remainder.
+type prefixReader struct {
+	prefix []byte
+	reader io.Reader
+}
+
+func (r *prefixReader) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+
+	return r.reader.Read(p)
+}
+
+// prefixWriterToReader preserves a remainder's direct-write path after writing
+// the already-read prefix. It is only used when the remainder supplies that
+// path itself.
+type prefixWriterToReader struct {
+	prefixReader
+	writerTo io.WriterTo
+}
+
+func (r *prefixWriterToReader) WriteTo(writer io.Writer) (int64, error) {
+	prefix := r.prefix
+	if len(prefix) > 0 {
+		n, err := writer.Write(prefix)
+		if n < 0 || n > len(prefix) {
+			return 0, io.ErrShortWrite
+		}
+		r.prefix = prefix[n:]
+		if err != nil {
+			return int64(n), err
+		}
+		if n != len(prefix) {
+			return int64(n), io.ErrShortWrite
+		}
+	}
+
+	bytesWritten, err := r.writerTo.WriteTo(writer)
+	return int64(len(prefix)) + bytesWritten, err
+}
+
+// joinPrefix returns the already-read prefix followed by reader. Non-WriterTo
+// streams stay reader-only so FileManager's pooled buffer drives the remainder.
+// A WriterTo remainder keeps its direct-write path, which is used by unary
+// byte-backed Puts.
+func joinPrefix(prefix []byte, reader io.Reader) io.Reader {
+	prefixed := prefixReader{prefix: prefix, reader: reader}
+	if writerTo, ok := reader.(io.WriterTo); ok {
+		return &prefixWriterToReader{prefixReader: prefixed, writerTo: writerTo}
+	}
+	return &prefixed
+}
+
 // Put streams the body into spillWriter, stores metadata, and handles TTL
 func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	storageType := "unknown"
@@ -1083,9 +1169,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	// the value length exceeds the small-value threshold.
 	if n > s.inlineThreshold {
 		storageType = "raw_file"
-		// Combine the bytes we already read with the remaining reader and write via the segment manager
-		multiReader := io.MultiReader(bytes.NewReader(firstChunk[:n]), body)
-		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, multiReader)
+		// Join the bytes already read with the remaining stream. A non-WriterTo
+		// stream uses FileManager's pooled copy buffer, while byte-backed unary
+		// readers retain their direct-write path.
+		reader := joinPrefix(firstChunk[:n], body)
+		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, reader)
 		if err != nil {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("file", "put").Inc()
@@ -1100,6 +1188,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			}
 		}
 
+		// From here until the row commits (or the file is queued for reclaim on
+		// failure) nothing references the file; keep the orphan sweep off it.
+		s.inflightRaw.Store(filePath, struct{}{})
+		defer s.inflightRaw.Delete(filePath)
+
 		valueMsg := &pb.ValueMessage{
 			RawFilePath: filePath,
 			Expiry:      expiry,
@@ -1110,6 +1203,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
+			s.stageRawFileDeletion(filePath)
 			return storageErrors.NewInternalError("Put", err)
 		}
 		prevSize, err := s.putLow(key, val, filePath, bytesWritten)
@@ -1121,6 +1215,12 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		} else {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
+			// The row never landed, so the file just written is referenced by
+			// nothing: not by metadata, the compaction index, or the cap's
+			// accounting. Left alone it is a permanent orphan (issue #156), one
+			// whole object's worth of disk per failed commit. Reclaim it through
+			// the deletion queue exactly as PutIfVersion does with its spill.
+			s.stageRawFileDeletion(filePath)
 		}
 		if err != nil {
 			// Map RocksDB write errors appropriately
@@ -1190,10 +1290,10 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// The replaced value's backing bytes must also be reclaimed (segment dead-byte
 	// credit / raw-file deletion), or an overwrite orphans them with no
 	// `!delete:segment/` record and the recompactor can never see them.
-	prev := s.existingValue(key, metaKey)
+	prev, hasPrev := s.existingValue(key, metaKey)
 	var prevSize int64
-	if prev != nil {
-		prevSize = prev.ValueLength
+	if hasPrev {
+		prevSize = prev.valueLength
 	}
 	batch.Put(metaKey, val)
 
@@ -1204,8 +1304,8 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// them permanently and undetectably. A replaced raw file is queued after the
 	// commit instead — a lost queue row leaves a file that a directory scan can
 	// still find.
-	if prev != nil && prev.ValueType == pb.ValueType_SEGMENT && prev.SegmentPath != "" {
-		batch.Merge(keys.MakeDeleteIndexKey(prev.SegmentPath), merge.MakeDeleteIndexOperand(1, prev.ValueLength))
+	if hasPrev && prev.valueType == pb.ValueType_SEGMENT && prev.segmentPath != "" {
+		batch.Merge(keys.MakeDeleteIndexKey(prev.segmentPath), merge.MakeDeleteIndexOperand(1, prev.valueLength))
 	}
 
 	// Index the key for eviction only if a disk cap is set. Each policy maintains
@@ -1222,6 +1322,11 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		}
 	}
 
+	if s.beforeMetaCommit != nil {
+		if err := s.beforeMetaCommit(); err != nil {
+			return 0, err
+		}
+	}
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		return 0, err
 	}
@@ -1229,8 +1334,8 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 	// Queued only after the write commits: the metadata row still pointed at this
 	// file until now, so queueing earlier could delete data a live row still
 	// references if the batch failed (the discipline evictByIndex.commit uses).
-	if prev != nil && prev.ValueType == pb.ValueType_RAW_FILE {
-		s.stageFileDeletion(prev)
+	if hasPrev && prev.valueType == pb.ValueType_RAW_FILE {
+		s.stageRawFileDeletion(prev.rawFilePath)
 	}
 	return prevSize, nil
 }
@@ -1244,27 +1349,27 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 // Destroy'd).
 var putPointReadOpts = metadata.CreateReadOptions(false, false)
 
-// existingValue returns the metadata row currently stored under metaKey, or nil
-// when the key is absent or its row cannot be decoded. The inline Data payload
-// is skipped: callers need only the control fields (length, type, backing
-// paths).
-func (s *Storage) existingValue(key string, metaKey []byte) *pb.ValueMessage {
+// existingValue returns the cleanup fields from the metadata row currently
+// stored under metaKey. It reports false when the key is absent or its row
+// cannot be decoded. The inline Data payload is skipped because callers need
+// only the control fields used for accounting and backing-file cleanup.
+func (s *Storage) existingValue(key string, metaKey []byte) (valueMessageCleanupFields, bool) {
 	slice, err := s.meta.Handle().Get(putPointReadOpts, metaKey)
 	if err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.existingValue: db.Get error, size accounting may drift")
-		return nil
+		return valueMessageCleanupFields{}, false
 	}
 	defer slice.Free()
 	if !slice.Exists() {
-		return nil
+		return valueMessageCleanupFields{}, false
 	}
 
-	valueMsg := &pb.ValueMessage{}
-	if !unmarshalValueMessageSkippingData(slice.Data(), valueMsg) {
+	valueMsg, ok := decodeValueMessageCleanupFields(slice.Data())
+	if !ok {
 		zlog.Error().Str("key", key).Msg("storage.existingValue: failed to decode previous value message")
-		return nil
+		return valueMessageCleanupFields{}, false
 	}
-	return valueMsg
+	return valueMsg, true
 }
 
 // writeFifoIndexEntry records key's FIFO eviction entry stamped at write time
@@ -1323,11 +1428,11 @@ func (s *Storage) FlushAccessUpdates() {
 	}
 }
 
-// SetAccessTime sets a specific access time for a key
-// This is mainly useful for testing to create predictable LRU scenarios
+// SetAccessTime sets a specific access time (Unix seconds) for a key.
+// This is mainly useful for testing to create predictable LRU scenarios.
 func (s *Storage) SetAccessTime(key string, accessTime int64) {
 	if s.accessUpdater != nil {
-		s.accessUpdater.Update(key, accessTime)
+		s.accessUpdater.Update(key, time.Unix(accessTime, 0))
 	}
 }
 

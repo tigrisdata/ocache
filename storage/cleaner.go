@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,7 +16,6 @@ import (
 	"github.com/tigrisdata/ocache/storage/merge"
 	"github.com/tigrisdata/ocache/storage/metadata"
 	pb "github.com/tigrisdata/ocache/storage/proto"
-	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -82,6 +82,13 @@ type Cleaner struct {
 	// up to an hour, bounding the window in which the cap cannot reclaim them.
 	backfillPending atomic.Bool
 
+	// lastSizeRecalc is owned by cleanupLoop and initialized when that loop starts.
+	lastSizeRecalc time.Time
+	// lastOrphanSweep is when the orphan raw-file sweep last ran; zero until the
+	// startup reconcile runs it. Owned by the reconcile caller (Start, then the
+	// cleanup loop), like lastSizeRecalc.
+	lastOrphanSweep time.Time
+
 	// stats
 	totalSize   atomic.Int64
 	cleanedKeys atomic.Int64
@@ -90,6 +97,30 @@ type Cleaner struct {
 	// background loop coordination
 	closeCh chan struct{}
 	wg      sync.WaitGroup
+
+	// onTickComplete is set only by package tests and benchmarks to observe a
+	// completed cleanup-loop iteration without changing the work it performs.
+	onTickComplete func()
+	// beforeExpiryFlush is set only by package tests: it runs just before a TTL
+	// deletion batch is re-checked and written, to inject a concurrent write
+	// into the window that re-check exists for (issue #256).
+	beforeExpiryFlush func()
+}
+
+// expiryFlushBatch bounds how many expired keys a TTL deletion batch holds.
+// Each key is re-read immediately before the batch is written (see
+// cleanupExpiredKeys), so the batch size is the width of the window in which a
+// concurrent write could still be shadowed by the delete; 100 keeps that window
+// to a few hundred microseconds while a batch write stays efficient.
+const expiryFlushBatch = 100
+
+// expiryCandidate is an expired row seen by the TTL scan: the key, its metadata
+// key (copied out of the iterator), and the expiry the scan saw, which the
+// pre-write re-check compares against.
+type expiryCandidate struct {
+	key     string
+	metaKey []byte
+	expiry  int64
 }
 
 // NewCleaner creates a new Cleaner for background TTL cleanup and LRU eviction
@@ -150,10 +181,13 @@ func (c *Cleaner) cleanupLoop() {
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
-	// Track when we last cleaned up old buckets
+	// Track when we last cleaned up old buckets.
 	lastBucketCleanup := time.Now()
-	// Track when we last re-derived the total size from the metadata
-	lastSizeRecalc := time.Now()
+	// Track when we last re-derived the total size from the metadata. A caller
+	// may seed this before the loop starts to make the normal hourly condition due.
+	if c.lastSizeRecalc.IsZero() {
+		c.lastSizeRecalc = time.Now()
+	}
 
 	for {
 		select {
@@ -162,9 +196,9 @@ func (c *Cleaner) cleanupLoop() {
 			// Also re-run promptly (every tick) while a prior backfill was left
 			// incomplete, so uncovered keys become evictable within a tick rather
 			// than waiting for the hourly recalc.
-			if c.backfillPending.Load() || time.Since(lastSizeRecalc) > totalSizeRecalcInterval {
+			if c.backfillPending.Load() || time.Since(c.lastSizeRecalc) > totalSizeRecalcInterval {
 				c.calculateTotalSize()
-				lastSizeRecalc = time.Now()
+				c.lastSizeRecalc = time.Now()
 			}
 
 			c.cleanupExpiredKeys()
@@ -192,6 +226,9 @@ func (c *Cleaner) cleanupLoop() {
 				c.cleanupOldBuckets(accessBucketCleanupThreshold)
 				lastBucketCleanup = time.Now()
 			}
+			if c.onTickComplete != nil {
+				c.onTickComplete()
+			}
 		case <-c.closeCh:
 			zlog.Info().Msg("cleaner: background loop stopping")
 			return
@@ -218,6 +255,10 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	// live) if the write failed — the dangling raw-file class reconciled by
 	// #150/#152.
 	var pendingFiles []*pb.ValueMessage
+	// candidates are the expired rows the scan has seen but not yet staged for
+	// deletion. They are re-read in flush, immediately before the batch is
+	// written, and deleted only if still the row the scan saw (issue #256).
+	var candidates []expiryCandidate
 
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
@@ -231,6 +272,8 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
+
+	now := time.Now().Unix()
 
 	// flush writes the current batch and, only on success, promotes the pending
 	// counts to committed. On failure the deletes did not persist, so the
@@ -249,6 +292,73 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		if final {
 			label = "final deletion batch"
 		}
+		if c.beforeExpiryFlush != nil {
+			c.beforeExpiryFlush()
+		}
+
+		// Re-check every candidate NOW, then write. The scan's view of a row can
+		// be seconds old on a large cache, and a plain Delete lands at a later
+		// sequence than any write that slipped in since — it would silently
+		// shadow that fresh value (issue #256). A fresh row always carries a
+		// different expiry (0, or a time after now, while the scan's row had one
+		// at or before now), so "same expiry as the scan saw" means "same row".
+		// This does not close the race — RocksDB has no conditional delete — but
+		// it shrinks the window from scan-to-flush to re-read-to-write, and a
+		// lost write in that sliver is just a cache miss the client refills.
+		for _, cand := range candidates {
+			slice, err := c.storage.meta.Handle().Get(ro, cand.metaKey)
+			if err != nil {
+				zlog.Debug().Err(err).Str("key", cand.key).Msg("cleaner: expiry re-check failed; retrying next sweep")
+				continue
+			}
+			if !slice.Exists() {
+				// Already deleted by someone else, who reclaimed it.
+				slice.Free()
+				continue
+			}
+			value := slice.Data()
+			expiry, ok := valueMessageExpiry(value)
+			if ok && expiry != cand.expiry {
+				// A write replaced the row since the scan: it is live, keep it.
+				slice.Free()
+				metrics.CleanerExpiryRaced.Inc()
+				zlog.Debug().Str("key", cand.key).Msg("cleaner: key rewritten since scan; skipping expiry")
+				continue
+			}
+			// Only expired rows need their remaining control fields to account for
+			// the deletion and reclaim a raw file or segment; decode from the
+			// re-read so the reclaim target is exactly the row being deleted. An
+			// undecodable row is dropped outright, as the scan does for invalid
+			// entries.
+			valueMsg := &pb.ValueMessage{}
+			decoded := ok && unmarshalValueMessageSkippingData(value, valueMsg)
+			slice.Free()
+
+			batch.Delete(cand.metaKey)
+			c.storage.stageEvictionIndexDeletes(batch, ro, cand.key)
+			pendingCleaned++
+			if !decoded {
+				continue
+			}
+			zlog.Debug().Str("key", cand.key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
+			pendingBytes += valueMsg.ValueLength
+
+			// Defer file reclaim to after the write: the backing file is freed only
+			// once this batch's write succeeds (see pendingFiles), never before.
+			// Segment credit rides the same batch as the metadata delete (atomic:
+			// no crash window between commit and credit); raw files are queued
+			// after the batch commits, below.
+			if valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
+				batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
+			} else {
+				pendingFiles = append(pendingFiles, valueMsg)
+			}
+		}
+		candidates = candidates[:0]
+		if batch.Count() == 0 {
+			return
+		}
+
 		if err := c.storage.meta.Handle().Write(wo, batch); err != nil {
 			zlog.Error().Err(err).Msgf("cleaner: failed to write %s", label)
 		} else {
@@ -268,8 +378,6 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		pendingFiles = pendingFiles[:0]
 		batch.Clear()
 	}
-
-	now := time.Now().Unix()
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// Check if we're shutting down
@@ -294,9 +402,11 @@ func (c *Cleaner) cleanupExpiredKeys() {
 
 		value := it.Value().Data()
 
-		// Try to decode as proto ValueMessage
-		valueMsg := &pb.ValueMessage{}
-		if err := proto.Unmarshal(value, valueMsg); err != nil {
+		// The usual TTL scan only needs expiry. Validate and read it directly
+		// from the wire so non-expiring rows do not allocate a reconstructed
+		// control message or copy their inline Data payload.
+		expiry, ok := valueMessageExpiry(value)
+		if !ok {
 			// Invalid entry, delete it
 			batch.Delete(keyBytes)
 			c.storage.stageEvictionIndexDeletes(batch, ro, key)
@@ -306,36 +416,24 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			continue
 		}
 
-		// Check if expired
-		if valueMsg.Expiry > 0 {
-			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Bool("expired", now >= valueMsg.Expiry).Msg("cleaner: checking expiry")
+		if expiry > 0 {
+			zlog.Debug().Str("key", key).Int64("expiry", expiry).Int64("now", now).Bool("expired", now >= expiry).Msg("cleaner: checking expiry")
 		}
-		if valueMsg.Expiry > 0 && now >= valueMsg.Expiry {
-			batch.Delete(keyBytes)
-			c.storage.stageEvictionIndexDeletes(batch, ro, key)
-			pendingCleaned++
-			zlog.Debug().Str("key", key).Int64("expiry", valueMsg.Expiry).Int64("now", now).Msg("cleaner: deleting expired key")
-
-			// Track bytes freed
-			pendingBytes += valueMsg.ValueLength
-
-			// Defer file reclaim to flush(): the backing file is freed only once
-			// this batch's write succeeds (see pendingFiles), never before.
-			// Segment credit rides the same batch as the metadata delete
-			// (atomic: no crash window between commit and credit); raw files
-			// are queued after the batch commits, in flush().
-			if valueMsg.ValueType == pb.ValueType_SEGMENT && valueMsg.SegmentPath != "" {
-				batch.Merge(keys.MakeDeleteIndexKey(valueMsg.SegmentPath), merge.MakeDeleteIndexOperand(1, valueMsg.ValueLength))
-			} else {
-				pendingFiles = append(pendingFiles, valueMsg)
-			}
+		if expiry > 0 && now >= expiry {
+			// Remember the row; it is re-read and deleted in flush, not here.
+			candidates = append(candidates, expiryCandidate{
+				key:     key,
+				metaKey: append([]byte(nil), keyBytes...),
+				expiry:  expiry,
+			})
 		}
 
 		it.Key().Free()
 		it.Value().Free()
 
-		// Write batch periodically to avoid large batches
-		if batch.Count() >= 1000 {
+		// Write batch periodically: bounded by the invalid-row deletes already
+		// staged and, more tightly, by the expired keys awaiting re-check.
+		if batch.Count() >= 1000 || len(candidates) >= expiryFlushBatch {
 			// Check if we're shutting down before writing
 			select {
 			case <-c.closeCh:
@@ -349,7 +447,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	}
 
 	// Write final batch
-	if batch.Count() > 0 {
+	if batch.Count() > 0 || len(candidates) > 0 {
 		flush(true)
 	}
 
@@ -454,6 +552,19 @@ func (c *Cleaner) reconcileFromMetadata() {
 		batch.Clear()
 	}
 
+	// When the orphan sweep is due (startup, then every orphanSweepInterval),
+	// this scan also collects the base name of every raw file a metadata row
+	// on the snapshot points at (live or expired-but-unswept: either way the
+	// row still owns the file), with its payload bytes. The sweep deletes
+	// nothing in this set and stats nothing in it either. Base names, not
+	// paths, so a data directory that has been moved still matches. Roughly
+	// 44 bytes per raw-file row, held only for this pass.
+	sweepDue := c.lastOrphanSweep.IsZero() || time.Since(c.lastOrphanSweep) >= orphanSweepInterval
+	var referencedRaw map[string]int64
+	if sweepDue {
+		referencedRaw = make(map[string]int64)
+	}
+
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// Check if we're shutting down
 		select {
@@ -477,8 +588,11 @@ func (c *Cleaner) reconcileFromMetadata() {
 		// it directly off the wire rather than fully decoding each message —
 		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
 		// threshold) on both the startup scan and the hourly reconciliation.
-		if length, ok := valueMessageValueLength(it.Value().Data()); ok {
+		if length, rawPath, ok := valueMessageSizeAndRawPath(it.Value().Data()); ok {
 			totalSize += length
+			if sweepDue && rawPath != "" {
+				referencedRaw[filepath.Base(rawPath)] = length
+			}
 		}
 
 		if backfill && !backrefBroken {
@@ -546,6 +660,14 @@ func (c *Cleaner) reconcileFromMetadata() {
 		event = event.Int("backfilled", backfilled).Str("policy", c.storage.evictionPolicy)
 	}
 	event.Msg("cleaner: reconciled total storage size from metadata")
+
+	// Only after a complete scan: a truncated one returned above, and sweeping
+	// against a partial reference set would delete live files.
+	// The clock advances only on a completed sweep, so one that could not read
+	// the directory is retried by the next reconcile instead of in a day.
+	if sweepDue && c.sweepOrphanRawFiles(referencedRaw, start) {
+		c.lastOrphanSweep = time.Now()
+	}
 }
 
 // advanceBackrefTo advances the sorted back-reference iterator to userKey and

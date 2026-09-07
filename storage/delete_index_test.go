@@ -444,3 +444,43 @@ func TestStorage_DeleteIndex_MergeOnExistingValue(t *testing.T) {
 	assert.Equal(t, int64(30720), entry.DeletedBytes,
 		"Merge operator should add to existing bytes count")
 }
+
+func TestStorage_DeleteKey_MalformedSegmentMetadataSkipsCleanup(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 8, 4096, 16*1024*1024, 1000, 1024*1024)
+	defer cleanup()
+
+	const (
+		key         = "malformed_segment_key"
+		segmentPath = "/data/segments/malformed.seg"
+		valueSize   = int64(1024)
+	)
+	valueMsg := &pb.ValueMessage{
+		ValueType:   pb.ValueType_SEGMENT,
+		SegmentPath: segmentPath,
+		ValueLength: valueSize,
+	}
+	data, err := proto.Marshal(valueMsg)
+	require.NoError(t, err)
+	// A truncated tag makes the whole record malformed after otherwise valid
+	// cleanup fields. DeleteKey has historically removed such metadata but not
+	// credited a segment it could not safely decode.
+	data = append(data, 0x80)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey(key), data))
+
+	require.NoError(t, s.DeleteKey(key))
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	slice, err := s.meta.Handle().Get(ro, keys.MakeMetadataKey(key))
+	require.NoError(t, err)
+	require.False(t, slice.Exists())
+	slice.Free()
+
+	entries, bytes, err := s.GetDeleteIndexStats(segmentPath)
+	require.NoError(t, err)
+	require.Zero(t, entries)
+	require.Zero(t, bytes)
+}

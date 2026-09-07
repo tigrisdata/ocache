@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	cacheclient "github.com/tigrisdata/ocache/client"
 	"github.com/tigrisdata/ocache/embedded"
 	stor "github.com/tigrisdata/ocache/storage"
 )
@@ -345,4 +346,75 @@ func TestEmbeddedClient_IsReady(t *testing.T) {
 
 	// Should be ready immediately in single-node mode
 	assert.True(t, client.IsReady())
+}
+
+// TestEmbeddedClient_CASOperations exercises the conditional operations through
+// the embedded client end to end in-process (issue #254/#258): the unary and
+// streaming CAS paths through server/operations onto real storage, plus the
+// embedded error translation that makes a lost race detectable with
+// cacheclient.IsVersionMismatch (the gap the adversarial review found).
+func TestEmbeddedClient_CASOperations(t *testing.T) {
+	client, err := embedded.New(&embedded.Config{
+		DiskPath: t.TempDir(),
+		TTL:      time.Hour,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// --- unary CAS ---
+	v1, err := client.PutIfVersion(ctx, "cas", []byte("v1"), 0, 0)
+	require.NoError(t, err)
+	require.NotZero(t, v1)
+
+	data, ver, found, err := client.GetWithVersion(ctx, "cas")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, v1, ver)
+	assert.Equal(t, []byte("v1"), data)
+
+	// A lost race must be a *cacheclient.VersionMismatchError even via embedded.
+	_, err = client.PutIfVersion(ctx, "cas", []byte("bad"), 0, v1+999)
+	vm, ok := cacheclient.IsVersionMismatch(err)
+	require.True(t, ok, "embedded must surface a detectable mismatch, got %v", err)
+	assert.Equal(t, v1, vm.CurrentVersion)
+
+	v2, err := client.PutIfVersion(ctx, "cas", []byte("v2"), 0, v1)
+	require.NoError(t, err)
+	assert.Greater(t, v2, v1)
+
+	require.NoError(t, client.DeleteIfVersion(ctx, "cas", v2))
+	_, _, found, err = client.GetWithVersion(ctx, "cas")
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	// --- streaming CAS (3MB value -> raw file, well past the unary path) ---
+	big := bytes.Repeat([]byte("z"), 3*1024*1024)
+	sv, err := client.PutStreamIfVersion(ctx, "big", bytes.NewReader(big), 0, 0)
+	require.NoError(t, err)
+	require.NotZero(t, sv)
+
+	var buf bytes.Buffer
+	gver, gfound, err := client.GetStreamWithVersion(ctx, "big", &buf)
+	require.NoError(t, err)
+	require.True(t, gfound)
+	assert.Equal(t, sv, gver)
+	assert.True(t, bytes.Equal(big, buf.Bytes()), "streamed value round-trip mismatch")
+
+	// Guarded streaming update applies; a stale token loses with a detectable mismatch.
+	sv2, err := client.PutStreamIfVersion(ctx, "big", bytes.NewReader(big), 0, sv)
+	require.NoError(t, err)
+	assert.Greater(t, sv2, sv)
+	_, err = client.PutStreamIfVersion(ctx, "big", bytes.NewReader(big), 0, sv)
+	_, ok = cacheclient.IsVersionMismatch(err)
+	require.True(t, ok, "stale streaming token must mismatch, got %v", err)
+
+	// Streaming get of an absent key reports found=false, version 0.
+	var gone bytes.Buffer
+	gv, gf, err := client.GetStreamWithVersion(ctx, "absent", &gone)
+	require.NoError(t, err)
+	assert.False(t, gf)
+	assert.Zero(t, gv)
+	assert.Zero(t, gone.Len())
 }

@@ -17,6 +17,7 @@ TEST_MIXED_OPERATIONS_DURING_COMPACTION=""
 TEST_LARGE_SCALE_COMPACTION=""
 TEST_COMPACTION_WITH_MIXED_SIZES=""
 TEST_CONCURRENT_ACCESS_DURING_COMPACTION=""
+TEST_CAS_ACROSS_COMPACTION=""
 TEST_SERVER_RESTART_AFTER_COMPACTION=""
 
 # Start the server with aggressive compaction settings for testing
@@ -299,6 +300,59 @@ echo -e "${GREEN}✓ Concurrent access during compaction completed${NC}"
 TEST_CONCURRENT_ACCESS_DURING_COMPACTION="PASSED"
 
 echo
+echo "=== Test 7b: Conditional (CAS) ops survive compaction ==="
+echo "A CAS-written medium object must keep its version across raw->segment"
+echo "migration (migration is not a write), and a CAS-deleted one must not be"
+echo "resurrected by a stale migration operand."
+CAS_COMPACT_ERRORS=0
+# Create a medium (>64KB) CAS value: becomes a raw file, then compacts.
+cas_medium=$(head -c 100000 /dev/urandom | base64 | head -c 100000)
+cas_put_out=$(./ocachecli put-if-version "cas-compact-key" "$cas_medium" --expected 0 2>/dev/null)
+cas_v1=$(echo "$cas_put_out" | grep -oE 'new_version=[0-9]+' | cut -d= -f2)
+# Create a medium CAS value that we will delete, to test non-resurrection.
+./ocachecli put-if-version "cas-compact-del" "$cas_medium" --expected 0 >/dev/null 2>&1
+cas_del_v=$(./ocachecli get-with-version "cas-compact-del" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+./ocachecli delete-if-version "cas-compact-del" --expected "$cas_del_v" >/dev/null 2>&1
+
+echo "Waiting for compaction to migrate the raw files to segments..."
+sleep 5
+
+# Version preserved across migration.
+cas_v_after=$(./ocachecli get-with-version "cas-compact-key" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+if [ -n "$cas_v1" ] && [ "$cas_v_after" = "$cas_v1" ]; then
+    echo -e "${GREEN}✓ CAS version preserved across compaction ($cas_v_after)${NC}"
+else
+    echo -e "${RED}✗ CAS version changed across compaction: before=$cas_v1 after=$cas_v_after${NC}"
+    ((CAS_COMPACT_ERRORS++))
+fi
+
+# Guarded update using the pre-compaction version still applies.
+./ocachecli put-if-version "cas-compact-key" "post-compaction" --expected "$cas_v1" >/dev/null 2>&1; cas_rc=$?
+cas_val=$(./ocachecli get "cas-compact-key" 2>/dev/null)
+if [ "$cas_rc" -eq 0 ] && [ "$cas_val" = "post-compaction" ]; then
+    echo -e "${GREEN}✓ Guarded update applied after compaction${NC}"
+else
+    echo -e "${RED}✗ Guarded update failed after compaction (rc=$cas_rc val len=${#cas_val})${NC}"
+    ((CAS_COMPACT_ERRORS++))
+fi
+
+# The CAS-deleted key must stay deleted (no resurrection by migration).
+cas_del_found=$(./ocachecli get-with-version "cas-compact-del" 2>/dev/null | grep -oE 'found=(true|false)' | cut -d= -f2)
+if [ "$cas_del_found" = "false" ]; then
+    echo -e "${GREEN}✓ CAS-deleted key stayed deleted across compaction${NC}"
+else
+    echo -e "${RED}✗ CAS-deleted key was resurrected by compaction${NC}"
+    ((CAS_COMPACT_ERRORS++))
+fi
+
+if [ "$CAS_COMPACT_ERRORS" -eq 0 ]; then
+    TEST_CAS_ACROSS_COMPACTION="PASSED"
+else
+    TEST_CAS_ACROSS_COMPACTION="FAILED"
+    TEST_PASSED=false
+fi
+
+echo
 echo "=== Test 7: Server Restart After Compaction ==="
 echo "Testing data integrity after server restart with compacted segments..."
 
@@ -366,6 +420,7 @@ print_test_result "Mixed Operations During Compaction" "$TEST_MIXED_OPERATIONS_D
 print_test_result "Large-Scale Compaction" "$TEST_LARGE_SCALE_COMPACTION"
 print_test_result "Compaction with Mixed Sizes" "$TEST_COMPACTION_WITH_MIXED_SIZES"
 print_test_result "Concurrent Access During Compaction" "$TEST_CONCURRENT_ACCESS_DURING_COMPACTION"
+print_test_result "CAS Ops Survive Compaction" "$TEST_CAS_ACROSS_COMPACTION"
 print_test_result "Server Restart After Compaction" "$TEST_SERVER_RESTART_AFTER_COMPACTION"
 
 print_overall_result

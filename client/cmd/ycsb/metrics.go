@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cacheclient "github.com/tigrisdata/ocache/client"
 )
 
 // MetricsCollector collects detailed metrics during benchmark execution
@@ -102,6 +104,29 @@ func (mc *MetricsCollector) RecordOperation(opType OpType, latency time.Duration
 		mc.errorsByType[errStr]++
 		mc.errorsByOp[opType]++
 	}
+}
+
+// CASOutcome classifies the result of one guarded read-modify-write (OpCAS).
+type CASOutcome int
+
+const (
+	CASWin      CASOutcome = iota // the conditional write applied
+	CASMismatch                   // lost the race: the expected outcome under contention, not an error
+	CASError                      // a real failure
+)
+
+// ClassifyCASResult maps a conditional-write result to its CAS outcome and the
+// error to record. A lost race (VersionMismatchError) is a CASMismatch with a
+// nil error — it is a benchmark outcome, never an error — so the classification
+// lives here in the metrics layer and callers only count what it returns.
+func ClassifyCASResult(err error) (CASOutcome, error) {
+	if err == nil {
+		return CASWin, nil
+	}
+	if _, lost := cacheclient.IsVersionMismatch(err); lost {
+		return CASMismatch, nil
+	}
+	return CASError, err
 }
 
 // RecordThroughput records throughput at current time

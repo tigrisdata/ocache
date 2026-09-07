@@ -24,13 +24,19 @@ type OpType int
 const (
 	OpRead OpType = iota
 	OpUpdate
+	// OpCAS is one guarded read-modify-write: GetWithVersion, then PutIfVersion
+	// against the version just read. This is the write-coordination pattern CAS
+	// exists for (issue #254). Losing the race (a VersionMismatchError) is the
+	// expected outcome under contention and is counted as a mismatch, not an
+	// error; the mismatch rate is the contention signal the benchmark reports.
+	OpCAS
 	OpNum
 )
 
-// StreamingThreshold defines the size threshold (4MB) above which streaming is automatically used
+// StreamingThreshold defines the size threshold (4MB) above which YCSB writes automatically use streaming.
 const StreamingThreshold = 4 * 1024 * 1024 // 4MB
 
-var opNames = []string{"read", "update"}
+var opNames = []string{"read", "update", "cas"}
 
 // WorkloadSpec defines the operation mix for a workload.
 type WorkloadSpec struct {
@@ -61,6 +67,8 @@ func ParseWorkload(s string) (WorkloadSpec, error) {
 			opIdx = int(OpRead)
 		case "update":
 			opIdx = int(OpUpdate)
+		case "cas":
+			opIdx = int(OpCAS)
 		default:
 			return ws, fmt.Errorf("unknown op: %q", kv[0])
 		}
@@ -90,7 +98,7 @@ type YCSBConfig struct {
 	Workload           string        // Workload type or custom mix (e.g. "A", "B", "read=70,update=30")
 	Seed               int64         // Seed for random number generation (for reproducibility)
 	NoProgress         bool          // Disable progress output during benchmark
-	ForceStreaming     bool          // Force streaming for all operations regardless of size
+	ForceStreaming     bool          // Force streaming for writes regardless of size; reads always stream
 }
 
 type Result struct {
@@ -98,6 +106,21 @@ type Result struct {
 	Duration  time.Duration
 	Errors    int
 	Latencies []time.Duration // All operation latencies
+
+	// Guarded read-modify-write (OpCAS) outcomes. A mismatch is a lost race —
+	// the expected outcome under contention — and is never counted in Errors.
+	CASAttempts   int
+	CASWins       int
+	CASMismatches int
+}
+
+// workerResult is what each worker hands back when it finishes or aborts.
+type workerResult struct {
+	errors        int
+	latencies     []time.Duration
+	opCounts      []int
+	casWins       int
+	casMismatches int
 }
 
 // hashKey generates a consistent string key from a key number using FNV-1a 64-bit hash.
@@ -114,6 +137,13 @@ func hashKey(keyNum int) string {
 		n >>= 8
 	}
 	return fmt.Sprintf("user%x", h)
+}
+
+// casKey names the CAS-guarded twin of key number keyNum. CAS keys live in
+// their own namespace so a key is never both plain-written and CAS-guarded
+// (an unsupported mix); they are created with put-if-absent at preload.
+func casKey(keyNum int) string {
+	return "cas-" + hashKey(keyNum)
 }
 
 // generateValue returns a random byte slice of the given size using the provided rng.
@@ -139,7 +169,7 @@ func isConnectionError(err error) bool {
 		strings.Contains(errStr, "transport")
 }
 
-func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
+func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand.Rand) error {
 	// Create client for preloading
 	addrs := strings.Split(cfg.Addr, ",")
 	for i, a := range addrs {
@@ -167,6 +197,18 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 			Start()
 	}
 
+	// Each key index does one preload put per enabled namespace (plain and/or
+	// CAS), so the summary and the failure threshold are sized by puts, not keys.
+	plainEnabled := ws.Weights[OpRead] > 0 || ws.Weights[OpUpdate] > 0
+	casEnabled := ws.Weights[OpCAS] > 0
+	expectedPuts := 0
+	if plainEnabled {
+		expectedPuts += cfg.NumKeys
+	}
+	if casEnabled {
+		expectedPuts += cfg.NumKeys
+	}
+
 	var preloadErrors int32
 	var successCount int32
 	errorCh := make(chan error, 100)
@@ -182,25 +224,47 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 		default:
 		}
 
-		k := hashKey(i)
-		val := generateValue(rng, cfg.ValueSize)
-
-		var err error
 		useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
-		if useStreaming {
-			err = client.PutStream(ctx, k, bytes.NewReader(val), 0)
-		} else {
-			err = client.Put(ctx, k, val, 0)
-		}
-
-		if err != nil {
-			atomic.AddInt32(&preloadErrors, 1)
-			select {
-			case errorCh <- fmt.Errorf("key %s: %w", k, err):
-			default: // Don't block on error channel
+		// Plain read/update keys and CAS keys live in disjoint namespaces so a key
+		// is never both plain-written and CAS-guarded (an unsupported mix). CAS
+		// keys are created with put-if-absent; a mismatch there means the key
+		// survived from an earlier run and is already CAS-owned, which is fine.
+		for _, p := range []struct {
+			enabled bool
+			key     string
+			cas     bool
+		}{
+			{plainEnabled, hashKey(i), false},
+			{casEnabled, casKey(i), true},
+		} {
+			if !p.enabled {
+				continue
 			}
-		} else {
-			atomic.AddInt32(&successCount, 1)
+			val := generateValue(rng, cfg.ValueSize)
+			var err error
+			switch {
+			case p.cas && useStreaming:
+				_, err = client.PutStreamIfVersion(ctx, p.key, bytes.NewReader(val), 0, 0)
+			case p.cas:
+				_, err = client.PutIfVersion(ctx, p.key, val, 0, 0)
+			case useStreaming:
+				err = client.PutStream(ctx, p.key, bytes.NewReader(val), 0)
+			default:
+				err = client.Put(ctx, p.key, val, 0)
+			}
+			if outcome, _ := ClassifyCASResult(err); outcome == CASMismatch {
+				err = nil // already present from an earlier run: fine
+			}
+
+			if err != nil {
+				atomic.AddInt32(&preloadErrors, 1)
+				select {
+				case errorCh <- fmt.Errorf("key %s: %w", p.key, err):
+				default: // Don't block on error channel
+				}
+			} else {
+				atomic.AddInt32(&successCount, 1)
+			}
 		}
 
 		if spinner != nil && i%100 == 0 {
@@ -222,10 +286,10 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, rng *rand.Rand) error {
 	totalErrors := atomic.LoadInt32(&preloadErrors)
 	if totalErrors > 0 {
 		if spinner != nil {
-			spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)",
-				atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
+			spinner.Warning(fmt.Sprintf("Preloaded %d/%d puts (%d errors)",
+				atomic.LoadInt32(&successCount), expectedPuts, totalErrors))
 		}
-		if int(totalErrors) > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
+		if int(totalErrors) > expectedPuts/10 { // If more than 10% failed, consider it a failure
 			if len(sampleErrors) > 0 {
 				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, sampleErrors[0])
 			}
@@ -295,7 +359,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		return Result{}, err
 	}
 	// Preload keys with context
-	if err := preloadKeys(ctx, cfg, rng); err != nil {
+	if err := preloadKeys(ctx, cfg, ws, rng); err != nil {
 		return Result{}, err
 	}
 
@@ -388,13 +452,12 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		}
 	}()
 
+	// Write transport selection is fixed for the duration of a run.
+	useStreamingWrites := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+
 	var wg sync.WaitGroup
 	opsPerWorker := cfg.NumOps / cfg.Concurrency
-	resultCh := make(chan struct {
-		errors    int
-		latencies []time.Duration
-		opCounts  []int
-	}, cfg.Concurrency)
+	resultCh := make(chan workerResult, cfg.Concurrency)
 	t0 := time.Now()
 	for i := range cfg.Concurrency {
 		wg.Add(1)
@@ -411,48 +474,72 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 			// Pre-allocate latencies slice with exact capacity to avoid reallocation
 			latencies := make([]time.Duration, 0, opsPerWorker)
 			opCounts := make([]int, OpNum) // Track count for each op type
+			casWins, casMismatches := 0, 0 // OpCAS outcomes; a mismatch is a lost race, not an error
 
 			for opIdx := 0; opIdx < opsPerWorker; opIdx++ {
 				// Check for context cancellation
 				select {
 				case <-ctx.Done():
 					// Context cancelled, report partial results
-					resultCh <- struct {
-						errors    int
-						latencies []time.Duration
-						opCounts  []int
-					}{errCount, latencies, opCounts}
+					resultCh <- workerResult{errCount, latencies, opCounts, casWins, casMismatches}
 					return
 				default:
 				}
 
 				keyNum := localRng.Intn(cfg.NumKeys)
-				k := hashKey(keyNum)
 				op := pickOp(ws.Weights, localRng)
+				// CAS uses its own key namespace (preloaded with put-if-absent) so a
+				// key is never both plain-written and CAS-guarded, an unsupported mix.
+				k := hashKey(keyNum)
+				if op == OpCAS {
+					k = casKey(keyNum)
+				}
 				start := time.Now()
 				var opErr error
 
 				// Use context with timeout for individual operations
 				opCtx, opCancel := context.WithTimeout(ctx, 5*time.Second)
 
-				// Determine if streaming should be used
-				useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
-
 				switch op {
 				case OpRead:
-					if useStreaming {
-						// Use streaming for reads, discard output for benchmarking
-						opErr = c.GetStream(opCtx, k, io.Discard)
-					} else {
-						_, opErr = c.Get(opCtx, k)
-					}
+					// YCSB does not consume read values, so drain chunks to io.Discard
+					// rather than assemble a result slice.
+					opErr = c.GetStream(opCtx, k, io.Discard)
 				case OpUpdate:
 					val := generateValue(localRng, cfg.ValueSize)
-					if useStreaming {
+					if useStreamingWrites {
 						// Use streaming for writes
 						opErr = c.PutStream(opCtx, k, bytes.NewReader(val), 0)
 					} else {
 						opErr = c.Put(opCtx, k, val, 0)
+					}
+				case OpCAS:
+					// Guarded read-modify-write: read the current version (draining
+					// the value), then write only if it is unchanged. Reads always
+					// stream; the write uses the same transport selection as an update.
+					ver, found, rerr := c.GetStreamWithVersion(opCtx, k, io.Discard)
+					if rerr != nil {
+						opErr = rerr
+					} else {
+						if !found {
+							ver = 0 // absent: recreate with put-if-absent
+						}
+						val := generateValue(localRng, cfg.ValueSize)
+						var perr error
+						if useStreamingWrites {
+							_, perr = c.PutStreamIfVersion(opCtx, k, bytes.NewReader(val), 0, ver)
+						} else {
+							_, perr = c.PutIfVersion(opCtx, k, val, 0, ver)
+						}
+						// Classification lives in the metrics layer; the worker only counts.
+						var outcome CASOutcome
+						outcome, opErr = ClassifyCASResult(perr)
+						switch outcome {
+						case CASWin:
+							casWins++
+						case CASMismatch:
+							casMismatches++ // lost the race: contention, not an error
+						}
 					}
 				}
 				opCancel()
@@ -466,11 +553,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 					}
 					// Count remaining operations as errors
 					remainingOps := opsPerWorker - opIdx - 1
-					resultCh <- struct {
-						errors    int
-						latencies []time.Duration
-						opCounts  []int
-					}{errCount + remainingOps + 1, latencies, opCounts}
+					resultCh <- workerResult{errCount + remainingOps + 1, latencies, opCounts, casWins, casMismatches}
 					return
 				}
 
@@ -499,11 +582,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 				latencies = append(latencies, latency)
 				opCounts[op]++
 			}
-			resultCh <- struct {
-				errors    int
-				latencies []time.Duration
-				opCounts  []int
-			}{errCount, latencies, opCounts}
+			resultCh <- workerResult{errCount, latencies, opCounts, casWins, casMismatches}
 		}(i, seed, client, progressReporter, metricsCollector, throughputCh, cfg.NoProgress)
 	}
 	wg.Wait()
@@ -514,6 +593,7 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 	totalErr := 0
 	allLatencies := make([]time.Duration, 0, cfg.NumOps)
 	totalOps := make([]int, OpNum)
+	casWins, casMismatches := 0, 0
 	for range cfg.Concurrency {
 		res := <-resultCh
 		totalErr += res.errors
@@ -521,9 +601,14 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 		for i := range int(OpNum) {
 			totalOps[i] += res.opCounts[i]
 		}
+		casWins += res.casWins
+		casMismatches += res.casMismatches
 	}
 	slices.Sort(allLatencies)
-	result := Result{Ops: cfg.NumOps, Duration: dur, Errors: totalErr, Latencies: allLatencies}
+	result := Result{
+		Ops: cfg.NumOps, Duration: dur, Errors: totalErr, Latencies: allLatencies,
+		CASAttempts: totalOps[OpCAS], CASWins: casWins, CASMismatches: casMismatches,
+	}
 
 	// Display final results using pterm with enhanced metrics
 	DisplayFinalResultsWithMetrics(cfg, result, totalOps, metricsCollector)

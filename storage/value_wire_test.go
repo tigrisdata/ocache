@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/tigrisdata/ocache/storage/proto"
@@ -80,10 +81,59 @@ func TestValueMessageValueLength_MalformedIsNotOK(t *testing.T) {
 
 	_, ok := valueMessageValueLength(buf)
 	require.False(t, ok, "truncated varint must be rejected")
+	_, ok = valueMessageExpiry(buf)
+	require.False(t, ok, "truncated varint must be rejected")
 
 	// A lone continuation byte with no valid tag is also malformed.
 	_, ok = valueMessageValueLength([]byte{0x80})
 	require.False(t, ok)
+	_, ok = valueMessageExpiry([]byte{0x80})
+	require.False(t, ok)
+}
+
+func TestValueMessageValueLength_InvalidFieldNumberIsNotOK(t *testing.T) {
+	buf := protowire.AppendTag(nil, protowire.MaxValidNumber+1, protowire.VarintType)
+	buf = protowire.AppendVarint(buf, 1)
+
+	var msg pb.ValueMessage
+	require.Error(t, proto.Unmarshal(buf, &msg))
+	_, ok := valueMessageValueLength(buf)
+	require.False(t, ok)
+	_, ok = valueMessageExpiry(buf)
+	require.False(t, ok)
+}
+
+// String fields reject invalid UTF-8 during proto.Unmarshal. The wire scanner
+// must reject every such row too, even though it only reads value_length.
+func TestValueMessageValueLength_InvalidStringIsNotOK(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		field       byte
+		lengthFirst bool
+	}{
+		{name: "raw_file_path_before_length", field: 4},
+		{name: "raw_file_path_after_length", field: 4, lengthFirst: true},
+		{name: "segment_path_before_length", field: 5},
+		{name: "segment_path_after_length", field: 5, lengthFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stringField := []byte{tc.field<<3 | 2, 1, 0xff}
+			lengthField := []byte{7 << 3, 1}
+			buf := append(stringField, lengthField...)
+			if tc.lengthFirst {
+				buf = append(lengthField, stringField...)
+			}
+
+			var msg pb.ValueMessage
+			require.Error(t, proto.Unmarshal(buf, &msg))
+			_, ok := valueMessageValueLength(buf)
+			require.False(t, ok)
+			_, ok = valueMessageExpiry(buf)
+			require.False(t, ok)
+			_, _, ok = valueMessageSegmentRef(buf)
+			require.False(t, ok)
+		})
+	}
 }
 
 // valueMessageExpiry must agree with a full decode's Expiry field across shapes.
@@ -101,6 +151,119 @@ func TestValueMessageExpiry_MatchesFullDecode(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, m.Expiry, got)
 	}
+}
+
+// A repeated expiry field must take its final value, matching proto scalar merge.
+func TestValueMessageExpiry_LastWinsOnDuplicateField(t *testing.T) {
+	tag := protowireTagVarint(t, 3)
+	buf := append(append(append([]byte{}, tag...), 10), append(append([]byte{}, tag...), 20)...)
+
+	var msg pb.ValueMessage
+	require.NoError(t, proto.Unmarshal(buf, &msg))
+
+	got, ok := valueMessageExpiry(buf)
+	require.True(t, ok)
+	require.Equal(t, msg.Expiry, got)
+	require.Equal(t, int64(20), got)
+}
+
+// decodeValueMessageCleanupFields must agree with proto.Unmarshal for every
+// retained field while avoiding a Data-sized allocation. It accepts an
+// unexpected field wire type in the same way proto.Unmarshal does: as an
+// unknown field that does not overwrite the retained value.
+func TestDecodeValueMessageCleanupFields(t *testing.T) {
+	messages := map[string]*pb.ValueMessage{
+		"empty": {},
+		"inline": {
+			ValueType: pb.ValueType_INLINE, Data: bytes.Repeat([]byte("x"), 64*1024), ValueLength: 64 * 1024,
+		},
+		"raw file": {
+			ValueType: pb.ValueType_RAW_FILE, RawFilePath: "/disk/files/abc.dat", ValueLength: 8 << 20,
+		},
+		"segment": {
+			ValueType: pb.ValueType_SEGMENT, SegmentPath: "/disk/segments/seg_1.seg", ValueLength: 262144,
+		},
+		"all retained fields": {
+			ValueType: pb.ValueType_SEGMENT, RawFilePath: "/raw", SegmentPath: "/segment", ValueLength: 9,
+		},
+	}
+
+	cases := make(map[string][]byte, len(messages)+4)
+	for name, msg := range messages {
+		buf, err := proto.Marshal(msg)
+		require.NoError(t, err)
+		cases[name] = buf
+	}
+
+	duplicate := protowire.AppendTag(nil, valueTypeField, protowire.VarintType)
+	duplicate = protowire.AppendVarint(duplicate, uint64(pb.ValueType_RAW_FILE))
+	duplicate = protowire.AppendTag(duplicate, valueTypeField, protowire.VarintType)
+	duplicate = protowire.AppendVarint(duplicate, uint64(pb.ValueType_SEGMENT))
+	duplicate = protowire.AppendTag(duplicate, valueLengthField, protowire.VarintType)
+	duplicate = protowire.AppendVarint(duplicate, 1)
+	duplicate = protowire.AppendTag(duplicate, valueLengthField, protowire.VarintType)
+	duplicate = protowire.AppendVarint(duplicate, 2)
+	cases["duplicate retained scalars"] = duplicate
+
+	wrongType := protowire.AppendTag(nil, valueTypeField, protowire.BytesType)
+	wrongType = protowire.AppendBytes(wrongType, []byte("unknown"))
+	wrongType = protowire.AppendTag(wrongType, valueLengthField, protowire.VarintType)
+	wrongType = protowire.AppendVarint(wrongType, 7)
+	cases["unexpected retained wire type"] = wrongType
+
+	unknown := protowire.AppendTag(nil, 99, protowire.BytesType)
+	unknown = protowire.AppendBytes(unknown, []byte("unknown"))
+	unknown = append(unknown, cases["inline"]...)
+	cases["unknown field"] = unknown
+
+	invalidUTF8 := protowire.AppendTag(nil, valueRawPathField, protowire.BytesType)
+	invalidUTF8 = protowire.AppendBytes(invalidUTF8, []byte{0xff})
+	cases["invalid UTF-8"] = invalidUTF8
+	cases["truncated"] = []byte{0x80}
+
+	for name, buf := range cases {
+		t.Run(name, func(t *testing.T) {
+			var full pb.ValueMessage
+			fullErr := proto.Unmarshal(buf, &full)
+
+			got, ok := decodeValueMessageCleanupFields(buf)
+			require.Equal(t, fullErr == nil, ok)
+			if !ok {
+				return
+			}
+			require.Equal(t, valueMessageCleanupFields{
+				valueType:   full.ValueType,
+				valueLength: full.ValueLength,
+				rawFilePath: full.RawFilePath,
+				segmentPath: full.SegmentPath,
+			}, got)
+		})
+	}
+}
+
+func TestDecodeValueMessageCleanupFieldsCopiesPaths(t *testing.T) {
+	msg := &pb.ValueMessage{
+		ValueType:   pb.ValueType_SEGMENT,
+		RawFilePath: "/raw/path",
+		SegmentPath: "/segment/path",
+		ValueLength: 9,
+	}
+	buf, err := proto.Marshal(msg)
+	require.NoError(t, err)
+
+	got, ok := decodeValueMessageCleanupFields(buf)
+	require.True(t, ok)
+
+	for _, path := range []string{msg.RawFilePath, msg.SegmentPath} {
+		start := bytes.Index(buf, []byte(path))
+		require.GreaterOrEqual(t, start, 0)
+		for i := range path {
+			buf[start+i] = 'x'
+		}
+	}
+
+	require.Equal(t, msg.RawFilePath, got.rawFilePath)
+	require.Equal(t, msg.SegmentPath, got.segmentPath)
 }
 
 // unmarshalValueMessageSkippingData must reproduce a full proto.Unmarshal on

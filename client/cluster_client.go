@@ -376,7 +376,56 @@ func (c *ClusterClient) Delete(ctx context.Context, key string) error {
 	return err
 }
 
-// PutStream, List, ListPage and ListPageWithValues are inherited from Operations
+// GetWithVersion reads a key's value and CAS version with routing-error retry.
+// A read is idempotent, so on a routing error we refresh topology and retry
+// once — the same treatment plain Get gets. A version mismatch is not a routing
+// error and never occurs on a read.
+func (c *ClusterClient) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
+	data, version, found, err := c.Operations.GetWithVersion(ctx, key)
+	if isRoutingError(err) && c.forceRefreshTopology(ctx) {
+		return c.Operations.GetWithVersion(ctx, key)
+	}
+	return data, version, found, err
+}
+
+// GetStreamWithVersion streams a value and its CAS version with routing-error
+// retry, mirroring plain GetStream: the read is idempotent, but a routing error
+// after partial output cannot be retried without corrupting w, so we retry only
+// when nothing has been written yet.
+func (c *ClusterClient) GetStreamWithVersion(ctx context.Context, key string, w io.Writer) (uint64, bool, error) {
+	cw := &casCountingWriter{w: w}
+	version, found, err := c.Operations.GetStreamWithVersion(ctx, key, cw)
+	if isRoutingError(err) && cw.n == 0 && c.forceRefreshTopology(ctx) {
+		return c.Operations.GetStreamWithVersion(ctx, key, cw)
+	}
+	return version, found, err
+}
+
+// PutIfVersion, DeleteIfVersion and PutStreamIfVersion are inherited from
+// Operations with NO retry override, exactly like the plain PutStream: a
+// conditional write is not idempotent (and a stream is not replayable), and a
+// routing error such as NotFound/Unavailable can be returned after the merge
+// committed but its read-back failed — re-running would issue a fresh stamp
+// against the now-committed value and report a false mismatch. Topology heals
+// without any CAS-specific hook: the connection-level epoch-mismatch handler
+// (onEpochMismatch) and the periodic refresh loop already refresh the ring, and
+// the caller's own re-read (GetWithVersion, which does retry) routes correctly.
+// A version mismatch is not a routing error and is returned unchanged.
+// PutStream, List, ListPage and ListPageWithValues are likewise inherited.
+
+// casCountingWriter counts bytes forwarded to the wrapped writer so a streaming
+// CAS read can tell whether any output has been emitted (and thus whether a
+// routing-error retry is still safe).
+type casCountingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *casCountingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
+}
 
 // Close closes all connections and stops background goroutines
 func (c *ClusterClient) Close() error {

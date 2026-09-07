@@ -32,6 +32,7 @@ TEST_SERVER_RESTART_PERSISTENCE=""
 TEST_BYTE_RANGE_READS=""
 TEST_DATA_CORRUPTION_DETECTION=""
 TEST_STRESS_TEST_INTEGRITY=""
+TEST_CAS_ACROSS_STORAGE_LAYERS=""
 
 # Fail on any command in a pipeline failing
 set -o pipefail
@@ -741,6 +742,53 @@ else
     echo -e "${RED}✗ $STRESS_ERRORS errors detected during stress test${NC}"
 fi
 
+echo
+echo "=== Test: Conditional (CAS) ops across storage layers ==="
+echo "CAS get/put must work for both inline (small) and raw-file (medium) values."
+CAS_LAYER_ERRORS=0
+# Inline value (< 64KB threshold).
+cas_small="cas-inline-value"
+cas_s_out=$(./ocachecli put-if-version "cas-layer-small" "$cas_small" --expected 0 2>/dev/null)
+cas_s_v=$(echo "$cas_s_out" | grep -oE 'new_version=[0-9]+' | cut -d= -f2)
+cas_s_gv=$(./ocachecli get-with-version "cas-layer-small" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+cas_s_val=$(./ocachecli get "cas-layer-small" 2>/dev/null)
+if [ -n "$cas_s_v" ] && [ "$cas_s_gv" = "$cas_s_v" ] && [ "$cas_s_val" = "$cas_small" ]; then
+    echo -e "${GREEN}✓ CAS on inline value: version and data consistent${NC}"
+else
+    echo -e "${RED}✗ CAS inline mismatch: v=$cas_s_v gv=$cas_s_gv${NC}"
+    ((CAS_LAYER_ERRORS++))
+fi
+
+# Medium value (> 64KB threshold -> raw file).
+cas_medium=$(head -c 100000 /dev/urandom | base64 | head -c 100000)
+cas_m_out=$(./ocachecli put-if-version "cas-layer-medium" "$cas_medium" --expected 0 2>/dev/null)
+cas_m_v=$(echo "$cas_m_out" | grep -oE 'new_version=[0-9]+' | cut -d= -f2)
+cas_m_gv=$(./ocachecli get-with-version "cas-layer-medium" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
+cas_m_found=$(./ocachecli get-with-version "cas-layer-medium" 2>/dev/null | grep -oE 'found=(true|false)' | cut -d= -f2)
+if [ -n "$cas_m_v" ] && [ "$cas_m_gv" = "$cas_m_v" ] && [ "$cas_m_found" = "true" ]; then
+    echo -e "${GREEN}✓ CAS on raw-file value: version consistent${NC}"
+else
+    echo -e "${RED}✗ CAS raw-file mismatch: v=$cas_m_v gv=$cas_m_gv found=$cas_m_found${NC}"
+    ((CAS_LAYER_ERRORS++))
+fi
+
+# A guarded update on each layer must apply with the right version.
+./ocachecli put-if-version "cas-layer-small" "updated-inline" --expected "$cas_s_v" >/dev/null 2>&1; cas_su_rc=$?
+./ocachecli put-if-version "cas-layer-medium" "updated-medium" --expected "$cas_m_v" >/dev/null 2>&1; cas_mu_rc=$?
+if [ "$cas_su_rc" -eq 0 ] && [ "$cas_mu_rc" -eq 0 ] && [ "$(./ocachecli get cas-layer-small 2>/dev/null)" = "updated-inline" ]; then
+    echo -e "${GREEN}✓ Guarded updates applied across both layers${NC}"
+else
+    echo -e "${RED}✗ Guarded update failed (small rc=$cas_su_rc medium rc=$cas_mu_rc)${NC}"
+    ((CAS_LAYER_ERRORS++))
+fi
+
+if [ "$CAS_LAYER_ERRORS" -eq 0 ]; then
+    TEST_CAS_ACROSS_STORAGE_LAYERS="PASSED"
+else
+    TEST_CAS_ACROSS_STORAGE_LAYERS="FAILED"
+    TEST_PASSED=false
+fi
+
 # Test Results Summary
 echo
 echo "========================================="
@@ -769,6 +817,7 @@ print_test_result "Server Restart Persistence" "$TEST_SERVER_RESTART_PERSISTENCE
 print_test_result "Byte-Range Reads" "$TEST_BYTE_RANGE_READS"
 print_test_result "Data Corruption Detection" "$TEST_DATA_CORRUPTION_DETECTION"
 print_test_result "Stress Test Integrity" "$TEST_STRESS_TEST_INTEGRITY"
+print_test_result "CAS Across Storage Layers" "$TEST_CAS_ACROSS_STORAGE_LAYERS"
 
 print_overall_result
 

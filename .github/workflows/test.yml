@@ -17,6 +17,13 @@ on:
       - ".gitignore"
   workflow_call:
 
+# Non-PR runs get a run-unique group: a shared non-cancelling group keeps at most
+# one pending run, silently dropping the middle of three rapid pushes (on main,
+# or a release invocation of this reusable workflow).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 env:
   GO_VERSION: "1.24.2"
   ROCKSDB_VERSION: "10.4.2"
@@ -32,6 +39,9 @@ jobs:
           - os: namespace-profile-ubuntu-2404
             arch: x86_64
     runs-on: ${{ matrix.os }}
+    # A hung step (e.g. an e2e script waiting on a background process) must not
+    # hold a runner for GitHub's 6-hour default; a normal run takes ~20 min.
+    timeout-minutes: 45
 
     permissions:
       actions: write
@@ -147,6 +157,9 @@ jobs:
       - name: Run integration tests - Cluster
         run: STATIC_BUILD=true make test-integration-cluster
 
+      - name: Run integration tests - CAS (conditional operations)
+        run: STATIC_BUILD=true make test-integration-cas
+
       - name: Run concurrent operations E2E test
         run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-concurrent
 
@@ -164,6 +177,9 @@ jobs:
 
       - name: Run recompaction E2E test
         run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-recompaction
+
+      - name: Run CAS (conditional operations) E2E test
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-cas
 
       - name: Run cluster mode concurrent operations E2E test
         run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-cluster

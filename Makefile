@@ -242,6 +242,40 @@ build-bench-compaction-serving-reads: proto
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/compaction-serving-reads.test" .
 
+# Compile the cleaner reconciliation benchmark once so paired runs measure the
+# scheduled cleanup-loop tick without Go compilation. BENCH_OUTPUT is supplied
+# by the benchmark runner.
+BENCH_OUTPUT ?=
+.PHONY: build-storage-bench
+build-storage-bench: proto
+	@test -n "$(BENCH_OUTPUT)" || { echo "BENCH_OUTPUT is required"; exit 1; }
+	@mkdir -p "$(dir $(BENCH_OUTPUT))"
+	@cd storage && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(BENCH_OUTPUT)" .
+
+# Compile the topology RPC benchmark once so paired runs do not include Go
+# compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+.PHONY: build-bench-cache-topology-rpc
+build-bench-cache-topology-rpc:
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd server && go test $(LDFLAGS) -tags=ocache_topology_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-topology-rpc.test" ./service
+
+# Compile the CacheService delete benchmark once so paired runs do not include
+# Go compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+.PHONY: build-bench-cache-service-delete
+build-bench-cache-service-delete: proto
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-delete.test" ./service
+
+# Compile the CacheService ListWithValues benchmark once so paired runs do not
+# include Go compilation. PERFLOOP_BUILD_OUTPUT_DIR is supplied by the benchmark runner.
+.PHONY: build-bench-cache-service-list-with-values
+build-bench-cache-service-list-with-values: proto
+	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
+	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
+	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-list-with-values.test" ./service
+
 .PHONY: run-background
 run-background:
 	@echo "Starting ocache in background..."
@@ -280,6 +314,14 @@ test-storage: proto
 	@echo "Running storage tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s $(TESTFLAGS) ./...
+
+.PHONY: test-storage-wire
+test-storage-wire: proto
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s -run '^TestValueMessage' .
+
+.PHONY: test-storage-reconcile
+test-storage-reconcile: proto
+	@cd storage && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -timeout 60s -run '^TestCleaner' .
 
 .PHONY: test-client
 test-client: proto
@@ -344,6 +386,7 @@ test-e2e: build build-cli
 	@$(MAKE) test-e2e-storage-layers
 	@$(MAKE) test-e2e-ttl
 	@$(MAKE) test-e2e-eviction
+	@$(MAKE) test-e2e-cas
 	@$(MAKE) test-e2e-compaction
 	@$(MAKE) test-e2e-recompaction
 	@$(MAKE) test-e2e-data-validation
@@ -368,6 +411,11 @@ test-e2e-ttl: build build-cli
 test-e2e-eviction: build build-cli
 	@echo "Running eviction E2E test (LRU + FIFO)..."
 	./tests/e2e/eviction_test.sh
+
+.PHONY: test-e2e-cas
+test-e2e-cas: build build-cli
+	@echo "Running CAS (conditional-ops) E2E test..."
+	./tests/e2e/cas_test.sh
 
 .PHONY: test-e2e-compaction
 test-e2e-compaction: build build-cli
@@ -426,6 +474,12 @@ test-integration-compaction:
 	@echo "Running compaction integration tests..."
 	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
 	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),TestIntegration_Compaction) -timeout 300s ./...
+
+.PHONY: test-integration-cas
+test-integration-cas:
+	@echo "Running CAS integration tests..."
+	$(if $(TEST)$(TESTRUN),@echo "Filter: $(if $(TEST),$(TEST),$(TESTRUN))",)
+	@cd tests/integration && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -v -run $(if $(TEST)$(TESTRUN),$(if $(TEST),$(TEST),$(TESTRUN)),CAS) -timeout 300s ./...
 
 .PHONY: test-integration-cleaner
 test-integration-cleaner:
@@ -551,6 +605,7 @@ help:
 	@echo "  test-integration-short      - Run integration tests in short mode"
 	@echo "  test-integration-objects    - Run small, medium, and large objects integration tests"
 	@echo "  test-integration-compaction - Run compaction integration tests"
+	@echo "  test-integration-cas        - Run CAS (conditional-ops) integration tests"
 	@echo "  test-integration-cleaner    - Run cleaner integration tests (TTL and LRU)"
 	@echo "  test-integration-workflow   - Run cross-component integration tests"
 	@echo "  test-integration-coordinator - Run coordinator/cluster integration tests"
@@ -560,6 +615,9 @@ help:
 	@echo "  bench                       - Run benchmarks"
 	@echo "  bench-integration           - Compile integration benchmarks (set INTEGRATION_BENCH_BINARY)"
 	@echo "  build-bench-compaction-serving-reads - Compile the compaction/serving benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
+	@echo "  build-bench-cache-topology-rpc - Compile the CacheService topology RPC benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
+	@echo "  build-bench-cache-service-delete - Compile the CacheService delete benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
+	@echo "  build-bench-cache-service-list-with-values - Compile the CacheService ListWithValues benchmark (set PERFLOOP_BUILD_OUTPUT_DIR)"
 	@echo ""
 	@echo "  To run specific tests, use TEST or TESTRUN variable:"
 	@echo "    make test TEST=TestMyFunction      - Run exact test name"

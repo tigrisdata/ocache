@@ -287,11 +287,11 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 	// Determine streaming mode
 	var streamingMode string
 	if cfg.ForceStreaming {
-		streamingMode = "Forced Streaming"
+		streamingMode = "Streaming reads and writes (forced)"
 	} else if cfg.ValueSize > StreamingThreshold {
-		streamingMode = fmt.Sprintf("Auto Streaming (size %d > 4MB)", cfg.ValueSize)
+		streamingMode = fmt.Sprintf("Streaming reads and writes (size %d > 4MB)", cfg.ValueSize)
 	} else {
-		streamingMode = "Standard (non-streaming)"
+		streamingMode = "Streaming reads; standard writes"
 	}
 
 	// Create summary table
@@ -312,6 +312,27 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 		WithBoxed(true).
 		WithData(summaryTable).
 		Render()
+
+	// CAS outcomes, only when the workload ran guarded read-modify-writes. A
+	// mismatch is a lost race (the expected outcome under contention), so it is
+	// reported as its own rate rather than folded into errors.
+	if result.CASAttempts > 0 {
+		pterm.DefaultSection.Println("CAS (guarded read-modify-write) Outcomes")
+		mismatchRate := float64(result.CASMismatches) / float64(result.CASAttempts) * 100
+		casTable := pterm.TableData{
+			{"Metric", "Value"},
+			{"Attempts", fmt.Sprintf("%d", result.CASAttempts)},
+			{"Wins", fmt.Sprintf("%d", result.CASWins)},
+			{"Mismatches (lost races)", fmt.Sprintf("%d", result.CASMismatches)},
+			{"Mismatch Rate", fmt.Sprintf("%.2f%%", mismatchRate)},
+		}
+		pterm.DefaultTable.
+			WithHasHeader(true).
+			WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
+			WithBoxed(true).
+			WithData(casTable).
+			Render()
+	}
 
 	// Per-Operation Statistics
 	opStats := metrics.GetPerOperationStats()

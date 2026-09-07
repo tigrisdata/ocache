@@ -16,6 +16,13 @@ const (
 	// Uses the same format as other internal keys (starting with !)
 	MetadataPrefix = "!meta/"
 
+	// VersionHWMKey stores the durable version-reservation high-water mark for
+	// the CAS stamp source (issue #254): nextVersion never issues a stamp above
+	// the persisted reservation without first extending it durably, so stamps
+	// stay monotonic across restarts even if the wall clock steps backward.
+	// A single internal key; pre-versioning binaries simply never read it.
+	VersionHWMKey = "!verhwm"
+
 	// AccessBucketPrefix is the prefix for time-bucketed access index entries
 	// Format: !access_bucket/YYYYMMDDHH/timestamp_nano/key
 	AccessBucketPrefix = "!access_bucket/"
