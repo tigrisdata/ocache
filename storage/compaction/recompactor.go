@@ -283,8 +283,11 @@ func (sr *SegmentRecompactor) recompactSegment(ctx context.Context, oldSeg *segm
 			if !live {
 				// Rows emitted beside a conditional migration are speculative.
 				// Once metadata no longer points at this source location, remove
-				// the row without treating the source segment as incomplete.
-				wb.Delete(indexKey)
+				// both halves of the row pair without treating the source segment
+				// as incomplete.
+				if err := stageSegmentLiveIndexDelete(wb, oldSeg.Path(), entry.Offset); err != nil {
+					return err
+				}
 				return nil
 			}
 		} else {

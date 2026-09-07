@@ -172,6 +172,17 @@ func segmentLiveIndexRowExistsForTest(t *testing.T, meta *metadata.MetaDB, segme
 	return exists
 }
 
+func segmentLiveWitnessRowExistsForTest(t *testing.T, meta *metadata.MetaDB, segmentPath string, offset int64) bool {
+	t.Helper()
+	ro := metadata.CreateReadOptions(false, false)
+	defer ro.Destroy()
+	slice, err := meta.Handle().Get(ro, keys.MakeSegmentLiveIndexWitnessKey(segmentPath, offset))
+	require.NoError(t, err)
+	exists := slice.Exists()
+	slice.Free()
+	return exists
+}
+
 func TestRecompactionRolloverPublishesBeforeFinalizing(t *testing.T) {
 	_, sm, meta, _, cleanup := setupTestRecompactor(t)
 	defer cleanup()
@@ -489,6 +500,82 @@ func TestSegmentRecompaction_MissingLiveRowRetainsSource(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, slice.Exists())
 	slice.Free()
+}
+
+func TestStaleIndexedRowsPrunePrimaryAndWitness(t *testing.T) {
+	t.Run("liveness walk", func(t *testing.T) {
+		recompactor, sm, meta, _, cleanup := setupTestRecompactor(t)
+		defer cleanup()
+
+		entries := map[string][]byte{
+			"walk-live":  []byte("live value"),
+			"walk-stale": []byte("stale value"),
+		}
+		seg, err := createTestSegmentWithEntries(t, sm, meta, entries)
+		require.NoError(t, err)
+		stale, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("walk-stale")))
+		require.NoError(t, err)
+
+		wo := grocksdb.NewDefaultWriteOptions()
+		require.NoError(t, meta.Handle().Delete(wo, keys.MakeMetadataKey("walk-stale")))
+		wo.Destroy()
+
+		deadEntries, deadBytes, err := recompactor.walkIndexedSegmentLiveness(context.Background(), seg)
+		require.NoError(t, err)
+		require.Equal(t, int64(1), deadEntries)
+		require.Equal(t, int64(len(entries["walk-stale"])), deadBytes)
+		require.False(t, segmentLiveIndexRowExistsForTest(t, meta, seg.Path(), stale.SegmentOffset))
+		require.False(t, segmentLiveWitnessRowExistsForTest(t, meta, seg.Path(), stale.SegmentOffset))
+
+		live, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("walk-live")))
+		require.NoError(t, err)
+		require.True(t, segmentLiveIndexRowExistsForTest(t, meta, seg.Path(), live.SegmentOffset))
+		require.True(t, segmentLiveWitnessRowExistsForTest(t, meta, seg.Path(), live.SegmentOffset))
+		covered, err := segmentLiveIndexCovered(meta, seg)
+		require.NoError(t, err)
+		require.True(t, covered)
+	})
+
+	t.Run("recompaction", func(t *testing.T) {
+		recompactor, sm, meta, _, cleanup := setupTestRecompactor(t)
+		defer cleanup()
+
+		entries := map[string][]byte{
+			"recompact-live":  []byte("live value"),
+			"recompact-stale": []byte("stale value"),
+		}
+		seg, err := createTestSegmentWithEntries(t, sm, meta, entries)
+		require.NoError(t, err)
+		stale, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("recompact-stale")))
+		require.NoError(t, err)
+		live, err := utils.GetMetadata(meta, string(keys.MakeMetadataKey("recompact-live")))
+		require.NoError(t, err)
+
+		wo := grocksdb.NewDefaultWriteOptions()
+		require.NoError(t, meta.Handle().Delete(wo, keys.MakeMetadataKey("recompact-stale")))
+		// Force the indexed pass to stop after the stale row has been visited.
+		// The source must remain tracked, which makes the paired stale cleanup
+		// observable before final source-index removal can hide the bug.
+		malformedOffset := live.SegmentOffset
+		if stale.SegmentOffset > malformedOffset {
+			malformedOffset = stale.SegmentOffset
+		}
+		malformedOffset++
+		require.NoError(t, meta.Handle().Put(wo, keys.MakeSegmentLiveIndexKey(seg.Path(), malformedOffset), []byte{0xff}))
+		wo.Destroy()
+
+		require.NoError(t, recompactor.recompactSegment(context.Background(), seg))
+		require.False(t, segmentLiveIndexRowExistsForTest(t, meta, seg.Path(), stale.SegmentOffset))
+		require.False(t, segmentLiveWitnessRowExistsForTest(t, meta, seg.Path(), stale.SegmentOffset))
+		covered, err := segmentLiveIndexCovered(meta, seg)
+		require.NoError(t, err)
+		require.False(t, covered)
+		paths := make(map[string]struct{})
+		for _, got := range sm.GetSegments() {
+			paths[got.Path()] = struct{}{}
+		}
+		require.Contains(t, paths, seg.Path())
+	})
 }
 
 func TestSegmentRecompaction_ContextCancellation(t *testing.T) {

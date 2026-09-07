@@ -175,7 +175,9 @@ func (sr *SegmentRecompactor) walkIndexedSegmentLiveness(ctx context.Context, se
 			return err
 		}
 		if !live {
-			batch.Delete(indexKey)
+			if err := stageSegmentLiveIndexDelete(batch, seg.Path(), entry.Offset); err != nil {
+				return err
+			}
 			return nil
 		}
 		liveEntries++
