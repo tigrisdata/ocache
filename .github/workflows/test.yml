@@ -157,6 +157,9 @@ jobs:
       - name: Run integration tests - Cluster
         run: STATIC_BUILD=true make test-integration-cluster
 
+      - name: Run integration tests - CAS (conditional operations)
+        run: STATIC_BUILD=true make test-integration-cas
+
       - name: Run concurrent operations E2E test
         run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-concurrent
 
@@ -174,6 +177,9 @@ jobs:
 
       - name: Run recompaction E2E test
         run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-recompaction
+
+      - name: Run CAS (conditional operations) E2E test
+        run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-cas
 
       - name: Run cluster mode concurrent operations E2E test
         run: STATIC_BUILD=true WITH_JEMALLOC=true make test-e2e-cluster
