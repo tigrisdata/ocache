@@ -151,11 +151,12 @@ func (s *Storage) readRowForCAS(metaKey []byte) (*pb.ValueMessage, bool, error) 
 }
 
 // readRowForCASRetry re-reads a row a few times before giving up. It is used for
-// the post-merge read-back, where a transient read glitch (the merge already
-// committed) would otherwise force an indeterminate outcome — and, for a spilled
-// raw-file put, leak the spill. Resolving the outcome lets the caller reclaim a
-// losing spill; only a persistent read failure (a genuinely unhealthy DB) is
-// surfaced, leaving the spill as a bounded, recoverable orphan.
+// the post-merge read-back of both CAS writes, where a transient read glitch
+// (the merge already committed) would otherwise force an indeterminate outcome:
+// for a put it would leak a losing spill, and for a delete it would skip the
+// immediate reclaim of the replaced value's backing bytes on a win. Resolving
+// the outcome lets the caller reclaim correctly; only a persistent read failure
+// (a genuinely unhealthy DB) is surfaced.
 func (s *Storage) readRowForCASRetry(metaKey []byte) (vm *pb.ValueMessage, found bool, err error) {
 	const attempts = 4
 	for i := 0; i < attempts; i++ {
@@ -600,7 +601,11 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
 
-	got, gotFound, err := s.readRowForCAS(metaKey)
+	// Read-your-writes with retry: the merge already committed, so a transient
+	// read glitch here must not turn a confirmed win into an unknown outcome — on
+	// a win it is this read-back that gates the immediate reclaim of the replaced
+	// value's (potentially 256 MB) backing bytes.
+	got, gotFound, err := s.readRowForCASRetry(metaKey)
 	if err != nil {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
