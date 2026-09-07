@@ -394,7 +394,7 @@ func init() {
 	benchCmd.Flags().IntVar(&valueSize, "value-size", 100, "Value size in bytes")
 	benchCmd.Flags().IntVar(&numOps, "num-ops", 10000, "Total number of operations")
 	benchCmd.Flags().IntVar(&concurrency, "concurrency", 8, "Number of concurrent workers")
-	benchCmd.Flags().StringVar(&workload, "workload", "A", "Workload type or custom mix (e.g. A, B, read=70,update=30)")
+	benchCmd.Flags().StringVar(&workload, "workload", "A", "Workload type or custom mix (e.g. A, B, read=70,update=30; cas=N adds guarded read-modify-writes)")
 	benchCmd.Flags().Int64Var(&seed, "seed", time.Now().UnixNano(), "Random seed")
 	benchCmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress output during benchmark")
 	benchCmd.Flags().BoolVar(&forceStreaming, "force-streaming", false, "Force streaming for writes regardless of size; reads always stream")

@@ -41,6 +41,13 @@ Read operations always stream their responses because the benchmark does not con
 | C      | Read only    | 100                            | 0        |
 | Custom | User defined | Specify as `read=70,update=30` |          |
 
+A custom mix also accepts `cas=N`: a guarded read-modify-write that reads a key's
+version (`GetWithVersion`) and then writes only if it is unchanged
+(`PutIfVersion`), the write-coordination pattern conditional operations exist for.
+CAS keys live in their own namespace, created with put-if-absent. A lost race is
+reported as a **mismatch**, not an error, and the results include the mismatch
+rate: run it with several workers over a narrow keyspace to measure contention.
+
 **Examples:**
 
 First, run the server with default settings:
@@ -122,6 +129,14 @@ ocachecli bench --workload "read=90,update=10"
 
 # Write-heavy workload (30% reads, 70% updates)
 ocachecli bench --workload "read=30,update=70"
+
+# Guarded read-modify-writes under contention: 16 workers on 200 keys race for
+# the same keys, so the reported mismatch rate is the contention signal
+# (a mismatch is a lost race, not an error)
+ocachecli bench --workload "cas=100" --concurrency 16 --num-keys 200
+
+# Reads mixed with guarded writes
+ocachecli bench --workload "read=70,cas=30"
 
 # Mixed with your actual data sizes
 ocachecli bench \

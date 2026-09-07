@@ -313,6 +313,27 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 		WithData(summaryTable).
 		Render()
 
+	// CAS outcomes, only when the workload ran guarded read-modify-writes. A
+	// mismatch is a lost race (the expected outcome under contention), so it is
+	// reported as its own rate rather than folded into errors.
+	if result.CASAttempts > 0 {
+		pterm.DefaultSection.Println("CAS (guarded read-modify-write) Outcomes")
+		mismatchRate := float64(result.CASMismatches) / float64(result.CASAttempts) * 100
+		casTable := pterm.TableData{
+			{"Metric", "Value"},
+			{"Attempts", fmt.Sprintf("%d", result.CASAttempts)},
+			{"Wins", fmt.Sprintf("%d", result.CASWins)},
+			{"Mismatches (lost races)", fmt.Sprintf("%d", result.CASMismatches)},
+			{"Mismatch Rate", fmt.Sprintf("%.2f%%", mismatchRate)},
+		}
+		pterm.DefaultTable.
+			WithHasHeader(true).
+			WithHeaderStyle(pterm.NewStyle(pterm.FgLightCyan)).
+			WithBoxed(true).
+			WithData(casTable).
+			Render()
+	}
+
 	// Per-Operation Statistics
 	opStats := metrics.GetPerOperationStats()
 	if len(opStats) > 0 {

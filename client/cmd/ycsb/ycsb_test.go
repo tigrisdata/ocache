@@ -29,12 +29,14 @@ type ycsbReadServer struct {
 
 	mu            sync.RWMutex
 	values        map[string][]byte
+	versions      map[string]uint64 // CAS version per key; 0 = absent
 	getCalls      atomic.Int64
 	responseBytes atomic.Int64
+	casBumps      atomic.Int64 // successful PutObjectIfVersion applications
 }
 
 func newYCSBReadServer() *ycsbReadServer {
-	return &ycsbReadServer{values: make(map[string][]byte)}
+	return &ycsbReadServer{values: make(map[string][]byte), versions: make(map[string]uint64)}
 }
 
 func (s *ycsbReadServer) PutObject(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
@@ -67,6 +69,45 @@ func (s *ycsbReadServer) Get(req *pb.GetRequest, stream pb.CacheService_GetServe
 	s.getCalls.Add(1)
 
 	return nil
+}
+
+// GetStreamWithVersion serves the versioned read the CAS workload uses: version
+// and found in the first message, then the value bytes.
+func (s *ycsbReadServer) GetStreamWithVersion(req *pb.GetRequest, stream pb.CacheService_GetStreamWithVersionServer) error {
+	s.mu.RLock()
+	data, ok := s.values[req.Key]
+	ver := s.versions[req.Key]
+	s.mu.RUnlock()
+	if !ok {
+		return stream.Send(&pb.GetWithVersionResponse{Found: false})
+	}
+	if err := stream.Send(&pb.GetWithVersionResponse{Version: ver, Found: true}); err != nil {
+		return err
+	}
+	for len(data) > 0 {
+		chunkSize := min(len(data), cacheclient.DefaultBufferSize)
+		if err := stream.Send(&pb.GetWithVersionResponse{Data: data[:chunkSize]}); err != nil {
+			return err
+		}
+		data = data[chunkSize:]
+	}
+	return nil
+}
+
+// PutObjectIfVersion applies the write only when expected_version matches the
+// key's current version (0 = absent), mirroring storage's contract: a lost race
+// is reported in-band with the current version, never as a transport error.
+func (s *ycsbReadServer) PutObjectIfVersion(_ context.Context, req *pb.PutIfVersionRequest) (*pb.PutIfVersionResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur := s.versions[req.Key]
+	if cur != req.ExpectedVersion {
+		return &pb.PutIfVersionResponse{Success: false, CurrentVersion: cur}, nil
+	}
+	s.values[req.Key] = append([]byte(nil), req.Data...)
+	s.versions[req.Key] = cur + 1
+	s.casBumps.Add(1)
+	return &pb.PutIfVersionResponse{Success: true, NewVersion: cur + 1}, nil
 }
 
 func startYCSBReadServer(tb testing.TB) (*ycsbReadServer, string) {
@@ -166,5 +207,70 @@ func BenchmarkRunYCSBReadOnly(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func casYCSBConfig(addr string, workers, keys, ops int) YCSBConfig {
+	return YCSBConfig{
+		Addr:               addr,
+		ConnMode:           string(cacheclient.ModeSimple),
+		ConnectionPoolSize: workers,
+		NumKeys:            keys,
+		ValueSize:          64,
+		NumOps:             ops,
+		Concurrency:        workers,
+		Workload:           "cas=100",
+		Seed:               1,
+		NoProgress:         true,
+	}
+}
+
+// TestRunYCSBCASAccountsWinsAndMismatches runs a fully contended guarded
+// read-modify-write workload (4 workers, 1 key) and checks the accounting
+// invariants that make the CAS numbers trustworthy: every attempt is either a
+// win or a mismatch, a lost race is never reported as an error, and the server
+// applied exactly one version bump per reported win (plus one per preloaded key).
+func TestRunYCSBCASAccountsWinsAndMismatches(t *testing.T) {
+	disablePtermOutput(t)
+	cacheServer, addr := startYCSBReadServer(t)
+	cfg := casYCSBConfig(addr, 4, 1, 64)
+
+	result, err := RunYCSBWithContext(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Errors != 0 {
+		t.Fatalf("RunYCSBWithContext reported %d errors; a lost CAS race must not be an error", result.Errors)
+	}
+	if result.CASAttempts != cfg.NumOps {
+		t.Errorf("CAS attempts = %d, want %d", result.CASAttempts, cfg.NumOps)
+	}
+	if got := result.CASWins + result.CASMismatches; got != result.CASAttempts {
+		t.Errorf("wins+mismatches = %d, want attempts %d", got, result.CASAttempts)
+	}
+	if got, want := cacheServer.casBumps.Load(), int64(cfg.NumKeys+result.CASWins); got != want {
+		t.Errorf("server version bumps = %d, want preload %d + wins %d = %d", got, cfg.NumKeys, result.CASWins, want)
+	}
+}
+
+// TestRunYCSBCASSingleWorkerNeverMismatches: with one worker there is no race,
+// so every attempt must win and the mismatch count must be exactly zero.
+func TestRunYCSBCASSingleWorkerNeverMismatches(t *testing.T) {
+	disablePtermOutput(t)
+	cacheServer, addr := startYCSBReadServer(t)
+	cfg := casYCSBConfig(addr, 1, 3, 30)
+
+	result, err := RunYCSBWithContext(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Errors != 0 || result.CASMismatches != 0 {
+		t.Fatalf("errors=%d mismatches=%d, want 0/0 with a single worker", result.Errors, result.CASMismatches)
+	}
+	if result.CASWins != cfg.NumOps {
+		t.Errorf("wins = %d, want %d", result.CASWins, cfg.NumOps)
+	}
+	if got, want := cacheServer.casBumps.Load(), int64(cfg.NumKeys+cfg.NumOps); got != want {
+		t.Errorf("server version bumps = %d, want %d", got, want)
 	}
 }

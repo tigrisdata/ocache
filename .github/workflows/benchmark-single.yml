@@ -178,6 +178,22 @@ jobs:
           # and serves as a performance-regression guard on the compactor commit path.
           ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee 256kb-compaction-churn.log
 
+      - name: Run CAS read-modify-write benchmark - 100 bytes, contended
+        run: |
+          echo "=== 100-byte values, narrow keyspace, 16 workers → contended guarded read-modify-write ==="
+          # Every op is GetWithVersion followed by PutIfVersion against the version just read: the
+          # write-coordination pattern CAS exists for (issue #254). 16 workers over 200 keys make
+          # workers race for the same key, so the reported mismatch rate is the contention signal —
+          # a mismatch is a lost race, not an error.
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --concurrency 16 --num-keys 200 --num-ops 100000 --value-size 100 --workload "cas=100" --no-progress | tee cas-100-byte-contended.log
+
+      - name: Run mixed read + CAS benchmark - 100 KB
+        run: |
+          echo "=== 100 KB values, 70% reads + 30% guarded read-modify-writes ==="
+          # Values land in the RAW_FILE tier (> InlineThreshold 64KB), so each CAS win spills a raw
+          # file and reclaims the one it replaced while the compactor migrates the keyspace underneath.
+          ./ocachecli bench --addr localhost:9000 --mode simple --connection-pool-size 4 --num-ops 50000 --value-size 102400 --workload "read=70,cas=30" --no-progress | tee cas-100kb-read-70-cas-30.log
+
       - name: Stop RSS sampler and summarize
         if: always()
         run: |
