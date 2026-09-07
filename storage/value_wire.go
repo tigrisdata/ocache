@@ -115,6 +115,49 @@ func valueMessageSegmentRef(buf []byte) (segmentPath string, valueLength int64, 
 	return segmentPath, valueLength, true
 }
 
+// valueMessageSizeAndRawPath extracts value_length (field 7) and raw_file_path
+// (field 4) in one pass, without copying Data. rawPath is empty for values that
+// are not raw files. The reconcile scan uses it to sum the live total and, in
+// the same pass, to collect the raw files that live metadata still references
+// (the orphan sweep's reference set, issue #156).
+func valueMessageSizeAndRawPath(buf []byte) (valueLength int64, rawPath string, ok bool) {
+	for len(buf) > 0 {
+		num, typ, n := protowire.ConsumeTag(buf)
+		if n < 0 || !num.IsValid() {
+			return 0, "", false
+		}
+		buf = buf[n:]
+
+		switch {
+		case num == valueLengthField && typ == protowire.VarintType:
+			v, vn := protowire.ConsumeVarint(buf)
+			if vn < 0 {
+				return 0, "", false
+			}
+			valueLength = int64(v)
+			buf = buf[vn:]
+			continue
+		case (num == valueRawPathField || num == valueSegPathField) && typ == protowire.BytesType:
+			v, vn := protowire.ConsumeBytes(buf)
+			if vn < 0 || !utf8.Valid(v) {
+				return 0, "", false
+			}
+			if num == valueRawPathField {
+				rawPath = string(v)
+			}
+			buf = buf[vn:]
+			continue
+		}
+
+		n = protowire.ConsumeFieldValue(num, typ, buf)
+		if n < 0 {
+			return 0, "", false
+		}
+		buf = buf[n:]
+	}
+	return valueLength, rawPath, true
+}
+
 // valueMessageValueLength extracts ValueMessage.value_length (field 7) off the
 // wire without copying Data. The size-accounting paths (the Put-overwrite delta
 // in existingValueLength and the cleaner's total-size scan) consume only

@@ -240,6 +240,31 @@ var (
 		},
 	)
 
+	// FilesDirBytes is the physical size of the raw-file directory, refreshed by
+	// the orphan sweep. Compared with the logical DiskUsageBytes it shows how
+	// much of files/ is not accounted for (orphans, in-flight writes).
+	FilesDirBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ocache_files_dir_bytes",
+			Help: "Physical size of the raw-file directory in bytes",
+		},
+	)
+
+	// OrphanFilesReclaimed / OrphanBytesReclaimed count raw files the sweep
+	// found referenced by no metadata row and queued for deletion (issue #156).
+	OrphanFilesReclaimed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_orphan_files_reclaimed_total",
+			Help: "Unreferenced raw files queued for deletion by the orphan sweep",
+		},
+	)
+	OrphanBytesReclaimed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_orphan_bytes_reclaimed_total",
+			Help: "Bytes of unreferenced raw files queued for deletion by the orphan sweep",
+		},
+	)
+
 	// LRU Metrics
 	LRUEvictions = promauto.NewCounter(
 		prometheus.CounterOpts{

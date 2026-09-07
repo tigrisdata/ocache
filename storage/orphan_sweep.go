@@ -1,0 +1,99 @@
+// Copyright 2026 Tigris Data, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package storage
+
+import (
+	"os"
+	"path/filepath"
+	"time"
+
+	zlog "github.com/rs/zerolog/log"
+	"github.com/tigrisdata/ocache/common/metrics"
+)
+
+// orphanGraceWindow is how recently a raw file must have been written for the
+// sweep to leave it alone even though no metadata row references it. Put
+// writes files/<uuid> first and commits the row second, so a file whose last
+// write is this recent may be an in-flight put the reconcile snapshot could
+// not yet see. The window only has to cover the gap between a file's last
+// write (its modification time) and its commit — the large-file fsync plus
+// one batch write, seconds at most — and ten minutes leaves that a wide
+// margin. A file that misses one sweep because it is recent is reconsidered
+// on the next.
+const orphanGraceWindow = 10 * time.Minute
+
+// sweepOrphanRawFiles reclaims raw files in files/ that no metadata row
+// references (issue #156). It runs after every complete reconcile scan — at
+// startup and hourly — with the set of raw-file names that scan saw.
+//
+// An orphan is a file that is neither referenced nor written within
+// orphanGraceWindow of the scan's start. Orphans arise from a crash between
+// the file write and the metadata commit, from a CAS put that could not
+// confirm its outcome, and historically from eviction (#155) and failed
+// commits (#263); none of them are counted by the disk cap or reachable by
+// eviction, so this sweep is the only thing that ever gives their space back.
+//
+// Nothing is removed here directly: each orphan is handed to the deletion
+// queue, so a file a reader still holds open is skipped and retried, and a
+// file already queued (by the compactor after a migration, or by a failed
+// put) is simply queued twice, which the queue resolves as a no-op. The
+// physical size of files/ is published alongside the logical cap so the two
+// can be compared without a manual du.
+func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, scanStart time.Time) {
+	filesDir := filepath.Join(c.storage.diskPath, "files")
+	entries, err := os.ReadDir(filesDir)
+	if err != nil {
+		zlog.Error().Err(err).Str("dir", filesDir).Msg("cleaner: orphan sweep could not read files directory")
+		return
+	}
+	cutoff := scanStart.Add(-orphanGraceWindow)
+
+	var physicalBytes, orphanBytes int64
+	var orphans, recent int
+	for i, entry := range entries {
+		if i%1000 == 0 {
+			select {
+			case <-c.closeCh:
+				zlog.Info().Msg("cleaner: orphan sweep interrupted by shutdown")
+				return
+			default:
+			}
+		}
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue // deleted between the listing and now
+		}
+		physicalBytes += info.Size()
+		if _, ok := referenced[entry.Name()]; ok {
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			recent++
+			continue
+		}
+		c.storage.stageRawFileDeletion(filepath.Join(filesDir, entry.Name()))
+		orphans++
+		orphanBytes += info.Size()
+	}
+
+	metrics.FilesDirBytes.Set(float64(physicalBytes))
+	metrics.OrphanFilesReclaimed.Add(float64(orphans))
+	metrics.OrphanBytesReclaimed.Add(float64(orphanBytes))
+
+	event := zlog.Info().
+		Int("files", len(entries)).
+		Int("referenced", len(referenced)).
+		Int("orphans_queued", orphans).
+		Int64("orphan_bytes", orphanBytes).
+		Int("recent_skipped", recent).
+		Int64("physical_bytes", physicalBytes).
+		Dur("duration_ms", time.Since(scanStart))
+	if orphans > 0 {
+		event = event.Str("grace", orphanGraceWindow.String())
+	}
+	event.Msg("cleaner: orphan raw-file sweep completed")
+}

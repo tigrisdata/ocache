@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -547,6 +548,13 @@ func (c *Cleaner) reconcileFromMetadata() {
 		batch.Clear()
 	}
 
+	// referencedRaw collects the base name of every raw file a metadata row on
+	// this snapshot points at (live or expired-but-unswept: either way the row
+	// still owns the file). The orphan sweep after the scan deletes nothing in
+	// this set. Base names, not paths, so a data directory that has been moved
+	// still matches. Roughly 36 bytes per raw-file row.
+	referencedRaw := make(map[string]struct{})
+
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// Check if we're shutting down
 		select {
@@ -570,8 +578,11 @@ func (c *Cleaner) reconcileFromMetadata() {
 		// it directly off the wire rather than fully decoding each message —
 		// that skips a Data-payload copy per inline row (up to the 64 KiB inline
 		// threshold) on both the startup scan and the hourly reconciliation.
-		if length, ok := valueMessageValueLength(it.Value().Data()); ok {
+		if length, rawPath, ok := valueMessageSizeAndRawPath(it.Value().Data()); ok {
 			totalSize += length
+			if rawPath != "" {
+				referencedRaw[filepath.Base(rawPath)] = struct{}{}
+			}
 		}
 
 		if backfill && !backrefBroken {
@@ -639,6 +650,10 @@ func (c *Cleaner) reconcileFromMetadata() {
 		event = event.Int("backfilled", backfilled).Str("policy", c.storage.evictionPolicy)
 	}
 	event.Msg("cleaner: reconciled total storage size from metadata")
+
+	// Only after a complete scan: a truncated one returned above, and sweeping
+	// against a partial reference set would delete live files.
+	c.sweepOrphanRawFiles(referencedRaw, start)
 }
 
 // advanceBackrefTo advances the sorted back-reference iterator to userKey and
