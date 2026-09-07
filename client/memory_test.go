@@ -516,3 +516,75 @@ func TestMemoryCache_CAS_MatchesStorageSemantics(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, found)
 }
+
+// TestMemoryCache_CAS_PlainWritesDemoteVersion: the test double must never be
+// MORE permissive than real storage. A plain (non-CAS) Put over a CAS'd key
+// stores no stamp, so the key must read as the legacy version and a stale CAS
+// token must be rejected; a plain Delete, a lazy TTL expiry and Close must all
+// make the key absent (version 0) and must not let the old stamp resurface on a
+// later plain re-create. (Mixing plain and CAS writes on one key is unsupported,
+// but "never accept a stale token" is the invariant storage keeps regardless.)
+func TestMemoryCache_CAS_PlainWritesDemoteVersion(t *testing.T) {
+	ctx := context.Background()
+	cache := NewMemoryCache()
+
+	// Plain Put over a CAS'd key: demoted to legacy, old token rejected.
+	v1, err := cache.PutIfVersion(ctx, "k", []byte("a"), 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, cache.Put(ctx, "k", []byte("plain"), 0))
+	_, ver, found, err := cache.GetWithVersion(ctx, "k")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, memoryLegacyVersion, ver, "a plain Put must not keep the old CAS stamp")
+	_, err = cache.PutIfVersion(ctx, "k", []byte("stale"), 0, v1)
+	vm, ok := IsVersionMismatch(err)
+	require.True(t, ok, "stale token must be rejected after a plain Put, got %v", err)
+	assert.Equal(t, memoryLegacyVersion, vm.CurrentVersion)
+
+	// Plain Delete: absent, and a plain re-create reads as legacy, not the stamp.
+	v2, err := cache.PutIfVersion(ctx, "d", []byte("a"), 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, cache.Delete(ctx, "d"))
+	_, ver, found, err = cache.GetWithVersion(ctx, "d")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Zero(t, ver)
+	require.NoError(t, cache.Put(ctx, "d", []byte("again"), 0))
+	_, ver, _, err = cache.GetWithVersion(ctx, "d")
+	require.NoError(t, err)
+	assert.Equal(t, memoryLegacyVersion, ver, "old stamp must not resurface on a plain re-create")
+	_, err = cache.PutIfVersion(ctx, "d", []byte("stale"), 0, v2)
+	_, ok = IsVersionMismatch(err)
+	require.True(t, ok)
+
+	// Lazy TTL expiry: absent (0), and the expiry sweep must drop the stamp too.
+	v3, err := cache.PutIfVersion(ctx, "e", []byte("a"), 0, 0)
+	require.NoError(t, err)
+	cache.mu.Lock()
+	ent := cache.data["e"]
+	ent.expiresAt = time.Now().Add(-time.Second)
+	cache.data["e"] = ent
+	cache.mu.Unlock()
+	_, ver, found, err = cache.GetWithVersion(ctx, "e")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Zero(t, ver)
+	_, err = cache.Get(ctx, "e") // triggers the lazy-expiry drop
+	require.Error(t, err)
+	require.NoError(t, cache.Put(ctx, "e", []byte("again"), 0))
+	_, ver, _, err = cache.GetWithVersion(ctx, "e")
+	require.NoError(t, err)
+	assert.Equal(t, memoryLegacyVersion, ver)
+	_, err = cache.PutIfVersion(ctx, "e", []byte("stale"), 0, v3)
+	_, ok = IsVersionMismatch(err)
+	require.True(t, ok)
+
+	// Close clears versions along with data.
+	_, err = cache.PutIfVersion(ctx, "c", []byte("a"), 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, cache.Close())
+	_, ver, found, err = cache.GetWithVersion(ctx, "c")
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Zero(t, ver)
+}

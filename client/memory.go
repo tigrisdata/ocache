@@ -75,6 +75,14 @@ func (m *MemoryCache) effectiveVersionLocked(key string) uint64 {
 	return memoryLegacyVersion
 }
 
+// dropLocked removes key from the cache AND forgets its CAS stamp, so a later
+// plain re-create reads as the legacy version rather than resurfacing a stale
+// token. Used by plain Delete, lazy TTL expiry and Close. Caller holds m.mu.
+func (m *MemoryCache) dropLocked(key string) {
+	delete(m.data, key)
+	delete(m.versions, key)
+}
+
 // GetWithVersion returns key's value and version; found is false (version 0)
 // for an absent or expired key.
 func (m *MemoryCache) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
@@ -156,6 +164,10 @@ func (m *MemoryCache) Put(ctx context.Context, key string, data []byte, ttlSecon
 	}
 
 	m.data[key] = entry
+	// A plain (non-CAS) write stores no stamp, exactly like storage: the row
+	// reads as the legacy version from here on and any older CAS token must be
+	// rejected, never silently accepted against a value it did not guard.
+	delete(m.versions, key)
 	return nil
 }
 
@@ -190,7 +202,7 @@ func (m *MemoryCache) Get(ctx context.Context, key string) ([]byte, error) {
 	// Check TTL expiration (lazy expiration)
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
 		m.mu.Lock()
-		delete(m.data, key)
+		m.dropLocked(key)
 		m.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "key not found")
 	}
@@ -229,7 +241,7 @@ func (m *MemoryCache) GetRange(ctx context.Context, key string, start, end int64
 	// Check TTL expiration
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
 		m.mu.Lock()
-		delete(m.data, key)
+		m.dropLocked(key)
 		m.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "key not found")
 	}
@@ -281,7 +293,7 @@ func (m *MemoryCache) Delete(ctx context.Context, key string) error {
 		return status.Error(codes.NotFound, "key not found")
 	}
 
-	delete(m.data, key)
+	m.dropLocked(key)
 	return nil
 }
 
@@ -436,6 +448,7 @@ func (m *MemoryCache) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.data = make(map[string]cacheEntry)
+	m.versions = make(map[string]uint64)
 	return nil
 }
 
