@@ -197,6 +197,18 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand
 			Start()
 	}
 
+	// Each key index does one preload put per enabled namespace (plain and/or
+	// CAS), so the summary and the failure threshold are sized by puts, not keys.
+	plainEnabled := ws.Weights[OpRead] > 0 || ws.Weights[OpUpdate] > 0
+	casEnabled := ws.Weights[OpCAS] > 0
+	expectedPuts := 0
+	if plainEnabled {
+		expectedPuts += cfg.NumKeys
+	}
+	if casEnabled {
+		expectedPuts += cfg.NumKeys
+	}
+
 	var preloadErrors int32
 	var successCount int32
 	errorCh := make(chan error, 100)
@@ -222,8 +234,8 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand
 			key     string
 			cas     bool
 		}{
-			{ws.Weights[OpRead] > 0 || ws.Weights[OpUpdate] > 0, hashKey(i), false},
-			{ws.Weights[OpCAS] > 0, casKey(i), true},
+			{plainEnabled, hashKey(i), false},
+			{casEnabled, casKey(i), true},
 		} {
 			if !p.enabled {
 				continue
@@ -240,8 +252,8 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand
 			default:
 				err = client.Put(ctx, p.key, val, 0)
 			}
-			if _, exists := cacheclient.IsVersionMismatch(err); exists {
-				err = nil
+			if outcome, _ := ClassifyCASResult(err); outcome == CASMismatch {
+				err = nil // already present from an earlier run: fine
 			}
 
 			if err != nil {
@@ -274,10 +286,10 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand
 	totalErrors := atomic.LoadInt32(&preloadErrors)
 	if totalErrors > 0 {
 		if spinner != nil {
-			spinner.Warning(fmt.Sprintf("Preloaded %d/%d keys (%d errors)",
-				atomic.LoadInt32(&successCount), cfg.NumKeys, totalErrors))
+			spinner.Warning(fmt.Sprintf("Preloaded %d/%d puts (%d errors)",
+				atomic.LoadInt32(&successCount), expectedPuts, totalErrors))
 		}
-		if int(totalErrors) > cfg.NumKeys/10 { // If more than 10% failed, consider it a failure
+		if int(totalErrors) > expectedPuts/10 { // If more than 10% failed, consider it a failure
 			if len(sampleErrors) > 0 {
 				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, sampleErrors[0])
 			}
@@ -519,12 +531,14 @@ func RunYCSBWithContext(ctx context.Context, cfg YCSBConfig) (Result, error) {
 						} else {
 							_, perr = c.PutIfVersion(opCtx, k, val, 0, ver)
 						}
-						if _, lost := cacheclient.IsVersionMismatch(perr); lost {
-							casMismatches++ // lost the race: contention, not an error
-						} else if perr == nil {
+						// Classification lives in the metrics layer; the worker only counts.
+						var outcome CASOutcome
+						outcome, opErr = ClassifyCASResult(perr)
+						switch outcome {
+						case CASWin:
 							casWins++
-						} else {
-							opErr = perr
+						case CASMismatch:
+							casMismatches++ // lost the race: contention, not an error
 						}
 					}
 				}
