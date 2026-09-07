@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -116,7 +117,9 @@ func (o *Operations) putStreamIfVersionRemote(ctx context.Context, key string, r
 	// error, which would hide the mismatch the caller must retry against.
 	sendErr := stream.Send(&pb.PutIfVersionRequest{Key: key, TtlSeconds: int64(ttl), ExpectedVersion: expected})
 	if sendErr == nil {
-		buf := make([]byte, 1<<20)
+		// Same chunk size and buffer pool as the plain streaming put.
+		buf, release := bufferpool.AcquireBuffer(DefaultStreamBufferSize)
+		defer release()
 		for {
 			n, rerr := r.Read(buf)
 			if n > 0 {

@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/tigrisdata/ocache/common/bufferpool"
 	pb "github.com/tigrisdata/ocache/proto"
 )
-
-// casStreamChunk is the chunk size for streaming CAS values (issue #258).
-const casStreamChunk = 1 << 20 // 1 MiB
 
 // VersionMismatchError reports a lost conditional (CAS) operation: the key's
 // current version did not equal the caller's expected version (issue #254).
@@ -134,7 +132,9 @@ func (o *Operations) PutStreamIfVersion(ctx context.Context, key string, r io.Re
 	// would hide the mismatch the caller needs to retry against).
 	sendErr := stream.Send(&pb.PutIfVersionRequest{Key: key, TtlSeconds: ttlSeconds, ExpectedVersion: expected})
 	if sendErr == nil {
-		buf := make([]byte, casStreamChunk)
+		// Same chunk size and buffer pool as the plain PutStream.
+		buf, release := bufferpool.AcquireBuffer(DefaultBufferSize)
+		defer release()
 		for {
 			n, rerr := r.Read(buf)
 			if n > 0 {

@@ -16,6 +16,7 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/operations"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -263,7 +264,8 @@ func (s *CacheService) GetStreamWithVersion(req *pb.GetRequest, stream pb.CacheS
 	if err := stream.Send(&pb.GetWithVersionResponse{Version: version, Found: true}); err != nil {
 		return err
 	}
-	buf, release := bufferpool.AcquireBuffer(1 << 20) // 1 MiB
+	// Same chunk size and buffer pool as the plain streaming Get/Put.
+	buf, release := bufferpool.AcquireBuffer(operations.DefaultStreamBufferSize)
 	defer release()
 	for {
 		n, readErr := r.Read(buf)
