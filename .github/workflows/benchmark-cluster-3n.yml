@@ -252,6 +252,15 @@ jobs:
           # and serves as a performance-regression guard on the compactor commit path.
           ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --concurrency 16 --num-keys 2000 --num-ops 500000 --value-size 262144 --workload "read=30,update=70" --no-progress | tee cluster-256kb-compaction-churn.log
 
+      - name: Run cluster CAS read-modify-write benchmark - 100 bytes, uncontended baseline
+        run: |
+          echo "=== 100-byte values at the plain benchmarks' defaults (8 workers, 1000 keys) → CAS cost isolated from contention ==="
+          # Same concurrency and keyspace as the plain 100-byte read/write benchmarks above, so the
+          # only difference is the op itself: this measures what one guarded read-modify-write costs
+          # over its two constituent RPCs (a versioned read + a conditional write) with almost no
+          # lost races. Compare against the contended run below to separate CAS cost from contention.
+          ./ocachecli bench --addr "localhost:9001,localhost:9002,localhost:9003" --mode cluster --connection-pool-size 4 --num-ops 100000 --value-size 100 --workload "cas=100" --no-progress | tee cluster-cas-100-byte-uncontended.log
+
       - name: Run cluster CAS read-modify-write benchmark - 100 bytes, contended
         run: |
           echo "=== 100-byte values, narrow keyspace, 16 workers → contended guarded read-modify-write across the ring ==="
