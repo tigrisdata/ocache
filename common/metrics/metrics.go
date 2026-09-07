@@ -203,6 +203,16 @@ var (
 		[]string{"type"},
 	)
 
+	// CleanerExpiryRaced counts expired rows the TTL sweep left alone because a
+	// write replaced the row between the scan and the pre-write re-check
+	// (issue #256); the fresh value was kept.
+	CleanerExpiryRaced = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "ocache_cleaner_expiry_raced_total",
+			Help: "Expired rows skipped by the TTL sweep because a concurrent write replaced them",
+		},
+	)
+
 	// Disk Usage Metrics
 	DiskUsageBytes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
