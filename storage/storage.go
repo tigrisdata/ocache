@@ -172,11 +172,15 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
-	evictionPolicy   string                // "lru" or "fifo"; governs whether reads refresh access time
-	closed           atomic.Bool           // True when storage has been closed
-	lastVersion      atomic.Uint64         // Last issued version stamp (see nextVersion)
-	versionHi        atomic.Uint64         // Durably reserved stamp ceiling (see nextVersion)
-	versionMu        sync.Mutex            // Serializes reservation extension (rare)
+	// beforeMetaCommit is set only by package tests: it runs inside putLow just
+	// before the metadata batch is written, and a non-nil error stands in for a
+	// RocksDB write failure so the callers' failure paths can be exercised.
+	beforeMetaCommit func() error
+	evictionPolicy   string        // "lru" or "fifo"; governs whether reads refresh access time
+	closed           atomic.Bool   // True when storage has been closed
+	lastVersion      atomic.Uint64 // Last issued version stamp (see nextVersion)
+	versionHi        atomic.Uint64 // Durably reserved stamp ceiling (see nextVersion)
+	versionMu        sync.Mutex    // Serializes reservation extension (rare)
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -1188,6 +1192,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		val, err := proto.Marshal(valueMsg)
 		if err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.Put: failed to marshal value message")
+			s.stageRawFileDeletion(filePath)
 			return storageErrors.NewInternalError("Put", err)
 		}
 		prevSize, err := s.putLow(key, val, filePath, bytesWritten)
@@ -1199,6 +1204,12 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		} else {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
+			// The row never landed, so the file just written is referenced by
+			// nothing: not by metadata, the compaction index, or the cap's
+			// accounting. Left alone it is a permanent orphan (issue #156), one
+			// whole object's worth of disk per failed commit. Reclaim it through
+			// the deletion queue exactly as PutIfVersion does with its spill.
+			s.stageRawFileDeletion(filePath)
 		}
 		if err != nil {
 			// Map RocksDB write errors appropriately
@@ -1300,6 +1311,11 @@ func (s *Storage) putLow(key string, val []byte, filePath string, bytesWritten i
 		}
 	}
 
+	if s.beforeMetaCommit != nil {
+		if err := s.beforeMetaCommit(); err != nil {
+			return 0, err
+		}
+	}
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		return 0, err
 	}
