@@ -445,13 +445,18 @@ CAS_CONC_ERRORS=0
 conc_ver=$(./ocachecli get-with-version "conc-cas" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
 conc_dir=$(mktemp -d)
 conc_n=12
+conc_pids=()
 for i in $(seq 1 $conc_n); do
     (
         ./ocachecli put-if-version "conc-cas" "val-$i" --expected "$conc_ver" >/dev/null 2>&1
         echo "$?" > "$conc_dir/rc-$i"
     ) &
+    conc_pids+=($!)
 done
-wait
+# Wait only for the contenders by PID: a bare `wait` would also block on the
+# backgrounded server that start_server launched, which never exits (every other
+# section of this suite tracks PIDs for the same reason).
+wait "${conc_pids[@]}"
 conc_wins=0
 for i in $(seq 1 $conc_n); do
     [ "$(cat "$conc_dir/rc-$i" 2>/dev/null)" = "0" ] && conc_wins=$((conc_wins+1))
