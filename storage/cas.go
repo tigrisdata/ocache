@@ -475,22 +475,51 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	return newStamp, nil
 }
 
-// reclaimReplacedValue releases the backing bytes of a value this CAS
-// replaced: a segment copy is credited to the delete index (the recompactor's
-// evidence the bytes are dead) and a raw file is queued for deletion. Safe to
-// call when another writer may have already reclaimed the same value: a
-// duplicate queue entry is a no-op and a duplicate segment credit only
-// advances recompaction eligibility, which validates liveness before acting.
-func (s *Storage) reclaimReplacedValue(prev *pb.ValueMessage) {
+// stageReclaimReplacedValue adds the bookkeeping for a replaced value to a
+// caller-owned batch. Segment credit and both live-index halves are one atomic
+// mutation, matching DeleteKey and ordinary overwrite. Raw files cannot be
+// represented in RocksDB, so the returned path must be queued after the caller
+// has attempted its metadata write.
+func (s *Storage) stageReclaimReplacedValue(batch *grocksdb.WriteBatch, prev *pb.ValueMessage) string {
+	if batch == nil || prev == nil {
+		return ""
+	}
 	switch {
 	case prev.ValueType == pb.ValueType_SEGMENT && prev.SegmentPath != "":
-		wo := grocksdb.NewDefaultWriteOptions()
-		defer wo.Destroy()
-		if err := s.meta.Handle().Merge(wo, keys.MakeDeleteIndexKey(prev.SegmentPath), merge.MakeDeleteIndexOperand(1, prev.ValueLength)); err != nil {
-			zlog.Error().Err(err).Str("segment", prev.SegmentPath).Msg("storage: failed to credit replaced segment bytes")
+		batch.Merge(keys.MakeDeleteIndexKey(prev.SegmentPath), merge.MakeDeleteIndexOperand(1, prev.ValueLength))
+		if prev.SegmentOffset >= 0 {
+			batch.Delete(keys.MakeSegmentLiveIndexKey(prev.SegmentPath, prev.SegmentOffset))
+			batch.Delete(keys.MakeSegmentLiveIndexWitnessKey(prev.SegmentPath, prev.SegmentOffset))
 		}
 	case prev.ValueType == pb.ValueType_RAW_FILE && prev.RawFilePath != "":
-		s.stageRawFileDeletion(prev.RawFilePath)
+		return prev.RawFilePath
+	}
+	return ""
+}
+
+// reclaimReplacedValue releases the backing bytes of a value this CAS
+// replaced: a segment copy is credited to the delete index and both live-index
+// halves are removed in the same batch, while a raw file is queued for deletion.
+// Safe to call when another writer may have already reclaimed the same value: a
+// duplicate queue entry is a no-op and a duplicate segment credit only advances
+// recompaction eligibility, which validates liveness before acting.
+func (s *Storage) reclaimReplacedValue(prev *pb.ValueMessage) {
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	rawPath := s.stageReclaimReplacedValue(batch, prev)
+	if batch.Count() > 0 {
+		wo := grocksdb.NewDefaultWriteOptions()
+		if err := s.meta.Handle().Write(wo, batch); err != nil {
+			segmentPath := ""
+			if prev != nil {
+				segmentPath = prev.SegmentPath
+			}
+			zlog.Error().Err(err).Str("segment", segmentPath).Msg("storage: failed to reclaim replaced segment")
+		}
+		wo.Destroy()
+	}
+	if rawPath != "" {
+		s.stageRawFileDeletion(rawPath)
 	}
 }
 
@@ -524,22 +553,26 @@ func (s *Storage) finishWonCASPut(key string, metaKey []byte, newVM *pb.ValueMes
 		}
 	}
 
+	// The replaced value's backing bytes are unreachable now that we won: the
+	// base the merge matched is the row the immediately-preceding refresh read
+	// observed (the version could not have changed in between without the CAS
+	// losing, and stamps are never reissued). Stage segment credit and both
+	// live-index deletions in this same bookkeeping batch. Raw-file queueing still
+	// happens after the batch attempt because it is an external side effect.
+	prevSize := int64(0)
+	replacedRawPath := ""
+	if hasPrev {
+		prevSize = prev.ValueLength
+		replacedRawPath = s.stageReclaimReplacedValue(batch, prev)
+	}
+
 	if batch.Count() > 0 {
 		if err := s.meta.Handle().Write(wo, batch); err != nil {
 			zlog.Error().Err(err).Str("key", key).Msg("storage.PutIfVersion: bookkeeping batch failed; indexes will self-heal")
 		}
 	}
-
-	// The replaced value's backing bytes are unreachable now that we won: the
-	// base the merge matched is the row the immediately-preceding refresh read
-	// observed (the version could not have changed in between without the CAS
-	// losing, and stamps are never reissued). Crash windows between the merge
-	// and this reclamation are the self-healing kind (duplicate-safe queue,
-	// walk-validated recompaction, hourly size reconcile).
-	prevSize := int64(0)
-	if hasPrev {
-		prevSize = prev.ValueLength
-		s.reclaimReplacedValue(prev)
+	if replacedRawPath != "" {
+		s.stageRawFileDeletion(replacedRawPath)
 	}
 
 	s.notifyPut(newVM.ValueLength - prevSize)

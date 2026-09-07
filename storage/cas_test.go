@@ -99,6 +99,53 @@ func TestCAS_PutIfVersion_IfAbsentAndGuardedUpdate(t *testing.T) {
 	assert.Equal(t, "second", readAllString(t, r))
 }
 
+func TestCAS_SegmentReplacementRemovesLiveIndexRows(t *testing.T) {
+	t.Run("winning put", func(t *testing.T) {
+		s, cleanup := createCASTestStorage(t)
+		defer cleanup()
+
+		seg, value := createIndexedSegmentValue(t, s, "cas-segment-put", bytes.Repeat([]byte("s"), 2048), 0)
+		require.True(t, segmentLiveIndexRowExists(t, s, seg.Path(), value.SegmentOffset))
+		require.True(t, segmentLiveWitnessRowExists(t, s, seg.Path(), value.SegmentOffset))
+
+		_, version, found, err := s.GetWithVersion("cas-segment-put")
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, merge.VersionLegacy, version)
+		_, err = s.PutIfVersion("cas-segment-put", bytes.NewReader([]byte("replacement")), 0, version)
+		require.NoError(t, err)
+
+		require.False(t, segmentLiveIndexRowExists(t, s, seg.Path(), value.SegmentOffset))
+		require.False(t, segmentLiveWitnessRowExists(t, s, seg.Path(), value.SegmentOffset))
+		deletedEntries, deletedBytes, err := s.GetDeleteIndexStats(seg.Path())
+		require.NoError(t, err)
+		require.Equal(t, int64(1), deletedEntries)
+		require.Equal(t, value.ValueLength, deletedBytes)
+	})
+
+	t.Run("winning delete", func(t *testing.T) {
+		s, cleanup := createCASTestStorage(t)
+		defer cleanup()
+
+		seg, value := createIndexedSegmentValue(t, s, "cas-segment-delete", bytes.Repeat([]byte("s"), 2048), 0)
+		require.True(t, segmentLiveIndexRowExists(t, s, seg.Path(), value.SegmentOffset))
+		require.True(t, segmentLiveWitnessRowExists(t, s, seg.Path(), value.SegmentOffset))
+
+		_, version, found, err := s.GetWithVersion("cas-segment-delete")
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, merge.VersionLegacy, version)
+		require.NoError(t, s.DeleteIfVersion("cas-segment-delete", version))
+
+		require.False(t, segmentLiveIndexRowExists(t, s, seg.Path(), value.SegmentOffset))
+		require.False(t, segmentLiveWitnessRowExists(t, s, seg.Path(), value.SegmentOffset))
+		deletedEntries, deletedBytes, err := s.GetDeleteIndexStats(seg.Path())
+		require.NoError(t, err)
+		require.Equal(t, int64(1), deletedEntries)
+		require.Equal(t, value.ValueLength, deletedBytes)
+	})
+}
+
 func TestCAS_PlainPutShadowsAndInvalidatesTokens(t *testing.T) {
 	s, cleanup := createCASTestStorage(t)
 	defer cleanup()
