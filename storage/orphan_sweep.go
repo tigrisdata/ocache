@@ -33,15 +33,19 @@ const orphanGraceWindow = 10 * time.Minute
 // sweepOrphanRawFiles reclaims raw files in files/ that no metadata row
 // references (issue #156). It runs after a complete reconcile scan — at
 // startup, then every orphanSweepInterval — with the set of raw-file names
-// that scan saw and the payload bytes they account for.
+// that scan saw, each with the payload bytes its row accounts for. It reports
+// whether it completed; a sweep that could not read the directory did not.
 //
 // Only unreferenced files are stat'ed. Compaction keeps files/ small when it
 // is healthy, but when it falls behind the directory fills with referenced
 // medium files, and a sweep that touched each of them would cost a syscall
 // per file for no decision; skipping them keeps the sweep proportional to the
-// number of orphans, which is roughly zero. The physical size published is
-// therefore the referenced payload bytes from metadata (excluding each raw
-// file's small header) plus the on-disk size of everything unreferenced.
+// number of orphans, which is roughly zero. The size published is therefore
+// the payload bytes (from metadata, excluding each raw file's small header)
+// of referenced files that are actually present in the listing, plus the
+// on-disk size of everything unreferenced. A reference whose file is absent
+// — a dangling row the read path purges on its next miss — adds nothing and
+// is counted separately.
 //
 // An orphan is a file that is neither referenced nor written within
 // orphanGraceWindow of the scan's start. Orphans arise from a crash between
@@ -70,33 +74,36 @@ const orphanGraceWindow = 10 * time.Minute
 // put) is simply queued twice, which the queue resolves as a no-op. The
 // physical size of files/ is published alongside the logical cap so the two
 // can be compared without a manual du.
-func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, referencedBytes int64, scanStart time.Time) {
+func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]int64, scanStart time.Time) bool {
 	filesDir := filepath.Join(c.storage.diskPath, "files")
 	entries, err := os.ReadDir(filesDir)
 	if err != nil {
-		zlog.Error().Err(err).Str("dir", filesDir).Msg("cleaner: orphan sweep could not read files directory")
-		return
+		zlog.Error().Err(err).Str("dir", filesDir).Msg("cleaner: orphan sweep could not read files directory; will retry next reconcile")
+		return false
 	}
 	cutoff := scanStart.Add(-orphanGraceWindow)
 
-	physicalBytes := referencedBytes
-	var orphanBytes int64
-	var orphans, recent, active int
+	var physicalBytes, orphanBytes int64
+	var orphans, recent, active, present int
 	locks := fd.GetFileLockManager()
 	for i, entry := range entries {
 		if i%1000 == 0 {
 			select {
 			case <-c.closeCh:
 				zlog.Info().Msg("cleaner: orphan sweep interrupted by shutdown")
-				return
+				return false
 			default:
 			}
 		}
 		if entry.IsDir() {
 			continue
 		}
-		if _, ok := referenced[entry.Name()]; ok {
-			continue // owned by a row; no stat needed
+		if size, ok := referenced[entry.Name()]; ok {
+			// Owned by a row and present on disk: its size comes from the row,
+			// no stat needed.
+			physicalBytes += size
+			present++
+			continue
 		}
 		info, err := entry.Info()
 		if err != nil {
@@ -134,10 +141,12 @@ func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, referenced
 		Int64("orphan_bytes", orphanBytes).
 		Int("recent_skipped", recent).
 		Int("active_skipped", active).
+		Int("dangling_refs", len(referenced)-present).
 		Int64("physical_bytes", physicalBytes).
 		Dur("duration_ms", time.Since(scanStart))
 	if orphans > 0 {
 		event = event.Str("grace", orphanGraceWindow.String())
 	}
 	event.Msg("cleaner: orphan raw-file sweep completed")
+	return true
 }

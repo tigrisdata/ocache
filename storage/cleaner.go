@@ -555,15 +555,14 @@ func (c *Cleaner) reconcileFromMetadata() {
 	// When the orphan sweep is due (startup, then every orphanSweepInterval),
 	// this scan also collects the base name of every raw file a metadata row
 	// on the snapshot points at (live or expired-but-unswept: either way the
-	// row still owns the file) and their payload bytes. The sweep deletes
+	// row still owns the file), with its payload bytes. The sweep deletes
 	// nothing in this set and stats nothing in it either. Base names, not
 	// paths, so a data directory that has been moved still matches. Roughly
-	// 36 bytes per raw-file row, held only for this pass.
+	// 44 bytes per raw-file row, held only for this pass.
 	sweepDue := c.lastOrphanSweep.IsZero() || time.Since(c.lastOrphanSweep) >= orphanSweepInterval
-	var referencedRaw map[string]struct{}
-	var referencedRawBytes int64
+	var referencedRaw map[string]int64
 	if sweepDue {
-		referencedRaw = make(map[string]struct{})
+		referencedRaw = make(map[string]int64)
 	}
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
@@ -592,8 +591,7 @@ func (c *Cleaner) reconcileFromMetadata() {
 		if length, rawPath, ok := valueMessageSizeAndRawPath(it.Value().Data()); ok {
 			totalSize += length
 			if sweepDue && rawPath != "" {
-				referencedRaw[filepath.Base(rawPath)] = struct{}{}
-				referencedRawBytes += length
+				referencedRaw[filepath.Base(rawPath)] = length
 			}
 		}
 
@@ -665,8 +663,9 @@ func (c *Cleaner) reconcileFromMetadata() {
 
 	// Only after a complete scan: a truncated one returned above, and sweeping
 	// against a partial reference set would delete live files.
-	if sweepDue {
-		c.sweepOrphanRawFiles(referencedRaw, referencedRawBytes, start)
+	// The clock advances only on a completed sweep, so one that could not read
+	// the directory is retried by the next reconcile instead of in a day.
+	if sweepDue && c.sweepOrphanRawFiles(referencedRaw, start) {
 		c.lastOrphanSweep = time.Now()
 	}
 }

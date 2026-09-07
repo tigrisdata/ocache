@@ -16,6 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/storage/fd"
+	"github.com/tigrisdata/ocache/storage/keys"
+	pb "github.com/tigrisdata/ocache/storage/proto"
 )
 
 func newOrphanTestStorage(t *testing.T, dir string) *Storage {
@@ -162,6 +164,51 @@ func TestOrphanSweep_IsDailyAfterStartup(t *testing.T) {
 	s.cleaner.reconcileFromMetadata()
 	assert.Eventually(t, func() bool { return !fileExists(aged) }, 10*time.Second, 50*time.Millisecond,
 		"a reconcile past the sweep interval must sweep")
+}
+
+// TestOrphanSweep_FailedSweepIsRetriedNextReconcile: a sweep that cannot
+// read files/ does not advance the daily clock, so the next reconcile tries
+// again rather than waiting a day.
+func TestOrphanSweep_FailedSweepIsRetriedNextReconcile(t *testing.T) {
+	dir := t.TempDir()
+	s := newOrphanTestStorage(t, dir)
+	defer s.Close()
+
+	filesDir := filepath.Join(dir, "files")
+	hidden := filepath.Join(dir, "files.hidden")
+	require.NoError(t, os.Rename(filesDir, hidden))
+	due := time.Now().Add(-orphanSweepInterval)
+	s.cleaner.lastOrphanSweep = due
+	s.cleaner.reconcileFromMetadata()
+	assert.Equal(t, due, s.cleaner.lastOrphanSweep, "a sweep that could not read files/ must not count as done")
+
+	require.NoError(t, os.Rename(hidden, filesDir))
+	s.cleaner.reconcileFromMetadata()
+	assert.True(t, s.cleaner.lastOrphanSweep.After(due), "the next reconcile must retry and complete the sweep")
+}
+
+// TestOrphanSweep_GaugeExcludesDanglingReferences: a row whose raw file is
+// missing (purged by the read path on its next miss) contributes nothing to
+// the directory-size gauge, because the size of a referenced file is counted
+// only when its name is present in the listing.
+func TestOrphanSweep_GaugeExcludesDanglingReferences(t *testing.T) {
+	dir := t.TempDir()
+	s := newOrphanTestStorage(t, dir)
+	defer s.Close()
+
+	require.NoError(t, s.Put("dangling", bytes.NewReader(bytes.Repeat([]byte("d"), 2048)), 0))
+	require.NoError(t, s.Put("present", bytes.NewReader(bytes.Repeat([]byte("p"), 3072)), 0))
+	// Remove the first key's file behind the row's back, using the path the row records.
+	row, found, err := s.readRowForCAS(keys.MakeMetadataKey("dangling"))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, pb.ValueType_RAW_FILE, row.ValueType)
+	require.NoError(t, os.Remove(row.RawFilePath))
+
+	forceSweep(s)
+	s.cleaner.reconcileFromMetadata()
+	assert.Equal(t, float64(3072), testutil.ToFloat64(metrics.FilesDirBytes),
+		"only the referenced file that exists on disk counts toward the gauge")
 }
 
 // TestOrphanSweep_RunsAtStartup: files leaked by an earlier process (the
