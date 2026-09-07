@@ -14,10 +14,14 @@ import (
 	"github.com/tigrisdata/ocache/storage/keys"
 )
 
-// accessUpdate represents a single access time update request
+// accessUpdate represents a single access time update request. The time is
+// kept at full precision: the access index orders entries by nanosecond and a
+// put records its write time at that precision, so a read bump rounded down to
+// the second would sort BEFORE keys written later in the same second and lose
+// to them at eviction (issue #257).
 type accessUpdate struct {
 	key  string
-	time int64
+	time time.Time
 }
 
 // accessUpdater handles asynchronous batched updates of access times for LRU tracking
@@ -29,14 +33,14 @@ type accessUpdater struct {
 	interval      time.Duration
 	delay         time.Duration // The delay after which an access time update is considered stale and should be updated
 	wg            sync.WaitGroup
-	accessTimeLRU *lru.Cache[string, int64]
+	accessTimeLRU *lru.Cache[string, time.Time]
 	batch         map[string]accessUpdate
 	batchMutex    sync.Mutex
 }
 
 // newAccessUpdater creates a new access updater
 func newAccessUpdater(s *Storage, bufferSize int, interval time.Duration, delay time.Duration) *accessUpdater {
-	accessTimeLRU, err := lru.New[string, int64](bufferSize)
+	accessTimeLRU, err := lru.New[string, time.Time](bufferSize)
 	if err != nil {
 		zlog.Fatal().Err(err).Msg("accessUpdater: failed to create LRU cache")
 	}
@@ -73,7 +77,7 @@ func (a *accessUpdater) Stop() {
 }
 
 // Update queues an access time update (non-blocking)
-func (a *accessUpdater) Update(key string, accessTime int64) {
+func (a *accessUpdater) Update(key string, accessTime time.Time) {
 	select {
 	case a.updates <- accessUpdate{key: key, time: accessTime}:
 		// Update queued successfully
@@ -86,7 +90,7 @@ func (a *accessUpdater) Update(key string, accessTime int64) {
 
 // UpdateNow queues an access time update with current time (non-blocking)
 func (a *accessUpdater) UpdateNow(key string) {
-	a.Update(key, time.Now().Unix())
+	a.Update(key, time.Now())
 }
 
 // Flush forces all pending updates to be written to RocksDB immediately.
@@ -166,7 +170,7 @@ func (a *accessUpdater) timeGateUpdate(update accessUpdate) {
 	// Get marks a gated hit as recently used without changing its timestamp.
 	accessTime, ok := a.accessTimeLRU.Get(update.key)
 	// Only add to the batch when the timestamp is stale or the cache misses.
-	if (ok && time.Unix(update.time, 0).Sub(time.Unix(accessTime, 0)) > a.delay) || !ok {
+	if !ok || update.time.Sub(accessTime) > a.delay {
 		a.addToBatch(update)
 
 		// Also add the key to the LRU cache so that it is marked as most recently used
@@ -207,8 +211,7 @@ func (a *accessUpdater) flushBatch() int {
 		}
 
 		// Create the new bucketed entry
-		accessTimeObj := time.Unix(update.time, 0)
-		newKey := keys.MakeBucketedAccessKey(key, accessTimeObj)
+		newKey := keys.MakeBucketedAccessKey(key, update.time)
 
 		writeBatch.Put(newKey, []byte{})
 

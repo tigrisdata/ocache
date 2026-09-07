@@ -65,9 +65,9 @@ func TestAccessUpdater_InBatchDeduplication(t *testing.T) {
 	defer updater.Stop()
 
 	// Queue multiple updates for the same key within one batch window
-	firstUpdate := time.Now().Unix()
+	firstUpdate := time.Now()
 	for i := 0; i < 5; i++ {
-		updater.Update("test-key-dedup", firstUpdate+int64(i))
+		updater.Update("test-key-dedup", firstUpdate.Add(time.Duration(i)*time.Second))
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -92,8 +92,8 @@ func TestAccessUpdater_InBatchDeduplication(t *testing.T) {
 	_, accessTime, err := keys.ParseBucketedAccessKey(bucketKey)
 	require.NoError(t, err)
 
-	// The access time should be the time of the first update
-	assert.Equal(t, firstUpdate, accessTime.Unix())
+	// The access time should be the time of the first update, at full precision
+	assert.Equal(t, firstUpdate.UnixNano(), accessTime.UnixNano())
 	slice.Free()
 
 	// Verify other keys were also written
@@ -175,7 +175,7 @@ func TestAccessUpdater_UpdatesOldBucketedEntry(t *testing.T) {
 	defer updater.Stop()
 
 	// First update with specific timestamp
-	firstTime := time.Now().Unix()
+	firstTime := time.Now()
 	updater.Update("test-key-bucket-update", firstTime)
 	updater.Flush()
 
@@ -199,7 +199,7 @@ func TestAccessUpdater_UpdatesOldBucketedEntry(t *testing.T) {
 
 	// Second update with timestamp 6 minutes later (simulate time passing)
 	// This ensures the bucket key timestamp is actually different
-	secondTime := firstTime + 6*60 // 6 minutes in seconds
+	secondTime := firstTime.Add(6 * time.Minute)
 	updater.Update("test-key-bucket-update", secondTime)
 	updater.Flush()
 
@@ -284,7 +284,7 @@ func TestAccessUpdater_TimeGating(t *testing.T) {
 	}
 
 	// Simulate time passing for one key
-	updater.accessTimeLRU.Add("key2", time.Now().Add(-6*time.Minute).Unix())
+	updater.accessTimeLRU.Add("key2", time.Now().Add(-6*time.Minute))
 	updater.UpdateNow("key2")
 	time.Sleep(500 * time.Millisecond)
 
@@ -299,7 +299,7 @@ func TestAccessUpdater_TimeGating(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should be recent
-	assert.Greater(t, accessTime.Unix(), keyAccessTimes["key2"].Unix())
+	assert.True(t, accessTime.After(keyAccessTimes["key2"]), "key2 access time %v should be after %v", accessTime, keyAccessTimes["key2"])
 	slice.Free()
 }
 
@@ -334,23 +334,55 @@ func TestAccessUpdater_StopFlushesRemaining(t *testing.T) {
 // TestAccessUpdater_TimeGatingRefreshesLRURecency verifies that a gated read
 // keeps a hot key resident when distinct keys create capacity pressure.
 func TestAccessUpdater_TimeGatingRefreshesLRURecency(t *testing.T) {
-	const initialAccessTime = int64(1_000_000)
+	initialAccessTime := time.Unix(1_000_000, 0)
 
 	updater := newAccessUpdater(nil, 2, time.Hour, time.Hour)
 	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime})
-	updater.timeGateUpdate(accessUpdate{key: "other", time: initialAccessTime + 1})
-	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime + 2})
-	updater.timeGateUpdate(accessUpdate{key: "new", time: initialAccessTime + 3})
+	updater.timeGateUpdate(accessUpdate{key: "other", time: initialAccessTime.Add(1 * time.Second)})
+	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime.Add(2 * time.Second)})
+	updater.timeGateUpdate(accessUpdate{key: "new", time: initialAccessTime.Add(3 * time.Second)})
 
 	_, ok := updater.accessTimeLRU.Peek("hot")
 	assert.True(t, ok, "a gated hot-key read must refresh LRU recency")
 
 	firstHotUpdate := updater.batch["hot"].time
-	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime + 4})
+	updater.timeGateUpdate(accessUpdate{key: "hot", time: initialAccessTime.Add(4 * time.Second)})
 	hotUpdate, ok := updater.batch["hot"]
 	require.True(t, ok)
-	assert.Equal(t, firstHotUpdate, hotUpdate.time,
+	assert.True(t, firstHotUpdate.Equal(hotUpdate.time),
 		"a hot key within the delay must not be readmitted to the batch")
+}
+
+// TestAccessUpdater_ReadBumpOutranksEarlierWrites pins the ordering contract
+// behind LRU read protection: a read bump must sort AFTER every key written
+// before the read, including keys written later in the same wall-clock second.
+// The updater used to queue whole seconds and rebuild the bump at the start of
+// that second, so a key read at hh:mm:ss.8 sorted before a key written at
+// hh:mm:ss.1 and was evicted first — the eviction e2e flake in issue #257.
+func TestAccessUpdater_ReadBumpOutranksEarlierWrites(t *testing.T) {
+	s, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1<<30)
+	defer cleanup()
+	require.NotNil(t, s.accessUpdater, "LRU with a disk cap must run the access updater")
+
+	require.NoError(t, s.Put("read-old", bytes.NewReader([]byte("old")), 0))
+	require.NoError(t, s.Put("written-later", bytes.NewReader([]byte("new")), 0))
+
+	// Bump read-old AFTER written-later was written, then force the flush.
+	s.accessUpdater.UpdateNow("read-old")
+	require.Equal(t, 1, s.accessUpdater.Flush())
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	entry := func(key string) []byte {
+		slice, err := s.meta.Handle().Get(ro, keys.MakeBucketedAccessIndexKey(key))
+		require.NoError(t, err)
+		require.True(t, slice.Exists(), "%s should have an access index entry", key)
+		defer slice.Free()
+		return append([]byte(nil), slice.Data()...)
+	}
+	bumped, written := entry("read-old"), entry("written-later")
+	assert.Equal(t, 1, bytes.Compare(bumped, written),
+		"a read bump must sort after a key written before the read, so eviction reaches it later:\n  bumped:  %s\n  written: %s", bumped, written)
 }
 
 func benchmarkStorageGet(b *testing.B, storage *Storage, key string) {

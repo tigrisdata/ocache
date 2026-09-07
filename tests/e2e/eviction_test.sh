@@ -101,7 +101,11 @@ run_eviction_suite() {
     # The read must return DATA for LRU to bump recency: the server refreshes
     # access time only AFTER the key is found, access buckets are hourly, and
     # eviction order within a bucket is purely by nanosecond — so an un-bumped key
-    # stays at its (oldest) write position and is evicted first. `ocachecli get`
+    # stays at its (oldest) write position and is evicted first. The bump keeps
+    # that nanosecond precision (#257: it used to be rounded down to the second,
+    # which sorted a key read at ss.8 BEFORE keys written at ss.1 and evicted the
+    # "protected" keys first whenever the reads landed in the same wall-clock
+    # second as the tail of the writes above). `ocachecli get`
     # exits non-zero and prints nothing on a miss, so retry until it both succeeds
     # AND returns a non-empty value; that proves the key was actually read (bump
     # triggered), not a silent miss counting as success.

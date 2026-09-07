@@ -1401,11 +1401,11 @@ func (s *Storage) FlushAccessUpdates() {
 	}
 }
 
-// SetAccessTime sets a specific access time for a key
-// This is mainly useful for testing to create predictable LRU scenarios
+// SetAccessTime sets a specific access time (Unix seconds) for a key.
+// This is mainly useful for testing to create predictable LRU scenarios.
 func (s *Storage) SetAccessTime(key string, accessTime int64) {
 	if s.accessUpdater != nil {
-		s.accessUpdater.Update(key, accessTime)
+		s.accessUpdater.Update(key, time.Unix(accessTime, 0))
 	}
 }
 
