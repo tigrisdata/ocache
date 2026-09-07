@@ -619,20 +619,25 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 	// value's (potentially 256 MB) backing bytes.
 	got, gotFound, err := s.readRowForCASRetry(metaKey)
 	if err != nil {
-		// The merge committed but the outcome is unreadable. prev is dead in
-		// EVERY outcome — we won (the row is a ref-less tombstone), we lost to a
-		// newer write (the winner holds a fresh path and already reclaimed prev),
-		// or the row vanished first (whoever removed it reclaimed prev) — so
-		// reclaiming it here is never wrong. Raw paths are unique UUIDs, so no
-		// live row can reference prev after our merge. On the dominant
-		// won-but-glitched case this is the only thing standing between prev's
-		// (potentially 256 MB) file and a permanent #156 orphan; on the rare
-		// lost case it is a bounded, self-healing duplicate (a raw delete is an
-		// exact no-op, a segment credit is liveness-validated, and the size
-		// decrement is corrected by the hourly reconcile).
+		// The merge committed but the outcome is unreadable. prev's BYTES are
+		// dead in EVERY outcome — we won (the row is a ref-less tombstone), we
+		// lost to a newer write (the winner holds a fresh path and already
+		// reclaimed prev), or the row vanished first (whoever removed it
+		// reclaimed prev) — so reclaiming them is never wrong: a duplicated raw
+		// delete is an exact no-op and a segment credit is liveness-validated.
+		// Raw paths are unique UUIDs, so no live row can reference prev after our
+		// merge. On the dominant won-but-glitched case this is the only thing
+		// standing between prev's (potentially 256 MB) file and a permanent #156
+		// orphan.
+		//
+		// The SIZE accounting, however, is outcome-dependent and must NOT be
+		// applied here: on a loss the displacing writer already subtracted prev,
+		// so a second notifyDelete would under-report usage and could let the
+		// disk cap over-admit. Leaving it to the startup/hourly reconcile means
+		// the worst case on a win is a temporary over-report — the safe
+		// direction. (Same split as PutIfVersion's read-back-failure path.)
 		if hasPrev {
 			s.reclaimReplacedValue(prev)
-			s.notifyDelete(prev.ValueLength)
 		}
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
