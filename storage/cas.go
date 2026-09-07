@@ -432,6 +432,18 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 					Msg("storage.PutIfVersion: read-back failed after commit; large spill may orphan if the CAS lost (issue #156)")
 			}
 		}
+		// prev, unlike our spill, IS safe to reclaim: it is dead in every outcome
+		// — we won (the row is now our value), we lost (the winner holds a fresh
+		// path and already reclaimed it), or the row vanished first. Raw paths
+		// are unique UUIDs, so no live row can reference prev after our merge.
+		// On the dominant won-but-glitched case this keeps prev's (potentially
+		// 256 MB) file out of the permanent #156 orphan class; on the rare lost
+		// case it is a bounded, self-healing duplicate. The win-only bookkeeping
+		// (eviction index, the size delta for our own value) is left to the
+		// startup/hourly reconcile, since whether our value landed is unknown.
+		if hasPrev {
+			s.reclaimReplacedValue(prev)
+		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
 	if !gotFound || got.Version != newStamp {
@@ -607,6 +619,21 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 	// value's (potentially 256 MB) backing bytes.
 	got, gotFound, err := s.readRowForCASRetry(metaKey)
 	if err != nil {
+		// The merge committed but the outcome is unreadable. prev is dead in
+		// EVERY outcome — we won (the row is a ref-less tombstone), we lost to a
+		// newer write (the winner holds a fresh path and already reclaimed prev),
+		// or the row vanished first (whoever removed it reclaimed prev) — so
+		// reclaiming it here is never wrong. Raw paths are unique UUIDs, so no
+		// live row can reference prev after our merge. On the dominant
+		// won-but-glitched case this is the only thing standing between prev's
+		// (potentially 256 MB) file and a permanent #156 orphan; on the rare
+		// lost case it is a bounded, self-healing duplicate (a raw delete is an
+		// exact no-op, a segment credit is liveness-validated, and the size
+		// decrement is corrected by the hourly reconcile).
+		if hasPrev {
+			s.reclaimReplacedValue(prev)
+			s.notifyDelete(prev.ValueLength)
+		}
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
 	switch {
