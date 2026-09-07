@@ -240,13 +240,15 @@ var (
 		},
 	)
 
-	// FilesDirBytes is the physical size of the raw-file directory, refreshed by
-	// the orphan sweep. Compared with the logical DiskUsageBytes it shows how
-	// much of files/ is not accounted for (orphans, in-flight writes).
+	// FilesDirBytes is the size of the raw-file directory, refreshed by the
+	// orphan sweep: payload bytes of referenced raw files (from metadata) plus
+	// the on-disk size of every unreferenced file. Compared with the logical
+	// DiskUsageBytes it shows how much of files/ is not accounted for
+	// (orphans, in-flight writes).
 	FilesDirBytes = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "ocache_files_dir_bytes",
-			Help: "Physical size of the raw-file directory in bytes",
+			Help: "Size of the raw-file directory in bytes (referenced payload bytes plus unreferenced files on disk)",
 		},
 	)
 

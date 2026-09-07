@@ -42,6 +42,10 @@ func dropOrphan(t *testing.T, dir, name string, size int, age time.Duration) str
 	return path
 }
 
+// forceSweep makes the next reconcile run the orphan sweep regardless of when
+// the last one ran (the sweep is otherwise daily after the startup pass).
+func forceSweep(s *Storage) { s.cleaner.lastOrphanSweep = time.Time{} }
+
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
@@ -74,6 +78,7 @@ func TestOrphanSweep_ReclaimsAgedUnreferencedFiles(t *testing.T) {
 	aged := dropOrphan(t, dir, "orphan-aged", 4096, time.Hour)
 	recent := dropOrphan(t, dir, "orphan-recent", 4096, 0)
 
+	forceSweep(s)
 	s.cleaner.reconcileFromMetadata()
 
 	assert.Eventually(t, func() bool { return !fileExists(aged) }, 10*time.Second, 50*time.Millisecond,
@@ -81,11 +86,12 @@ func TestOrphanSweep_ReclaimsAgedUnreferencedFiles(t *testing.T) {
 	assert.True(t, fileExists(recent), "a file inside the grace window may be an in-flight put and must be kept")
 	assert.Equal(t, string(live), readAllValue(t, s, "live"))
 	assert.Equal(t, float64(2048+4096+4096), testutil.ToFloat64(metrics.FilesDirBytes),
-		"physical files/ size is published as measured before reclaim")
+		"files/ size = referenced payload bytes (from metadata) + unreferenced files on disk, as measured before reclaim")
 
 	// Once the recent orphan ages past the window, the next pass takes it.
 	old := time.Now().Add(-2 * orphanGraceWindow)
 	require.NoError(t, os.Chtimes(recent, old, old))
+	forceSweep(s)
 	s.cleaner.reconcileFromMetadata()
 	assert.Eventually(t, func() bool { return !fileExists(recent) }, 10*time.Second, 50*time.Millisecond)
 	assert.Equal(t, string(live), readAllValue(t, s, "live"))
@@ -107,6 +113,7 @@ func TestOrphanSweep_LeavesActiveWritesAlone(t *testing.T) {
 	uncommitted := dropOrphan(t, dir, "written-not-committed", 4096, time.Hour)
 	s.inflightRaw.Store(uncommitted, struct{}{}) // Put holds this until the row commits
 
+	forceSweep(s)
 	s.cleaner.reconcileFromMetadata()
 	time.Sleep(1500 * time.Millisecond) // longer than the deletion queue's interval
 	assert.True(t, fileExists(stalled), "a file whose lock is held is being written and must not be queued")
@@ -114,6 +121,7 @@ func TestOrphanSweep_LeavesActiveWritesAlone(t *testing.T) {
 
 	lock.Unlock()
 	s.inflightRaw.Delete(uncommitted)
+	forceSweep(s)
 	s.cleaner.reconcileFromMetadata()
 	assert.Eventually(t, func() bool { return !fileExists(stalled) && !fileExists(uncommitted) },
 		10*time.Second, 50*time.Millisecond, "once the guards are released the aged orphans are reclaimed")
@@ -135,6 +143,25 @@ func TestPut_RegistersRawFileUntilCommit(t *testing.T) {
 	after := 0
 	s.inflightRaw.Range(func(_, _ any) bool { after++; return true })
 	assert.Zero(t, after, "the registration must be released once the row is committed")
+}
+
+// TestOrphanSweep_IsDailyAfterStartup: a reconcile inside the interval does
+// not sweep (the reference set is not even collected), one past it does.
+func TestOrphanSweep_IsDailyAfterStartup(t *testing.T) {
+	dir := t.TempDir()
+	s := newOrphanTestStorage(t, dir) // the startup reconcile has just swept
+	defer s.Close()
+	require.False(t, s.cleaner.lastOrphanSweep.IsZero(), "startup must run the sweep")
+
+	aged := dropOrphan(t, dir, "orphan-aged", 4096, time.Hour)
+	s.cleaner.reconcileFromMetadata() // within the interval: hourly reconcile, no sweep
+	time.Sleep(1500 * time.Millisecond)
+	assert.True(t, fileExists(aged), "a reconcile inside the sweep interval must not sweep")
+
+	s.cleaner.lastOrphanSweep = time.Now().Add(-orphanSweepInterval)
+	s.cleaner.reconcileFromMetadata()
+	assert.Eventually(t, func() bool { return !fileExists(aged) }, 10*time.Second, 50*time.Millisecond,
+		"a reconcile past the sweep interval must sweep")
 }
 
 // TestOrphanSweep_RunsAtStartup: files leaked by an earlier process (the

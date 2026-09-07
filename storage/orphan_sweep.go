@@ -13,6 +13,12 @@ import (
 	"github.com/tigrisdata/ocache/storage/fd"
 )
 
+// orphanSweepInterval is how often the orphan sweep runs after the startup
+// pass. Orphans are rare single files (a crash inside the write-to-commit
+// window, a CAS put that could not confirm its outcome), so nothing is gained
+// by reclaiming one within the hour; the backlog case is the startup pass.
+const orphanSweepInterval = 24 * time.Hour
+
 // orphanGraceWindow is how recently a raw file must have been written for the
 // sweep to leave it alone even though no metadata row references it. Put
 // writes files/<uuid> first and commits the row second, so a file whose last
@@ -25,8 +31,17 @@ import (
 const orphanGraceWindow = 10 * time.Minute
 
 // sweepOrphanRawFiles reclaims raw files in files/ that no metadata row
-// references (issue #156). It runs after every complete reconcile scan — at
-// startup and hourly — with the set of raw-file names that scan saw.
+// references (issue #156). It runs after a complete reconcile scan — at
+// startup, then every orphanSweepInterval — with the set of raw-file names
+// that scan saw and the payload bytes they account for.
+//
+// Only unreferenced files are stat'ed. Compaction keeps files/ small when it
+// is healthy, but when it falls behind the directory fills with referenced
+// medium files, and a sweep that touched each of them would cost a syscall
+// per file for no decision; skipping them keeps the sweep proportional to the
+// number of orphans, which is roughly zero. The physical size published is
+// therefore the referenced payload bytes from metadata (excluding each raw
+// file's small header) plus the on-disk size of everything unreferenced.
 //
 // An orphan is a file that is neither referenced nor written within
 // orphanGraceWindow of the scan's start. Orphans arise from a crash between
@@ -55,7 +70,7 @@ const orphanGraceWindow = 10 * time.Minute
 // put) is simply queued twice, which the queue resolves as a no-op. The
 // physical size of files/ is published alongside the logical cap so the two
 // can be compared without a manual du.
-func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, scanStart time.Time) {
+func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, referencedBytes int64, scanStart time.Time) {
 	filesDir := filepath.Join(c.storage.diskPath, "files")
 	entries, err := os.ReadDir(filesDir)
 	if err != nil {
@@ -64,7 +79,8 @@ func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, scanStart 
 	}
 	cutoff := scanStart.Add(-orphanGraceWindow)
 
-	var physicalBytes, orphanBytes int64
+	physicalBytes := referencedBytes
+	var orphanBytes int64
 	var orphans, recent, active int
 	locks := fd.GetFileLockManager()
 	for i, entry := range entries {
@@ -79,14 +95,14 @@ func (c *Cleaner) sweepOrphanRawFiles(referenced map[string]struct{}, scanStart 
 		if entry.IsDir() {
 			continue
 		}
+		if _, ok := referenced[entry.Name()]; ok {
+			continue // owned by a row; no stat needed
+		}
 		info, err := entry.Info()
 		if err != nil {
 			continue // deleted between the listing and now
 		}
 		physicalBytes += info.Size()
-		if _, ok := referenced[entry.Name()]; ok {
-			continue
-		}
 		if info.ModTime().After(cutoff) {
 			recent++
 			continue

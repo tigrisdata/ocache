@@ -84,6 +84,10 @@ type Cleaner struct {
 
 	// lastSizeRecalc is owned by cleanupLoop and initialized when that loop starts.
 	lastSizeRecalc time.Time
+	// lastOrphanSweep is when the orphan raw-file sweep last ran; zero until the
+	// startup reconcile runs it. Owned by the reconcile caller (Start, then the
+	// cleanup loop), like lastSizeRecalc.
+	lastOrphanSweep time.Time
 
 	// stats
 	totalSize   atomic.Int64
@@ -548,12 +552,19 @@ func (c *Cleaner) reconcileFromMetadata() {
 		batch.Clear()
 	}
 
-	// referencedRaw collects the base name of every raw file a metadata row on
-	// this snapshot points at (live or expired-but-unswept: either way the row
-	// still owns the file). The orphan sweep after the scan deletes nothing in
-	// this set. Base names, not paths, so a data directory that has been moved
-	// still matches. Roughly 36 bytes per raw-file row.
-	referencedRaw := make(map[string]struct{})
+	// When the orphan sweep is due (startup, then every orphanSweepInterval),
+	// this scan also collects the base name of every raw file a metadata row
+	// on the snapshot points at (live or expired-but-unswept: either way the
+	// row still owns the file) and their payload bytes. The sweep deletes
+	// nothing in this set and stats nothing in it either. Base names, not
+	// paths, so a data directory that has been moved still matches. Roughly
+	// 36 bytes per raw-file row, held only for this pass.
+	sweepDue := c.lastOrphanSweep.IsZero() || time.Since(c.lastOrphanSweep) >= orphanSweepInterval
+	var referencedRaw map[string]struct{}
+	var referencedRawBytes int64
+	if sweepDue {
+		referencedRaw = make(map[string]struct{})
+	}
 
 	for it.SeekToFirst(); it.Valid(); it.Next() {
 		// Check if we're shutting down
@@ -580,8 +591,9 @@ func (c *Cleaner) reconcileFromMetadata() {
 		// threshold) on both the startup scan and the hourly reconciliation.
 		if length, rawPath, ok := valueMessageSizeAndRawPath(it.Value().Data()); ok {
 			totalSize += length
-			if rawPath != "" {
+			if sweepDue && rawPath != "" {
 				referencedRaw[filepath.Base(rawPath)] = struct{}{}
+				referencedRawBytes += length
 			}
 		}
 
@@ -653,7 +665,10 @@ func (c *Cleaner) reconcileFromMetadata() {
 
 	// Only after a complete scan: a truncated one returned above, and sweeping
 	// against a partial reference set would delete live files.
-	c.sweepOrphanRawFiles(referencedRaw, start)
+	if sweepDue {
+		c.sweepOrphanRawFiles(referencedRaw, referencedRawBytes, start)
+		c.lastOrphanSweep = time.Now()
+	}
 }
 
 // advanceBackrefTo advances the sorted back-reference iterator to userKey and
