@@ -334,6 +334,10 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 			return 0, storageErrors.NewIOError("PutIfVersion", key, err)
 		}
 		spilledPath = filePath
+		// Unreferenced until the merge lands (or the spill is queued for
+		// reclaim); keep the orphan sweep off it meanwhile (#156).
+		s.inflightRaw.Store(filePath, struct{}{})
+		defer s.inflightRaw.Delete(filePath)
 		operand.ValueType = pb.ValueType_RAW_FILE
 		operand.RawFilePath = filePath
 		operand.ValueLength = bytesWritten

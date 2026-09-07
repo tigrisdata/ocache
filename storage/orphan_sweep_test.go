@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/storage/fd"
 )
 
 func newOrphanTestStorage(t *testing.T, dir string) *Storage {
@@ -88,6 +89,52 @@ func TestOrphanSweep_ReclaimsAgedUnreferencedFiles(t *testing.T) {
 	s.cleaner.reconcileFromMetadata()
 	assert.Eventually(t, func() bool { return !fileExists(recent) }, 10*time.Second, 50*time.Millisecond)
 	assert.Equal(t, string(live), readAllValue(t, s, "live"))
+}
+
+// TestOrphanSweep_LeavesActiveWritesAlone pins the two guards that make the
+// sweep safe against a write in progress regardless of how old the file's
+// mtime is: a file whose lock is held (a client stalled mid-stream, or a
+// reader) and a file registered as in-flight (written, not yet committed)
+// are both skipped, and each is reclaimed once the guard is released.
+func TestOrphanSweep_LeavesActiveWritesAlone(t *testing.T) {
+	dir := t.TempDir()
+	s := newOrphanTestStorage(t, dir)
+	defer s.Close()
+
+	stalled := dropOrphan(t, dir, "stalled-upload", 4096, time.Hour)
+	lock := fd.GetFileLockManager().GetFileLock(stalled)
+	lock.Lock() // FileManager.Write holds this for the whole write and fsync
+	uncommitted := dropOrphan(t, dir, "written-not-committed", 4096, time.Hour)
+	s.inflightRaw.Store(uncommitted, struct{}{}) // Put holds this until the row commits
+
+	s.cleaner.reconcileFromMetadata()
+	time.Sleep(1500 * time.Millisecond) // longer than the deletion queue's interval
+	assert.True(t, fileExists(stalled), "a file whose lock is held is being written and must not be queued")
+	assert.True(t, fileExists(uncommitted), "a file registered as in-flight must not be queued")
+
+	lock.Unlock()
+	s.inflightRaw.Delete(uncommitted)
+	s.cleaner.reconcileFromMetadata()
+	assert.Eventually(t, func() bool { return !fileExists(stalled) && !fileExists(uncommitted) },
+		10*time.Second, 50*time.Millisecond, "once the guards are released the aged orphans are reclaimed")
+}
+
+// TestPut_RegistersRawFileUntilCommit: Put holds its raw file in the in-flight
+// registry from the write through the metadata commit, and releases it after.
+func TestPut_RegistersRawFileUntilCommit(t *testing.T) {
+	s := newOrphanTestStorage(t, t.TempDir())
+	defer s.Close()
+
+	inflightAtCommit := 0
+	s.beforeMetaCommit = func() error {
+		s.inflightRaw.Range(func(_, _ any) bool { inflightAtCommit++; return true })
+		return nil
+	}
+	require.NoError(t, s.Put("k", bytes.NewReader(bytes.Repeat([]byte("x"), 2048)), 0))
+	assert.Equal(t, 1, inflightAtCommit, "the raw file must be registered while its row is being committed")
+	after := 0
+	s.inflightRaw.Range(func(_, _ any) bool { after++; return true })
+	assert.Zero(t, after, "the registration must be released once the row is committed")
 }
 
 // TestOrphanSweep_RunsAtStartup: files leaked by an earlier process (the

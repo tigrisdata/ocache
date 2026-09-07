@@ -250,18 +250,22 @@ var (
 		},
 	)
 
-	// OrphanFilesReclaimed / OrphanBytesReclaimed count raw files the sweep
-	// found referenced by no metadata row and queued for deletion (issue #156).
-	OrphanFilesReclaimed = promauto.NewCounter(
+	// OrphanFilesQueued / OrphanBytesQueued count raw files the sweep found
+	// referenced by no metadata row and handed to the deletion queue (issue
+	// #156). They count queueing, not deletion: a file the queue cannot yet
+	// remove (held open by a reader, or a filesystem error) is queued again
+	// by the next sweep and counted again. Actual removals are
+	// ocache_deletion_queue_processed_total.
+	OrphanFilesQueued = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "ocache_orphan_files_reclaimed_total",
-			Help: "Unreferenced raw files queued for deletion by the orphan sweep",
+			Name: "ocache_orphan_files_queued_total",
+			Help: "Unreferenced raw files handed to the deletion queue by the orphan sweep (queued, not necessarily deleted yet)",
 		},
 	)
-	OrphanBytesReclaimed = promauto.NewCounter(
+	OrphanBytesQueued = promauto.NewCounter(
 		prometheus.CounterOpts{
-			Name: "ocache_orphan_bytes_reclaimed_total",
-			Help: "Bytes of unreferenced raw files queued for deletion by the orphan sweep",
+			Name: "ocache_orphan_bytes_queued_total",
+			Help: "Bytes of unreferenced raw files handed to the deletion queue by the orphan sweep",
 		},
 	)
 

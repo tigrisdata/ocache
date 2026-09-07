@@ -172,6 +172,12 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
+	// inflightRaw holds the raw-file paths that have been written but whose
+	// metadata is not yet committed (or, on failure, not yet queued for
+	// reclaim). The orphan sweep never touches a path in it: the file lock
+	// covers a file only while it is being written, and this covers the gap
+	// from that unlock to the commit that makes the file referenced (#156).
+	inflightRaw sync.Map
 	// beforeMetaCommit is set only by package tests: it runs inside putLow just
 	// before the metadata batch is written, and a non-nil error stands in for a
 	// RocksDB write failure so the callers' failure paths can be exercised.
@@ -1181,6 +1187,11 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 				return storageErrors.NewIOError("Put", key, err)
 			}
 		}
+
+		// From here until the row commits (or the file is queued for reclaim on
+		// failure) nothing references the file; keep the orphan sweep off it.
+		s.inflightRaw.Store(filePath, struct{}{})
+		defer s.inflightRaw.Delete(filePath)
 
 		valueMsg := &pb.ValueMessage{
 			RawFilePath: filePath,
