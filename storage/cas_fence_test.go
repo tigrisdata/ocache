@@ -202,6 +202,62 @@ func TestCAS_Fence_SweepKeepsFenceMovedInTheWindow(t *testing.T) {
 	assert.Greater(t, second, first, "the fence moved in the window must survive the sweep")
 }
 
+// TestCAS_DropDeadEvictionGeneration_RefreshedEntryAndRecreate exercises the
+// cleanup helper directly around the two interleavings a sequential test
+// cannot produce. (1) The asynchronous LRU refresh swapped in a newer ordered
+// entry for the key after the delete captured its entry but before the
+// cleanup ran: the row is still this delete's tombstone, so the refreshed
+// entry is dead too and must go, along with the back-reference. (2) A recreate
+// landed before the cleanup: the row is no longer this delete's tombstone, so
+// only the captured (dead) entry goes and the recreate's generation is left
+// fully intact.
+func TestCAS_DropDeadEvictionGeneration_RefreshedEntryAndRecreate(t *testing.T) {
+	s, cleanup := createCASTestStorage(t) // disk cap set: LRU index and async refresh active
+	defer cleanup()
+	require.NotNil(t, s.accessUpdater)
+
+	exists := func(k []byte) bool {
+		slice, err := s.meta.Handle().Get(putPointReadOpts, k)
+		require.NoError(t, err)
+		defer slice.Free()
+		return slice.Exists()
+	}
+	backref := keys.MakeBucketedAccessIndexKey("k")
+	metaKey := keys.MakeMetadataKey("k")
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+
+	// (1) Refresh after capture, key dead.
+	v, err := s.PutIfVersion("k", bytes.NewReader([]byte("data")), 0, 0)
+	require.NoError(t, err)
+	captured := s.evictionEntryFor("k")
+	require.NotNil(t, captured)
+	time.Sleep(1100 * time.Millisecond)                         // a refresh is admitted only past the time gate's granularity
+	s.accessUpdater.Update("k", time.Now().Add(10*time.Minute)) // past the 5-minute gate: a real refresh
+	s.FlushAccessUpdates()
+	refreshed := s.evictionEntryFor("k")
+	require.NotNil(t, refreshed)
+	require.NotEqual(t, captured, refreshed, "the refresh must have swapped in a newer entry")
+	// The delete won (its tombstone is on the row) but captured the OLD entry.
+	deadStamp := v + 1
+	tomb, err := proto.Marshal(&pb.ValueMessage{Expiry: 1, Version: deadStamp})
+	require.NoError(t, err)
+	require.NoError(t, s.meta.Handle().Put(wo, metaKey, tomb))
+	s.dropDeadEvictionGeneration("k", metaKey, deadStamp, captured)
+	assert.False(t, exists(refreshed), "the refreshed entry belongs to the dead key and must go")
+	assert.False(t, exists(backref), "and so must the back-reference")
+
+	// (2) Recreate before cleanup.
+	fence := absentToken(t, s, "k")
+	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("again")), 0, fence)
+	require.NoError(t, err)
+	fresh := s.evictionEntryFor("k")
+	require.NotNil(t, fresh)
+	s.dropDeadEvictionGeneration("k", metaKey, deadStamp, captured) // stale delete's cleanup runs late
+	assert.True(t, exists(fresh), "a recreate's entry must be left intact")
+	assert.True(t, exists(backref), "and its back-reference too")
+}
+
 // TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry: a confirmed
 // CAS delete removes the dead value's eviction-index generation — its ordered
 // entry and the back-reference that pointed at it — so a dead key does not sit

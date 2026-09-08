@@ -761,10 +761,9 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		// The key is dead and its tombstone is retained as a fence for hours
 		// (issue #267), so the dead value's eviction-index generation would
 		// otherwise sit at the head of the eviction order, skipped with a point
-		// read on every pass. Drop that generation — the entry captured before
-		// the merge, and the back-reference only while it still points at it —
-		// and nothing that could belong to a recreate.
-		s.dropDeadEvictionGeneration(key, deadEntry)
+		// read on every pass. Drop that generation, and nothing that could
+		// belong to a recreate.
+		s.dropDeadEvictionGeneration(key, metaKey, newStamp, deadEntry)
 		return nil
 	default:
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
@@ -793,25 +792,25 @@ func (s *Storage) evictionEntryFor(key string) []byte {
 }
 
 // dropDeadEvictionGeneration removes the eviction-index generation of a value
-// a confirmed CAS delete replaced: its ordered entry (captured before the
-// merge; entries are keyed by write time, so no other value can share it) and
-// the key's back-reference, the latter only if it still points at that entry.
-// A recreate that landed since rewrote the back-reference to its own entry,
-// and that is left untouched, so the recreate stays covered. Nothing is left
-// dangling: a back-reference pointing at a deleted entry would read as
-// "covered" to the hourly coverage backfill and hide a recreate whose own
-// bookkeeping batch failed, for the life of the process.
+// a confirmed CAS delete replaced, deciding by the ROW rather than by the
+// entry: it re-reads the key and, only if the row is still this delete's own
+// tombstone (stamp == deadStamp), drops whatever ordered entry the
+// back-reference points at, plus the back-reference. That covers both the
+// entry captured before the merge and one the asynchronous LRU refresh may
+// have swapped in since (a read queued shortly before the delete flushes a
+// newer entry for the same, now dead, key without touching its version). The
+// captured entry is deleted regardless: entries are keyed by write time, so
+// no other value can share it. If the row is no longer this delete's
+// tombstone, a recreate has landed; its generation is left untouched, so the
+// recreate stays covered, and nothing is left dangling for the hourly
+// coverage backfill to mistake for coverage.
 //
-// The re-read and the write are not atomic. A recreate rewriting the
-// back-reference in that window loses it (its entry survives): eviction then
-// treats the entry as authoritative — the key stays evictable — and the next
-// reconcile backfills a fresh generation, superseding it. Microseconds wide,
-// self-healing within the hour, and the same re-check shape the TTL sweep
-// uses. A no-op when the dead value had no entry.
-func (s *Storage) dropDeadEvictionGeneration(key string, deadEntry []byte) {
-	if deadEntry == nil {
-		return
-	}
+// The row re-read and the write are not atomic. A recreate landing in that
+// window loses its generation entirely — entry and back-reference — which the
+// next reconcile's coverage backfill restores within the hour. Microseconds
+// wide, self-healing, and the same re-check shape the TTL sweep uses. A no-op
+// when the dead value had no entry and no refresh is pending.
+func (s *Storage) dropDeadEvictionGeneration(key string, metaKey []byte, deadStamp uint64, deadEntry []byte) {
 	var backref []byte
 	if s.evictionPolicy == EvictionPolicyFIFO {
 		backref = keys.MakeFifoBackrefKey(key)
@@ -822,12 +821,21 @@ func (s *Storage) dropDeadEvictionGeneration(key string, deadEntry []byte) {
 	defer wo.Destroy()
 	batch := grocksdb.NewWriteBatch()
 	defer batch.Destroy()
-	batch.Delete(deadEntry)
-	if cur, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
-		if cur.Exists() && bytes.Equal(cur.Data(), deadEntry) {
-			batch.Delete(backref)
+	if deadEntry != nil {
+		batch.Delete(deadEntry)
+	}
+	row, found, err := s.readRowForCAS(metaKey)
+	if err == nil && found && row.Expiry == merge.TombstoneExpiry && row.Version == deadStamp {
+		if cur, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
+			if cur.Exists() {
+				batch.Delete(cur.Data())
+				batch.Delete(backref)
+			}
+			cur.Free()
 		}
-		cur.Free()
+	}
+	if batch.Count() == 0 {
+		return
 	}
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteIfVersion: dropping the dead value's eviction generation failed; eviction skips it until the fence is swept")
