@@ -278,8 +278,8 @@ fi
 
 echo
 echo "=== Test 9: CAS recreate after TTL expiry (via the cleaner) ==="
-echo "A CAS key that TTL-expires and is swept must read as absent (version 0)"
-echo "and be recreatable with put-if-absent."
+echo "A CAS key that TTL-expires and is swept must read as absent (found=false,"
+echo "with an observation token, never 0) and be recreatable with put-if-absent."
 # Cleanup interval is 5s; use a 3s TTL and wait past a sweep.
 ./ocachecli put-if-version "cas-ttl-key" "temporary" --expected 0 --ttl 3 >/dev/null 2>&1
 echo "Waiting for TTL expiry + cleaner sweep..."
@@ -288,10 +288,10 @@ cas_ttl_found=$(./ocachecli get-with-version "cas-ttl-key" 2>/dev/null | grep -o
 cas_ttl_ver=$(./ocachecli get-with-version "cas-ttl-key" 2>/dev/null | grep -oE 'version=[0-9]+' | cut -d= -f2)
 cas_ttl_out=$(./ocachecli put-if-version "cas-ttl-key" "reborn" --expected 0 2>/dev/null); cas_ttl_rc=$?
 cas_ttl_val=$(./ocachecli get "cas-ttl-key" 2>/dev/null)
-if [ "$cas_ttl_found" = "false" ] && [ "$cas_ttl_ver" = "0" ] && [ "$cas_ttl_rc" -eq 0 ] && [ "$cas_ttl_val" = "reborn" ]; then
-    pass_test "TEST_CAS_RECREATE_AFTER_TTL" "expired CAS key read absent and was recreated via put-if-absent"
+if [ "$cas_ttl_found" = "false" ] && [ -n "$cas_ttl_ver" ] && [ "$cas_ttl_ver" != "0" ] && [ "$cas_ttl_rc" -eq 0 ] && [ "$cas_ttl_val" = "reborn" ]; then
+    pass_test "TEST_CAS_RECREATE_AFTER_TTL" "expired CAS key read absent (with a token) and was recreated via put-if-absent"
 else
-    fail_test "TEST_CAS_RECREATE_AFTER_TTL" "expected absent/0 then recreate, got found=$cas_ttl_found ver=$cas_ttl_ver rc=$cas_ttl_rc val=$cas_ttl_val"
+    fail_test "TEST_CAS_RECREATE_AFTER_TTL" "expected absent with a nonzero token then recreate, got found=$cas_ttl_found ver=$cas_ttl_ver rc=$cas_ttl_rc val=$cas_ttl_val"
 fi
 
 echo

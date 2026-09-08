@@ -34,14 +34,21 @@ import (
 // The outcome is learned by reading the row back (read-your-writes): the winner
 // sees its own stamp, a loser sees whoever beat it.
 //
-// CAS is self-contained: it does not coordinate with the TTL cleaner's
-// unconditional sweep. An expired or deleted (tombstoned) row reads as absent
-// (version 0), so recreating over it is put-if-absent (expected == 0) — a
-// best-effort operation with the same cleaner-race semantics as a plain Put,
-// never an atomic recreate guarantee. Live legacy (pre-versioning) rows match
-// merge.VersionLegacy. A CAS_DELETE reclaims the replaced value's backing bytes
-// on its confirmed win, since the ref-less tombstone it leaves carries no
-// references for the cleaner to act on.
+// Absence has history (issue #267). A CAS delete leaves a ref-less tombstone
+// stamped with the delete's version, and that stamp is the key's FENCE until
+// the TTL sweep ages it out (fence retention). An absent read hands out an
+// observation token — the fence stamp, or a fresh stamp for a key with no
+// fence — and a put carrying a token from BEFORE a fence loses to it, so a
+// populate that fetched stale bytes cannot land over an invalidation. Passing
+// expected == 0 opts out of ordering (put-if-absent). Delete-if-absent on a
+// missing or dead key records or moves the fence. TTL expiry is unfenced: an
+// expired row reads absent with a fresh token, and recreating over it is
+// best-effort with the same cleaner-race semantics as a plain Put. Live legacy
+// (pre-versioning) rows match merge.VersionLegacy. A CAS_DELETE reclaims the
+// replaced value's backing bytes on its confirmed win, since the ref-less
+// tombstone it leaves carries no references for the cleaner to act on. Plain
+// Put/Get/Delete are untouched by all of this; mixing plain and CAS ops on one
+// key voids the guarantees, as it always has for versions.
 
 // versionReservationBlock is how far past the current stamp each durable
 // reservation extends — one minute of nanosecond stamps. Reservations are
@@ -172,20 +179,30 @@ func (s *Storage) readRowForCASRetry(metaKey []byte) (vm *pb.ValueMessage, found
 // version (issue #254). It is a CAS-path operation that does not touch the plain
 // Get read path. The value reader and the version come from a SINGLE metadata
 // read, so the pair is one atomic snapshot (a second read via Get could pair one
-// generation's data with another's version). An absent, expired, or deleted
-// (tombstoned) key reports version 0 and found == false — recreate over it with
-// PutIfVersion(expected == 0). A live pre-versioning (plain-written) row reports
-// merge.VersionLegacy; mixing plain writes and CAS on one key is unsupported.
+// generation's data with another's version).
+//
+// An absent key reports found == false together with an OBSERVATION TOKEN
+// (issue #267), never 0: the stamp of the CAS delete that removed it while that
+// fence is retained, otherwise a fresh stamp meaning "absent as of now". Pass
+// the token back as expected to PutIfVersion to order the write against any
+// delete: a delete stamped after the observation rejects it. Pass 0 instead for
+// the unordered put-if-absent. A live pre-versioning (plain-written) row
+// reports merge.VersionLegacy; mixing plain writes and CAS on one key is
+// unsupported.
 func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 	vm, hasPrev, err := s.readRowForCAS(keys.MakeMetadataKey(key))
 	if err != nil {
 		return nil, 0, false, mapRocksDBError("GetWithVersion", key, err)
 	}
-	// Absent, or expired/tombstoned (both are logically gone) → absent.
-	if !hasPrev || (vm.Expiry > 0 && time.Now().Unix() >= vm.Expiry) {
-		return nil, 0, false, nil
+	state, cur := casClassify(vm, hasPrev)
+	if state != casLive {
+		token, err := s.absenceToken(state, cur)
+		if err != nil {
+			return nil, 0, false, storageErrors.NewInternalError("GetWithVersion", err)
+		}
+		return nil, token, false, nil
 	}
-	version := merge.EffectiveRowVersion(vm)
+	version := cur
 
 	// Refresh LRU recency exactly as Get does — a CAS read is still a read, and
 	// a key read only via GetWithVersion must not be treated as cold and evicted
@@ -229,36 +246,83 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 	return reader, version, true, nil
 }
 
-// currentVersionOf maps a read row to the version the CAS match rule reports:
-// 0 for absent or a tombstone, the effective version otherwise.
-func currentVersionOf(vm *pb.ValueMessage, found bool) uint64 {
-	if !found {
-		return 0
-	}
-	return merge.EffectiveRowVersion(vm)
-}
+// casRowState classifies a read row for the CAS entry points (issue #267).
+type casRowState int
 
-// casCurrentVersion is currentVersionOf plus a clock check: a TTL-expired but
-// unswept row is logically absent (Get reports not-found), so it reports 0 —
-// letting put-if-absent (expected == 0) recreate over it, matching what
-// GetWithVersion returns for the same row. The merge operator is clock-blind, so
-// PutIfVersion additionally translates the operand's precondition to the row's
-// real stored version when it recreates over such a row (see PutIfVersion).
-func casCurrentVersion(vm *pb.ValueMessage, found bool) uint64 {
+const (
+	casAbsent casRowState = iota // no row, or a TTL-expired one: absent with no history
+	casFenced                    // a stamped tombstone: absent, fenced by the delete's stamp
+	casLive
+)
+
+// casClassify maps a read row to its CAS state and the version that goes with
+// it: a live row's effective version, a tombstone's fence stamp, or 0 when
+// absent. A TTL-expired but unswept row is absent: expiry is unfenced
+// (recreating naturally expired data invalidates nothing), matching what the
+// plain read path reports. An unstamped tombstone (the no-base sentinel, or a
+// dangling-file purge) is plain absence too. The merge operator is clock-blind,
+// so the writers translate an expired row's precondition to its real stored
+// version before the merge (see PutIfVersion / DeleteIfVersion).
+func casClassify(vm *pb.ValueMessage, found bool) (casRowState, uint64) {
 	if !found {
-		return 0
+		return casAbsent, 0
+	}
+	if vm.Expiry == merge.TombstoneExpiry {
+		if vm.Version == 0 {
+			return casAbsent, 0
+		}
+		return casFenced, vm.Version
 	}
 	if vm.Expiry > 0 && time.Now().Unix() >= vm.Expiry {
-		return 0
+		return casAbsent, 0
 	}
-	return merge.EffectiveRowVersion(vm)
+	return casLive, merge.EffectiveRowVersion(vm)
 }
 
-// PutIfVersion writes the value only if the key's current version equals
-// expected (0 = put-if-absent). On success it returns the new version; on a
-// lost race it returns *storageErrors.VersionMismatchError carrying the
-// current version. Plain writes keep last-write-wins semantics and are
-// unaffected.
+// casAdmits is the storage-side copy of the merge operator's admission rule,
+// used to fast-fail before the merge (an optimization, not the correctness
+// mechanism): a live row needs an exact match; a fence admits expected == 0 or
+// an observation at or after the fence's stamp (merge.fenceAdmits); absence
+// admits anything, there being no history to order against.
+func casAdmits(state casRowState, cur, expected uint64) bool {
+	switch state {
+	case casLive:
+		return cur == expected
+	case casFenced:
+		return expected == 0 || expected >= cur
+	default:
+		return true
+	}
+}
+
+// absenceToken is the version an absent read hands out (issue #267): the fence
+// stamp while the key is dead-but-fenced, otherwise a freshly issued stamp —
+// the caller's "I observed absence now". Either token, passed back as
+// expected, orders a later put against every CAS delete: one stamped after the
+// observation rejects it. 0 is never handed out, so a caller that echoes what
+// it read always orders itself; the unordered put-if-absent is an explicit 0.
+func (s *Storage) absenceToken(state casRowState, fence uint64) (uint64, error) {
+	if state == casFenced {
+		return fence, nil
+	}
+	return s.nextVersion()
+}
+
+// currentVersionOf maps a read-back row to the version a mismatch reports: 0
+// for absent, the fence stamp for a tombstone, the effective version otherwise
+// — always something the caller can re-read against or retry with.
+func currentVersionOf(vm *pb.ValueMessage, found bool) uint64 {
+	_, v := casClassify(vm, found)
+	return v
+}
+
+// PutIfVersion writes the value only if the key admits expected: a live key
+// needs an exact version match; an absent key admits 0 (put-if-absent) or an
+// observation token from GetWithVersion, which a CAS delete stamped after that
+// observation rejects (issue #267). On success it returns the new version; on
+// a lost race it returns *storageErrors.VersionMismatchError carrying the
+// current version — for a fenced key, the fence stamp to refetch and retry
+// with. Plain writes keep last-write-wins semantics and are unaffected.
 func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uint64) (newVersion uint64, retErr error) {
 	storageType := "unknown"
 	start := time.Now()
@@ -279,12 +343,10 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 	if err != nil {
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
-	// casCurrentVersion reports 0 for an absent row, a tombstone, AND a
-	// TTL-expired-but-unswept row, so a single check covers put-if-absent
-	// (expected == 0, matching any logically-absent key) and a guarded update
-	// (expected == a live version).
-	if casCurrentVersion(prev, hasPrev) != expected {
-		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, casCurrentVersion(prev, hasPrev))
+	// One admission rule covers put-if-absent, a guarded update, and a put
+	// ordered against a fence: see casAdmits.
+	if state, cur := casClassify(prev, hasPrev); !casAdmits(state, cur, expected) {
+		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, cur)
 	}
 
 	// Read the body exactly as Put does: up to threshold+1 bytes decides
@@ -365,22 +427,24 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		}
 		return 0, mapRocksDBError("PutIfVersion", key, err)
 	}
-	if casCurrentVersion(prev, hasPrev) != expected {
+	state, cur := casClassify(prev, hasPrev)
+	if !casAdmits(state, cur, expected) {
 		if spilledPath != "" {
 			s.stageRawFileDeletion(spilledPath)
 		}
-		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, casCurrentVersion(prev, hasPrev))
+		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, cur)
 	}
 
-	// Recreating over a TTL-expired-but-unswept row: casCurrentVersion reported
-	// it as absent (0), but the merge operator is clock-blind and sees the row's
-	// real stored version. Match that version so the operand is not dropped.
-	// (Tombstones need no translation — the operator already reads Expiry == 1 as
-	// absent, so expected == 0 matches them directly.)
-	if expected == 0 && hasPrev {
-		if realVer := merge.EffectiveRowVersion(prev); realVer != 0 {
-			operand.CasExpectedVersion = realVer
-		}
+	// Recreating over a TTL-expired-but-unswept LIVE row: the read classified
+	// it absent, but the merge operator is clock-blind and sees a live row
+	// with its real stored version. Match that version so the operand is not
+	// dropped. A fence that lands between this read and the merge still wins:
+	// the translated version predates it. Tombstones — stamped or not — and
+	// missing rows need no translation, and must not get one: the operator's
+	// fence rule takes the caller's token as is, and rewriting it to 0 would
+	// opt the caller out of ordering against a fence that lands in between.
+	if state == casAbsent && hasPrev && prev.Expiry != merge.TombstoneExpiry {
+		operand.CasExpectedVersion = merge.EffectiveRowVersion(prev)
 	}
 
 	operandBytes, err := proto.Marshal(operand)
@@ -549,14 +613,23 @@ func (s *Storage) finishWonCASPut(key string, metaKey []byte, newVM *pb.ValueMes
 	s.notifyPut(newVM.ValueLength - prevSize)
 }
 
-// DeleteIfVersion deletes the key only if its current version equals expected.
-// The delete lands as a REF-LESS already-expired tombstone (the merge operator
-// drops the backing references so an in-flight compaction operand cannot
-// resurrect it). Because the tombstone carries no references, this method
-// reclaims the replaced value's backing bytes itself on a confirmed win — the
-// cleaner only removes the tiny leftover row on its next sweep. This frees the
-// (potentially 256 MB) backing file immediately rather than one cleanup
-// interval later.
+// DeleteIfVersion deletes the key only if it admits expected: a live key needs
+// an exact version match; an absent or dead key admits 0 (delete-if-absent) or
+// a token at or after its fence. The delete lands as a REF-LESS already-expired
+// tombstone stamped with this delete's version (the merge operator drops the
+// backing references so an in-flight compaction operand cannot resurrect it).
+// That stamp is the key's FENCE (issue #267): until the cleaner ages it out
+// (fence retention), GetWithVersion reports it as the absent key's token and a
+// put carrying an older observation is rejected. Delete-if-absent on a missing
+// or dead key therefore is NOT a no-op: it records the delete as a fence, or
+// moves an existing fence forward, so a populate that observed absence before
+// this delete loses to it.
+//
+// Because the tombstone carries no references, this method reclaims the
+// replaced value's backing bytes itself on a confirmed win and drops the key's
+// eviction-index entries; the cleaner only removes the tiny leftover row once
+// the fence has aged out. This frees the (potentially 256 MB) backing file
+// immediately rather than one cleanup interval later.
 func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 	start := time.Now()
 	defer func() {
@@ -576,26 +649,33 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		return mapRocksDBError("DeleteIfVersion", key, err)
 	}
 
-	// A logically-absent key — missing, tombstoned, or TTL-expired-but-unswept —
-	// reports version 0, consistent with GetWithVersion, and never runs the merge
-	// (a clock-blind CAS_DELETE against an expired row would loop). There is
-	// nothing live to delete:
-	//   - delete-if-absent (expected == 0) is already satisfied → success, no-op;
-	//   - any other expected mismatches against the current version 0.
-	// An unswept expired row's backing bytes are reclaimed by the TTL cleaner on
-	// its next sweep, so nothing leaks.
-	cur := casCurrentVersion(prev, hasPrev)
-	if cur == 0 {
-		if expected == 0 {
-			return nil
+	// Admission (see casAdmits), with one deliberate narrowing: on a plainly
+	// absent key (missing, or TTL-expired-but-unswept) only delete-if-absent
+	// (expected == 0) proceeds — there is no history a token could match — and
+	// it proceeds to the merge rather than returning early, because recording
+	// the delete IS its job (the fence, issue #267). On a fenced key, 0 or a
+	// token at or after the fence moves the fence forward; on a live key the
+	// version must match exactly.
+	state, cur := casClassify(prev, hasPrev)
+	switch state {
+	case casLive:
+		if cur != expected {
+			return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, cur)
 		}
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
+	case casFenced:
+		if !casAdmits(state, cur, expected) {
+			return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, cur)
+		}
+	default:
+		if expected != 0 {
+			return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, 0)
+		}
 	}
-	// Live row: match its version (cur == the physical version, since it is not
-	// expired). The merge below tombstones it on a match.
-	if cur != expected {
-		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, cur)
-	}
+
+	// Capture the eviction-index entry that belongs to the value being
+	// deleted, BEFORE the merge: it is the only entry this delete may remove
+	// (see the win path below).
+	deadEntry := s.evictionEntryFor(key)
 
 	newStamp, err := s.nextVersion()
 	if err != nil {
@@ -606,10 +686,25 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		OpType:             pb.MetaOp_META_OP_CAS_DELETE,
 		CasExpectedVersion: expected,
 	}
+	// Delete-if-absent over a TTL-expired-but-unswept LIVE row: the clock-blind
+	// operator sees a row with its real stored version, so match that version
+	// to tombstone it — and since the result is ref-less, this delete then owns
+	// the reclaim of the expired row's bytes. An unstamped tombstone needs no
+	// translation: expected is already 0 here, and the fence rule admits it.
+	if state == casAbsent && hasPrev && prev.Expiry != merge.TombstoneExpiry {
+		operand.CasExpectedVersion = merge.EffectiveRowVersion(prev)
+	}
 	operandBytes, err := proto.Marshal(operand)
 	if err != nil {
 		return storageErrors.NewInternalError("DeleteIfVersion", err)
 	}
+
+	// Every eviction-index entry of the value being deleted — the captured
+	// one, and any the asynchronous LRU refresh flushes for a read that
+	// preceded the delete — carries a write time before this instant; a
+	// recreate's entry, written after the merge commits, carries one after it.
+	// The win path uses this cutoff to tell the two apart.
+	cutoff := time.Now()
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -672,8 +767,103 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 			s.reclaimReplacedValue(prev)
 			s.notifyDelete(prev.ValueLength)
 		}
+		// The key is dead and its tombstone is retained as a fence for hours
+		// (issue #267), so the dead value's eviction-index generation would
+		// otherwise sit at the head of the eviction order, skipped with a point
+		// read on every pass. Drop that generation, and nothing that could
+		// belong to a recreate.
+		s.dropDeadEvictionGeneration(key, cutoff, deadEntry)
 		return nil
 	default:
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
 	}
+}
+
+// evictionEntryFor returns a copy of the ordered eviction-index entry key that
+// key's back-reference currently points at, or nil when there is none (no
+// disk cap, or an unindexed key). Policy-aware, like stageEvictionIndexDeletes.
+func (s *Storage) evictionEntryFor(key string) []byte {
+	var backref []byte
+	if s.evictionPolicy == EvictionPolicyFIFO {
+		backref = keys.MakeFifoBackrefKey(key)
+	} else {
+		backref = keys.MakeBucketedAccessIndexKey(key)
+	}
+	slice, err := s.meta.Handle().Get(putPointReadOpts, backref)
+	if err != nil {
+		return nil
+	}
+	defer slice.Free()
+	if !slice.Exists() {
+		return nil
+	}
+	return append([]byte(nil), slice.Data()...)
+}
+
+// dropDeadEvictionGeneration removes the eviction-index generation of a value
+// a confirmed CAS delete replaced, deciding by the ENTRY'S WRITE TIME, which
+// every index entry key embeds. Entries of the dead value — the one captured
+// before the merge, and any the asynchronous LRU refresh flushed for a read
+// that preceded the delete — were written before cutoff (the instant before
+// the merge); a recreate's entry, written after the merge committed, was
+// written after it. So the entry the back-reference currently points at is
+// dropped, together with the back-reference, only if it is older than cutoff;
+// a recreate's generation is never touched, and no atomicity between reading
+// the row and writing the deletes is needed. The captured entry is deleted
+// regardless: no other value can share its key.
+//
+// Two residuals, both chosen over the alternative. A back-reference rewritten
+// by a recreate between the read here and the batch write: the recreate keeps
+// its entry (eviction treats an entry with no back-reference as
+// authoritative, so the key stays evictable) and the next reconcile's coverage
+// backfill restores a back-reference. And a read that fetched the live row
+// before the merge but reached its access refresh after cutoff: its refreshed
+// entry looks newer than cutoff and is left for the sweep to drop with the
+// tombstone, costing eviction one skipped point read per pass until then.
+// Taking cutoff after the merge, or re-checking the row, would trade that
+// efficiency residual for a coverage one — a recreate's generation deleted
+// until the hourly backfill — which is the wrong side for the disk cap.
+// Coverage is never lost. A backward wall-clock step could make a recreate's
+// entry look older than cutoff; that is the same clock residual fence
+// retention has, and it self-heals the same way.
+func (s *Storage) dropDeadEvictionGeneration(key string, cutoff time.Time, deadEntry []byte) {
+	var backref []byte
+	if s.evictionPolicy == EvictionPolicyFIFO {
+		backref = keys.MakeFifoBackrefKey(key)
+	} else {
+		backref = keys.MakeBucketedAccessIndexKey(key)
+	}
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	if deadEntry != nil {
+		batch.Delete(deadEntry)
+	}
+	if cur, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
+		if cur.Exists() {
+			if written, ok := evictionEntryTime(cur.Data()); ok && written.Before(cutoff) {
+				batch.Delete(cur.Data())
+				batch.Delete(backref)
+			}
+		}
+		cur.Free()
+	}
+	if batch.Count() == 0 {
+		return
+	}
+	if err := s.meta.Handle().Write(wo, batch); err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteIfVersion: dropping the dead value's eviction generation failed; eviction skips it until the fence is swept")
+	}
+}
+
+// evictionEntryTime returns the write time embedded in an ordered
+// eviction-index entry key of either policy.
+func evictionEntryTime(entry []byte) (time.Time, bool) {
+	if keys.IsBucketedAccessKey(entry) {
+		_, at, err := keys.ParseBucketedAccessKey(entry)
+		return at, err == nil
+	}
+	at, err := keys.ParseFifoIndexTime(entry)
+	return at, err == nil
 }

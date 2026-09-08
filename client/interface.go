@@ -29,9 +29,13 @@ type CacheClient interface {
 
 	// Conditional (compare-and-swap) operations (issue #254). A write applies
 	// only if the key's current version equals the caller's expectation; a lost
-	// race returns a *VersionMismatchError carrying the current version. Note:
-	// adding these methods extends CacheClient — external implementers must add
-	// them too.
+	// race returns a *VersionMismatchError carrying the current version. An
+	// absent key reads with an observation token rather than 0 (issue #267):
+	// passing it back as expected orders the write against any CAS delete
+	// stamped after the observation, while expected == 0 remains the unordered
+	// put-if-absent. A CAS delete of a missing or dead key records that fence.
+	// Note: adding these methods extends CacheClient — external implementers
+	// must add them too.
 	GetWithVersion(ctx context.Context, key string) (data []byte, version uint64, found bool, err error)
 	PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (newVersion uint64, err error)
 	DeleteIfVersion(ctx context.Context, key string, expected uint64) error

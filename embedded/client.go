@@ -346,8 +346,9 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 }
 
 // GetWithVersion returns a key's value together with its current CAS version
-// (issue #254). found is false (version 0) for an absent, expired, or deleted
-// key.
+// (issue #254). found is false for an absent, expired, or deleted key; version
+// is then an observation token (issue #267) to pass back as expected so the
+// write is ordered against any later CAS delete, or 0 to skip ordering.
 func (c *Client) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
 	return c.ops.GetWithVersion(ctx, key)
 }

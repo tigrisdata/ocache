@@ -222,6 +222,7 @@ func TestMergeMetadataCAS_PurgeMatches_Tombstones(t *testing.T) {
 	assert.Equal(t, int64(1), got.Expiry, "purge must tombstone via the always-expired sentinel")
 	assert.Empty(t, got.RawFilePath)
 	assert.Zero(t, got.ValueLength)
+	assert.Zero(t, got.Version, "a purge is data loss, not a delete: it must not leave a fence (#267)")
 }
 
 func TestMergeMetadataCAS_PurgeMismatch_KeepsBase(t *testing.T) {

@@ -89,12 +89,14 @@ func TestMergeCAS_PutIfAbsentAndAbsentMismatch(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, uint64(100), mustUnmarshal(t, out).Version)
 
-	// expected != 0 with no base → lost CAS on an absent row; the established
-	// no-base convention applies (expired sentinel, never corruption/resurrection).
-	out, ok = op.FullMerge(casMetaKey, nil, [][]byte{casPutOperand(t, 100, 200, "stale")})
+	// expected != 0 with no base → applies (issue #267): with no row there is
+	// no history to order against, so an absent read's fresh token — or a token
+	// whose fence has aged past the horizon — recreates the key.
+	out, ok = op.FullMerge(casMetaKey, nil, [][]byte{casPutOperand(t, 100, 200, "token")})
 	require.True(t, ok)
 	got = mustUnmarshal(t, out)
-	assert.Equal(t, int64(1), got.Expiry, "no-base lost CAS must resolve to the expired sentinel")
+	assert.Equal(t, []byte("token"), got.Data, "a put carrying a token over no row applies")
+	assert.Equal(t, uint64(200), got.Version)
 }
 
 func TestMergeCAS_LegacyBaseMatchesVersionLegacy(t *testing.T) {
@@ -137,7 +139,7 @@ func TestMergeCAS_DeleteEmitsRefLessTombstone(t *testing.T) {
 	assert.Zero(t, got.ValueLength)
 	assert.Equal(t, pb.ValueType_INLINE, got.ValueType)
 	assert.Equal(t, uint64(200), got.Version, "raw stamp retained for the deleter's read-back")
-	assert.Zero(t, EffectiveRowVersion(got), "a tombstone reads as absent")
+	assert.Equal(t, uint64(200), EffectiveRowVersion(got), "a tombstone reports its delete stamp: the key's fence token (#267)")
 
 	// Mismatch leaves the base untouched.
 	out, ok = op.FullMerge(casMetaKey, base, [][]byte{casDeleteOperand(t, 999, 200)})
@@ -145,24 +147,89 @@ func TestMergeCAS_DeleteEmitsRefLessTombstone(t *testing.T) {
 	assert.Zero(t, mustUnmarshal(t, out).Expiry)
 }
 
-// TestMergeCAS_RecreateOverTombstoneViaPutIfAbsent: a tombstone reads as absent,
-// so only put-if-absent (expected == 0) recreates over it — a pre-delete token
-// (the tombstone's own stamp) must NOT match.
-func TestMergeCAS_RecreateOverTombstoneViaPutIfAbsent(t *testing.T) {
+// TestMergeCAS_RecreateOverTombstone pins the fence rule (issue #267): a
+// tombstone's stamp is the time of the delete, and a put applies over it only
+// if its observation token is at or after that stamp, or if it is
+// put-if-absent (expected == 0). A token from before the delete — the live
+// row's old version, or an absent read taken before the delete — must lose.
+func TestMergeCAS_RecreateOverTombstone(t *testing.T) {
 	op := NewMultiplexOperator()
 	tombstone := mustMarshal(t, &pb.ValueMessage{Expiry: 1, Version: 100})
 
-	// A stale token (the tombstone's stamp, or any prior generation) does NOT match.
-	out, ok := op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 100, 300, "stale")})
+	// A pre-delete token does NOT recreate: the populate carrying it fetched
+	// before the invalidation.
+	out, ok := op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 50, 300, "stale")})
 	require.True(t, ok)
-	assert.Equal(t, int64(1), mustUnmarshal(t, out).Expiry, "stale token must not recreate over a tombstone")
+	assert.Equal(t, int64(1), mustUnmarshal(t, out).Expiry, "a token older than the fence must not recreate")
 
-	// put-if-absent recreates.
+	// The fence token itself (what GetWithVersion hands out for the dead key)
+	// recreates: the caller observed the deletion.
+	out, ok = op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 100, 300, "observed")})
+	require.True(t, ok)
+	assert.Equal(t, []byte("observed"), mustUnmarshal(t, out).Data)
+
+	// A later observation token recreates too.
+	out, ok = op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 150, 300, "later")})
+	require.True(t, ok)
+	assert.Equal(t, []byte("later"), mustUnmarshal(t, out).Data)
+
+	// put-if-absent (0) still recreates: it declined to order itself.
 	out, ok = op.FullMerge(casMetaKey, tombstone, [][]byte{casPutOperand(t, 0, 200, "recreated")})
 	require.True(t, ok)
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, []byte("recreated"), got.Data)
 	assert.Equal(t, uint64(200), got.Version)
+}
+
+// TestMergeCAS_FenceOnAbsentKey: delete-if-absent (expected == 0) on a missing
+// key records the delete as a stamped tombstone — the fence for a key that is
+// not here yet — while a guarded delete (expected != 0) on a missing key still
+// yields the unstamped sentinel, so its read-back can never mistake it for a win.
+func TestMergeCAS_FenceOnAbsentKey(t *testing.T) {
+	op := NewMultiplexOperator()
+
+	out, ok := op.FullMerge(casMetaKey, nil, [][]byte{casDeleteOperand(t, 0, 200)})
+	require.True(t, ok)
+	fence := mustUnmarshal(t, out)
+	assert.Equal(t, int64(1), fence.Expiry)
+	assert.Equal(t, uint64(200), fence.Version, "delete-if-absent on a missing key writes a stamped fence")
+	assert.True(t, IsTombstone(fence))
+
+	// A populate that observed absence BEFORE the delete (token 150) loses;
+	// one that observed it after (token 250) wins.
+	out2, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 150, 300, "stale")})
+	require.True(t, ok)
+	assert.Equal(t, int64(1), mustUnmarshal(t, out2).Expiry, "pre-delete observation must lose to the fence")
+	out3, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 250, 300, "fresh")})
+	require.True(t, ok)
+	assert.Equal(t, []byte("fresh"), mustUnmarshal(t, out3).Data)
+}
+
+// TestMergeCAS_FenceBump: deleting a dead key again moves the fence forward,
+// so a second invalidation orders after anything that observed the first.
+func TestMergeCAS_FenceBump(t *testing.T) {
+	op := NewMultiplexOperator()
+	fence := mustMarshal(t, &pb.ValueMessage{Expiry: 1, Version: 100})
+
+	out, ok := op.FullMerge(casMetaKey, fence, [][]byte{casDeleteOperand(t, 0, 200)})
+	require.True(t, ok)
+	assert.Equal(t, uint64(200), mustUnmarshal(t, out).Version, "delete-if-absent bumps the fence")
+
+	out, ok = op.FullMerge(casMetaKey, fence, [][]byte{casDeleteOperand(t, 100, 300)})
+	require.True(t, ok)
+	assert.Equal(t, uint64(300), mustUnmarshal(t, out).Version, "deleting with the fence token bumps it")
+
+	out, ok = op.FullMerge(casMetaKey, fence, [][]byte{casDeleteOperand(t, 50, 400)})
+	require.True(t, ok)
+	assert.Equal(t, uint64(100), mustUnmarshal(t, out).Version, "a pre-fence token cannot move the fence")
+
+	// The TAG double invalidation: v1 pre-forward, v2 post-confirm; a refill
+	// that read the fence between them (token 200) loses to v2.
+	out, ok = op.FullMerge(casMetaKey, nil, [][]byte{casDeleteOperand(t, 0, 200), casDeleteOperand(t, 0, 400), casPutOperand(t, 200, 500, "refill")})
+	require.True(t, ok)
+	got := mustUnmarshal(t, out)
+	assert.Equal(t, int64(1), got.Expiry, "a refill that observed only the first invalidation must lose to the second")
+	assert.Equal(t, uint64(400), got.Version)
 }
 
 // TestMergeCAS_Determinism asserts read-time and compaction-time resolution
@@ -229,7 +296,7 @@ func TestMergeCAS_TombstoneNotResurrectedByMigration(t *testing.T) {
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, int64(1), got.Expiry, "tombstone must survive the migration operand")
 	assert.NotEqual(t, pb.ValueType_SEGMENT, got.ValueType, "deleted key must not be resurrected as a live segment row")
-	assert.Zero(t, EffectiveRowVersion(got), "row stays absent")
+	assert.True(t, IsTombstone(got), "row stays a ref-less tombstone (absent, fenced by its stamp)")
 }
 
 // TestMergeCAS_CompactionMigrationPreservesVersion pins the invariant that
@@ -279,8 +346,8 @@ func TestMergeCAS_DeleteOnAbsentRowEmitsUnstampedSentinel(t *testing.T) {
 	require.True(t, ok)
 	got := mustUnmarshal(t, out)
 	assert.Equal(t, int64(1), got.Expiry)
-	assert.Zero(t, got.Version, "no-base delete tombstone carries no stamp, so read-back cannot mistake it for a win")
-	assert.Zero(t, EffectiveRowVersion(got), "and it reads as absent")
+	assert.Zero(t, got.Version, "no-base guarded delete carries no stamp, so read-back cannot mistake it for a win")
+	assert.Zero(t, EffectiveRowVersion(got), "and it reads as plain absence, not a fence")
 
 	// put-if-absent recreates over it; the stale stamp would not.
 	out2, ok := op.FullMerge(casMetaKey, out, [][]byte{casPutOperand(t, 0, 300, "recreated")})

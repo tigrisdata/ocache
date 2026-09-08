@@ -39,11 +39,11 @@ func TestCAS_GetWithVersion_AbsentPutLegacy(t *testing.T) {
 	s, cleanup := createCASTestStorage(t)
 	defer cleanup()
 
-	// Absent → version 0.
+	// Absent → found=false with an observation token (#267), never 0.
 	_, ver, found, err := s.GetWithVersion("missing")
 	require.NoError(t, err)
 	assert.False(t, found)
-	assert.Zero(t, ver)
+	assert.NotZero(t, ver, "an absent read hands out an observation token")
 
 	// Plain Put does NOT stamp a version — versioning lives only in CAS ops.
 	// A plain-written row therefore reads as the legacy sentinel (mixing plain
@@ -145,12 +145,14 @@ func TestCAS_DeleteIfVersion_TokenModelAndRecreate(t *testing.T) {
 	_, tombVer, found, err := s.GetWithVersion("k")
 	require.NoError(t, err)
 	assert.False(t, found)
-	assert.Zero(t, tombVer, "a deleted key reads as absent (version 0), not a recreate token")
+	assert.Greater(t, tombVer, v1, "a deleted key reads as absent with the delete's stamp as its fence token (#267)")
 
-	// A stale token must NOT recreate over the tombstone...
+	// A pre-delete token must NOT recreate over the tombstone; the mismatch
+	// carries the fence so the caller can refetch and retry against it.
 	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("wrong")), 0, v1)
-	_, ok = storageErrors.IsVersionMismatch(err)
+	vmErr, ok := storageErrors.IsVersionMismatch(err)
 	require.True(t, ok)
+	assert.Equal(t, tombVer, vmErr.CurrentVersion)
 
 	// ...put-if-absent does.
 	v3, err := s.PutIfVersion("k", bytes.NewReader([]byte("reborn")), 0, 0)
@@ -163,9 +165,9 @@ func TestCAS_DeleteIfVersion_TokenModelAndRecreate(t *testing.T) {
 	assert.Equal(t, v3, ver)
 	assert.Equal(t, "reborn", readAllString(t, r))
 
-	// Deleting an absent key mismatches with current 0.
+	// A guarded delete of a never-written key mismatches with current 0.
 	err = s.DeleteIfVersion("never-existed", 42)
-	vmErr, ok := storageErrors.IsVersionMismatch(err)
+	vmErr, ok = storageErrors.IsVersionMismatch(err)
 	require.True(t, ok)
 	assert.Zero(t, vmErr.CurrentVersion)
 }
@@ -294,7 +296,7 @@ func TestCAS_TombstoneReadsAsAbsentAndRecreatesViaPutIfAbsent(t *testing.T) {
 	_, ver, found, err := s.GetWithVersion("exp")
 	require.NoError(t, err)
 	assert.False(t, found, "a tombstone reads as absent")
-	assert.Zero(t, ver, "and exposes no recreate token")
+	assert.Equal(t, uint64(12345), ver, "and reports the delete's stamp as its fence token (#267)")
 
 	// put-if-absent recreates over it.
 	v2, err := s.PutIfVersion("exp", bytes.NewReader([]byte("fresh")), 0, 0)
@@ -349,11 +351,11 @@ func TestCAS_RecreateOverTTLExpiredRow(t *testing.T) {
 	defer wo.Destroy()
 	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("exp"), expired))
 
-	// Reads as absent, version 0 — the documented contract.
+	// Reads as absent with a fresh observation token: expiry is unfenced.
 	_, ver, found, err := s.GetWithVersion("exp")
 	require.NoError(t, err)
 	assert.False(t, found)
-	assert.Zero(t, ver)
+	assert.NotZero(t, ver)
 
 	// put-if-absent recreates over it (the fix: previously mismatched forever
 	// until the cleaner swept).

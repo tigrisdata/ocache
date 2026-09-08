@@ -96,8 +96,12 @@ message DeleteResponse {
 }
 
 // GetWithVersionResponse carries the value together with its current CAS
-// version (issue #254). found=false with version 0 means the key is absent,
-// expired, or deleted — recreate it with PutObjectIfVersion(expected_version=0).
+// version (issue #254). found=false means the key is absent, expired, or
+// deleted; version is then an OBSERVATION TOKEN (issue #267), never 0: the
+// stamp of the CAS delete that removed the key while that fence is retained,
+// otherwise a fresh stamp meaning "absent as of now". Pass it back as
+// expected_version to PutObjectIfVersion to order the write against any
+// delete stamped after the observation; pass 0 for the unordered put-if-absent.
 message GetWithVersionResponse {
   bytes data = 1;
   uint64 version = 2;
@@ -108,7 +112,7 @@ message PutIfVersionRequest {
   string key = 1;
   int64 ttl_seconds = 2;
   bytes data = 3;
-  uint64 expected_version = 4; // 0 = put-if-absent
+  uint64 expected_version = 4; // a live version, an absent read's token, or 0 = unordered put-if-absent
 }
 
 message PutIfVersionResponse {

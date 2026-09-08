@@ -261,6 +261,20 @@ func MakeFifoBackrefKey(key string) []byte {
 	return fmt.Appendf(nil, "%s%s", FifoBackrefPrefix, key)
 }
 
+// ParseFifoIndexTime extracts the write time embedded in a FIFO index key.
+// Format: !fifo/<19-digit nano>/<key>
+func ParseFifoIndexTime(fifoKey []byte) (time.Time, error) {
+	s := string(fifoKey)
+	if len(s) < len(FifoIndexPrefix)+20 || s[:len(FifoIndexPrefix)] != FifoIndexPrefix || s[len(FifoIndexPrefix)+19] != '/' {
+		return time.Time{}, fmt.Errorf("invalid fifo index key: bad prefix or timestamp")
+	}
+	var nanos int64
+	if n, err := fmt.Sscanf(s[len(FifoIndexPrefix):len(FifoIndexPrefix)+19], "%d", &nanos); err != nil || n != 1 {
+		return time.Time{}, fmt.Errorf("invalid fifo index key: bad timestamp")
+	}
+	return time.Unix(0, nanos), nil
+}
+
 // ParseFifoIndexKey extracts the original user key from a FIFO index key.
 // Format: !fifo/<19-digit nano>/<key>
 func ParseFifoIndexKey(fifoKey []byte) (string, error) {

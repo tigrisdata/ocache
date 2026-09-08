@@ -122,10 +122,11 @@ func (s *CASSuite) Test_CAS_RecreateAfterTTLExpiry() {
 		return err != nil
 	}, 5*time.Second, 100*time.Millisecond, "key should be swept after TTL")
 
-	// GetWithVersion reports it absent (version 0) — no recreate token handout.
+	// GetWithVersion reports it absent with a fresh observation token (#267):
+	// expiry is unfenced, so the token is not a fence and put-if-absent recreates.
 	_, ver, found := casRead(t, stor, key)
 	require.False(t, found)
-	require.Zero(t, ver)
+	require.NotZero(t, ver)
 
 	// Put-if-absent recreates over the swept key.
 	v2, err := stor.PutIfVersion(key, bytes.NewReader([]byte("second")), 0, 0)
