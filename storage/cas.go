@@ -812,13 +812,20 @@ func (s *Storage) evictionEntryFor(key string) []byte {
 // the row and writing the deletes is needed. The captured entry is deleted
 // regardless: no other value can share its key.
 //
-// The one residual is a back-reference rewritten by a recreate between the
-// read here and the batch write: the recreate keeps its entry (eviction treats
-// an entry with no back-reference as authoritative, so the key stays
-// evictable) and the next reconcile's coverage backfill restores a
-// back-reference. Coverage is never lost. A backward wall-clock step could
-// make a recreate's entry look older than cutoff; that is the same clock
-// residual fence retention has, and it self-heals the same way.
+// Two residuals, both chosen over the alternative. A back-reference rewritten
+// by a recreate between the read here and the batch write: the recreate keeps
+// its entry (eviction treats an entry with no back-reference as
+// authoritative, so the key stays evictable) and the next reconcile's coverage
+// backfill restores a back-reference. And a read that fetched the live row
+// before the merge but reached its access refresh after cutoff: its refreshed
+// entry looks newer than cutoff and is left for the sweep to drop with the
+// tombstone, costing eviction one skipped point read per pass until then.
+// Taking cutoff after the merge, or re-checking the row, would trade that
+// efficiency residual for a coverage one — a recreate's generation deleted
+// until the hourly backfill — which is the wrong side for the disk cap.
+// Coverage is never lost. A backward wall-clock step could make a recreate's
+// entry look older than cutoff; that is the same clock residual fence
+// retention has, and it self-heals the same way.
 func (s *Storage) dropDeadEvictionGeneration(key string, cutoff time.Time, deadEntry []byte) {
 	var backref []byte
 	if s.evictionPolicy == EvictionPolicyFIFO {
