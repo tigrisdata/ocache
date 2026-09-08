@@ -88,6 +88,34 @@ type clientState struct {
 	mu              sync.RWMutex
 }
 
+// dialFuture represents one in-flight connection attempt for a node. The
+// result is published before done is closed, so all waiters observe the same
+// client or typed error without holding Router.mu during the dial.
+type dialFuture struct {
+	done       chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	address    string
+	generation uint64
+
+	client pb.CacheServiceClient
+	err    error
+	once   sync.Once
+}
+
+func (d *dialFuture) complete(client pb.CacheServiceClient, err error) {
+	d.once.Do(func() {
+		d.client = client
+		d.err = err
+		close(d.done)
+	})
+}
+
+func (d *dialFuture) wait() (pb.CacheServiceClient, error) {
+	<-d.done
+	return d.client, d.err
+}
+
 // ConnectionStats represents statistics for a single connection
 type ConnectionStats struct {
 	State           string
@@ -99,11 +127,13 @@ type ConnectionStats struct {
 
 // Router is a router for routing requests to the appropriate node
 type Router struct {
-	ring    Ring
-	clients map[string]*clientState
-	localID string
-	config  *RouterConfig
-	mu      sync.RWMutex
+	ring        Ring
+	clients     map[string]*clientState
+	dialFutures map[string]*dialFuture
+	generations map[string]uint64
+	localID     string
+	config      *RouterConfig
+	mu          sync.RWMutex
 }
 
 // NewRouter creates a new router with the default configuration
@@ -117,10 +147,12 @@ func NewRouterWithConfig(ring Ring, localID string, config *RouterConfig) *Route
 		config = DefaultRouterConfig()
 	}
 	return &Router{
-		ring:    ring,
-		clients: make(map[string]*clientState),
-		localID: localID,
-		config:  config,
+		ring:        ring,
+		clients:     make(map[string]*clientState),
+		dialFutures: make(map[string]*dialFuture),
+		generations: make(map[string]uint64),
+		localID:     localID,
+		config:      config,
 	}
 }
 
@@ -196,108 +228,177 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 	return nil, NewMaxRetriesExceededError(node.ID, key, maxRetries+1, lastErr)
 }
 
-// getClient returns a client for the given node, creating one if necessary
+// getClient returns a client for the given node, creating one if necessary.
+// Connection establishment is coordinated per node so a slow dial cannot hold
+// up healthy cached clients for other nodes.
 func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
-	// Fast path: check if client exists and is healthy
+	// Fast path: keep the map read lock while checking the state. Connection
+	// fields are published under the same lock by runDial, so this avoids a
+	// race with reconnect, removal, or refresh without extending the critical
+	// section into any network operation.
 	r.mu.RLock()
 	state, exists := r.clients[nodeID]
+	if exists && state != nil {
+		if err := r.getConnectionHealth(state, nodeID); err == nil {
+			client := state.client
+			r.mu.RUnlock()
+			return client, nil
+		} else if errors.Is(err, ErrCircuitBreakerOpen) {
+			r.mu.RUnlock()
+			metrics.ClusterRoutingErrors.WithLabelValues("circuit_breaker_open").Inc()
+			return nil, err
+		}
+	}
 	r.mu.RUnlock()
 
 	zlog.Debug().
 		Str("node_id", nodeID).
 		Msg("Checking if client exists and is healthy")
 
-	if exists && state != nil {
-		if err := r.getConnectionHealth(state, nodeID); err == nil {
-			return state.client, nil
-		} else if errors.Is(err, ErrCircuitBreakerOpen) {
-			metrics.ClusterRoutingErrors.WithLabelValues("circuit_breaker_open").Inc()
-			return nil, err
-		}
-	}
+	return r.startOrJoinDial(nodeID)
+}
 
-	// Slow path: create new client or reconnect
+// startOrJoinDial rechecks the client state under Router.mu, then either joins
+// the current node-specific dial or installs a new future. The actual dial is
+// always performed after the map lock is released.
+func (r *Router) startOrJoinDial(nodeID string) (pb.CacheServiceClient, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	zlog.Debug().
 		Str("node_id", nodeID).
 		Msg("Creating new client or reconnecting")
 
-	// Double-check after acquiring write lock
-	state, exists = r.clients[nodeID]
+	state, exists := r.clients[nodeID]
 	if exists && state != nil {
 		if err := r.getConnectionHealth(state, nodeID); err == nil {
-			return state.client, nil
+			client := state.client
+			r.mu.Unlock()
+			return client, nil
 		} else if errors.Is(err, ErrCircuitBreakerOpen) {
+			r.mu.Unlock()
 			return nil, err
 		}
 	}
 
-	// Get node listen address from ring
-	nodes := r.ring.GetAllNodes()
-	var nodeAddr string
-	for _, node := range nodes {
-		if node.ID == nodeID {
-			// Use listen address for client connections
-			nodeAddr = node.ListenAddress
-			break
-		}
+	if future := r.dialFutures[nodeID]; future != nil {
+		r.mu.Unlock()
+		return future.wait()
 	}
 
+	nodeAddr := r.nodeAddressLocked(nodeID)
 	if nodeAddr == "" {
 		logsample.DegradedRing().
 			Str("node_id", nodeID).
 			Msg("Node not found in ring")
 
 		metrics.ClusterRoutingErrors.WithLabelValues("node_not_found").Inc()
+		r.mu.Unlock()
 		return nil, NewNodeNotFoundError(nodeID, "")
 	}
 
-	// Create or update client state
 	if state == nil {
 		state = &clientState{}
 		r.clients[nodeID] = state
 	}
 
-	// Close existing connection if any
-	if state.conn != nil {
-		state.conn.Close()
+	// Detach the old connection before handing the state to the new dial. It
+	// is closed after releasing Router.mu, and a concurrent healthy lookup can
+	// no longer return it while the reconnect is in progress.
+	oldConn := state.conn
+	state.conn = nil
+	state.client = nil
+
+	generation := r.generations[nodeID] + 1
+	r.generations[nodeID] = generation
+	dialCtx, cancel := context.WithCancel(context.Background())
+	future := &dialFuture{
+		done:       make(chan struct{}),
+		ctx:        dialCtx,
+		cancel:     cancel,
+		address:    nodeAddr,
+		generation: generation,
+	}
+	r.dialFutures[nodeID] = future
+	r.mu.Unlock()
+
+	if oldConn != nil {
+		_ = oldConn.Close()
 	}
 
-	// Create new connection with keepalive
-	conn, err := r.createConnection(nodeAddr)
+	go r.runDial(nodeID, state, future)
+	return future.wait()
+}
+
+func (r *Router) nodeAddressLocked(nodeID string) string {
+	for _, node := range r.ring.GetAllNodes() {
+		if node.ID == nodeID {
+			// Use listen address for client connections.
+			return node.ListenAddress
+		}
+	}
+	return ""
+}
+
+func (r *Router) isCurrentDialLocked(nodeID string, state *clientState, future *dialFuture) bool {
+	return r.clients[nodeID] == state &&
+		r.dialFutures[nodeID] == future &&
+		r.generations[nodeID] == future.generation
+}
+
+func (r *Router) runDial(nodeID string, state *clientState, future *dialFuture) {
+	defer future.cancel()
+
+	conn, err := r.createConnection(future.ctx, future.address)
 	if err != nil {
+		r.mu.Lock()
+		if !r.isCurrentDialLocked(nodeID, state, future) {
+			r.mu.Unlock()
+			future.complete(nil, NewConnectionFailedError(nodeID, future.address, err))
+			return
+		}
+
+		delete(r.dialFutures, nodeID)
 		r.recordFailureAndOpenCircuit(state, nodeID)
+		routeErr := NewConnectionFailedError(nodeID, future.address, err)
+		future.complete(nil, routeErr)
+		r.mu.Unlock()
 
 		logsample.DegradedRing().
 			Str("node_id", nodeID).
-			Str("address", nodeAddr).
+			Str("address", future.address).
 			Msg("Failed to create connection to node")
 
 		metrics.ClusterConnectionFailures.WithLabelValues(nodeID, "connection_failed").Inc()
 		metrics.ClusterRoutingErrors.WithLabelValues("connection_failed").Inc()
-		return nil, NewConnectionFailedError(nodeID, nodeAddr, err)
+		return
 	}
 
 	client := pb.NewCacheServiceClient(conn)
+	r.mu.Lock()
+	if !r.isCurrentDialLocked(nodeID, state, future) {
+		r.mu.Unlock()
+		_ = conn.Close()
+		future.complete(nil, NewConnectionFailedError(nodeID, future.address, context.Canceled))
+		return
+	}
+
+	delete(r.dialFutures, nodeID)
 	state.client = client
 	state.conn = conn
-
 	atomic.StoreInt32(&state.failureCount, 0) // Reset failure count on successful connection
 	metrics.ClusterConnectionsActive.WithLabelValues(nodeID).Set(1)
+	future.complete(client, nil)
+	r.mu.Unlock()
 
 	zlog.Debug().
 		Str("node_id", nodeID).
-		Str("address", nodeAddr).
+		Str("address", future.address).
 		Msg("Created connection to node")
-
-	return client, nil
 }
 
 // createConnection creates a new gRPC connection with configured parameters
-func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), r.config.ConnectionTimeout)
+func (r *Router) createConnection(parent context.Context, address string) (*grpc.ClientConn, error) {
+	ctx, cancel := context.WithTimeout(parent, r.config.ConnectionTimeout)
 	defer cancel()
 
 	zlog.Debug().
@@ -447,41 +548,77 @@ func (r *Router) GetClientForNode(nodeID string) (pb.CacheServiceClient, error) 
 	return r.getClient(nodeID)
 }
 
-// RemoveClient removes and closes the client connection for a node
+// RemoveClient removes and closes the client connection for a node. Any
+// in-flight dial is invalidated before the map entry is removed, so a stale
+// result cannot repopulate the router after removal.
 func (r *Router) RemoveClient(nodeID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	var conn *grpc.ClientConn
+	var future *dialFuture
+	removed := false
 
+	r.mu.Lock()
+	r.generations[nodeID]++
+	if current, exists := r.dialFutures[nodeID]; exists {
+		delete(r.dialFutures, nodeID)
+		future = current
+		current.complete(nil, NewConnectionFailedError(nodeID, current.address, context.Canceled))
+	}
 	if state, exists := r.clients[nodeID]; exists {
-		if state.conn != nil {
-			state.conn.Close()
+		if state != nil {
+			conn = state.conn
 		}
 		delete(r.clients, nodeID)
 		metrics.ClusterConnectionsActive.WithLabelValues(nodeID).Set(0)
+		removed = true
+	}
+	r.mu.Unlock()
 
+	if future != nil {
+		future.cancel()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if removed {
 		zlog.Debug().
 			Str("node_id", nodeID).
 			Msg("Removed client connection")
 	}
 }
 
-// Close closes all client connections
+// Close closes all client connections and cancels in-flight dials. It leaves
+// the Router reusable, matching the previous behavior after the client map was
+// cleared, while generations prevent old dial results from being published.
 func (r *Router) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	var conns []*grpc.ClientConn
+	var futures []*dialFuture
 
+	r.mu.Lock()
 	for nodeID, state := range r.clients {
+		r.generations[nodeID]++
 		if state != nil && state.conn != nil {
-			if err := state.conn.Close(); err != nil {
-				zlog.Error().
-					Err(err).
-					Str("node_id", nodeID).
-					Msg("Error closing connection")
-			}
+			conns = append(conns, state.conn)
 		}
 	}
-
+	for nodeID, future := range r.dialFutures {
+		r.generations[nodeID]++
+		future.complete(nil, NewConnectionFailedError(nodeID, future.address, context.Canceled))
+		futures = append(futures, future)
+	}
 	r.clients = make(map[string]*clientState)
+	r.dialFutures = make(map[string]*dialFuture)
+	r.mu.Unlock()
+
+	for _, future := range futures {
+		future.cancel()
+	}
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil {
+			zlog.Error().
+				Err(err).
+				Msg("Error closing connection")
+		}
+	}
 
 	zlog.Debug().
 		Msg("Closed all client connections")
@@ -489,10 +626,14 @@ func (r *Router) Close() error {
 	return nil
 }
 
-// RefreshConnections removes connections to inactive nodes
+// RefreshConnections removes connections to inactive nodes. It also
+// invalidates pending dials for those nodes, then performs cancellation and
+// connection closes without Router.mu held.
 func (r *Router) RefreshConnections() {
+	var conns []*grpc.ClientConn
+	var futures []*dialFuture
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	zlog.Debug().
 		Msg("Refreshing connections")
@@ -504,15 +645,32 @@ func (r *Router) RefreshConnections() {
 		activeNodeMap[node.ID] = true
 	}
 
+	for nodeID, future := range r.dialFutures {
+		if !activeNodeMap[nodeID] {
+			r.generations[nodeID]++
+			delete(r.dialFutures, nodeID)
+			future.complete(nil, NewConnectionFailedError(nodeID, future.address, context.Canceled))
+			futures = append(futures, future)
+		}
+	}
+
 	// Remove connections to inactive nodes
 	for nodeID, state := range r.clients {
 		if !activeNodeMap[nodeID] {
+			r.generations[nodeID]++
 			if state != nil && state.conn != nil {
-				state.conn.Close()
+				conns = append(conns, state.conn)
 			}
 			delete(r.clients, nodeID)
-
 		}
+	}
+	r.mu.Unlock()
+
+	for _, future := range futures {
+		future.cancel()
+	}
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 }
 
@@ -528,7 +686,11 @@ func (r *Router) GetConnectionStats() map[string]ConnectionStats {
 		}
 
 		var connState connectivity.State
-		if state.conn != nil {
+		if _, dialing := r.dialFutures[nodeID]; dialing {
+			// A pending router dial has no ClientConn yet, so the zero-value
+			// connectivity.State would otherwise be reported as IDLE.
+			connState = connectivity.Connecting
+		} else if state.conn != nil {
 			connState = state.conn.GetState()
 		}
 
