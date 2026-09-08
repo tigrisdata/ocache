@@ -203,10 +203,11 @@ func TestCAS_Fence_SweepKeepsFenceMovedInTheWindow(t *testing.T) {
 }
 
 // TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry: a confirmed
-// CAS delete removes the dead value's ordered eviction-index entry (so a dead
-// key does not sit at the head of the eviction order for the whole retention
-// horizon) and nothing else: a recreate's own entry and back-reference are
-// never touched, so a recreated key always stays covered by eviction.
+// CAS delete removes the dead value's eviction-index generation — its ordered
+// entry and the back-reference that pointed at it — so a dead key does not sit
+// at the head of the eviction order for the whole retention horizon and
+// nothing is left dangling for the coverage backfill to mistake for coverage.
+// A recreate's own entry and back-reference are never touched.
 func TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry(t *testing.T) {
 	s, cleanup := createCASTestStorage(t) // disk cap set: LRU index active
 	defer cleanup()
@@ -227,6 +228,7 @@ func TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry(t *testing.T) {
 
 	require.NoError(t, s.DeleteIfVersion("k", v))
 	assert.False(t, exists(dead), "a confirmed CAS delete drops the dead value's ordered entry")
+	assert.False(t, exists(keys.MakeBucketedAccessIndexKey("k")), "and the back-reference that pointed at it, so nothing dangles")
 
 	// A recreate is fully covered: it has its own, different entry, and the
 	// back-reference points at it.
