@@ -6,6 +6,7 @@ package storage
 import (
 	"bytes"
 	"io"
+	"strconv"
 	"testing"
 	"time"
 
@@ -458,4 +459,50 @@ func BenchmarkAccessUpdater_CapacityPressure(b *testing.B) {
 	b.ReportMetric(float64(flushed), "access-index-reads/op")
 	b.ReportMetric(float64(flushed*3), "access-index-key-writes/op")
 	b.ReportMetric(float64(flushed-2), "hot-key-readmissions/op")
+}
+
+// BenchmarkAccessUpdater_BatchedIndexReads drives a large group of distinct
+// local reads through the updater and flushes every access update. The setup
+// makes each read stale so the benchmark measures the secondary-index lookup
+// and rewrite work for all preloaded keys.
+func BenchmarkAccessUpdater_BatchedIndexReads(b *testing.B) {
+	originalLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.Disabled)
+	b.Cleanup(func() { zerolog.SetGlobalLevel(originalLevel) })
+
+	const keyCount = 1024
+	storage, cleanup := createTestStorage(b, 3600, 1024, 4096, 16*1024*1024, 1000, 1<<30)
+	b.Cleanup(cleanup)
+
+	storage.accessUpdater.Stop()
+	updater := newAccessUpdater(storage, keyCount, time.Hour, -time.Nanosecond)
+	updater.updates = make(chan accessUpdate, keyCount*2)
+	storage.accessUpdater = updater
+	updater.Start()
+
+	keys := make([]string, keyCount)
+	for i := range keys {
+		key := "batch-key-" + strconv.Itoa(i)
+		keys[i] = key
+		if err := storage.Put(key, bytes.NewReader([]byte(key)), 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	runAccessGroup := func() int {
+		for _, key := range keys {
+			benchmarkStorageGet(b, storage, key)
+		}
+		return updater.Flush()
+	}
+
+	if flushed := runAccessGroup(); flushed != keyCount {
+		b.Fatalf("warm-up flushed %d updates, want %d", flushed, keyCount)
+	}
+	b.ResetTimer()
+	for b.Loop() {
+		if flushed := runAccessGroup(); flushed != keyCount {
+			b.Fatalf("access group flushed %d updates, want %d", flushed, keyCount)
+		}
+	}
 }
