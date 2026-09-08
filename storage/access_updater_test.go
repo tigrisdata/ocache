@@ -230,6 +230,56 @@ func TestAccessUpdater_UpdatesOldBucketedEntry(t *testing.T) {
 	slice4.Free()
 }
 
+func TestAccessUpdater_MultiGetPreservesMixedIndexEntries(t *testing.T) {
+	storage, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 0)
+	defer cleanup()
+
+	updater := newAccessUpdater(storage, 100, 10*time.Second, 5*time.Minute)
+	updater.Start()
+	defer updater.Stop()
+
+	existingKeys := []string{"existing-1", "existing-2"}
+	firstTime := time.Now()
+	for _, key := range existingKeys {
+		updater.Update(key, firstTime)
+	}
+	require.Equal(t, len(existingKeys), updater.Flush())
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	oldBucketKeys := make(map[string][]byte, len(existingKeys))
+	for _, key := range existingKeys {
+		slice, err := storage.meta.Handle().Get(ro, keys.MakeBucketedAccessIndexKey(key))
+		require.NoError(t, err)
+		require.True(t, slice.Exists())
+		oldBucketKeys[key] = append([]byte(nil), slice.Data()...)
+		slice.Free()
+	}
+
+	allKeys := append(append([]string(nil), existingKeys...), "missing-1", "missing-2", "missing-3", "missing-4", "missing-5", "missing-6")
+	secondTime := firstTime.Add(6 * time.Minute)
+	for _, key := range allKeys {
+		updater.Update(key, secondTime)
+	}
+	require.Equal(t, len(allKeys), updater.Flush())
+
+	for _, key := range allKeys {
+		slice, err := storage.meta.Handle().Get(ro, keys.MakeBucketedAccessIndexKey(key))
+		require.NoError(t, err)
+		require.True(t, slice.Exists(), "secondary index for %s should exist", key)
+		currentBucketKey := append([]byte(nil), slice.Data()...)
+		slice.Free()
+
+		if oldBucketKey, ok := oldBucketKeys[key]; ok {
+			assert.NotEqual(t, oldBucketKey, currentBucketKey, "key %s should get a new bucket entry", key)
+			oldSlice, err := storage.meta.Handle().Get(ro, oldBucketKey)
+			require.NoError(t, err)
+			assert.False(t, oldSlice.Exists(), "old bucket entry for %s should be deleted", key)
+			oldSlice.Free()
+		}
+	}
+}
+
 func TestAccessUpdater_TimeGating(t *testing.T) {
 	storage, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 0)
 	defer cleanup()
