@@ -91,6 +91,20 @@ func (m *MemoryCache) dropLocked(key string) {
 	delete(m.fences, key)
 }
 
+// expireLocked is the lazy-expiry drop: it removes key's value and stamp only
+// if the entry is still present and still expired when the write lock is
+// held (Get/GetRange observe expiry under the read lock and re-lock to drop),
+// and it never touches fences — a CAS delete that landed in between recorded
+// a fence that must survive. Caller holds m.mu for writing.
+func (m *MemoryCache) expireLocked(key string) {
+	entry, ok := m.data[key]
+	if !ok || entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt) {
+		return
+	}
+	delete(m.data, key)
+	delete(m.versions, key)
+}
+
 // absenceTokenLocked mirrors storage's absent-read token (issue #267): the
 // fence stamp if the key was CAS-deleted, else a fresh stamp. Caller holds m.mu
 // for writing.
@@ -253,7 +267,7 @@ func (m *MemoryCache) Get(ctx context.Context, key string) ([]byte, error) {
 	// Check TTL expiration (lazy expiration)
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
 		m.mu.Lock()
-		m.dropLocked(key)
+		m.expireLocked(key)
 		m.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "key not found")
 	}
@@ -292,7 +306,7 @@ func (m *MemoryCache) GetRange(ctx context.Context, key string, start, end int64
 	// Check TTL expiration
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
 		m.mu.Lock()
-		m.dropLocked(key)
+		m.expireLocked(key)
 		m.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "key not found")
 	}

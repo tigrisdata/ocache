@@ -202,25 +202,39 @@ func TestCAS_Fence_SweepKeepsFenceMovedInTheWindow(t *testing.T) {
 	assert.Greater(t, second, first, "the fence moved in the window must survive the sweep")
 }
 
-// TestCAS_DeleteIfVersion_DropsEvictionIndexEntries: a confirmed CAS delete
-// removes the key's eviction-index entries, so a dead key does not sit at the
-// head of the eviction order for the whole retention horizon.
-func TestCAS_DeleteIfVersion_DropsEvictionIndexEntries(t *testing.T) {
+// TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry: a confirmed
+// CAS delete removes the dead value's ordered eviction-index entry (so a dead
+// key does not sit at the head of the eviction order for the whole retention
+// horizon) and nothing else: a recreate's own entry and back-reference are
+// never touched, so a recreated key always stays covered by eviction.
+func TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry(t *testing.T) {
 	s, cleanup := createCASTestStorage(t) // disk cap set: LRU index active
 	defer cleanup()
 	require.Greater(t, s.cleaner.maxDiskUsage, int64(0))
 
+	exists := func(k []byte) bool {
+		slice, err := s.meta.Handle().Get(putPointReadOpts, k)
+		require.NoError(t, err)
+		defer slice.Free()
+		return slice.Exists()
+	}
+
 	v, err := s.PutIfVersion("k", bytes.NewReader([]byte("data")), 0, 0)
 	require.NoError(t, err)
-	backref := keys.MakeBucketedAccessIndexKey("k")
-	slice, err := s.meta.Handle().Get(putPointReadOpts, backref)
-	require.NoError(t, err)
-	require.True(t, slice.Exists(), "a won CAS put indexes the key for eviction")
-	slice.Free()
+	dead := s.evictionEntryFor("k")
+	require.NotNil(t, dead, "a won CAS put indexes the key for eviction")
+	require.True(t, exists(dead))
 
 	require.NoError(t, s.DeleteIfVersion("k", v))
-	slice, err = s.meta.Handle().Get(putPointReadOpts, backref)
+	assert.False(t, exists(dead), "a confirmed CAS delete drops the dead value's ordered entry")
+
+	// A recreate is fully covered: it has its own, different entry, and the
+	// back-reference points at it.
+	fence := absentToken(t, s, "k")
+	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("again")), 0, fence)
 	require.NoError(t, err)
-	assert.False(t, slice.Exists(), "a confirmed CAS delete drops the eviction-index entries")
-	slice.Free()
+	fresh := s.evictionEntryFor("k")
+	require.NotNil(t, fresh, "a recreated key must be indexed for eviction")
+	assert.NotEqual(t, dead, fresh, "the recreate's entry is its own generation")
+	assert.True(t, exists(fresh))
 }

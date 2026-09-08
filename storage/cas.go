@@ -671,6 +671,11 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		}
 	}
 
+	// Capture the eviction-index entry that belongs to the value being
+	// deleted, BEFORE the merge: it is the only entry this delete may remove
+	// (see the win path below).
+	deadEntry := s.evictionEntryFor(key)
+
 	newStamp, err := s.nextVersion()
 	if err != nil {
 		return storageErrors.NewInternalError("DeleteIfVersion", err)
@@ -754,30 +759,53 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 			s.notifyDelete(prev.ValueLength)
 		}
 		// The key is dead and its tombstone is retained as a fence for hours
-		// (issue #267), so its eviction-index entries would otherwise sit at
-		// the head of the eviction order, skipped with a point read on every
-		// pass. Drop them now. A recreate racing this exact window loses its
-		// fresh entry, which the hourly reconcile's coverage backfill restores.
-		s.dropEvictionIndexEntries(key)
+		// (issue #267), so the dead value's ordered eviction-index entry would
+		// otherwise sit at the head of the eviction order, skipped with a point
+		// read on every pass. Remove exactly that entry — the one captured
+		// before the merge — and nothing else: a recreate that lands after this
+		// win writes its own, differently-keyed entry and rewrites the
+		// back-reference, neither of which this touches, so it can never be
+		// left uncovered. The back-reference is left alone (a recreate
+		// overwrites it; the sweep drops it with the tombstone).
+		s.deleteEvictionEntry(key, deadEntry)
 		return nil
 	default:
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
 	}
 }
 
-// dropEvictionIndexEntries removes key's eviction-index entries (the ordered
-// entry and its back-reference) in their own batch, after a confirmed CAS
-// delete. A no-op when there are none.
-func (s *Storage) dropEvictionIndexEntries(key string) {
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-	batch := grocksdb.NewWriteBatch()
-	defer batch.Destroy()
-	s.stageEvictionIndexDeletes(batch, putPointReadOpts, key)
-	if batch.Count() == 0 {
+// evictionEntryFor returns a copy of the ordered eviction-index entry key that
+// key's back-reference currently points at, or nil when there is none (no
+// disk cap, or an unindexed key). Policy-aware, like stageEvictionIndexDeletes.
+func (s *Storage) evictionEntryFor(key string) []byte {
+	var backref []byte
+	if s.evictionPolicy == EvictionPolicyFIFO {
+		backref = keys.MakeFifoBackrefKey(key)
+	} else {
+		backref = keys.MakeBucketedAccessIndexKey(key)
+	}
+	slice, err := s.meta.Handle().Get(putPointReadOpts, backref)
+	if err != nil {
+		return nil
+	}
+	defer slice.Free()
+	if !slice.Exists() {
+		return nil
+	}
+	return append([]byte(nil), slice.Data()...)
+}
+
+// deleteEvictionEntry removes one ordered eviction-index entry after a
+// confirmed CAS delete. Deleting a specific entry key is safe against any
+// concurrent write: entries are keyed by write time, so no other value can
+// share it. A no-op for nil.
+func (s *Storage) deleteEvictionEntry(key string, entry []byte) {
+	if entry == nil {
 		return
 	}
-	if err := s.meta.Handle().Write(wo, batch); err != nil {
-		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteIfVersion: dropping eviction-index entries failed; eviction reclaims them as orphans")
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	if err := s.meta.Handle().Delete(wo, entry); err != nil {
+		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteIfVersion: dropping the dead value's eviction entry failed; eviction skips it until the fence is swept")
 	}
 }

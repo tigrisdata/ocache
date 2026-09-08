@@ -244,6 +244,25 @@ func (c *Cleaner) cleanupLoop() {
 	}
 }
 
+// fenceAgeReference is "now" on the timeline fence stamps are drawn from: the
+// wall clock, or the last issued stamp if that is ahead of it. Stamps are
+// wall-clock nanoseconds bumped monotonically, so after a restart they resume
+// from the durably reserved ceiling and can lead the clock by up to
+// versionReservationBlock; measuring a fence's age against the newer of the
+// two removes that lead. A backward clock step is the one residual: stamps
+// keep creeping above the old time while the clock catches up, and a fence is
+// then held longer by the size of the step — the safe direction, a delay on
+// reclaiming a small row and on the ordering it provides.
+func (c *Cleaner) fenceAgeReference() time.Time {
+	ref := time.Now()
+	if c.storage != nil {
+		if last := c.storage.lastVersion.Load(); last > uint64(ref.UnixNano()) {
+			ref = time.Unix(0, int64(last))
+		}
+	}
+	return ref
+}
+
 // cleanupExpiredKeys scans for and removes expired keys
 func (c *Cleaner) cleanupExpiredKeys() {
 	start := time.Now()
@@ -442,11 +461,14 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			// — the delete's time, in nanoseconds — is younger than the retention
 			// horizon: GetWithVersion hands it out and puts are ordered against
 			// it. Keep it until then. An unstamped tombstone is plain absence and
-			// goes at once.
+			// goes at once. Age is measured against the stamp source's own
+			// timeline (fenceAgeReference), not the bare wall clock: stamps can
+			// lead the clock by up to the durable reservation block after a
+			// restart, which would otherwise hold a fence past the horizon.
 			version, fenced := uint64(0), false
 			if expiry == merge.TombstoneExpiry {
 				version, _ = valueMessageVersion(value)
-				fenced = version != 0 && time.Since(time.Unix(0, int64(version))) < c.fenceRetention
+				fenced = version != 0 && c.fenceAgeReference().Sub(time.Unix(0, int64(version))) < c.fenceRetention
 			}
 			if !fenced {
 				// Remember the row; it is re-read and deleted in flush, not here.
