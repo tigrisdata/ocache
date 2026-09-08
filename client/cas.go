@@ -38,7 +38,10 @@ func IsVersionMismatch(err error) (*VersionMismatchError, bool) {
 }
 
 // GetWithVersion returns a key's value together with its current CAS version.
-// found is false (version 0) when the key is absent, expired, or deleted.
+// found is false when the key is absent, expired, or deleted; version is then
+// an observation token (issue #267): the fence stamp of the CAS delete that
+// removed the key, or a fresh stamp. Pass it back as expected to PutIfVersion
+// to order the write against any later delete; pass 0 to skip ordering.
 func (o *Operations) GetWithVersion(ctx context.Context, key string) (data []byte, version uint64, found bool, err error) {
 	conn, err := o.router.Route(key)
 	if err != nil {
@@ -55,9 +58,12 @@ func (o *Operations) GetWithVersion(ctx context.Context, key string) (data []byt
 	return resp.Data, resp.Version, resp.Found, nil
 }
 
-// PutIfVersion writes the value only if the key's current version equals
-// expected (0 = put-if-absent). It returns the new version on success, or a
-// *VersionMismatchError carrying the current version on a lost race.
+// PutIfVersion writes the value only if the key admits expected: a live key
+// needs an exact version match; an absent key admits 0 (put-if-absent) or an
+// observation token from GetWithVersion, which a CAS delete stamped after that
+// observation rejects (issue #267). It returns the new version on success, or a
+// *VersionMismatchError carrying the current version — for a fenced key, the
+// fence stamp to refetch and retry with — on a lost race.
 func (o *Operations) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
 	conn, err := o.router.Route(key)
 	if err != nil {
@@ -85,8 +91,10 @@ func (o *Operations) PutIfVersion(ctx context.Context, key string, data []byte, 
 	return resp.NewVersion, nil
 }
 
-// DeleteIfVersion deletes the key only if its current version equals expected.
-// A lost race returns a *VersionMismatchError.
+// DeleteIfVersion deletes the key only if it admits expected (see
+// PutIfVersion). A CAS delete leaves a fence (issue #267): delete-if-absent on
+// a missing or dead key is not a no-op, it records the delete so a put that
+// observed absence before it loses. A lost race returns a *VersionMismatchError.
 func (o *Operations) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
 	conn, err := o.router.Route(key)
 	if err != nil {

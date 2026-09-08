@@ -353,8 +353,12 @@ func (x *DeleteResponse) GetError() string {
 }
 
 // GetWithVersionResponse carries the value together with its current CAS
-// version (issue #254). found=false with version 0 means the key is absent,
-// expired, or deleted — recreate it with PutObjectIfVersion(expected_version=0).
+// version (issue #254). found=false means the key is absent, expired, or
+// deleted; version is then an OBSERVATION TOKEN (issue #267), never 0: the
+// stamp of the CAS delete that removed the key while that fence is retained,
+// otherwise a fresh stamp meaning "absent as of now". Pass it back as
+// expected_version to PutObjectIfVersion to order the write against any
+// delete stamped after the observation; pass 0 for the unordered put-if-absent.
 type GetWithVersionResponse struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -426,7 +430,7 @@ type PutIfVersionRequest struct {
 	Key             string `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	TtlSeconds      int64  `protobuf:"varint,2,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`
 	Data            []byte `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
-	ExpectedVersion uint64 `protobuf:"varint,4,opt,name=expected_version,json=expectedVersion,proto3" json:"expected_version,omitempty"` // 0 = put-if-absent
+	ExpectedVersion uint64 `protobuf:"varint,4,opt,name=expected_version,json=expectedVersion,proto3" json:"expected_version,omitempty"` // a live version, an absent read's token, or 0 = unordered put-if-absent
 }
 
 func (x *PutIfVersionRequest) Reset() {

@@ -33,6 +33,7 @@ var (
 	recompactMinSegments   = flag.Int("recompaction-min-segments", stor.DefaultMinSegmentsBeforeRecompaction, "Minimum number of segments for recompaction")
 	recompactDisable       = flag.Bool("disable-recompaction", stor.DefaultRecompactionDisabled, "Disable automatic segment recompaction")
 	ttlCleanupInterval     = flag.Duration("ttl-cleanup-interval", stor.DefaultTTLCleanupInterval, "Interval at which TTL keys are cleaned up")
+	fenceRetention         = flag.Duration("fence-retention", stor.DefaultFenceRetention, "How long a CAS delete keeps ordering later put-if-absent writes on the key (its tombstone is retained as a fence for this long)")
 
 	compactionBytesPerSecond = flag.Int64("compaction-bytes-per-second", stor.DefaultCompactionBytesPerSecond, "Maximum shared compaction payload bytes per second (0 = unthrottled)")
 
@@ -127,6 +128,7 @@ func initializeStorage() *stor.Storage {
 		MinSegments:            AppConfig.RecompactMinSegments,
 		DisableRecompaction:    AppConfig.RecompactDisable,
 		CleanupInterval:        AppConfig.TTLCleanupInterval,
+		FenceRetention:         AppConfig.FenceRetention,
 		MetadataCacheSize:      AppConfig.MetadataCacheSize,
 		MetadataBackgroundJobs: AppConfig.MetadataBackgroundJobs,
 		RecoveryWorkers:        AppConfig.RecoveryWorkers,

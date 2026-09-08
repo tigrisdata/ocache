@@ -56,25 +56,50 @@ const VersionLegacy uint64 = 1
 // It can never collide with a real TTL, which is time.Now().Add(...).Unix().
 const tombstoneExpiry int64 = 1
 
-// EffectiveRowVersion maps a stored row to the version the CAS match rule and
-// the API report for it. A tombstone (Expiry == tombstoneExpiry) reads as 0 —
-// "effectively absent" — regardless of the stamp it carries, so a stale token
-// held before the delete can never match it and put-if-absent (expected == 0)
-// recreates over it; the raw stored stamp is used only by DeleteIfVersion's
-// read-back to confirm its own win. A live pre-versioning row (stored 0) reads
-// as VersionLegacy; any other live row reads as its stamp. Shared by the merge
-// operator and the read path so the two can never disagree.
+// TombstoneExpiry is the exported tombstone sentinel for the storage layer's
+// read paths and the cleaner, which must recognise tombstone rows.
+const TombstoneExpiry = tombstoneExpiry
+
+// IsTombstone reports whether a stored row is a ref-less tombstone: the
+// sentinel expiry with no backing location. Every tombstone producer (CAS
+// delete, the read path's purge, the no-base fallback) emits exactly this
+// shape, and its backing bytes were reclaimed by that producer.
+func IsTombstone(vm *pb.ValueMessage) bool {
+	return vm != nil && vm.Expiry == tombstoneExpiry && vm.RawFilePath == "" && vm.SegmentPath == ""
+}
+
+// EffectiveRowVersion maps a stored row to the version the API reports for
+// it. A tombstone (Expiry == tombstoneExpiry) reports the stamp of the delete
+// that produced it — its FENCE token (issue #267): the key is absent, but with
+// history, and a put-if-absent that observed absence before that delete must
+// lose to it (see the CAS_PUT rule in mergeMetadataCAS). An unstamped
+// tombstone (the no-base sentinel) reports 0. A live pre-versioning row (stored
+// 0) reads as VersionLegacy; any other live row reads as its stamp. Shared by
+// the merge operator and the read path so the two can never disagree.
 func EffectiveRowVersion(vm *pb.ValueMessage) uint64 {
 	if vm == nil {
 		return 0
 	}
 	if vm.Expiry == tombstoneExpiry {
-		return 0
+		return vm.Version
 	}
 	if vm.Version == 0 {
 		return VersionLegacy
 	}
 	return vm.Version
+}
+
+// fenceAdmits is the ordering rule for a CAS operand meeting a tombstone
+// (issue #267). The tombstone's stamp is the time of the delete; the operand's
+// expected version is the caller's observation token — the delete stamp it
+// read, or the fresh stamp an absent read handed it. The operand applies if
+// its observation is at or after the delete (expected >= stamp), or if it
+// declined to order itself at all (expected == 0, "put-if-absent, don't
+// care"). A token from BEFORE the delete — a populate that fetched stale bytes
+// — is rejected, which is the whole point of the fence. Pure in (base,
+// operand): safe to re-run at compaction.
+func fenceAdmits(tombstone *pb.ValueMessage, expected uint64) bool {
+	return expected == 0 || expected >= tombstone.Version
 }
 
 // MultiplexOperator is a merge operator that routes to different merge strategies
@@ -203,11 +228,22 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 		// convention as the path-preconditioned CAS below.
 		switch op.OpType {
 		case pb.MetaOp_META_OP_CAS_PUT:
-			cur := uint64(0)
-			if hadBase {
-				cur = EffectiveRowVersion(&base)
+			// Three bases, three rules (issue #267):
+			//   - no row: nothing to order against, any expected applies (an
+			//     absent read's fresh token, put-if-absent's 0, or a token
+			//     whose fence has aged out — the documented horizon ABA);
+			//   - a tombstone: the fence rule (fenceAdmits);
+			//   - a live row: exact match on its effective version.
+			var apply bool
+			switch {
+			case !hadBase:
+				apply = true
+			case base.Expiry == tombstoneExpiry:
+				apply = fenceAdmits(&base, op.CasExpectedVersion)
+			default:
+				apply = EffectiveRowVersion(&base) == op.CasExpectedVersion
 			}
-			if cur == op.CasExpectedVersion {
+			if apply {
 				// Adopt the operand as the new base, stripping the
 				// operand-only fields so stored values never carry them
 				// (the RawFilePath-clearing pattern). Field copy, not struct
@@ -227,30 +263,43 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			}
 			continue
 		case pb.MetaOp_META_OP_CAS_DELETE:
-			if !hadBase {
-				// The row vanished before the operand resolved: there was no base
-				// to match the precondition against, so this delete did NOT apply
-				// to the version the caller guarded on. Emit a version-0 tombstone
-				// (not the operand's stamp): DeleteIfVersion's read-back then sees a
-				// stamp that is not its own and reports a mismatch, never a false
-				// win for a precondition that never held. EffectiveRowVersion still
-				// reads it as absent (Expiry == tombstoneExpiry) so put-if-absent
-				// can recreate, and the ref-less tombstone still blocks a stale
-				// path-CAS from resurrecting the key.
-				base = pb.ValueMessage{Expiry: tombstoneExpiry}
+			// The result of a delete that applies is always the REF-LESS
+			// tombstone {Expiry: tombstoneExpiry, Version: op.Version}: no
+			// ValueType/paths/length, so an in-flight compactor/recompactor
+			// path-CAS operand (which matches on ValueType + path) can never
+			// resurrect the key. Reclamation of the backing bytes is therefore the
+			// caller's job (DeleteIfVersion reclaims on its confirmed win); the
+			// stamp is both the deleter's read-back proof and the key's FENCE
+			// (issue #267) until the cleaner ages it out.
+			switch {
+			case !hadBase:
+				if op.CasExpectedVersion == 0 {
+					// Delete-if-absent on a missing key records the delete anyway:
+					// this is the fence for a key that is not here yet, so a
+					// populate that observed absence before this delete still
+					// loses to it.
+					base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
+				} else {
+					// The row vanished before the operand resolved: there was no
+					// base to match the guard against, so this delete did NOT
+					// apply to the version the caller guarded on. Emit a version-0
+					// tombstone (not the operand's stamp): the read-back then sees
+					// a stamp that is not its own and reports a mismatch, never a
+					// false win for a precondition that never held.
+					base = pb.ValueMessage{Expiry: tombstoneExpiry}
+				}
 				hadBase = true
-				continue
-			}
-			if EffectiveRowVersion(&base) == op.CasExpectedVersion {
-				// Tombstone via a REF-LESS sentinel: no ValueType/paths/length.
-				// Dropping the backing references is what prevents an in-flight
-				// compactor/recompactor path-CAS operand (which matches on
-				// ValueType + RawFilePath/SegmentPath) from resurrecting a
-				// deleted key. Reclamation of the backing bytes is therefore the
-				// caller's job (DeleteIfVersion reclaims on its confirmed win);
-				// the cleaner only needs to remove the tiny row. The operand's
-				// stamp lets the deleter confirm its win via read-back.
-				base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
+			case base.Expiry == tombstoneExpiry:
+				// Deleting a dead key again bumps the fence to a newer stamp, so
+				// a second invalidation orders AFTER anything that observed the
+				// first. Same admission rule as a put over a fence.
+				if fenceAdmits(&base, op.CasExpectedVersion) {
+					base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
+				}
+			default:
+				if EffectiveRowVersion(&base) == op.CasExpectedVersion {
+					base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
+				}
 			}
 			continue
 		}
@@ -270,10 +319,12 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 			if hadBase &&
 				base.ValueType == pb.ValueType_RAW_FILE &&
 				base.RawFilePath == op.RawFilePath {
-				// Preserve the row's version through the tombstone: purging a
-				// dangling file is not a user write, and the surviving token
-				// keeps CAS semantics consistent until the cleaner sweeps.
-				base = pb.ValueMessage{Expiry: 1, Version: base.Version}
+				// An UNSTAMPED tombstone: purging a dangling file is data loss,
+				// not a user delete, so it must not read as a fence (issue #267)
+				// — a stamped tombstone would block put-if-absent until the fence
+				// aged out. With version 0 it reads as plain absence and the
+				// cleaner removes it on its next pass.
+				base = pb.ValueMessage{Expiry: tombstoneExpiry}
 			}
 			continue
 		}

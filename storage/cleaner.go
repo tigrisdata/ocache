@@ -105,6 +105,10 @@ type Cleaner struct {
 	// deletion batch is re-checked and written, to inject a concurrent write
 	// into the window that re-check exists for (issue #256).
 	beforeExpiryFlush func()
+	// fenceRetention is how long a CAS-delete tombstone outlives the delete as
+	// the key's fence (issue #267) before this sweep removes it. Defaults to
+	// DefaultFenceRetention; StorageConfig.FenceRetention overrides.
+	fenceRetention time.Duration
 }
 
 // expiryFlushBatch bounds how many expired keys a TTL deletion batch holds.
@@ -116,11 +120,14 @@ const expiryFlushBatch = 100
 
 // expiryCandidate is an expired row seen by the TTL scan: the key, its metadata
 // key (copied out of the iterator), and the expiry the scan saw, which the
-// pre-write re-check compares against.
+// pre-write re-check compares against. For a tombstone the re-check also
+// compares version: a fence that was moved forward since the scan is a newer
+// row and must be kept (issue #267).
 type expiryCandidate struct {
 	key     string
 	metaKey []byte
 	expiry  int64
+	version uint64
 }
 
 // NewCleaner creates a new Cleaner for background TTL cleanup and LRU eviction
@@ -131,6 +138,7 @@ func NewCleaner(storage *Storage, interval time.Duration, maxDiskUsage int64) *C
 		maxDiskUsage:     maxDiskUsage,
 		diskReserveBytes: defaultDiskReserveBytes,
 		diskUsageFn:      diskUsage,
+		fenceRetention:   DefaultFenceRetention,
 		closeCh:          make(chan struct{}),
 	}
 }
@@ -325,6 +333,16 @@ func (c *Cleaner) cleanupExpiredKeys() {
 				zlog.Debug().Str("key", cand.key).Msg("cleaner: key rewritten since scan; skipping expiry")
 				continue
 			}
+			if ok && cand.expiry == merge.TombstoneExpiry {
+				// A tombstone's identity is its stamp: a CAS delete since the scan
+				// moved the fence forward, and that newer fence must be kept.
+				if v, _ := valueMessageVersion(value); v != cand.version {
+					slice.Free()
+					metrics.CleanerExpiryRaced.Inc()
+					zlog.Debug().Str("key", cand.key).Msg("cleaner: fence moved since scan; keeping it")
+					continue
+				}
+			}
 			// Only expired rows need their remaining control fields to account for
 			// the deletion and reclaim a raw file or segment; decode from the
 			// re-read so the reclaim target is exactly the row being deleted. An
@@ -420,12 +438,25 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			zlog.Debug().Str("key", key).Int64("expiry", expiry).Int64("now", now).Bool("expired", now >= expiry).Msg("cleaner: checking expiry")
 		}
 		if expiry > 0 && now >= expiry {
-			// Remember the row; it is re-read and deleted in flush, not here.
-			candidates = append(candidates, expiryCandidate{
-				key:     key,
-				metaKey: append([]byte(nil), keyBytes...),
-				expiry:  expiry,
-			})
+			// A tombstone is the key's FENCE (issue #267) for as long as its stamp
+			// — the delete's time, in nanoseconds — is younger than the retention
+			// horizon: GetWithVersion hands it out and puts are ordered against
+			// it. Keep it until then. An unstamped tombstone is plain absence and
+			// goes at once.
+			version, fenced := uint64(0), false
+			if expiry == merge.TombstoneExpiry {
+				version, _ = valueMessageVersion(value)
+				fenced = version != 0 && time.Since(time.Unix(0, int64(version))) < c.fenceRetention
+			}
+			if !fenced {
+				// Remember the row; it is re-read and deleted in flush, not here.
+				candidates = append(candidates, expiryCandidate{
+					key:     key,
+					metaKey: append([]byte(nil), keyBytes...),
+					expiry:  expiry,
+					version: version,
+				})
+			}
 		}
 
 		it.Key().Free()

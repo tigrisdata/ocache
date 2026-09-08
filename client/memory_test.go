@@ -548,7 +548,7 @@ func TestMemoryCache_CAS_PlainWritesDemoteVersion(t *testing.T) {
 	_, ver, found, err = cache.GetWithVersion(ctx, "d")
 	require.NoError(t, err)
 	assert.False(t, found)
-	assert.Zero(t, ver)
+	assert.NotZero(t, ver, "absent reads hand out an observation token (#267)")
 	require.NoError(t, cache.Put(ctx, "d", []byte("again"), 0))
 	_, ver, _, err = cache.GetWithVersion(ctx, "d")
 	require.NoError(t, err)
@@ -568,7 +568,7 @@ func TestMemoryCache_CAS_PlainWritesDemoteVersion(t *testing.T) {
 	_, ver, found, err = cache.GetWithVersion(ctx, "e")
 	require.NoError(t, err)
 	assert.False(t, found)
-	assert.Zero(t, ver)
+	assert.NotZero(t, ver, "absent reads hand out an observation token (#267)")
 	_, err = cache.Get(ctx, "e") // triggers the lazy-expiry drop
 	require.Error(t, err)
 	require.NoError(t, cache.Put(ctx, "e", []byte("again"), 0))
@@ -586,5 +586,71 @@ func TestMemoryCache_CAS_PlainWritesDemoteVersion(t *testing.T) {
 	_, ver, found, err = cache.GetWithVersion(ctx, "c")
 	require.NoError(t, err)
 	assert.False(t, found)
-	assert.Zero(t, ver)
+	assert.NotZero(t, ver, "absent reads hand out an observation token (#267)")
+}
+
+// TestMemoryCache_CAS_Fences mirrors storage's fenced deletes (issue #267): an
+// absent read hands out an observation token; a CAS delete on a missing or
+// dead key records a fence; a put carrying a token from before the fence
+// loses and is told the fence; the fence token (or a later one, or 0)
+// recreates; a second delete moves the fence forward.
+func TestMemoryCache_CAS_Fences(t *testing.T) {
+	ctx := context.Background()
+	cache := NewMemoryCache()
+
+	// A populate observes absence...
+	_, tok, found, err := cache.GetWithVersion(ctx, "k")
+	require.NoError(t, err)
+	require.False(t, found)
+	require.NotZero(t, tok)
+	// ...an invalidation lands on the still-missing key...
+	require.NoError(t, cache.DeleteIfVersion(ctx, "k", 0))
+	_, fence, found, err := cache.GetWithVersion(ctx, "k")
+	require.NoError(t, err)
+	require.False(t, found)
+	assert.Greater(t, fence, tok, "the fence is stamped after the observation")
+	// ...and the populate's write, carrying its pre-delete token, loses.
+	_, err = cache.PutIfVersion(ctx, "k", []byte("stale"), 0, tok)
+	vm, ok := IsVersionMismatch(err)
+	require.True(t, ok, "a pre-fence token must lose, got %v", err)
+	assert.Equal(t, fence, vm.CurrentVersion, "the mismatch carries the fence to retry with")
+
+	// Second invalidation moves the fence; a token from between them loses too.
+	require.NoError(t, cache.DeleteIfVersion(ctx, "k", 0))
+	_, fence2, _, err := cache.GetWithVersion(ctx, "k")
+	require.NoError(t, err)
+	assert.Greater(t, fence2, fence)
+	_, err = cache.PutIfVersion(ctx, "k", []byte("between"), 0, fence)
+	_, ok = IsVersionMismatch(err)
+	require.True(t, ok)
+
+	// The current fence token recreates; the fence is consumed.
+	v, err := cache.PutIfVersion(ctx, "k", []byte("fresh"), 0, fence2)
+	require.NoError(t, err)
+	data, ver, found, err := cache.GetWithVersion(ctx, "k")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, v, ver)
+	assert.Equal(t, []byte("fresh"), data)
+
+	// put-if-absent (0) stays the unordered escape hatch over a fence.
+	require.NoError(t, cache.DeleteIfVersion(ctx, "k", v))
+	_, err = cache.PutIfVersion(ctx, "k", []byte("unordered"), 0, 0)
+	require.NoError(t, err)
+
+	// A guarded delete with a pre-fence token cannot move the fence.
+	_, cur, _, _ := cache.GetWithVersion(ctx, "k")
+	require.NoError(t, cache.DeleteIfVersion(ctx, "k", cur))
+	_, f3, _, _ := cache.GetWithVersion(ctx, "k")
+	err = cache.DeleteIfVersion(ctx, "k", cur)
+	vm, ok = IsVersionMismatch(err)
+	require.True(t, ok)
+	assert.Equal(t, f3, vm.CurrentVersion)
+
+	// Plain ops drop the fence: mixing plain and CAS ops on a key voids the
+	// guarantee, exactly as a plain overwrite replaces the tombstone in storage.
+	require.NoError(t, cache.Put(ctx, "k", []byte("plain"), 0))
+	require.NoError(t, cache.Delete(ctx, "k"))
+	_, tok2, _, _ := cache.GetWithVersion(ctx, "k")
+	assert.NotEqual(t, f3, tok2, "after plain ops the key has no fence, just a fresh token")
 }

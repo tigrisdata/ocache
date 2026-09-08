@@ -68,6 +68,13 @@ const (
 
 	// Default TTL cleanup interval
 	DefaultTTLCleanupInterval = 1 * time.Minute
+	// DefaultFenceRetention is how long a CAS delete keeps ordering later
+	// put-if-absent writes (issue #267): its tombstone stays as the key's fence
+	// for this long before the TTL sweep removes it. A sizing knob — one small
+	// row per CAS-deleted key for the window — not an enable switch; it need
+	// only outlive the longest populate that could have observed absence
+	// before the delete.
+	DefaultFenceRetention = 6 * time.Hour
 
 	// Default access update buffer size, batch interval and delay
 	DefaultAccessUpdateBufferSize = 100000
@@ -128,6 +135,7 @@ type StorageConfig struct {
 	DisableRecompaction  bool          // Disable automatic segment recompaction
 	RecompactionInterval time.Duration // Interval between segment recompaction runs
 	CleanupInterval      time.Duration // Cleanup interval
+	FenceRetention       time.Duration // How long a CAS-delete fence outlives the delete (0 = DefaultFenceRetention)
 	AccessUpdateDelay    time.Duration // Access update delay
 	RecoveryWorkers      int           // Number of parallel workers for startup file recovery (<= 0 = default)
 	DeleteBatchSize      int           // Number of file deletions processed per deletion-queue batch (<= 0 = default)
@@ -364,6 +372,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		cleanupInterval = config.CleanupInterval
 	}
 	s.cleaner = NewCleaner(s, cleanupInterval, config.MaxDiskUsage)
+	if config.FenceRetention > 0 {
+		s.cleaner.fenceRetention = config.FenceRetention
+	}
 
 	// Restore the CAS stamp source's durable reservation so versions stay
 	// monotonic across restarts even under a backward clock step: every stamp

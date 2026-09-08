@@ -24,6 +24,12 @@ type MemoryCache struct {
 	// counter is a monotonic stamp source mirroring the real storage layer.
 	versions       map[string]uint64
 	versionCounter uint64
+	// fences records, per CAS-deleted key, the stamp of the delete (issue
+	// #267): an absent read hands it out as the key's observation token and a
+	// put or delete carrying an older token loses to it. Mirrors the stamped
+	// tombstone real storage retains; the double keeps fences until a CAS put
+	// recreates the key, a plain op drops it, or Close.
+	fences map[string]uint64
 }
 
 // cacheEntry holds a cached value with optional expiration.
@@ -46,6 +52,7 @@ func NewMemoryCache() *MemoryCache {
 	return &MemoryCache{
 		data:     make(map[string]cacheEntry),
 		versions: make(map[string]uint64),
+		fences:   make(map[string]uint64),
 		// Start above memoryLegacyVersion so the first CAS stamp (++counter) is 2
 		// and can never collide with the legacy sentinel a plain Put reports.
 		versionCounter: memoryLegacyVersion,
@@ -81,18 +88,46 @@ func (m *MemoryCache) effectiveVersionLocked(key string) uint64 {
 func (m *MemoryCache) dropLocked(key string) {
 	delete(m.data, key)
 	delete(m.versions, key)
+	delete(m.fences, key)
 }
 
-// GetWithVersion returns key's value and version; found is false (version 0)
-// for an absent or expired key.
+// absenceTokenLocked mirrors storage's absent-read token (issue #267): the
+// fence stamp if the key was CAS-deleted, else a fresh stamp. Caller holds m.mu
+// for writing.
+func (m *MemoryCache) absenceTokenLocked(key string) uint64 {
+	if f, ok := m.fences[key]; ok {
+		return f
+	}
+	m.versionCounter++
+	return m.versionCounter
+}
+
+// admitsLocked mirrors storage's casAdmits: a live key needs an exact match; a
+// fenced key admits 0 or a token at or after the fence; absence admits
+// anything. Returns the version a mismatch reports. Caller holds m.mu.
+func (m *MemoryCache) admitsLocked(key string, expected uint64) (bool, uint64) {
+	if m.liveLocked(key) {
+		cur := m.effectiveVersionLocked(key)
+		return cur == expected, cur
+	}
+	if f, ok := m.fences[key]; ok {
+		return expected == 0 || expected >= f, f
+	}
+	return true, 0
+}
+
+// GetWithVersion returns key's value and version. For an absent or expired key
+// found is false and the version is an observation token (issue #267): the
+// fence stamp of the CAS delete that removed it, else a fresh stamp. Pass it
+// back to PutIfVersion to order the write against any later delete.
 func (m *MemoryCache) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, false, err
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock() // a fresh token advances the stamp counter
+	defer m.mu.Unlock()
 	if !m.liveLocked(key) {
-		return nil, 0, false, nil
+		return nil, m.absenceTokenLocked(key), false, nil
 	}
 	entry := m.data[key]
 	out := make([]byte, len(entry.value))
@@ -100,17 +135,21 @@ func (m *MemoryCache) GetWithVersion(ctx context.Context, key string) ([]byte, u
 	return out, m.effectiveVersionLocked(key), true, nil
 }
 
-// PutIfVersion writes only if key's current version equals expected (0 =
-// put-if-absent), returning the new version or a *VersionMismatchError.
+// PutIfVersion writes only if key admits expected: a live key needs an exact
+// match; an absent key admits 0 (put-if-absent) or an observation token, which
+// a CAS delete stamped after the observation rejects (issue #267). Returns the
+// new version or a *VersionMismatchError carrying the current version (the
+// fence stamp, for a fenced key).
 func (m *MemoryCache) PutIfVersion(ctx context.Context, key string, data []byte, ttlSeconds int64, expected uint64) (uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur := m.effectiveVersionLocked(key); cur != expected {
+	if ok, cur := m.admitsLocked(key, expected); !ok {
 		return 0, &VersionMismatchError{Key: key, CurrentVersion: cur}
 	}
+	delete(m.fences, key)
 	dataCopy := make([]byte, len(data))
 	copy(dataCopy, data)
 	entry := cacheEntry{value: dataCopy}
@@ -123,25 +162,34 @@ func (m *MemoryCache) PutIfVersion(ctx context.Context, key string, data []byte,
 	return m.versionCounter, nil
 }
 
-// DeleteIfVersion deletes only if key's current version equals expected.
+// DeleteIfVersion deletes only if key admits expected (see PutIfVersion), and
+// records the delete as the key's fence (issue #267): delete-if-absent on a
+// missing or dead key is not a no-op, it writes or moves the fence so a
+// populate that observed absence before this delete loses to it.
 func (m *MemoryCache) DeleteIfVersion(ctx context.Context, key string, expected uint64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cur := m.effectiveVersionLocked(key)
-	if cur == 0 {
-		if expected == 0 {
-			return nil // already absent — delete-if-absent is a no-op success
+	switch {
+	case m.liveLocked(key):
+		if cur := m.effectiveVersionLocked(key); cur != expected {
+			return &VersionMismatchError{Key: key, CurrentVersion: cur}
 		}
-		return &VersionMismatchError{Key: key, CurrentVersion: 0}
-	}
-	if cur != expected {
-		return &VersionMismatchError{Key: key, CurrentVersion: cur}
+	default:
+		if f, fenced := m.fences[key]; fenced {
+			if !(expected == 0 || expected >= f) {
+				return &VersionMismatchError{Key: key, CurrentVersion: f}
+			}
+		} else if expected != 0 {
+			return &VersionMismatchError{Key: key, CurrentVersion: 0}
+		}
 	}
 	delete(m.data, key)
 	delete(m.versions, key)
+	m.versionCounter++
+	m.fences[key] = m.versionCounter
 	return nil
 }
 
@@ -164,6 +212,9 @@ func (m *MemoryCache) Put(ctx context.Context, key string, data []byte, ttlSecon
 	}
 
 	m.data[key] = entry
+	// A plain overwrite replaces any tombstone row in storage, so it drops the
+	// fence here too (mixing plain and CAS ops on a key voids the guarantee).
+	delete(m.fences, key)
 	// A plain (non-CAS) write stores no stamp, exactly like storage: the row
 	// reads as the legacy version from here on and any older CAS token must be
 	// rejected, never silently accepted against a value it did not guard.
@@ -449,6 +500,7 @@ func (m *MemoryCache) Close() error {
 	defer m.mu.Unlock()
 	m.data = make(map[string]cacheEntry)
 	m.versions = make(map[string]uint64)
+	m.fences = make(map[string]uint64)
 	return nil
 }
 

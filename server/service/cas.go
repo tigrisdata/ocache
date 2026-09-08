@@ -255,7 +255,8 @@ func (s *CacheService) GetStreamWithVersion(req *pb.GetRequest, stream pb.CacheS
 	}
 	if !found {
 		metrics.RPCRequests.WithLabelValues("GetStreamWithVersion", "not_found").Inc()
-		return stream.Send(&pb.GetWithVersionResponse{Found: false, Version: 0})
+		// The absent key's observation token (issue #267) travels with found=false.
+		return stream.Send(&pb.GetWithVersionResponse{Found: false, Version: version})
 	}
 	if closer, ok := r.(io.Closer); ok {
 		defer closer.Close()

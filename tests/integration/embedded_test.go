@@ -410,11 +410,12 @@ func TestEmbeddedClient_CASOperations(t *testing.T) {
 	_, ok = cacheclient.IsVersionMismatch(err)
 	require.True(t, ok, "stale streaming token must mismatch, got %v", err)
 
-	// Streaming get of an absent key reports found=false, version 0.
+	// Streaming get of an absent key reports found=false with an observation
+	// token (#267), never 0.
 	var gone bytes.Buffer
 	gv, gf, err := client.GetStreamWithVersion(ctx, "absent", &gone)
 	require.NoError(t, err)
 	assert.False(t, gf)
-	assert.Zero(t, gv)
+	assert.NotZero(t, gv)
 	assert.Zero(t, gone.Len())
 }

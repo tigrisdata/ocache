@@ -28,6 +28,7 @@ type Config struct {
 	RecompactMinSegments   int           // Minimum number of segments for recompaction
 	RecompactDisable       bool          // Disable automatic segment recompaction
 	TTLCleanupInterval     time.Duration // TTL cleanup interval
+	FenceRetention         time.Duration // CAS-delete fence retention (issue #267)
 	RecoveryWorkers        int           // Number of parallel workers for startup file recovery
 	DeleteBatchSize        int           // File deletions processed per deletion-queue batch
 	RequestLogging         bool          // Enable request logging
@@ -71,6 +72,7 @@ func LoadConfig() {
 		RecompactMinSegments:   *recompactMinSegments,
 		RecompactDisable:       *recompactDisable,
 		TTLCleanupInterval:     *ttlCleanupInterval,
+		FenceRetention:         *fenceRetention,
 		RecoveryWorkers:        *recoveryWorkers,
 		DeleteBatchSize:        *deleteBatchSize,
 		RequestLogging:         *requestLogging,

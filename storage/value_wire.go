@@ -17,6 +17,7 @@ const (
 	valueRawPathField protowire.Number = 4
 	valueSegPathField protowire.Number = 5
 	valueLengthField  protowire.Number = 7
+	valueVersionField protowire.Number = 9
 )
 
 // valueMessageVarintField extracts a varint-typed scalar field (identified by
@@ -164,6 +165,14 @@ func valueMessageSizeAndRawPath(buf []byte) (valueLength int64, rawPath string, 
 // value_length. See Perfloop cases case_2j2veg0hs5 and case_0pe7dc8ta7.
 func valueMessageValueLength(buf []byte) (length int64, ok bool) {
 	return valueMessageVarintField(buf, valueLengthField)
+}
+
+// valueMessageVersion extracts ValueMessage.version (field 9) off the wire
+// without copying Data. The TTL sweep reads it for tombstone rows only: the
+// stamp is the fence's birth time (issue #267).
+func valueMessageVersion(buf []byte) (version uint64, ok bool) {
+	v, ok := valueMessageVarintField(buf, valueVersionField)
+	return uint64(v), ok
 }
 
 // valueMessageExpiry extracts ValueMessage.expiry (field 3) off the wire without
