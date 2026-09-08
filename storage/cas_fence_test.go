@@ -227,35 +227,70 @@ func TestCAS_DropDeadEvictionGeneration_RefreshedEntryAndRecreate(t *testing.T) 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 
-	// (1) Refresh after capture, key dead.
+	// (1) A read just before the delete queued a refresh that flushes after
+	// the delete captured the old entry: the refreshed entry is older than the
+	// cutoff and belongs to the dead key.
 	v, err := s.PutIfVersion("k", bytes.NewReader([]byte("data")), 0, 0)
 	require.NoError(t, err)
 	captured := s.evictionEntryFor("k")
 	require.NotNil(t, captured)
-	time.Sleep(1100 * time.Millisecond)                         // a refresh is admitted only past the time gate's granularity
-	s.accessUpdater.Update("k", time.Now().Add(10*time.Minute)) // past the 5-minute gate: a real refresh
+	s.accessUpdater.accessTimeLRU.Add("k", time.Now().Add(-10*time.Minute)) // past the 5-minute gate
+	s.accessUpdater.UpdateNow("k")                                          // the read's refresh, stamped now
 	s.FlushAccessUpdates()
 	refreshed := s.evictionEntryFor("k")
 	require.NotNil(t, refreshed)
 	require.NotEqual(t, captured, refreshed, "the refresh must have swapped in a newer entry")
-	// The delete won (its tombstone is on the row) but captured the OLD entry.
-	deadStamp := v + 1
-	tomb, err := proto.Marshal(&pb.ValueMessage{Expiry: 1, Version: deadStamp})
+	cutoff := time.Now() // the instant before the (simulated) merge
+	tomb, err := proto.Marshal(&pb.ValueMessage{Expiry: 1, Version: v + 1})
 	require.NoError(t, err)
 	require.NoError(t, s.meta.Handle().Put(wo, metaKey, tomb))
-	s.dropDeadEvictionGeneration("k", metaKey, deadStamp, captured)
+	s.dropDeadEvictionGeneration("k", cutoff, captured)
+	assert.False(t, exists(captured))
 	assert.False(t, exists(refreshed), "the refreshed entry belongs to the dead key and must go")
 	assert.False(t, exists(backref), "and so must the back-reference")
 
-	// (2) Recreate before cleanup.
+	// (2) A recreate lands before the cleanup runs: its entry is newer than the
+	// cutoff and must be left intact, back-reference included.
 	fence := absentToken(t, s, "k")
 	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("again")), 0, fence)
 	require.NoError(t, err)
 	fresh := s.evictionEntryFor("k")
 	require.NotNil(t, fresh)
-	s.dropDeadEvictionGeneration("k", metaKey, deadStamp, captured) // stale delete's cleanup runs late
+	s.dropDeadEvictionGeneration("k", cutoff, captured) // the stale delete's cleanup runs late
 	assert.True(t, exists(fresh), "a recreate's entry must be left intact")
 	assert.True(t, exists(backref), "and its back-reference too")
+}
+
+// TestCAS_Fence_UnstampedTombstoneKeepsTheCallersToken: recreating over an
+// unstamped tombstone (a purge, or the no-base sentinel) must carry the
+// caller's observation token to the merge unchanged, so a fence that lands
+// between the read and the merge still orders it out. Rewriting the token to
+// the tombstone's version (0) would opt the caller out of ordering.
+func TestCAS_Fence_UnstampedTombstoneKeepsTheCallersToken(t *testing.T) {
+	s, cleanup := createCASTestStorage(t)
+	defer cleanup()
+
+	unstamped, err := proto.Marshal(&pb.ValueMessage{Expiry: 1})
+	require.NoError(t, err)
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("k"), unstamped))
+
+	tok := absentToken(t, s, "k") // a fresh token: an unstamped tombstone is plain absence
+	require.NoError(t, s.DeleteIfVersion("k", 0))
+	fence := absentToken(t, s, "k")
+	assert.Greater(t, fence, tok)
+
+	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("stale")), 0, tok)
+	assert.Equal(t, fence, mismatchWith(t, err), "a token observed over the unstamped tombstone must lose to the later fence")
+	_, err = s.PutIfVersion("k", bytes.NewReader([]byte("fresh")), 0, fence)
+	require.NoError(t, err)
+
+	// And with no fence in between, the token recreates over the unstamped tombstone.
+	require.NoError(t, s.meta.Handle().Put(wo, keys.MakeMetadataKey("u"), unstamped))
+	tok = absentToken(t, s, "u")
+	_, err = s.PutIfVersion("u", bytes.NewReader([]byte("ok")), 0, tok)
+	require.NoError(t, err)
 }
 
 // TestCAS_DeleteIfVersion_DropsOnlyTheDeadValuesEvictionEntry: a confirmed

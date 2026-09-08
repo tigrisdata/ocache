@@ -244,23 +244,20 @@ func (c *Cleaner) cleanupLoop() {
 	}
 }
 
-// fenceAgeReference is "now" on the timeline fence stamps are drawn from: the
-// wall clock, or the last issued stamp if that is ahead of it. Stamps are
-// wall-clock nanoseconds bumped monotonically, so after a restart they resume
-// from the durably reserved ceiling and can lead the clock by up to
-// versionReservationBlock; measuring a fence's age against the newer of the
-// two removes that lead. A backward clock step is the one residual: stamps
-// keep creeping above the old time while the clock catches up, and a fence is
-// then held longer by the size of the step — the safe direction, a delay on
-// reclaiming a small row and on the ordering it provides.
+// fenceAgeReference is "now" for measuring a fence's age: the wall clock. A
+// fence's stamp is wall-clock nanoseconds bumped monotonically, and after a
+// restart stamps resume from the durably reserved ceiling, so a stamp can lead
+// the clock by up to versionReservationBlock (60s). Measured against the wall
+// clock, such a fence is held up to that much LONGER than the horizon; the
+// alternative, measuring against the stamp source's own high-water mark, would
+// age fences up to that much EARLIER after a restart, since the mark is
+// initialised to the ceiling rather than to the last stamp actually issued.
+// Between the two, longer is the safe direction: a small row lingers and the
+// ordering it provides lasts slightly beyond the horizon, whereas earlier
+// would admit a pre-delete populate inside the horizon. A backward clock step
+// holds fences longer by the size of the step, for the same reason.
 func (c *Cleaner) fenceAgeReference() time.Time {
-	ref := time.Now()
-	if c.storage != nil {
-		if last := c.storage.lastVersion.Load(); last > uint64(ref.UnixNano()) {
-			ref = time.Unix(0, int64(last))
-		}
-	}
-	return ref
+	return time.Now()
 }
 
 // cleanupExpiredKeys scans for and removes expired keys

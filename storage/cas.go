@@ -435,14 +435,15 @@ func (s *Storage) PutIfVersion(key string, body io.Reader, ttl int, expected uin
 		return 0, storageErrors.NewVersionMismatchError("PutIfVersion", key, cur)
 	}
 
-	// Recreating over a TTL-expired-but-unswept row (or an unstamped
-	// tombstone): the read classified it absent, but the merge operator is
-	// clock-blind and sees a row with its real stored version. Match that
-	// version so the operand is not dropped. A fence that lands between this
-	// read and the merge still wins: the translated version predates it. (A
-	// stamped tombstone and a missing row need no translation: the operator's
-	// fence and no-base rules take the caller's token as is.)
-	if state == casAbsent && hasPrev {
+	// Recreating over a TTL-expired-but-unswept LIVE row: the read classified
+	// it absent, but the merge operator is clock-blind and sees a live row
+	// with its real stored version. Match that version so the operand is not
+	// dropped. A fence that lands between this read and the merge still wins:
+	// the translated version predates it. Tombstones — stamped or not — and
+	// missing rows need no translation, and must not get one: the operator's
+	// fence rule takes the caller's token as is, and rewriting it to 0 would
+	// opt the caller out of ordering against a fence that lands in between.
+	if state == casAbsent && hasPrev && prev.Expiry != merge.TombstoneExpiry {
 		operand.CasExpectedVersion = merge.EffectiveRowVersion(prev)
 	}
 
@@ -685,17 +686,25 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		OpType:             pb.MetaOp_META_OP_CAS_DELETE,
 		CasExpectedVersion: expected,
 	}
-	// Delete-if-absent over a TTL-expired-but-unswept row (or an unstamped
-	// tombstone): the clock-blind operator sees a row with its real stored
-	// version, so match that version to tombstone it — and since the result is
-	// ref-less, this delete then owns the reclaim of the expired row's bytes.
-	if state == casAbsent && hasPrev {
+	// Delete-if-absent over a TTL-expired-but-unswept LIVE row: the clock-blind
+	// operator sees a row with its real stored version, so match that version
+	// to tombstone it — and since the result is ref-less, this delete then owns
+	// the reclaim of the expired row's bytes. An unstamped tombstone needs no
+	// translation: expected is already 0 here, and the fence rule admits it.
+	if state == casAbsent && hasPrev && prev.Expiry != merge.TombstoneExpiry {
 		operand.CasExpectedVersion = merge.EffectiveRowVersion(prev)
 	}
 	operandBytes, err := proto.Marshal(operand)
 	if err != nil {
 		return storageErrors.NewInternalError("DeleteIfVersion", err)
 	}
+
+	// Every eviction-index entry of the value being deleted — the captured
+	// one, and any the asynchronous LRU refresh flushes for a read that
+	// preceded the delete — carries a write time before this instant; a
+	// recreate's entry, written after the merge commits, carries one after it.
+	// The win path uses this cutoff to tell the two apart.
+	cutoff := time.Now()
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
@@ -763,7 +772,7 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		// otherwise sit at the head of the eviction order, skipped with a point
 		// read on every pass. Drop that generation, and nothing that could
 		// belong to a recreate.
-		s.dropDeadEvictionGeneration(key, metaKey, newStamp, deadEntry)
+		s.dropDeadEvictionGeneration(key, cutoff, deadEntry)
 		return nil
 	default:
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))
@@ -792,25 +801,25 @@ func (s *Storage) evictionEntryFor(key string) []byte {
 }
 
 // dropDeadEvictionGeneration removes the eviction-index generation of a value
-// a confirmed CAS delete replaced, deciding by the ROW rather than by the
-// entry: it re-reads the key and, only if the row is still this delete's own
-// tombstone (stamp == deadStamp), drops whatever ordered entry the
-// back-reference points at, plus the back-reference. That covers both the
-// entry captured before the merge and one the asynchronous LRU refresh may
-// have swapped in since (a read queued shortly before the delete flushes a
-// newer entry for the same, now dead, key without touching its version). The
-// captured entry is deleted regardless: entries are keyed by write time, so
-// no other value can share it. If the row is no longer this delete's
-// tombstone, a recreate has landed; its generation is left untouched, so the
-// recreate stays covered, and nothing is left dangling for the hourly
-// coverage backfill to mistake for coverage.
+// a confirmed CAS delete replaced, deciding by the ENTRY'S WRITE TIME, which
+// every index entry key embeds. Entries of the dead value — the one captured
+// before the merge, and any the asynchronous LRU refresh flushed for a read
+// that preceded the delete — were written before cutoff (the instant before
+// the merge); a recreate's entry, written after the merge committed, was
+// written after it. So the entry the back-reference currently points at is
+// dropped, together with the back-reference, only if it is older than cutoff;
+// a recreate's generation is never touched, and no atomicity between reading
+// the row and writing the deletes is needed. The captured entry is deleted
+// regardless: no other value can share its key.
 //
-// The row re-read and the write are not atomic. A recreate landing in that
-// window loses its generation entirely — entry and back-reference — which the
-// next reconcile's coverage backfill restores within the hour. Microseconds
-// wide, self-healing, and the same re-check shape the TTL sweep uses. A no-op
-// when the dead value had no entry and no refresh is pending.
-func (s *Storage) dropDeadEvictionGeneration(key string, metaKey []byte, deadStamp uint64, deadEntry []byte) {
+// The one residual is a back-reference rewritten by a recreate between the
+// read here and the batch write: the recreate keeps its entry (eviction treats
+// an entry with no back-reference as authoritative, so the key stays
+// evictable) and the next reconcile's coverage backfill restores a
+// back-reference. Coverage is never lost. A backward wall-clock step could
+// make a recreate's entry look older than cutoff; that is the same clock
+// residual fence retention has, and it self-heals the same way.
+func (s *Storage) dropDeadEvictionGeneration(key string, cutoff time.Time, deadEntry []byte) {
 	var backref []byte
 	if s.evictionPolicy == EvictionPolicyFIFO {
 		backref = keys.MakeFifoBackrefKey(key)
@@ -824,15 +833,14 @@ func (s *Storage) dropDeadEvictionGeneration(key string, metaKey []byte, deadSta
 	if deadEntry != nil {
 		batch.Delete(deadEntry)
 	}
-	row, found, err := s.readRowForCAS(metaKey)
-	if err == nil && found && row.Expiry == merge.TombstoneExpiry && row.Version == deadStamp {
-		if cur, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
-			if cur.Exists() {
+	if cur, err := s.meta.Handle().Get(putPointReadOpts, backref); err == nil {
+		if cur.Exists() {
+			if written, ok := evictionEntryTime(cur.Data()); ok && written.Before(cutoff) {
 				batch.Delete(cur.Data())
 				batch.Delete(backref)
 			}
-			cur.Free()
 		}
+		cur.Free()
 	}
 	if batch.Count() == 0 {
 		return
@@ -840,4 +848,15 @@ func (s *Storage) dropDeadEvictionGeneration(key string, metaKey []byte, deadSta
 	if err := s.meta.Handle().Write(wo, batch); err != nil {
 		zlog.Error().Err(err).Str("key", key).Msg("storage.DeleteIfVersion: dropping the dead value's eviction generation failed; eviction skips it until the fence is swept")
 	}
+}
+
+// evictionEntryTime returns the write time embedded in an ordered
+// eviction-index entry key of either policy.
+func evictionEntryTime(entry []byte) (time.Time, bool) {
+	if keys.IsBucketedAccessKey(entry) {
+		_, at, err := keys.ParseBucketedAccessKey(entry)
+		return at, err == nil
+	}
+	at, err := keys.ParseFifoIndexTime(entry)
+	return at, err == nil
 }
