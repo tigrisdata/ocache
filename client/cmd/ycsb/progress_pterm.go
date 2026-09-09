@@ -273,6 +273,10 @@ func DisplayFinalResults(cfg YCSBConfig, result Result, totalOps []int) {
 	pterm.Println() // Final spacing
 }
 
+// getPerOperationStatsForReport is replaceable only by same-package benchmarks
+// so they can time the real statistics step without changing report output.
+var getPerOperationStatsForReport = (*MetricsCollector).GetPerOperationStats
+
 // DisplayFinalResultsWithMetrics displays the final benchmark results with enhanced metrics
 func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []int, metrics *MetricsCollector) {
 	pterm.Println() // Add spacing
@@ -335,7 +339,7 @@ func DisplayFinalResultsWithMetrics(cfg YCSBConfig, result Result, totalOps []in
 	}
 
 	// Per-Operation Statistics
-	opStats := metrics.GetPerOperationStats()
+	opStats := getPerOperationStatsForReport(metrics)
 	if len(opStats) > 0 {
 		pterm.DefaultSection.Println("Per-Operation Latency Statistics")
 
