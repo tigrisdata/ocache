@@ -56,7 +56,9 @@ func (s *CacheService) PutObjectIfVersion(ctx context.Context, req *pb.PutIfVers
 		metrics.RPCDuration.WithLabelValues("PutObjectIfVersion").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	// Info level while CAS is in initial production testing (new feature).
+	// Debug, like every plain handler's per-request line: per-request Info
+	// floods the log under a put or delete storm (it was Info during CAS's
+	// initial production testing).
 	zlog.Debug().Str("key", req.Key).Uint64("expected", req.ExpectedVersion).Int("data_len", len(req.Data)).Msg("PutObjectIfVersion called")
 
 	if req.Key == "" {
@@ -90,7 +92,9 @@ func (s *CacheService) DeleteIfVersion(ctx context.Context, req *pb.DeleteIfVers
 		metrics.RPCDuration.WithLabelValues("DeleteIfVersion").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	// Info level while CAS is in initial production testing (new feature).
+	// Debug, like every plain handler's per-request line: per-request Info
+	// floods the log under a put or delete storm (it was Info during CAS's
+	// initial production testing).
 	zlog.Debug().Str("key", req.Key).Uint64("expected", req.ExpectedVersion).Msg("DeleteIfVersion called")
 
 	if req.Key == "" {
