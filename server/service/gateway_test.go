@@ -18,7 +18,9 @@ import (
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type gatewayTestClient struct {
@@ -253,6 +255,44 @@ func TestGatewayCacheServiceClientTranslatesForwardingFailures(t *testing.T) {
 			require.NotNil(t, resp)
 			assert.False(t, resp.Success)
 			assert.Equal(t, tt.wantError, resp.Error)
+		})
+	}
+}
+
+func TestGatewayCacheServiceClientPreservesCancellationFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{name: "context canceled", err: context.Canceled, code: codes.Canceled},
+		{name: "grpc deadline", err: status.Error(codes.DeadlineExceeded, "owner deadline"), code: codes.DeadlineExceeded},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local := &gatewayTestClient{putObject: func(context.Context, *pb.PutRequest, ...grpc.CallOption) (*pb.PutResponse, error) {
+				return &pb.PutResponse{Success: true}, nil
+			}}
+			remote := &gatewayTestClient{putObject: func(context.Context, *pb.PutRequest, ...grpc.CallOption) (*pb.PutResponse, error) {
+				return nil, tt.err
+			}}
+			router := &gatewayTestRouter{
+				owner:   &ring.NodeInfo{ID: "owner"},
+				localID: "gateway",
+				remote:  remote,
+			}
+			client := &gatewayCacheServiceClient{CacheServiceClient: local, router: router}
+
+			resp, err := client.PutObject(context.Background(), &pb.PutRequest{Key: "key", Data: []byte("value")})
+
+			assert.Nil(t, resp)
+			require.Error(t, err)
+			if errors.Is(tt.err, context.Canceled) {
+				assert.ErrorIs(t, err, context.Canceled)
+			} else {
+				assert.Equal(t, tt.code, status.Code(err))
+			}
 		})
 	}
 }

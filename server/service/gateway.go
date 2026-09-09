@@ -7,11 +7,14 @@ package service
 
 import (
 	"context"
+	"errors"
 
 	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // gatewayUnaryForwardLimit keeps the HTTP gateway's direct owner call on the
@@ -78,6 +81,13 @@ func (c *gatewayCacheServiceClient) PutObject(ctx context.Context, req *pb.PutRe
 }
 
 func gatewayPutError(err error) (*pb.PutResponse, error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil, err
+	}
+	code := status.Code(err)
+	if code == codes.Canceled || code == codes.DeadlineExceeded {
+		return nil, err
+	}
 	userErr := mapStorageErrorToGRPC(err)
 	return &pb.PutResponse{Success: false, Error: userErr.Error()}, nil
 }
