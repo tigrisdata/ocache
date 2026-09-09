@@ -193,10 +193,6 @@ func (r *Router) routeToNode(nodeID, key string, maxRetries int) (pb.CacheServic
 
 		client, err := r.getClient(nodeID)
 		if err == nil {
-			zlog.Info().
-				Str("node_id", nodeID).
-				Msg("Successfully routed to node")
-
 			metrics.ClusterRouteRequests.WithLabelValues("remote").Inc()
 			return client, nil
 		}
@@ -309,6 +305,9 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		Str("node_id", nodeID).
 		Str("address", nodeAddr).
 		Msg("Created connection to node")
+	zlog.Info().
+		Str("node_id", nodeID).
+		Msg("Successfully routed to node")
 
 	return client, nil
 }
