@@ -144,8 +144,8 @@ func (mc *MetricsCollector) RecordThroughput(opsPerSec float64, opType OpType) {
 
 // GetPerOperationStats returns statistics for each operation type
 func (mc *MetricsCollector) GetPerOperationStats() map[OpType]OperationStats {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
 
 	stats := make(map[OpType]OperationStats)
 
@@ -154,23 +154,23 @@ func (mc *MetricsCollector) GetPerOperationStats() map[OpType]OperationStats {
 			continue
 		}
 
-		// Sort latencies for percentile calculation
-		sorted := make([]time.Duration, len(latencies))
-		copy(sorted, latencies)
-		sort.Slice(sorted, func(i, j int) bool {
-			return sorted[i] < sorted[j]
+		// Sort latencies in place for percentile calculation. Their internal order
+		// is not part of the metrics contract, and the exclusive lock keeps the
+		// collector from recording while the owned slice is sorted.
+		sort.Slice(latencies, func(i, j int) bool {
+			return latencies[i] < latencies[j]
 		})
 
 		stats[opType] = OperationStats{
 			Count:       len(latencies),
 			ErrorCount:  mc.errorsByOp[opType],
-			MinLatency:  sorted[0],
-			MaxLatency:  sorted[len(sorted)-1],
+			MinLatency:  latencies[0],
+			MaxLatency:  latencies[len(latencies)-1],
 			AvgLatency:  calculateAverage(latencies),
-			P50Latency:  percentile(sorted, 0.50),
-			P95Latency:  percentile(sorted, 0.95),
-			P99Latency:  percentile(sorted, 0.99),
-			P999Latency: percentile(sorted, 0.999),
+			P50Latency:  percentile(latencies, 0.50),
+			P95Latency:  percentile(latencies, 0.95),
+			P99Latency:  percentile(latencies, 0.99),
+			P999Latency: percentile(latencies, 0.999),
 		}
 	}
 
