@@ -184,7 +184,7 @@ func (r *Router) routeToNode(nodeID, key string, maxRetries int) (pb.CacheServic
 
 			metrics.ClusterRetryAttempts.WithLabelValues(nodeID).Inc()
 
-			zlog.Info().
+			zlog.Debug().
 				Str("node_id", nodeID).
 				Int("attempt", attempt).
 				Dur("backoff", backoff).
@@ -305,7 +305,7 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		Str("node_id", nodeID).
 		Str("address", nodeAddr).
 		Msg("Created connection to node")
-	zlog.Info().
+	zlog.Debug().
 		Str("node_id", nodeID).
 		Msg("Successfully routed to node")
 
