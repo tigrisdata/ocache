@@ -59,9 +59,12 @@ type ResponseMetadata struct {
 	ForwardedBy string
 }
 
-// ExtractRequestMetadata extracts routing metadata from the incoming context
+// ExtractRequestMetadata extracts routing metadata from incoming or outgoing context.
 func ExtractRequestMetadata(ctx context.Context) RequestMetadata {
 	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		md, ok = metadata.FromOutgoingContext(ctx)
+	}
 	if !ok {
 		return RequestMetadata{}
 	}
@@ -97,12 +100,17 @@ func ExtractRequestMetadata(ctx context.Context) RequestMetadata {
 
 // AttachForwardingMetadata attaches forwarding metadata to outgoing context
 func AttachForwardingMetadata(ctx context.Context, rm RequestMetadata) context.Context {
-	return metadata.AppendToOutgoingContext(ctx,
-		MetadataKeyRingEpoch, strconv.FormatUint(rm.RingEpoch, 10),
-		MetadataKeyHop, strconv.Itoa(rm.HopCount),
-		MetadataKeyForwarded, strconv.FormatBool(rm.Forwarded),
-		MetadataKeyOrigin, rm.OriginNode,
-	)
+	md, ok := metadata.FromOutgoingContext(ctx)
+	if !ok {
+		md = metadata.MD{}
+	} else {
+		md = md.Copy()
+	}
+	md.Set(MetadataKeyRingEpoch, strconv.FormatUint(rm.RingEpoch, 10))
+	md.Set(MetadataKeyHop, strconv.Itoa(rm.HopCount))
+	md.Set(MetadataKeyForwarded, strconv.FormatBool(rm.Forwarded))
+	md.Set(MetadataKeyOrigin, rm.OriginNode)
+	return metadata.NewOutgoingContext(ctx, md)
 }
 
 // CheckHopCount validates that the hop count hasn't exceeded MaxHops.

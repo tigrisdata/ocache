@@ -105,6 +105,26 @@ func TestAttachForwardingMetadata(t *testing.T) {
 	assert.Equal(t, []string{"node1"}, md.Get(MetadataKeyOrigin))
 }
 
+func TestIncrementHopCountUsesOutgoingMetadata(t *testing.T) {
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(
+		MetadataKeyRingEpoch, "42",
+		MetadataKeyHop, "1",
+		MetadataKeyOrigin, "origin",
+		"authorization", "bearer",
+	))
+
+	forwarded, err := IncrementHopCount(ctx, "gateway")
+	require.NoError(t, err)
+
+	md, ok := metadata.FromOutgoingContext(forwarded)
+	require.True(t, ok)
+	assert.Equal(t, []string{"42"}, md.Get(MetadataKeyRingEpoch))
+	assert.Equal(t, []string{"2"}, md.Get(MetadataKeyHop))
+	assert.Equal(t, []string{"true"}, md.Get(MetadataKeyForwarded))
+	assert.Equal(t, []string{"origin"}, md.Get(MetadataKeyOrigin))
+	assert.Equal(t, []string{"bearer"}, md.Get("authorization"))
+}
+
 func TestCheckHopCount(t *testing.T) {
 	tests := []struct {
 		name      string

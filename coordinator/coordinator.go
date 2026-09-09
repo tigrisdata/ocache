@@ -340,6 +340,17 @@ func (c *Coordinator) Route(key string) (pb.CacheServiceClient, error) {
 	return c.router.Route(key)
 }
 
+// Resolve returns the current owner for a key without acquiring a peer client.
+func (c *Coordinator) Resolve(key string) (*ring.NodeInfo, error) {
+	return c.router.Resolve(key)
+}
+
+// RouteToNode returns a client for an already-resolved owner while preserving
+// the router's connection retry, health, and circuit-breaker behavior.
+func (c *Coordinator) RouteToNode(nodeID string) (pb.CacheServiceClient, error) {
+	return c.router.RouteToNode(nodeID)
+}
+
 // GetNodeForKey returns the node for the given key
 func (c *Coordinator) GetNodeForKey(key string) (*ring.NodeInfo, error) {
 	return c.ringManager.GetNode(key)

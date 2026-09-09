@@ -207,11 +207,27 @@ func StartGRPCGatewayServer(coord *coordinator.Coordinator, grpcAddr string, lis
 	mux := http.NewServeMux()
 
 	gwMux := runtime.NewServeMux()
-	// Register the gRPC service handler with grpc-gateway
+	// Keep the generated gateway client for ordinary requests, but dispatch
+	// eligible nonlocal unary puts directly to their resolved owner.
 	opts := []grpc.DialOption{grpc.WithInsecure()}
-	if err := pb.RegisterCacheServiceHandlerFromEndpoint(ctx, gwMux, grpcAddr, opts); err != nil {
+	localConn, err := grpc.NewClient(grpcAddr, opts...)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("failed to connect grpc-gateway handler")
+	}
+	localClient := pb.NewCacheServiceClient(localConn)
+	gatewayClient := newGatewayCacheServiceClient(localClient, coord)
+	if err := pb.RegisterCacheServiceHandlerClient(ctx, gwMux, gatewayClient); err != nil {
+		if closeErr := localConn.Close(); closeErr != nil {
+			zlog.Error().Err(closeErr).Msg("failed to close grpc-gateway client")
+		}
 		zlog.Fatal().Err(err).Msg("failed to register grpc-gateway handler")
 	}
+	go func() {
+		<-ctx.Done()
+		if err := localConn.Close(); err != nil {
+			zlog.Error().Err(err).Msg("failed to close grpc-gateway client")
+		}
+	}()
 
 	// Health check endpoints for Docker/Kubernetes
 	mux.HandleFunc("/health", healthHandler())

@@ -124,6 +124,13 @@ func NewRouterWithConfig(ring Ring, localID string, config *RouterConfig) *Route
 	}
 }
 
+// Resolve returns the current owner for a key without acquiring a peer client.
+// Keeping ownership lookup separate lets callers that already resolved a key
+// acquire the corresponding cached client without hashing the key again.
+func (r *Router) Resolve(key string) (*ring.NodeInfo, error) {
+	return r.ring.GetNode(key)
+}
+
 // Route returns a client for routing requests for the given key
 // Returns an error if the key should be handled locally (defensive check)
 func (r *Router) Route(key string) (pb.CacheServiceClient, error) {
@@ -134,7 +141,7 @@ func (r *Router) Route(key string) (pb.CacheServiceClient, error) {
 // Returns an error if the key maps to the local node (this should not happen
 // as callers should check IsLocal first, but we check defensively)
 func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClient, error) {
-	node, err := r.ring.GetNode(key)
+	node, err := r.Resolve(key)
 	if err != nil {
 		metrics.ClusterRouteRequests.WithLabelValues("error").Inc()
 		return nil, err
@@ -153,6 +160,17 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 		return nil, NewLocalRoutingError(r.localID, key)
 	}
 
+	return r.routeToNode(node.ID, key, maxRetries)
+}
+
+// RouteToNode returns a client for an already-resolved owner. It uses the same
+// connection retry, health, and circuit-breaker path as Route, but does not
+// resolve the key again.
+func (r *Router) RouteToNode(nodeID string) (pb.CacheServiceClient, error) {
+	return r.routeToNode(nodeID, "", r.config.MaxRetries)
+}
+
+func (r *Router) routeToNode(nodeID, key string, maxRetries int) (pb.CacheServiceClient, error) {
 	var lastErr error
 	backoff := r.config.InitialRetryBackoff
 
@@ -164,19 +182,19 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 			time.Sleep(jittered(backoff))
 			backoff = r.calculateBackoff(backoff)
 
-			metrics.ClusterRetryAttempts.WithLabelValues(node.ID).Inc()
+			metrics.ClusterRetryAttempts.WithLabelValues(nodeID).Inc()
 
 			zlog.Debug().
-				Str("node_id", node.ID).
+				Str("node_id", nodeID).
 				Int("attempt", attempt).
 				Dur("backoff", backoff).
 				Msg("Retrying connection after failure")
 		}
 
-		client, err := r.getClient(node.ID)
+		client, err := r.getClient(nodeID)
 		if err == nil {
 			zlog.Debug().
-				Str("node_id", node.ID).
+				Str("node_id", nodeID).
 				Msg("Successfully routed to node")
 
 			metrics.ClusterRouteRequests.WithLabelValues("remote").Inc()
@@ -193,7 +211,7 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 
 	metrics.ClusterRouteRequests.WithLabelValues("error").Inc()
 	metrics.ClusterRoutingErrors.WithLabelValues("max_retries_exceeded").Inc()
-	return nil, NewMaxRetriesExceededError(node.ID, key, maxRetries+1, lastErr)
+	return nil, NewMaxRetriesExceededError(nodeID, key, maxRetries+1, lastErr)
 }
 
 // getClient returns a client for the given node, creating one if necessary

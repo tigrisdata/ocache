@@ -309,6 +309,15 @@ func TestRouter_BasicRouting(t *testing.T) {
 	client, err = router.Route("remote-key")
 	assert.NoError(t, err)
 	assert.NotNil(t, client, "Remote routing should return a client")
+
+	// An already-resolved owner should reuse the same client acquisition path
+	// without resolving the key again.
+	owner, err := router.Resolve("remote-key")
+	require.NoError(t, err)
+	assert.Equal(t, "remote-node", owner.ID)
+	resolvedClient, err := router.RouteToNode(owner.ID)
+	assert.NoError(t, err)
+	assert.NotNil(t, resolvedClient)
 }
 
 func TestRouter_CircuitBreaker(t *testing.T) {
