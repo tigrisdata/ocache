@@ -174,41 +174,46 @@ def put_requests(http_port, key, body, count):
 
 
 def start_cluster(binary, root):
-    ports = free_ports(9)
-    grpc_ports = ports[0:3]
-    http_ports = ports[3:6]
-    gossip_ports = ports[6:9]
-    seeds = ",".join(f"{HOST}:{port}" for port in gossip_ports)
-    processes = []
-    try:
-        for index in range(3):
-            node_root = root / f"node{index + 1}"
-            node_root.mkdir()
-            log = (root / f"node{index + 1}.log").open("w")
-            command = [
-                binary,
-                "-cluster-enabled",
-                "-node-id",
-                f"node{index + 1}",
-                "-disk",
-                str(node_root),
-                "-listen-addr",
-                f"{HOST}:{grpc_ports[index]}",
-                "-listen-http",
-                f"{HOST}:{http_ports[index]}",
-                "-cluster-addr",
-                f"{HOST}:{gossip_ports[index]}",
-                "-seeds",
-                seeds,
-            ]
-            processes.append(subprocess.Popen(command, stdout=log, stderr=log))
-            wait_for_http(http_ports[index], "/ready")
-            log.close()
-        topology = wait_for_http(http_ports[0], "/v1/topology", topology_ready, timeout=90)
-        return processes, grpc_ports, http_ports, topology
-    except Exception:
-        stop_cluster(processes)
-        raise
+    for attempt in range(5):
+        ports = free_ports(9)
+        grpc_ports = ports[0:3]
+        http_ports = ports[3:6]
+        gossip_ports = ports[6:9]
+        seeds = ",".join(f"{HOST}:{port}" for port in gossip_ports)
+        attempt_root = root / f"attempt-{attempt}"
+        attempt_root.mkdir()
+        processes = []
+        try:
+            for index in range(3):
+                node_root = attempt_root / f"node{index + 1}"
+                node_root.mkdir()
+                log = (attempt_root / f"node{index + 1}.log").open("w")
+                command = [
+                    binary,
+                    "-cluster-enabled",
+                    "-node-id",
+                    f"node{index + 1}",
+                    "-disk",
+                    str(node_root),
+                    "-listen-addr",
+                    f"{HOST}:{grpc_ports[index]}",
+                    "-listen-http",
+                    f"{HOST}:{http_ports[index]}",
+                    "-cluster-addr",
+                    f"{HOST}:{gossip_ports[index]}",
+                    "-seeds",
+                    seeds,
+                ]
+                processes.append(subprocess.Popen(command, stdout=log, stderr=log))
+                wait_for_http(http_ports[index], "/ready")
+                log.close()
+            topology = wait_for_http(http_ports[0], "/v1/topology", topology_ready, timeout=90)
+            return processes, grpc_ports, http_ports, topology
+        except Exception:
+            stop_cluster(processes)
+            if attempt == 4:
+                raise
+            time.sleep(0.2)
 
 
 def stop_cluster(processes):
