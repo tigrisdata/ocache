@@ -5,6 +5,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,7 +31,7 @@ func TestListKeyValuesWithPagination_OmitsOversizeValues(t *testing.T) {
 	require.NoError(t, s.Put("a-small", bytes.NewReader(small), 0))
 	require.NoError(t, s.Put("b-large", bytes.NewReader(large), 0))
 
-	entries, _, _, err := s.ListKeyValuesWithPagination("", "", 100)
+	entries, _, _, err := s.ListKeyValuesWithPagination(context.Background(), "", "", 100)
 	require.NoError(t, err)
 
 	got := make(map[string]KeyValue, len(entries))
@@ -46,6 +47,64 @@ func TestListKeyValuesWithPagination_OmitsOversizeValues(t *testing.T) {
 	assert.True(t, got["b-large"].ValueOmitted, "value over the cap must be omitted")
 	assert.Nil(t, got["b-large"].Value, "omitted value must not be buffered")
 	assert.Equal(t, int64(len(large)), got["b-large"].ValueLength, "size must still be reported")
+}
+
+// TestListKeyValuesWithPaginationReadsRawValuesAndPreservesCursor verifies
+// that spilled raw-file values retain page ordering and continuation behavior.
+func TestListKeyValuesWithPaginationReadsRawValuesAndPreservesCursor(t *testing.T) {
+	s, cleanup := createTestStorage(t, 0, 1, 4*1024, 16*1024*1024, 1000, 0)
+	defer cleanup()
+
+	value := bytes.Repeat([]byte("r"), 8*1024)
+	for _, key := range []string{"list-01", "list-02", "list-03"} {
+		require.NoError(t, s.Put(key, bytes.NewReader(value), 0))
+	}
+
+	entries, lastKey, hasMore, err := s.ListKeyValuesWithPagination(context.Background(), "list-", "", 2)
+	require.NoError(t, err)
+	require.Equal(t, []string{"list-01", "list-02"}, []string{entries[0].Key, entries[1].Key})
+	require.Equal(t, "list-02", lastKey)
+	require.True(t, hasMore)
+	for _, entry := range entries {
+		require.Equal(t, value, entry.Value)
+		require.Equal(t, int64(len(value)), entry.ValueLength)
+		require.False(t, entry.ValueOmitted)
+	}
+
+	entries, lastKey, hasMore, err = s.ListKeyValuesWithPagination(context.Background(), "list-", lastKey, 2)
+	require.NoError(t, err)
+	require.Equal(t, []string{"list-03"}, []string{entries[0].Key})
+	require.Empty(t, lastKey)
+	require.False(t, hasMore)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	entries, lastKey, hasMore, err = s.ListKeyValuesWithPagination(ctx, "list-", "", 2)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, entries)
+	require.Empty(t, lastKey)
+	require.False(t, hasMore)
+}
+
+// TestListKeyValuesWithPaginationReadsSegmentValues verifies that the
+// interruptible list reader also returns values from compacted segments.
+func TestListKeyValuesWithPaginationReadsSegmentValues(t *testing.T) {
+	s, cleanup := createTestStorage(t, 0, 1, 64*1024, 16*1024*1024, 1000, 0)
+	defer cleanup()
+
+	value := bytes.Repeat([]byte("s"), 8*1024)
+	require.NoError(t, s.Put("segment-list", bytes.NewReader(value), 0))
+	_, _ = s.compactor.CompactFiles(context.Background(), 0)
+
+	entries, lastKey, hasMore, err := s.ListKeyValuesWithPagination(context.Background(), "segment-", "", 1)
+	require.NoError(t, err)
+	require.Empty(t, lastKey)
+	require.False(t, hasMore)
+	require.Len(t, entries, 1)
+	require.Equal(t, "segment-list", entries[0].Key)
+	require.Equal(t, value, entries[0].Value)
+	require.Equal(t, int64(len(value)), entries[0].ValueLength)
+	require.False(t, entries[0].ValueOmitted)
 }
 
 // TestNewStorageWithConfig_ClampsCompactThresholdBelowSegmentSize verifies the

@@ -5,6 +5,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -256,7 +257,7 @@ func (h *IntegrationTestHarness) ListPage(prefix string, limit int, continuation
 
 // ListPageWithValues returns a page of key-value pairs with pagination support
 func (h *IntegrationTestHarness) ListPageWithValues(prefix string, limit int, continuationToken string) (entries []KeyValueEntry, nextToken string, hasMore bool, err error) {
-	storageEntries, lastKey, more, listErr := h.Storage.ListKeyValuesWithPagination(prefix, continuationToken, limit)
+	storageEntries, lastKey, more, listErr := h.Storage.ListKeyValuesWithPagination(context.Background(), prefix, continuationToken, limit)
 	if listErr != nil {
 		h.Metrics.ErrorCount.Add(1)
 		return nil, "", false, listErr

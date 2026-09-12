@@ -60,18 +60,29 @@ func (o *Operations) ListLocalWithValues(ctx context.Context, prefix string, lim
 	var lastKey string
 	var hasMore bool
 
-	err := retry.Do(ctx, retry.DefaultConfig(), "ListKeyValuesWithPagination", func() error {
-		var listErr error
-		storageEntries, lastKey, hasMore, listErr = o.storage.ListKeyValuesWithPagination(prefix, startKey, limit)
-		return listErr
-	})
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, "", false, err
 	}
 
-	// Convert storage entries to proto entries
+	err := retry.Do(ctx, retry.DefaultConfig(), "ListKeyValuesWithPagination", func() error {
+		var listErr error
+		storageEntries, lastKey, hasMore, listErr = o.storage.ListKeyValuesWithPagination(ctx, prefix, startKey, limit)
+		return listErr
+	})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, "", false, ctxErr
+		}
+		return nil, "", false, err
+	}
+
+	// Convert storage entries to proto entries. A canceled request never
+	// publishes a partially converted page.
 	entries := make([]*pb.KeyValue, len(storageEntries))
 	for i, e := range storageEntries {
+		if err := ctx.Err(); err != nil {
+			return nil, "", false, err
+		}
 		entries[i] = &pb.KeyValue{
 			Key:          e.Key,
 			Value:        e.Value,

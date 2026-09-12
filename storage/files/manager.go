@@ -151,6 +151,35 @@ func (fm *FileManager) Read(filePath string, length int64) (io.ReadCloser, error
 	}), nil
 }
 
+// ReadForList duplicates the cached descriptor for a paginated value read.
+// Once the duplicate is made, the cached reference and read lock are released;
+// the private descriptor keeps the published raw file readable if the path is
+// removed while cancellation unwinds the list operation.
+func (fm *FileManager) ReadForList(filePath string, length int64) (io.ReadCloser, error) {
+	if filePath == "" || length <= 0 {
+		return nil, fmt.Errorf("invalid file path or length: path=%s, length=%d", filePath, length)
+	}
+
+	entry, err := fm.fdCache.Acquire(filePath)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("nil file entry for raw file: %s", filePath)
+	}
+
+	entry.RLock()
+	privateFile, err := fd.DuplicateFile(entry.File())
+	entry.RUnlock()
+	fm.fdCache.Release(filePath, entry)
+	if err != nil {
+		return nil, err
+	}
+
+	reader := io.NewSectionReader(privateFile, 0, length)
+	return wrapReadForBenchmark(fd.NewInterruptibleReadCloser(privateFile, reader, nil)), nil
+}
+
 // Remove removes a file for the given key without blocking if it's being read
 func (fm *FileManager) Remove(filePath string) error {
 	// Get file-specific lock (use GetFileLock, not Acquire, to avoid opening the file)

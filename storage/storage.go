@@ -5,6 +5,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -618,10 +619,79 @@ type KeyValue struct {
 	ValueOmitted bool
 }
 
+// interruptibleListReader is implemented by the private readers used for
+// paginated values. Interrupt stops the private read when the reader supports
+// it; Close also releases the shared file ownership without closing a cached
+// descriptor.
+type interruptibleListReader interface {
+	io.ReadCloser
+	Interrupt()
+}
+
+func readListPayload(ctx context.Context, reader io.ReadCloser) ([]byte, error) {
+	interruptible, ok := reader.(interruptibleListReader)
+	if !ok {
+		_ = reader.Close()
+		return nil, fmt.Errorf("list payload reader is not interruptible")
+	}
+
+	type readResult struct {
+		data []byte
+		err  error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		data, err := io.ReadAll(reader)
+		resultCh <- readResult{data: data, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		_ = reader.Close()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return result.data, result.err
+	case <-ctx.Done():
+		// The reader owns only a private descriptor. Interrupt and Close can
+		// therefore release the shared cache reference and read lock immediately;
+		// a blocked private read cannot invalidate another reader's descriptor.
+		interruptible.Interrupt()
+		_ = reader.Close()
+		return nil, ctx.Err()
+	}
+}
+
+func (s *Storage) readListPayload(ctx context.Context, valueKey string, valueMsg *pb.ValueMessage) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var (
+		reader  io.ReadCloser
+		readErr error
+	)
+	switch valueMsg.ValueType {
+	case pb.ValueType_SEGMENT:
+		reader, readErr = s.segmentManager.ReadEntryForList(valueKey, valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
+	case pb.ValueType_RAW_FILE:
+		reader, readErr = s.fileManager.ReadForList(valueMsg.RawFilePath, valueMsg.ValueLength)
+	default:
+		return nil, nil
+	}
+	if readErr != nil || reader == nil {
+		return nil, readErr
+	}
+	return readListPayload(ctx, reader)
+}
+
 // ListKeyValuesWithPagination returns paginated, sorted key-value pairs from RocksDB.
 // For inline values the data is returned directly; for file/segment values the data is
 // read from disk. Returns: (entries, lastKey, hasMore, error).
-func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string, limit int) ([]KeyValue, string, bool, error) {
+func (s *Storage) ListKeyValuesWithPagination(ctx context.Context, userPrefix string, startKey string, limit int) ([]KeyValue, string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	endBenchmarkScan := benchio.BeginListScanForBenchmark()
 	defer endBenchmarkScan()
 
@@ -630,6 +700,10 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("list_kv_paginated", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
+
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, err
+	}
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
@@ -659,27 +733,52 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 
 	// Seek to start position
 	it.Seek(seekKey)
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, err
+	}
 
 	// If we have a startKey, skip it (pagination is exclusive)
 	if startKey != "" && it.Valid() {
-		k := it.Key().Data()
-		currentUserKey := keys.ExtractUserKey(k)
+		keySlice := it.Key()
+		valueSlice := it.Value()
+		currentUserKey := keys.ExtractUserKey(keySlice.Data())
+		keySlice.Free()
+		valueSlice.Free()
 		if currentUserKey == startKey {
-			it.Key().Free()
-			it.Value().Free()
+			if err := ctx.Err(); err != nil {
+				return nil, "", false, err
+			}
 			it.Next()
 		}
 	}
 
-	// Collect up to limit key-value pairs
-	for it.ValidForPrefix(prefixBoundary) {
+	// Collect up to limit key-value pairs. A cancellation discards the entire
+	// page so callers never receive a cursor that describes a partial scan.
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", false, err
+		}
+		if !it.ValidForPrefix(prefixBoundary) {
+			break
+		}
 		if limit > 0 && len(entries) >= limit {
 			break
 		}
 		benchio.RecordListRowForBenchmark()
 
-		k := it.Key().Data()
-		v := it.Value().Data()
+		keySlice := it.Key()
+		valueSlice := it.Value()
+		k := keySlice.Data()
+		v := valueSlice.Data()
+		releaseSlices := func() {
+			keySlice.Free()
+			valueSlice.Free()
+		}
+
+		if err := ctx.Err(); err != nil {
+			releaseSlices()
+			return nil, "", false, err
+		}
 
 		// Try to decode as proto ValueMessage to check expiry.
 		// If unmarshal fails, include the key with nil value to keep
@@ -690,8 +789,10 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 		valueMsg := &pb.ValueMessage{}
 		if err := proto.Unmarshal(v, valueMsg); err == nil {
 			if valueMsg.Expiry > 0 && time.Now().Unix() >= valueMsg.Expiry {
-				it.Key().Free()
-				it.Value().Free()
+				releaseSlices()
+				if err := ctx.Err(); err != nil {
+					return nil, "", false, err
+				}
 				it.Next()
 				continue
 			}
@@ -714,41 +815,37 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 				case pb.ValueType_INLINE:
 					// proto.Unmarshal owns a copy separate from the iterator buffer.
 					data = valueMsg.Data
-				case pb.ValueType_SEGMENT:
-					r, readErr := s.segmentManager.ReadEntry(keys.ExtractUserKey(k), valueMsg.SegmentPath, valueMsg.SegmentOffset, valueMsg.ValueLength)
-					if readErr == nil && r != nil {
-						data, readErr = io.ReadAll(r)
-						if closer, ok := r.(io.Closer); ok {
-							closer.Close()
+				case pb.ValueType_SEGMENT, pb.ValueType_RAW_FILE:
+					var readErr error
+					data, readErr = s.readListPayload(ctx, keys.ExtractUserKey(k), valueMsg)
+					if readErr != nil {
+						if ctxErr := ctx.Err(); ctxErr != nil {
+							releaseSlices()
+							return nil, "", false, ctxErr
 						}
-						if readErr != nil {
-							data = nil
-						}
-					}
-				case pb.ValueType_RAW_FILE:
-					r, readErr := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
-					if readErr == nil && r != nil {
-						data, readErr = io.ReadAll(r)
-						if closer, ok := r.(io.Closer); ok {
-							closer.Close()
-						}
-						if readErr != nil {
-							data = nil
-						}
+						// Preserve the existing best-effort behavior for ordinary
+						// payload read failures: keep the key and report no value.
+						data = nil
 					}
 				}
 			}
 		}
 
+		if err := ctx.Err(); err != nil {
+			releaseSlices()
+			return nil, "", false, err
+		}
 		userKey := keys.ExtractUserKey(k)
 		entries = append(entries, KeyValue{Key: userKey, Value: data, ValueLength: valueLength, ValueOmitted: valueOmitted})
 		lastKey = userKey
 
-		it.Key().Free()
-		it.Value().Free()
+		releaseSlices()
 		it.Next()
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, err
+	}
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_kv_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_kv_paginated").Inc()
@@ -758,12 +855,15 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	// Check if there are more keys
 	hasMore := it.ValidForPrefix(prefixBoundary)
 	if hasMore {
-		k := it.Key().Data()
-		nextUserKey := keys.ExtractUserKey(k)
+		keySlice := it.Key()
+		nextUserKey := keys.ExtractUserKey(keySlice.Data())
 		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
 			hasMore = false
 		}
-		it.Key().Free()
+		keySlice.Free()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, err
 	}
 
 	if !hasMore {

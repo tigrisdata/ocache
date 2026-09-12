@@ -266,6 +266,36 @@ func (s *Segment) ReadEntry(key string, offset, length int64, fdCache *fd.FdCach
 	}, nil
 }
 
+// ReadEntryForList duplicates the cached descriptor for a paginated value
+// read. Once the duplicate is made, the cached reference and segment read lock
+// are released; the private descriptor keeps the published extent readable if
+// the segment is removed while cancellation unwinds the list operation.
+func (s *Segment) ReadEntryForList(key string, offset, length int64, fdCache *fd.FdCache) (io.ReadCloser, error) {
+	if key == "" || offset < 0 || length <= 0 {
+		return nil, fmt.Errorf("invalid key, offset or length: key=%s, offset=%d, length=%d", key, offset, length)
+	}
+
+	entry, err := fdCache.Acquire(s.path)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return nil, fmt.Errorf("nil file entry for segment: %s", s.path)
+	}
+
+	entry.RLock()
+	privateFile, err := fd.DuplicateFile(entry.File())
+	entry.RUnlock()
+	fdCache.Release(s.path, entry)
+	if err != nil {
+		return nil, err
+	}
+
+	offset += CalculateValueHeaderSize(key)
+	reader := io.NewSectionReader(privateFile, offset, length)
+	return fd.NewInterruptibleReadCloser(privateFile, reader, nil), nil
+}
+
 // WriteEntry writes an entry to a segment from an io.Reader
 func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int64, error) {
 	if vm.ValueType != pb.ValueType_RAW_FILE && vm.ValueType != pb.ValueType_SEGMENT {
