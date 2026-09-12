@@ -170,16 +170,17 @@ type canceledListBenchmarkStats struct {
 
 // waitForCanceledListBenchmarkFanout waits until both cluster branches have
 // reached their first payload reader before cancellation is recorded.
-func waitForCanceledListBenchmarkFanout() {
+func waitForCanceledListBenchmarkFanout() bool {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if benchio.ActiveListScansForBenchmark() >= 2 &&
 			benchio.ActiveListHandlersForBenchmark() >= 2 &&
 			benchio.ActivePayloadReadersForBenchmark() >= 2 {
-			return
+			return true
 		}
 		time.Sleep(100 * time.Microsecond)
 	}
+	return false
 }
 
 // BenchmarkCacheServiceListWithValuesCancellation measures the public list
@@ -203,6 +204,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 		ctx, cancel := context.WithCancel(context.Background())
 		ready := make(chan struct{})
 		cancelled := make(chan time.Time, 1)
+		fanoutReady := make(chan bool, 1)
 		activeStats := make(chan canceledListBenchmarkStats, 1)
 		postCancelStats := make(chan canceledListBenchmarkStats, 1)
 		handlerDone := make(chan struct{})
@@ -210,7 +212,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 		go func() {
 			close(ready)
 			<-started
-			waitForCanceledListBenchmarkFanout()
+			fanoutReady <- waitForCanceledListBenchmarkFanout()
 			cancelAt := time.Now()
 			benchio.MarkPayloadCancellationForBenchmark()
 			cancel()
@@ -239,6 +241,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 
 		cancelAt := <-cancelled
 		stats.cancelToExitNanos += time.Since(cancelAt).Nanoseconds()
+		fanoutReached := <-fanoutReady
 		select {
 		case <-released:
 		default:
@@ -254,6 +257,9 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 		stats.bytesAfterCancel += postCancel.bytesAfterCancel
 		restore()
 		cancel()
+		if !fanoutReached {
+			b.Fatal("cluster cancellation workload did not reach both handlers, scans, and payload readers")
+		}
 		b.StartTimer()
 	}
 	b.StopTimer()
@@ -268,7 +274,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 	b.ReportMetric(float64(stats.handlerExitedBeforeGate)/operations, "handler-exit-before-gate/op")
 }
 
-func consumeClusterListWithValuesBenchmarkResponse(b *testing.B, response *pb.ListWithValuesResponse, count, valueSize int) {
+func consumeClusterListWithValuesBenchmarkResponse(b *testing.B, response *pb.ListWithValuesResponse, count, valueSize int, expectMore bool) []string {
 	b.Helper()
 	if response == nil {
 		b.Fatal("ListWithValues returned a nil response")
@@ -276,10 +282,14 @@ func consumeClusterListWithValuesBenchmarkResponse(b *testing.B, response *pb.Li
 	if len(response.Entries) != count {
 		b.Fatalf("ListWithValues returned %d entries, want %d", len(response.Entries), count)
 	}
-	if !response.HasMore || response.ContinuationToken == "" {
-		b.Fatalf("ListWithValues returned no cluster continuation: has_more=%v token=%q", response.HasMore, response.ContinuationToken)
+	if response.HasMore != expectMore {
+		b.Fatalf("ListWithValues returned unexpected has_more: got=%v want=%v", response.HasMore, expectMore)
+	}
+	if (response.ContinuationToken != "") != expectMore {
+		b.Fatalf("ListWithValues returned unexpected continuation: has_more=%v token=%q", response.HasMore, response.ContinuationToken)
 	}
 
+	keys := make([]string, 0, len(response.Entries))
 	var totalBytes int
 	previousKey := ""
 	for _, entry := range response.Entries {
@@ -290,6 +300,7 @@ func consumeClusterListWithValuesBenchmarkResponse(b *testing.B, response *pb.Li
 			b.Fatalf("ListWithValues returned keys out of order: %q after %q", entry.Key, previousKey)
 		}
 		previousKey = entry.Key
+		keys = append(keys, entry.Key)
 		if entry.ValueOmitted || entry.ValueLength != int64(valueSize) || len(entry.Value) != valueSize {
 			b.Fatalf("ListWithValues returned an invalid value: key=%q omitted=%v length=%d bytes=%d", entry.Key, entry.ValueOmitted, entry.ValueLength, len(entry.Value))
 		}
@@ -298,6 +309,7 @@ func consumeClusterListWithValuesBenchmarkResponse(b *testing.B, response *pb.Li
 	if totalBytes != count*valueSize {
 		b.Fatalf("ListWithValues returned %d value bytes, want %d", totalBytes, count*valueSize)
 	}
+	return keys
 }
 
 // BenchmarkCacheServiceListWithValuesRawLive is the live-context guard for
@@ -314,10 +326,31 @@ func BenchmarkCacheServiceListWithValuesRawLive(b *testing.B) {
 	for b.Loop() {
 		ctx, cancel := context.WithCancel(context.Background())
 		response, err := env.service.ListWithValues(ctx, req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		firstKeys := consumeClusterListWithValuesBenchmarkResponse(b, response, 100, canceledListBenchmarkValueSize, true)
+		response, err = env.service.ListWithValues(ctx, &pb.ListRequest{
+			Prefix:            env.prefix,
+			Limit:             100,
+			ContinuationToken: response.ContinuationToken,
+		})
 		cancel()
 		if err != nil {
 			b.Fatal(err)
 		}
-		consumeClusterListWithValuesBenchmarkResponse(b, response, 100, canceledListBenchmarkValueSize)
+		secondKeys := consumeClusterListWithValuesBenchmarkResponse(b, response, 100, canceledListBenchmarkValueSize, false)
+		if firstKeys[len(firstKeys)-1] >= secondKeys[0] {
+			b.Fatalf("cluster continuation moved backwards: first=%q second=%q", firstKeys[len(firstKeys)-1], secondKeys[0])
+		}
+		seen := make(map[string]struct{}, len(firstKeys))
+		for _, key := range firstKeys {
+			seen[key] = struct{}{}
+		}
+		for _, key := range secondKeys {
+			if _, exists := seen[key]; exists {
+				b.Fatalf("cluster continuation repeated key %q", key)
+			}
+		}
 	}
 }
