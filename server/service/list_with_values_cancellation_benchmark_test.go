@@ -109,13 +109,14 @@ func TestCacheServiceListWithValuesCancellationReleasesBlockedRead(t *testing.T)
 }
 
 type canceledListBenchmarkStats struct {
-	cancelToExitNanos        int64
-	rowsAfterCancel          int64
-	bytesAfterCancel         int64
-	activeScansAfterCancel   int64
-	activeReadersAfterCancel int64
-	handlerExitedBeforeGate  int64
-	operations               int64
+	cancelToExitNanos         int64
+	rowsAfterCancel           int64
+	bytesAfterCancel          int64
+	activeScansAfterCancel    int64
+	activeHandlersAfterCancel int64
+	activeReadersAfterCancel  int64
+	handlerExitedBeforeGate   int64
+	operations                int64
 }
 
 // BenchmarkCacheServiceListWithValuesCancellation measures the public list
@@ -152,8 +153,9 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 			cancelled <- cancelAt
 			time.Sleep(5 * time.Millisecond)
 			activeStats <- canceledListBenchmarkStats{
-				activeScansAfterCancel:   benchio.ActiveListScansForBenchmark(),
-				activeReadersAfterCancel: benchio.ActivePayloadReadersForBenchmark(),
+				activeScansAfterCancel:    benchio.ActiveListScansForBenchmark(),
+				activeHandlersAfterCancel: benchio.ActiveListHandlersForBenchmark(),
+				activeReadersAfterCancel:  benchio.ActivePayloadReadersForBenchmark(),
 			}
 			time.Sleep(5 * time.Millisecond)
 			release()
@@ -180,6 +182,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 		}
 		active := <-activeStats
 		stats.activeScansAfterCancel += active.activeScansAfterCancel
+		stats.activeHandlersAfterCancel += active.activeHandlersAfterCancel
 		stats.activeReadersAfterCancel += active.activeReadersAfterCancel
 		<-released
 		postCancel := <-postCancelStats
@@ -196,6 +199,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 	b.ReportMetric(float64(stats.rowsAfterCancel)/operations, "rows-after-cancel/op")
 	b.ReportMetric(float64(stats.bytesAfterCancel)/operations, "bytes-after-cancel/op")
 	b.ReportMetric(float64(stats.activeScansAfterCancel)/operations, "active-list-scans-after-cancel/op")
+	b.ReportMetric(float64(stats.activeHandlersAfterCancel)/operations, "active-list-handlers-after-cancel/op")
 	b.ReportMetric(float64(stats.activeReadersAfterCancel)/operations, "active-payload-readers-after-cancel/op")
 	b.ReportMetric(float64(stats.handlerExitedBeforeGate)/operations, "handler-exit-before-gate/op")
 }

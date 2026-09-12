@@ -36,6 +36,7 @@ var benchmarkReadStats struct {
 	postCancelRows  atomic.Int64
 	postCancelBytes atomic.Int64
 	activeScans     atomic.Int64
+	activeHandlers  atomic.Int64
 	activeReaders   atomic.Int64
 }
 
@@ -45,6 +46,7 @@ func ResetPayloadStatsForBenchmark() {
 	benchmarkReadStats.postCancelRows.Store(0)
 	benchmarkReadStats.postCancelBytes.Store(0)
 	benchmarkReadStats.activeScans.Store(0)
+	benchmarkReadStats.activeHandlers.Store(0)
 	benchmarkReadStats.activeReaders.Store(0)
 }
 
@@ -73,6 +75,12 @@ func BeginListScanForBenchmark() func() {
 	return func() { benchmarkReadStats.activeScans.Add(-1) }
 }
 
+// BeginListHandlerForBenchmark tracks one public or peer list handler.
+func BeginListHandlerForBenchmark() func() {
+	benchmarkReadStats.activeHandlers.Add(1)
+	return func() { benchmarkReadStats.activeHandlers.Add(-1) }
+}
+
 // RecordPayloadReaderOpenedForBenchmark tracks a foreground payload reader.
 func RecordPayloadReaderOpenedForBenchmark() {
 	benchmarkReadStats.activeReaders.Add(1)
@@ -93,6 +101,10 @@ func PostCancellationBytesForBenchmark() int64 {
 
 func ActiveListScansForBenchmark() int64 {
 	return benchmarkReadStats.activeScans.Load()
+}
+
+func ActiveListHandlersForBenchmark() int64 {
+	return benchmarkReadStats.activeHandlers.Load()
 }
 
 func ActivePayloadReadersForBenchmark() int64 {

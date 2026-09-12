@@ -12,11 +12,15 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/storage/benchio"
 )
 
 // ListWithValues implements the public ListWithValues RPC.
 // Returns sorted, paginated key-value pairs with continuation token.
 func (s *CacheService) ListWithValues(ctx context.Context, req *pb.ListRequest) (*pb.ListWithValuesResponse, error) {
+	endBenchmarkHandler := benchio.BeginListHandlerForBenchmark()
+	defer endBenchmarkHandler()
+
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("ListWithValues").Observe(float64(time.Since(start).Milliseconds()))
@@ -52,6 +56,9 @@ func (s *CacheService) ListWithValues(ctx context.Context, req *pb.ListRequest) 
 // ListLocalWithValues implements the internal node-local ListWithValues RPC.
 // Returns sorted, paginated key-value pairs from this node's local storage.
 func (s *CacheService) ListLocalWithValues(ctx context.Context, req *pb.ListRequest) (*pb.ListWithValuesResponse, error) {
+	endBenchmarkHandler := benchio.BeginListHandlerForBenchmark()
+	defer endBenchmarkHandler()
+
 	start := time.Now()
 	defer func() {
 		metrics.RPCDuration.WithLabelValues("ListLocalWithValues").Observe(float64(time.Since(start).Milliseconds()))

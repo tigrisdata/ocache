@@ -52,6 +52,11 @@ func BeginListScanForBenchmark() func() {
 	return func() {}
 }
 
+// BeginListHandlerForBenchmark returns a no-op cleanup outside benchmark builds.
+func BeginListHandlerForBenchmark() func() {
+	return func() {}
+}
+
 // RecordPayloadReaderOpenedForBenchmark is a no-op outside benchmark builds.
 func RecordPayloadReaderOpenedForBenchmark() {}
 
@@ -66,6 +71,9 @@ func PostCancellationBytesForBenchmark() int64 { return 0 }
 
 // ActiveListScansForBenchmark returns zero outside benchmark builds.
 func ActiveListScansForBenchmark() int64 { return 0 }
+
+// ActiveListHandlersForBenchmark returns zero outside benchmark builds.
+func ActiveListHandlersForBenchmark() int64 { return 0 }
 
 // ActivePayloadReadersForBenchmark returns zero outside benchmark builds.
 func ActivePayloadReadersForBenchmark() int64 { return 0 }
