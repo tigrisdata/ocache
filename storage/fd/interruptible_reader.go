@@ -4,12 +4,9 @@
 package fd
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"sync"
-
-	"golang.org/x/sys/unix"
 )
 
 // InterruptibleReadCloser owns a private file descriptor. Interrupt closes only
@@ -23,25 +20,6 @@ type InterruptibleReadCloser struct {
 
 	interruptOnce sync.Once
 	closeOnce     sync.Once
-}
-
-// DuplicateFile makes a private descriptor for a cached file. The duplicate
-// has its own lifetime, so closing it cannot invalidate the cached descriptor
-// held by another reader.
-func DuplicateFile(file *os.File) (*os.File, error) {
-	if file == nil {
-		return nil, fmt.Errorf("cannot duplicate a nil file")
-	}
-	duplicateFD, err := unix.Dup(int(file.Fd()))
-	if err != nil {
-		return nil, err
-	}
-	duplicate := os.NewFile(uintptr(duplicateFD), file.Name())
-	if duplicate == nil {
-		_ = unix.Close(duplicateFD)
-		return nil, fmt.Errorf("failed to create duplicate file descriptor for %s", file.Name())
-	}
-	return duplicate, nil
 }
 
 // NewInterruptibleReadCloser creates a read closer for a private descriptor.
