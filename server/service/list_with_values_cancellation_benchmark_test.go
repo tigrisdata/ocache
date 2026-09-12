@@ -268,10 +268,42 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 	b.ReportMetric(float64(stats.handlerExitedBeforeGate)/operations, "handler-exit-before-gate/op")
 }
 
+func consumeClusterListWithValuesBenchmarkResponse(b *testing.B, response *pb.ListWithValuesResponse, count, valueSize int) {
+	b.Helper()
+	if response == nil {
+		b.Fatal("ListWithValues returned a nil response")
+	}
+	if len(response.Entries) != count {
+		b.Fatalf("ListWithValues returned %d entries, want %d", len(response.Entries), count)
+	}
+	if !response.HasMore || response.ContinuationToken == "" {
+		b.Fatalf("ListWithValues returned no cluster continuation: has_more=%v token=%q", response.HasMore, response.ContinuationToken)
+	}
+
+	var totalBytes int
+	previousKey := ""
+	for _, entry := range response.Entries {
+		if entry == nil {
+			b.Fatal("ListWithValues returned a nil entry")
+		}
+		if previousKey != "" && entry.Key <= previousKey {
+			b.Fatalf("ListWithValues returned keys out of order: %q after %q", entry.Key, previousKey)
+		}
+		previousKey = entry.Key
+		if entry.ValueOmitted || entry.ValueLength != int64(valueSize) || len(entry.Value) != valueSize {
+			b.Fatalf("ListWithValues returned an invalid value: key=%q omitted=%v length=%d bytes=%d", entry.Key, entry.ValueOmitted, entry.ValueLength, len(entry.Value))
+		}
+		totalBytes += len(entry.Value)
+	}
+	if totalBytes != count*valueSize {
+		b.Fatalf("ListWithValues returned %d value bytes, want %d", totalBytes, count*valueSize)
+	}
+}
+
 // BenchmarkCacheServiceListWithValuesRawLive is the live-context guard for
 // the same spilled-value consumer path. It checks that opening a private
 // interruptible descriptor does not silently transfer material cost to
-// successful raw-file pages.
+// successful raw-file pages while preserving cluster ordering and cursors.
 func BenchmarkCacheServiceListWithValuesRawLive(b *testing.B) {
 	quietCacheServiceBenchmarkLogs(b)
 	env := newCanceledListBenchmarkEnvironment(b, 100, canceledListBenchmarkValueSize)
@@ -286,6 +318,6 @@ func BenchmarkCacheServiceListWithValuesRawLive(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		consumeListWithValuesBenchmarkResponse(b, response, 100, canceledListBenchmarkValueSize)
+		consumeClusterListWithValuesBenchmarkResponse(b, response, 100, canceledListBenchmarkValueSize)
 	}
 }
