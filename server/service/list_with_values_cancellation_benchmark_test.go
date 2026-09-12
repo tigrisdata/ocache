@@ -168,6 +168,20 @@ type canceledListBenchmarkStats struct {
 	operations                int64
 }
 
+// waitForCanceledListBenchmarkFanout waits until both cluster branches have
+// reached their first payload reader before cancellation is recorded.
+func waitForCanceledListBenchmarkFanout() {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if benchio.ActiveListScansForBenchmark() >= 2 &&
+			benchio.ActiveListHandlersForBenchmark() >= 2 &&
+			benchio.ActivePayloadReadersForBenchmark() >= 2 {
+			return
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+}
+
 // BenchmarkCacheServiceListWithValuesCancellation measures the public list
 // operation after its first raw-file payload read has started. The benchmark
 // records cancellation delay, post-cancel scan work, and ownership state while
@@ -196,6 +210,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 		go func() {
 			close(ready)
 			<-started
+			waitForCanceledListBenchmarkFanout()
 			cancelAt := time.Now()
 			benchio.MarkPayloadCancellationForBenchmark()
 			cancel()
