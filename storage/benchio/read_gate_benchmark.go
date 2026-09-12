@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -28,6 +29,74 @@ var readGate struct {
 	sync.RWMutex
 	limiter *rate.Limiter
 	block   *readBlock
+}
+
+var benchmarkReadStats struct {
+	canceled        atomic.Bool
+	postCancelRows  atomic.Int64
+	postCancelBytes atomic.Int64
+	activeScans     atomic.Int64
+	activeReaders   atomic.Int64
+}
+
+// ResetPayloadStatsForBenchmark clears the counters for one measured list page.
+func ResetPayloadStatsForBenchmark() {
+	benchmarkReadStats.canceled.Store(false)
+	benchmarkReadStats.postCancelRows.Store(0)
+	benchmarkReadStats.postCancelBytes.Store(0)
+	benchmarkReadStats.activeScans.Store(0)
+	benchmarkReadStats.activeReaders.Store(0)
+}
+
+// MarkPayloadCancellationForBenchmark marks the request cancellation boundary.
+func MarkPayloadCancellationForBenchmark() {
+	benchmarkReadStats.canceled.Store(true)
+}
+
+// RecordListRowForBenchmark records rows visited after cancellation.
+func RecordListRowForBenchmark() {
+	if benchmarkReadStats.canceled.Load() {
+		benchmarkReadStats.postCancelRows.Add(1)
+	}
+}
+
+// RecordPayloadBytesForBenchmark records payload bytes returned after cancellation.
+func RecordPayloadBytesForBenchmark(bytes int) {
+	if benchmarkReadStats.canceled.Load() {
+		benchmarkReadStats.postCancelBytes.Add(int64(bytes))
+	}
+}
+
+// BeginListScanForBenchmark tracks the lifetime of a storage list iterator.
+func BeginListScanForBenchmark() func() {
+	benchmarkReadStats.activeScans.Add(1)
+	return func() { benchmarkReadStats.activeScans.Add(-1) }
+}
+
+// RecordPayloadReaderOpenedForBenchmark tracks a foreground payload reader.
+func RecordPayloadReaderOpenedForBenchmark() {
+	benchmarkReadStats.activeReaders.Add(1)
+}
+
+// RecordPayloadReaderClosedForBenchmark tracks a closed foreground payload reader.
+func RecordPayloadReaderClosedForBenchmark() {
+	benchmarkReadStats.activeReaders.Add(-1)
+}
+
+func PostCancellationRowsForBenchmark() int64 {
+	return benchmarkReadStats.postCancelRows.Load()
+}
+
+func PostCancellationBytesForBenchmark() int64 {
+	return benchmarkReadStats.postCancelBytes.Load()
+}
+
+func ActiveListScansForBenchmark() int64 {
+	return benchmarkReadStats.activeScans.Load()
+}
+
+func ActivePayloadReadersForBenchmark() int64 {
+	return benchmarkReadStats.activeReaders.Load()
 }
 
 // SetReadRateLimitForBenchmark installs one shared payload-read budget for the

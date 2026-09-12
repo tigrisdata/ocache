@@ -284,6 +284,14 @@ build-bench-cache-service-list-with-values: proto
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
 	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-list-with-values.test" ./service
 
+.PHONY: test-bench-cache-service-list-with-values-cancellation
+test-bench-cache-service-list-with-values-cancellation: proto
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -v -timeout 60s -run '^TestCacheServiceListWithValuesCancellationReleasesBlockedRead$$' ./service
+
+.PHONY: test-race-bench-cache-service-list-with-values-cancellation
+test-race-bench-cache-service-list-with-values-cancellation: proto
+	@cd server && CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -race -tags=ocache_benchmark -v -timeout 60s -run '^TestCacheServiceListWithValuesCancellationReleasesBlockedRead$$' ./service
+
 .PHONY: run-background
 run-background:
 	@echo "Starting ocache in background..."

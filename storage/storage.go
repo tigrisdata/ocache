@@ -20,6 +20,7 @@ import (
 
 	"github.com/tigrisdata/ocache/common/bufferpool"
 	"github.com/tigrisdata/ocache/common/metrics"
+	"github.com/tigrisdata/ocache/storage/benchio"
 	"github.com/tigrisdata/ocache/storage/compaction"
 	"github.com/tigrisdata/ocache/storage/deletion"
 	storageErrors "github.com/tigrisdata/ocache/storage/errors"
@@ -621,6 +622,9 @@ type KeyValue struct {
 // For inline values the data is returned directly; for file/segment values the data is
 // read from disk. Returns: (entries, lastKey, hasMore, error).
 func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string, limit int) ([]KeyValue, string, bool, error) {
+	endBenchmarkScan := benchio.BeginListScanForBenchmark()
+	defer endBenchmarkScan()
+
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -672,6 +676,7 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 		if limit > 0 && len(entries) >= limit {
 			break
 		}
+		benchio.RecordListRowForBenchmark()
 
 		k := it.Key().Data()
 		v := it.Value().Data()

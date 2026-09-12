@@ -34,3 +34,38 @@ func WrapPayloadReaderForBenchmark(reader io.Reader) io.Reader {
 func WrapPayloadReaderAtForBenchmark(reader io.ReaderAt) io.ReaderAt {
 	return reader
 }
+
+// ResetPayloadStatsForBenchmark is a no-op outside benchmark builds.
+func ResetPayloadStatsForBenchmark() {}
+
+// MarkPayloadCancellationForBenchmark is a no-op outside benchmark builds.
+func MarkPayloadCancellationForBenchmark() {}
+
+// RecordListRowForBenchmark is a no-op outside benchmark builds.
+func RecordListRowForBenchmark() {}
+
+// RecordPayloadBytesForBenchmark is a no-op outside benchmark builds.
+func RecordPayloadBytesForBenchmark(_ int) {}
+
+// BeginListScanForBenchmark returns a no-op cleanup outside benchmark builds.
+func BeginListScanForBenchmark() func() {
+	return func() {}
+}
+
+// RecordPayloadReaderOpenedForBenchmark is a no-op outside benchmark builds.
+func RecordPayloadReaderOpenedForBenchmark() {}
+
+// RecordPayloadReaderClosedForBenchmark is a no-op outside benchmark builds.
+func RecordPayloadReaderClosedForBenchmark() {}
+
+// PostCancellationRowsForBenchmark returns zero outside benchmark builds.
+func PostCancellationRowsForBenchmark() int64 { return 0 }
+
+// PostCancellationBytesForBenchmark returns zero outside benchmark builds.
+func PostCancellationBytesForBenchmark() int64 { return 0 }
+
+// ActiveListScansForBenchmark returns zero outside benchmark builds.
+func ActiveListScansForBenchmark() int64 { return 0 }
+
+// ActivePayloadReadersForBenchmark returns zero outside benchmark builds.
+func ActivePayloadReadersForBenchmark() int64 { return 0 }

@@ -18,13 +18,16 @@ type benchmarkReadCloser struct {
 	seeker        io.Seeker
 	interruptCh   chan struct{}
 	interruptOnce sync.Once
+	closeOnce     sync.Once
 }
 
 func (r *benchmarkReadCloser) Read(p []byte) (int, error) {
 	if err := benchio.WaitForReadBudgetCancelable(r.interruptCh, len(p)); err != nil {
 		return 0, err
 	}
-	return r.ReadCloser.Read(p)
+	n, err := r.ReadCloser.Read(p)
+	benchio.RecordPayloadBytesForBenchmark(n)
+	return n, err
 }
 
 // Interrupt wakes benchmark-gated reads before forwarding the interrupt to
@@ -37,8 +40,13 @@ func (r *benchmarkReadCloser) Interrupt() {
 }
 
 func (r *benchmarkReadCloser) Close() error {
-	r.Interrupt()
-	return r.ReadCloser.Close()
+	var err error
+	r.closeOnce.Do(func() {
+		benchio.RecordPayloadReaderClosedForBenchmark()
+		r.Interrupt()
+		err = r.ReadCloser.Close()
+	})
+	return err
 }
 
 func (r *benchmarkReadCloser) Seek(offset int64, whence int) (int64, error) {
@@ -49,6 +57,7 @@ func (r *benchmarkReadCloser) Seek(offset int64, whence int) (int64, error) {
 }
 
 func wrapReadForBenchmark(reader io.ReadCloser) io.ReadCloser {
+	benchio.RecordPayloadReaderOpenedForBenchmark()
 	readerWithSeek, _ := reader.(io.Seeker)
 	return &benchmarkReadCloser{
 		ReadCloser:  reader,

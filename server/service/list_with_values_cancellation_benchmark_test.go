@@ -66,45 +66,138 @@ func (env *canceledListBenchmarkEnvironment) close() {
 	}
 }
 
+func TestCacheServiceListWithValuesCancellationReleasesBlockedRead(t *testing.T) {
+	quietCacheServiceBenchmarkLogs(t)
+	env := newCanceledListBenchmarkEnvironment(t, 2, canceledListBenchmarkValueSize)
+	defer env.close()
+
+	started, release, restore := benchio.BlockPayloadReadsForBenchmark()
+	defer func() {
+		release()
+		restore()
+	}()
+
+	type result struct {
+		response *pb.ListWithValuesResponse
+		err      error
+	}
+	resultCh := make(chan result, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		response, err := env.service.ListWithValues(ctx, &pb.ListRequest{
+			Prefix: env.prefix,
+			Limit:  2,
+		})
+		resultCh <- result{response: response, err: err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListWithValues did not reach the payload read")
+	}
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		require.ErrorIs(t, result.err, context.Canceled)
+		require.Nil(t, result.response)
+	case <-time.After(2 * time.Second):
+		t.Fatal("ListWithValues remained blocked after cancellation")
+	}
+}
+
+type canceledListBenchmarkStats struct {
+	cancelToExitNanos        int64
+	rowsAfterCancel          int64
+	bytesAfterCancel         int64
+	activeScansAfterCancel   int64
+	activeReadersAfterCancel int64
+	handlerExitedBeforeGate  int64
+	operations               int64
+}
+
 // BenchmarkCacheServiceListWithValuesCancellation measures the public list
 // operation after its first raw-file payload read has started. The benchmark
-// gate holds that read so the cancellation boundary is deterministic. The
-// base path is released after a short hold; the changed path interrupts its
-// private descriptor and returns as soon as cancellation is observed.
+// records cancellation delay, post-cancel scan work, and ownership state while
+// a gate holds the first payload read.
 func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 	quietCacheServiceBenchmarkLogs(b)
 	env := newCanceledListBenchmarkEnvironment(b, canceledListBenchmarkCount, canceledListBenchmarkValueSize)
 	defer env.close()
 
 	req := &pb.ListRequest{Prefix: env.prefix, Limit: canceledListBenchmarkCount}
+	var stats canceledListBenchmarkStats
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		b.StopTimer()
+		stats.operations++
+		benchio.ResetPayloadStatsForBenchmark()
 		started, release, restore := benchio.BlockPayloadReadsForBenchmark()
 		ctx, cancel := context.WithCancel(context.Background())
 		ready := make(chan struct{})
-		finished := make(chan struct{})
+		cancelled := make(chan time.Time, 1)
+		activeStats := make(chan canceledListBenchmarkStats, 1)
+		postCancelStats := make(chan canceledListBenchmarkStats, 1)
+		handlerDone := make(chan struct{})
+		released := make(chan struct{})
 		go func() {
 			close(ready)
 			<-started
+			cancelAt := time.Now()
+			benchio.MarkPayloadCancellationForBenchmark()
 			cancel()
+			cancelled <- cancelAt
+			time.Sleep(5 * time.Millisecond)
+			activeStats <- canceledListBenchmarkStats{
+				activeScansAfterCancel:   benchio.ActiveListScansForBenchmark(),
+				activeReadersAfterCancel: benchio.ActivePayloadReadersForBenchmark(),
+			}
 			time.Sleep(5 * time.Millisecond)
 			release()
-			close(finished)
+			close(released)
+			<-handlerDone
+			postCancelStats <- canceledListBenchmarkStats{
+				rowsAfterCancel:  benchio.PostCancellationRowsForBenchmark(),
+				bytesAfterCancel: benchio.PostCancellationBytesForBenchmark(),
+			}
 		}()
 		<-ready
 
 		b.StartTimer()
 		_, _ = env.service.ListWithValues(ctx, req)
 		b.StopTimer()
+		close(handlerDone)
 
-		<-finished
+		cancelAt := <-cancelled
+		stats.cancelToExitNanos += time.Since(cancelAt).Nanoseconds()
+		select {
+		case <-released:
+		default:
+			stats.handlerExitedBeforeGate++
+		}
+		active := <-activeStats
+		stats.activeScansAfterCancel += active.activeScansAfterCancel
+		stats.activeReadersAfterCancel += active.activeReadersAfterCancel
+		<-released
+		postCancel := <-postCancelStats
+		stats.rowsAfterCancel += postCancel.rowsAfterCancel
+		stats.bytesAfterCancel += postCancel.bytesAfterCancel
 		restore()
 		cancel()
 		b.StartTimer()
 	}
 	b.StopTimer()
+
+	operations := float64(stats.operations)
+	b.ReportMetric(float64(stats.cancelToExitNanos)/operations, "cancel-to-exit-ns/op")
+	b.ReportMetric(float64(stats.rowsAfterCancel)/operations, "rows-after-cancel/op")
+	b.ReportMetric(float64(stats.bytesAfterCancel)/operations, "bytes-after-cancel/op")
+	b.ReportMetric(float64(stats.activeScansAfterCancel)/operations, "active-list-scans-after-cancel/op")
+	b.ReportMetric(float64(stats.activeReadersAfterCancel)/operations, "active-payload-readers-after-cancel/op")
+	b.ReportMetric(float64(stats.handlerExitedBeforeGate)/operations, "handler-exit-before-gate/op")
 }
 
 // BenchmarkCacheServiceListWithValuesRawLive is the live-context guard for
