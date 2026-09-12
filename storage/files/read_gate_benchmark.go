@@ -39,6 +39,12 @@ func (r *benchmarkReadCloser) Interrupt() {
 	}
 }
 
+// ReadAll preserves the synchronous private-file fast path while the storage
+// list reader's cancellation callback interrupts this wrapper when needed.
+func (r *benchmarkReadCloser) ReadAll() ([]byte, error) {
+	return io.ReadAll(r)
+}
+
 func (r *benchmarkReadCloser) Close() error {
 	var err error
 	r.closeOnce.Do(func() {

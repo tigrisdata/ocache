@@ -69,6 +69,14 @@ func (r *InterruptibleReadCloser) Interrupt() {
 	})
 }
 
+// ReadAll reads the private descriptor synchronously. List storage pairs this
+// method with a context cancellation callback that interrupts the descriptor;
+// callers using an arbitrary reader should use the asynchronous fallback
+// instead.
+func (r *InterruptibleReadCloser) ReadAll() ([]byte, error) {
+	return io.ReadAll(r)
+}
+
 // Close is idempotent so it can safely race with Interrupt. It runs the
 // optional ownership callback only once, even if a private read is still
 // unwinding.

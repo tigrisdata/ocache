@@ -633,25 +633,65 @@ type listPayloadReadResult struct {
 	err  error
 }
 
-// listPayloadReader keeps one read worker per list operation instead of
-// starting a goroutine for every value. The worker can outlive a canceled
-// operation only while an underlying private read is unwinding; the caller
-// closes that private reader before returning.
-type listPayloadReader struct {
-	requests chan io.ReadCloser
-	results  chan listPayloadReadResult
-	stop     chan struct{}
-	stopOnce sync.Once
+type listPayloadReadAller interface {
+	ReadAll() ([]byte, error)
 }
 
-func newListPayloadReader() *listPayloadReader {
-	reader := &listPayloadReader{
-		requests: make(chan io.ReadCloser, 1),
-		results:  make(chan listPayloadReadResult, 1),
-		stop:     make(chan struct{}),
-	}
-	go reader.run()
+// listPayloadReader uses a synchronous fast path for the private file readers
+// owned by this package. A context callback interrupts the current descriptor,
+// so the handler does not need a per-value worker or channel round trip. An
+// arbitrary interruptible reader uses the worker fallback because its Read may
+// ignore Interrupt and Close; that path can outlive the canceled list without
+// retaining shared descriptor ownership.
+type listPayloadReader struct {
+	requests   chan io.ReadCloser
+	results    chan listPayloadReadResult
+	stop       chan struct{}
+	stopOnce   sync.Once
+	workerOnce sync.Once
+
+	currentMu sync.Mutex
+	current   interruptibleListReader
+	stopWatch func() bool
+}
+
+func newListPayloadReader(ctx context.Context) *listPayloadReader {
+	reader := &listPayloadReader{stop: make(chan struct{})}
+	reader.stopWatch = context.AfterFunc(ctx, reader.interruptCurrent)
 	return reader
+}
+
+func (r *listPayloadReader) interruptCurrent() {
+	r.currentMu.Lock()
+	defer r.currentMu.Unlock()
+	if r.current != nil {
+		r.current.Interrupt()
+		_ = r.current.Close()
+	}
+}
+
+func (r *listPayloadReader) setCurrent(ctx context.Context, reader interruptibleListReader) error {
+	r.currentMu.Lock()
+	defer r.currentMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.current = reader
+	return nil
+}
+
+func (r *listPayloadReader) clearCurrent() {
+	r.currentMu.Lock()
+	r.current = nil
+	r.currentMu.Unlock()
+}
+
+func (r *listPayloadReader) startWorker() {
+	r.workerOnce.Do(func() {
+		r.requests = make(chan io.ReadCloser, 1)
+		r.results = make(chan listPayloadReadResult, 1)
+		go r.run()
+	})
 }
 
 func (r *listPayloadReader) run() {
@@ -672,7 +712,30 @@ func (r *listPayloadReader) run() {
 }
 
 func (r *listPayloadReader) close() {
+	if r.stopWatch != nil {
+		r.stopWatch()
+	}
 	r.stopOnce.Do(func() { close(r.stop) })
+}
+
+func (r *listPayloadReader) readSynchronous(ctx context.Context, reader io.ReadCloser, readAll func() ([]byte, error)) ([]byte, error) {
+	interruptible, ok := reader.(interruptibleListReader)
+	if !ok {
+		_ = reader.Close()
+		return nil, fmt.Errorf("list payload reader is not interruptible")
+	}
+	if err := r.setCurrent(ctx, interruptible); err != nil {
+		_ = reader.Close()
+		return nil, err
+	}
+
+	data, err := readAll()
+	r.clearCurrent()
+	_ = reader.Close()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return data, err
 }
 
 func (r *listPayloadReader) read(ctx context.Context, reader io.ReadCloser) ([]byte, error) {
@@ -681,6 +744,11 @@ func (r *listPayloadReader) read(ctx context.Context, reader io.ReadCloser) ([]b
 		_ = reader.Close()
 		return nil, fmt.Errorf("list payload reader is not interruptible")
 	}
+	if err := ctx.Err(); err != nil {
+		_ = reader.Close()
+		return nil, err
+	}
+	r.startWorker()
 
 	select {
 	case r.requests <- reader:
@@ -699,8 +767,8 @@ func (r *listPayloadReader) read(ctx context.Context, reader io.ReadCloser) ([]b
 		return result.data, result.err
 	case <-ctx.Done():
 		// The reader owns only a private descriptor. Interrupt and Close can
-		// therefore release the shared cache reference and read lock immediately;
-		// a blocked private read cannot invalidate another reader's descriptor.
+		// therefore release the private descriptor immediately; a blocked read
+		// cannot invalidate another reader's cached descriptor.
 		interruptible.Interrupt()
 		_ = reader.Close()
 		return nil, ctx.Err()
@@ -731,6 +799,9 @@ func (s *Storage) readListPayload(ctx context.Context, payloadReader *listPayloa
 		data, err := io.ReadAll(reader)
 		_ = reader.Close()
 		return data, err
+	}
+	if readAller, ok := reader.(listPayloadReadAller); ok {
+		return payloadReader.readSynchronous(ctx, reader, readAller.ReadAll)
 	}
 	return payloadReader.read(ctx, reader)
 }
@@ -873,7 +944,7 @@ func (s *Storage) ListKeyValuesWithPagination(ctx context.Context, userPrefix st
 					data = valueMsg.Data
 				case pb.ValueType_SEGMENT, pb.ValueType_RAW_FILE:
 					if payloadReader == nil && ctx.Done() != nil {
-						payloadReader = newListPayloadReader()
+						payloadReader = newListPayloadReader(ctx)
 					}
 					var readErr error
 					data, readErr = s.readListPayload(ctx, payloadReader, keys.ExtractUserKey(k), valueMsg)

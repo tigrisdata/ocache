@@ -59,7 +59,7 @@ func TestReadListPayloadCancelsAndClosesNeverReturningRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	payloadReader := newListPayloadReader()
+	payloadReader := newListPayloadReader(ctx)
 	defer payloadReader.close()
 
 	resultCh := make(chan error, 1)
