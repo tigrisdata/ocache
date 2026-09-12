@@ -18,7 +18,10 @@ import (
 	"github.com/tigrisdata/ocache/storage/benchio"
 )
 
-const canceledListBenchmarkCount = 1000
+const (
+	canceledListBenchmarkCount     = 1000
+	canceledListBenchmarkValueSize = 128 * 1024
+)
 
 type canceledListBenchmarkEnvironment struct {
 	storage *stor.Storage
@@ -70,7 +73,7 @@ func (env *canceledListBenchmarkEnvironment) close() {
 // private descriptor and returns as soon as cancellation is observed.
 func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 	quietCacheServiceBenchmarkLogs(b)
-	env := newCanceledListBenchmarkEnvironment(b, canceledListBenchmarkCount, 8*1024)
+	env := newCanceledListBenchmarkEnvironment(b, canceledListBenchmarkCount, canceledListBenchmarkValueSize)
 	defer env.close()
 
 	req := &pb.ListRequest{Prefix: env.prefix, Limit: canceledListBenchmarkCount}
@@ -110,7 +113,7 @@ func BenchmarkCacheServiceListWithValuesCancellation(b *testing.B) {
 // successful raw-file pages.
 func BenchmarkCacheServiceListWithValuesRawLive(b *testing.B) {
 	quietCacheServiceBenchmarkLogs(b)
-	env := newCanceledListBenchmarkEnvironment(b, 100, 8*1024)
+	env := newCanceledListBenchmarkEnvironment(b, 100, canceledListBenchmarkValueSize)
 	defer env.close()
 
 	req := &pb.ListRequest{Prefix: env.prefix, Limit: 100}
@@ -122,6 +125,6 @@ func BenchmarkCacheServiceListWithValuesRawLive(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		consumeListWithValuesBenchmarkResponse(b, response, 100, 8*1024)
+		consumeListWithValuesBenchmarkResponse(b, response, 100, canceledListBenchmarkValueSize)
 	}
 }
