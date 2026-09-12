@@ -94,7 +94,10 @@ func newCanceledListBenchmarkEnvironment(tb testing.TB, count, valueSize int) *c
 
 func (env *canceledListBenchmarkEnvironment) close() {
 	if env.peerServer != nil {
-		env.peerServer.Stop()
+		// Wait for in-flight peer handlers before closing their storage. The
+		// baseline intentionally holds a read gate, so Stop could return while
+		// its handler was still unwinding and let RocksDB close under its iterator.
+		env.peerServer.GracefulStop()
 		env.peerServer = nil
 	}
 	if env.peerListener != nil {
