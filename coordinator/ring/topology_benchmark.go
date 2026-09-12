@@ -1,7 +1,7 @@
 // Copyright 2026 Tigris Data, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//go:build ocache_topology_benchmark
+//go:build ocache_benchmark || ocache_topology_benchmark
 
 package ring
 

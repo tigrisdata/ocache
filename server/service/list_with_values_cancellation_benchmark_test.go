@@ -9,13 +9,17 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/coordinator"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/benchio"
+	"google.golang.org/grpc"
 )
 
 const (
@@ -24,45 +28,90 @@ const (
 )
 
 type canceledListBenchmarkEnvironment struct {
-	storage *stor.Storage
-	service *CacheService
-	prefix  string
+	storage      *stor.Storage
+	peerStorage  *stor.Storage
+	service      *CacheService
+	peerServer   *grpc.Server
+	peerListener net.Listener
+	closeRing    func()
+	prefix       string
 }
 
 func newCanceledListBenchmarkEnvironment(tb testing.TB, count, valueSize int) *canceledListBenchmarkEnvironment {
 	tb.Helper()
 
-	storage, err := stor.NewStorageWithConfig(&stor.StorageConfig{
-		DiskPath:            tb.TempDir(),
-		InlineThreshold:     1,
-		CompactThreshold:    4 * 1024,
-		SegmentSize:         256 * 1024 * 1024,
-		CleanupInterval:     time.Hour,
-		DisableRecompaction: true,
-	})
+	newStorage := func() *stor.Storage {
+		storage, err := stor.NewStorageWithConfig(&stor.StorageConfig{
+			DiskPath:            tb.TempDir(),
+			InlineThreshold:     1,
+			CompactThreshold:    4 * 1024,
+			SegmentSize:         256 * 1024 * 1024,
+			CleanupInterval:     time.Hour,
+			DisableRecompaction: true,
+		})
+		require.NoError(tb, err)
+		return storage
+	}
+
+	storage := newStorage()
+	peerStorage := newStorage()
+	ringManager, closeRing, err := ring.NewTopologyBenchmarkManager(2, 128)
 	require.NoError(tb, err)
+	coord := coordinator.NewBenchmarkCoordinator(ringManager, "member-0")
+
+	peerListener, err := net.Listen("tcp", "127.0.0.1:10001")
+	require.NoError(tb, err)
+	peerServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(128*1024*1024),
+		grpc.MaxSendMsgSize(128*1024*1024),
+	)
+	pb.RegisterCacheServiceServer(peerServer, NewCacheService(nil, peerStorage))
+	go func() { _ = peerServer.Serve(peerListener) }()
 
 	env := &canceledListBenchmarkEnvironment{
-		storage: storage,
-		service: NewCacheService(nil, storage),
-		prefix:  "list-values-cancel-benchmark-",
+		storage:      storage,
+		peerStorage:  peerStorage,
+		service:      NewCacheService(coord, storage),
+		peerServer:   peerServer,
+		peerListener: peerListener,
+		closeRing:    closeRing,
+		prefix:       "list-values-cancel-benchmark-",
 	}
 	value := bytes.Repeat([]byte("x"), valueSize)
 	for i := 0; i < count; i++ {
-		response, putErr := env.service.PutObject(context.Background(), &pb.PutRequest{
-			Key:  fmt.Sprintf("%s%04d", env.prefix, i),
-			Data: value,
-		})
-		require.NoError(tb, putErr)
-		require.True(tb, response.Success)
+		for _, nodeStorage := range []*stor.Storage{storage, peerStorage} {
+			key := fmt.Sprintf("%s%04d", env.prefix, i)
+			if nodeStorage == peerStorage {
+				key = fmt.Sprintf("%speer-%04d", env.prefix, i)
+			} else {
+				key = fmt.Sprintf("%slocal-%04d", env.prefix, i)
+			}
+			require.NoError(tb, nodeStorage.Put(key, bytes.NewReader(value), 0))
+		}
 	}
 	return env
 }
 
 func (env *canceledListBenchmarkEnvironment) close() {
+	if env.peerServer != nil {
+		env.peerServer.Stop()
+		env.peerServer = nil
+	}
+	if env.peerListener != nil {
+		_ = env.peerListener.Close()
+		env.peerListener = nil
+	}
 	if env.storage != nil {
 		env.storage.Close()
 		env.storage = nil
+	}
+	if env.peerStorage != nil {
+		env.peerStorage.Close()
+		env.peerStorage = nil
+	}
+	if env.closeRing != nil {
+		env.closeRing()
+		env.closeRing = nil
 	}
 }
 
