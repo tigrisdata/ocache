@@ -102,10 +102,9 @@ func (sm *Manager) ReadEntry(userKey string, segPath string, offset, length int6
 	return wrapReadForBenchmark(reader), nil
 }
 
-// ReadEntryForList duplicates a private descriptor for a paginated value read.
-// The descriptor is wrapped with the benchmark I/O gate when enabled, just as
-// the regular foreground reader is, so cancellation tests exercise the same
-// payload boundary without sharing cached descriptor ownership.
+// ReadEntryForList opens a private descriptor for a paginated value read. The
+// segment and file locks cover the lookup-to-open window, then cancellation can
+// close the private descriptor without touching the shared descriptor cache.
 func (sm *Manager) ReadEntryForList(userKey string, segPath string, offset, length int64) (io.ReadCloser, error) {
 	if segPath == "" || offset < 0 || length <= 0 {
 		return nil, fmt.Errorf("invalid segment path, offset or length: path=%s, offset=%d, length=%d", segPath, offset, length)
@@ -114,16 +113,23 @@ func (sm *Manager) ReadEntryForList(userKey string, segPath string, offset, leng
 	sm.mu.RLock()
 	seg := sm.segMap[segPath]
 	sm.mu.RUnlock()
-
 	if seg == nil {
 		return nil, fmt.Errorf("segment not found: %s", segPath)
 	}
 
-	reader, err := seg.ReadEntryForList(userKey, offset, length, sm.fdCache)
+	fileLock := fd.GetFileLockManager().GetFileLock(seg.path)
+	fileLock.RLock()
+	seg.mu.RLock()
+	privateFile, err := os.Open(seg.path)
+	seg.mu.RUnlock()
+	fileLock.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	return wrapReadForBenchmark(reader), nil
+
+	offset += CalculateValueHeaderSize(userKey)
+	reader := io.NewSectionReader(privateFile, offset, length)
+	return wrapReadForBenchmark(fd.NewInterruptibleReadCloser(privateFile, reader, nil)), nil
 }
 
 // AcquireOpenSegmentWithReservation returns an open segment reserved for the caller
