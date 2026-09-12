@@ -7,17 +7,27 @@ package benchio
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"golang.org/x/time/rate"
 )
 
 const readGateBurst = 64 * 1024
 
+type readBlock struct {
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
 var readGate struct {
 	sync.RWMutex
 	limiter *rate.Limiter
+	block   *readBlock
 }
 
 // SetReadRateLimitForBenchmark installs one shared payload-read budget for the
@@ -39,12 +49,60 @@ func SetReadRateLimitForBenchmark(bytesPerSecond int64) func() {
 	}
 }
 
+// BlockPayloadReadsForBenchmark holds every foreground payload read at the
+// read boundary until Release is called or the reader's interrupt channel is
+// closed. It returns the first-read notification, a release function, and a
+// restore function for the previous gate state.
+func BlockPayloadReadsForBenchmark() (started <-chan struct{}, release func(), restore func()) {
+	block := &readBlock{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	readGate.Lock()
+	previous := readGate.block
+	readGate.block = block
+	readGate.Unlock()
+
+	release = func() {
+		block.releaseOnce.Do(func() { close(block.release) })
+	}
+	restore = func() {
+		readGate.Lock()
+		if readGate.block == block {
+			readGate.block = previous
+		}
+		readGate.Unlock()
+	}
+	return block.started, release, restore
+}
+
 // WaitForReadBudget admits a payload read in bounded chunks so every raw-file
 // and segment reader in the benchmark shares the same throughput cap.
 func WaitForReadBudget(bytes int) error {
+	return WaitForReadBudgetCancelable(nil, bytes)
+}
+
+// WaitForReadBudgetCancelable waits at the benchmark payload boundary while
+// also allowing the private list reader to wake it through cancellation.
+func WaitForReadBudgetCancelable(cancel <-chan struct{}, bytes int) error {
 	readGate.RLock()
+	block := readGate.block
 	limiter := readGate.limiter
 	readGate.RUnlock()
+
+	if block != nil {
+		block.startOnce.Do(func() { close(block.started) })
+		if cancel == nil {
+			<-block.release
+		} else {
+			select {
+			case <-block.release:
+			case <-cancel:
+				return context.Canceled
+			}
+		}
+	}
 	if limiter == nil {
 		return nil
 	}
@@ -54,8 +112,27 @@ func WaitForReadBudget(bytes int) error {
 		if chunk > readGateBurst {
 			chunk = readGateBurst
 		}
-		if err := limiter.WaitN(context.Background(), chunk); err != nil {
-			return err
+
+		reservation := limiter.ReserveN(time.Now(), chunk)
+		if !reservation.OK() {
+			return fmt.Errorf("read budget reservation exceeds burst")
+		}
+		delay := reservation.Delay()
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			if cancel == nil {
+				<-timer.C
+			} else {
+				select {
+				case <-timer.C:
+				case <-cancel:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					reservation.CancelAt(time.Now())
+					return context.Canceled
+				}
+			}
 		}
 		bytes -= chunk
 	}

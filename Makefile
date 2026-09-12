@@ -282,7 +282,7 @@ build-bench-cache-service-delete: proto
 build-bench-cache-service-list-with-values: proto
 	@test -n "$(PERFLOOP_BUILD_OUTPUT_DIR)" || { echo "PERFLOOP_BUILD_OUTPUT_DIR is required"; exit 1; }
 	@mkdir -p "$(PERFLOOP_BUILD_OUTPUT_DIR)"
-	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-list-with-values.test" ./service
+	@cd server && CGO_ENABLED=1 CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go test $(LDFLAGS) -tags=ocache_benchmark -c -o "$(PERFLOOP_BUILD_OUTPUT_DIR)/cache-service-list-with-values.test" ./service
 
 .PHONY: run-background
 run-background:

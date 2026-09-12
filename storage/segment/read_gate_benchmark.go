@@ -8,20 +8,37 @@ package segment
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/tigrisdata/ocache/storage/benchio"
 )
 
 type benchmarkReadCloser struct {
 	io.ReadCloser
-	seeker io.Seeker
+	seeker        io.Seeker
+	interruptCh   chan struct{}
+	interruptOnce sync.Once
 }
 
 func (r *benchmarkReadCloser) Read(p []byte) (int, error) {
-	if err := benchio.WaitForReadBudget(len(p)); err != nil {
+	if err := benchio.WaitForReadBudgetCancelable(r.interruptCh, len(p)); err != nil {
 		return 0, err
 	}
 	return r.ReadCloser.Read(p)
+}
+
+// Interrupt wakes benchmark-gated reads before forwarding the interrupt to
+// the private production descriptor.
+func (r *benchmarkReadCloser) Interrupt() {
+	r.interruptOnce.Do(func() { close(r.interruptCh) })
+	if interrupter, ok := r.ReadCloser.(interface{ Interrupt() }); ok {
+		interrupter.Interrupt()
+	}
+}
+
+func (r *benchmarkReadCloser) Close() error {
+	r.Interrupt()
+	return r.ReadCloser.Close()
 }
 
 func (r *benchmarkReadCloser) Seek(offset int64, whence int) (int64, error) {
@@ -33,5 +50,9 @@ func (r *benchmarkReadCloser) Seek(offset int64, whence int) (int64, error) {
 
 func wrapReadForBenchmark(reader io.ReadCloser) io.ReadCloser {
 	readerWithSeek, _ := reader.(io.Seeker)
-	return &benchmarkReadCloser{ReadCloser: reader, seeker: readerWithSeek}
+	return &benchmarkReadCloser{
+		ReadCloser:  reader,
+		seeker:      readerWithSeek,
+		interruptCh: make(chan struct{}),
+	}
 }

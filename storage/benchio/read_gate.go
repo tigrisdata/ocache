@@ -18,6 +18,13 @@ func WaitForReadBudget(_ int) error {
 	return nil
 }
 
+// WaitForReadBudgetCancelable is the context-free build's no-op equivalent of
+// the benchmark read gate. Production reads use their own cancellation
+// boundary; this helper exists so benchmark wrappers share one interface.
+func WaitForReadBudgetCancelable(_ <-chan struct{}, _ int) error {
+	return nil
+}
+
 // WrapPayloadReaderForBenchmark leaves readers unchanged outside benchmark builds.
 func WrapPayloadReaderForBenchmark(reader io.Reader) io.Reader {
 	return reader
