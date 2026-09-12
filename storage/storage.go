@@ -628,25 +628,70 @@ type interruptibleListReader interface {
 	Interrupt()
 }
 
-func readListPayload(ctx context.Context, reader io.ReadCloser) ([]byte, error) {
+type listPayloadReadResult struct {
+	data []byte
+	err  error
+}
+
+// listPayloadReader keeps one read worker per list operation instead of
+// starting a goroutine for every value. The worker can outlive a canceled
+// operation only while an underlying private read is unwinding; the caller
+// closes that private reader before returning.
+type listPayloadReader struct {
+	requests chan io.ReadCloser
+	results  chan listPayloadReadResult
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+func newListPayloadReader() *listPayloadReader {
+	reader := &listPayloadReader{
+		requests: make(chan io.ReadCloser, 1),
+		results:  make(chan listPayloadReadResult, 1),
+		stop:     make(chan struct{}),
+	}
+	go reader.run()
+	return reader
+}
+
+func (r *listPayloadReader) run() {
+	for {
+		select {
+		case reader := <-r.requests:
+			data, err := io.ReadAll(reader)
+			_ = reader.Close()
+			select {
+			case r.results <- listPayloadReadResult{data: data, err: err}:
+			case <-r.stop:
+				return
+			}
+		case <-r.stop:
+			return
+		}
+	}
+}
+
+func (r *listPayloadReader) close() {
+	r.stopOnce.Do(func() { close(r.stop) })
+}
+
+func (r *listPayloadReader) read(ctx context.Context, reader io.ReadCloser) ([]byte, error) {
 	interruptible, ok := reader.(interruptibleListReader)
 	if !ok {
 		_ = reader.Close()
 		return nil, fmt.Errorf("list payload reader is not interruptible")
 	}
 
-	type readResult struct {
-		data []byte
-		err  error
+	select {
+	case r.requests <- reader:
+	case <-ctx.Done():
+		interruptible.Interrupt()
+		_ = reader.Close()
+		return nil, ctx.Err()
 	}
-	resultCh := make(chan readResult, 1)
-	go func() {
-		data, err := io.ReadAll(reader)
-		resultCh <- readResult{data: data, err: err}
-	}()
 
 	select {
-	case result := <-resultCh:
+	case result := <-r.results:
 		_ = reader.Close()
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -662,7 +707,7 @@ func readListPayload(ctx context.Context, reader io.ReadCloser) ([]byte, error) 
 	}
 }
 
-func (s *Storage) readListPayload(ctx context.Context, valueKey string, valueMsg *pb.ValueMessage) ([]byte, error) {
+func (s *Storage) readListPayload(ctx context.Context, payloadReader *listPayloadReader, valueKey string, valueMsg *pb.ValueMessage) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -682,7 +727,12 @@ func (s *Storage) readListPayload(ctx context.Context, valueKey string, valueMsg
 	if readErr != nil || reader == nil {
 		return nil, readErr
 	}
-	return readListPayload(ctx, reader)
+	if ctx.Done() == nil {
+		data, err := io.ReadAll(reader)
+		_ = reader.Close()
+		return data, err
+	}
+	return payloadReader.read(ctx, reader)
 }
 
 // ListKeyValuesWithPagination returns paginated, sorted key-value pairs from RocksDB.
@@ -712,6 +762,12 @@ func (s *Storage) ListKeyValuesWithPagination(ctx context.Context, userPrefix st
 
 	var entries []KeyValue
 	var lastKey string
+	var payloadReader *listPayloadReader
+	defer func() {
+		if payloadReader != nil {
+			payloadReader.close()
+		}
+	}()
 
 	// Determine where to start iteration
 	var seekKey []byte
@@ -816,8 +872,11 @@ func (s *Storage) ListKeyValuesWithPagination(ctx context.Context, userPrefix st
 					// proto.Unmarshal owns a copy separate from the iterator buffer.
 					data = valueMsg.Data
 				case pb.ValueType_SEGMENT, pb.ValueType_RAW_FILE:
+					if payloadReader == nil && ctx.Done() != nil {
+						payloadReader = newListPayloadReader()
+					}
 					var readErr error
-					data, readErr = s.readListPayload(ctx, keys.ExtractUserKey(k), valueMsg)
+					data, readErr = s.readListPayload(ctx, payloadReader, keys.ExtractUserKey(k), valueMsg)
 					if readErr != nil {
 						if ctxErr := ctx.Err(); ctxErr != nil {
 							releaseSlices()
