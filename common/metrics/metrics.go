@@ -213,6 +213,18 @@ var (
 		},
 	)
 
+	// CleanerRowsScanned counts the metadata rows each cleaner scan walked:
+	// "ttl" for the per-tick expiry sweep, "reconcile" for the startup and
+	// hourly size reconciliation. Both walk only the metadata prefix, so this
+	// tracks the key count rather than the whole keyspace.
+	CleanerRowsScanned = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_cleaner_rows_scanned_total",
+			Help: "Metadata rows walked by cleaner scans",
+		},
+		[]string{"scan"},
+	)
+
 	// Disk Usage Metrics
 	DiskUsageBytes = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
