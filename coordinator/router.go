@@ -86,10 +86,15 @@ type clientState struct {
 	circuitOpen     int32 // atomic: 0=closed, 1=open
 	lastFailure     time.Time
 	mu              sync.RWMutex
-	// dialMu serializes dials to this one node. It is never held together
+	// dialSem serializes dials to this one node (a one-slot semaphore, so a
+	// waiter can give up when its context ends). It is never held together
 	// with Router.mu, so a slow dial to one node cannot stall routing to any
 	// other node (see getClient).
-	dialMu sync.Mutex
+	dialSem chan struct{}
+}
+
+func newClientState() *clientState {
+	return &clientState{dialSem: make(chan struct{}, 1)}
 }
 
 // closeConn closes the node's current connection, if any.
@@ -270,13 +275,20 @@ func (r *Router) getClient(ctx context.Context, nodeID string) (pb.CacheServiceC
 	r.mu.Lock()
 	state = r.clients[nodeID]
 	if state == nil {
-		state = &clientState{}
+		state = newClientState()
 		r.clients[nodeID] = state
 	}
 	r.mu.Unlock()
 
-	state.dialMu.Lock()
-	defer state.dialMu.Unlock()
+	// Take the node's dial slot, or give up with the caller: a second request
+	// for a node whose dial is stalled must not outlive its own deadline
+	// waiting for that dial.
+	select {
+	case state.dialSem <- struct{}{}:
+		defer func() { <-state.dialSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	zlog.Debug().
 		Str("node_id", nodeID).
@@ -520,15 +532,16 @@ func (r *Router) IsLocal(key string) bool {
 	return r.ring.IsLocal(key)
 }
 
-// GetClientForNode returns a client for a specific node ID
-// This is useful for operations that need to query all nodes (e.g., List)
-func (r *Router) GetClientForNode(nodeID string) (pb.CacheServiceClient, error) {
+// GetClientForNode returns a client for a specific node ID, dialing it under
+// ctx if needed. This is useful for operations that need to query all nodes
+// (e.g., List).
+func (r *Router) GetClientForNode(ctx context.Context, nodeID string) (pb.CacheServiceClient, error) {
 	// Check if this is the local node (shouldn't be called for local, but check defensively)
 	if nodeID == r.localID {
 		return nil, NewLocalRoutingError(r.localID, "")
 	}
 
-	return r.getClient(context.Background(), nodeID)
+	return r.getClient(ctx, nodeID)
 }
 
 // RemoveClient removes and closes the client connection for a node

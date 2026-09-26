@@ -108,6 +108,43 @@ func TestRouter_CancelledContextAbortsDial(t *testing.T) {
 	assert.False(t, stats.CircuitOpen)
 }
 
+// TestRouter_CancelledContextStopsWaitingForDial: a second caller for a node
+// whose dial is already stalled gives up when its own context ends instead
+// of queueing behind that dial for the full connection timeout.
+func TestRouter_CancelledContextStopsWaitingForDial(t *testing.T) {
+	mockRing := newMockRing("local-node")
+	mockRing.AddNode("stuck-node", "localhost:1", stuckAddr)
+	mockRing.SetKeyOwner("stuck-key", "stuck-node")
+
+	const connTimeout = 3 * time.Second
+	router := NewRouterWithConfig(mockRing, "local-node", dialTestConfig(connTimeout, blockingDialer(stuckAddr)))
+	defer router.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := router.Route("stuck-key")
+		firstDone <- err
+	}()
+	require.Eventually(t, func() bool {
+		_, ok := router.GetConnectionStats()["stuck-node"]
+		return ok
+	}, time.Second, 5*time.Millisecond, "stuck dial never started")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := router.RouteContext(ctx, "stuck-key")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), connTimeout/2, "second caller waited on the first caller's dial")
+
+	select {
+	case err := <-firstDone:
+		assert.Error(t, err)
+	case <-time.After(2 * connTimeout):
+		t.Fatal("stuck dial never timed out")
+	}
+}
+
 // TestRouter_CancelledContextStopsRetryBackoff: the retry sleep between
 // attempts ends when the caller's context does.
 func TestRouter_CancelledContextStopsRetryBackoff(t *testing.T) {
