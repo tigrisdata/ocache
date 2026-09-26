@@ -6,6 +6,8 @@
 package operations
 
 import (
+	"context"
+
 	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
@@ -44,6 +46,15 @@ func (o *Operations) Route(key string) (pb.CacheServiceClient, error) {
 		return nil, nil
 	}
 	return o.coordinator.Route(key)
+}
+
+// RouteContext is Route bound to the caller's context, so an abandoned request
+// stops dialing and backing off against the owner node promptly.
+func (o *Operations) RouteContext(ctx context.Context, key string) (pb.CacheServiceClient, error) {
+	if o.coordinator == nil {
+		return nil, nil
+	}
+	return o.coordinator.RouteContext(ctx, key)
 }
 
 // IsClusterMode returns true if clustering is enabled.

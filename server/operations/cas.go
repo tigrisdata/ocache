@@ -103,7 +103,7 @@ func (o *Operations) putStreamIfVersionRemote(ctx context.Context, key string, r
 	if err != nil {
 		return 0, err
 	}
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		return 0, err
 	}
@@ -157,7 +157,7 @@ func (o *Operations) getStreamWithVersionRemote(ctx context.Context, key string,
 	if err != nil {
 		return 0, false, err
 	}
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		return 0, false, err
 	}
@@ -228,7 +228,7 @@ func (o *Operations) getWithVersionRemote(ctx context.Context, key string) ([]by
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Hop count limit exceeded for GetWithVersion")
 		return nil, 0, false, err
 	}
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key for GetWithVersion")
 		return nil, 0, false, err
@@ -249,7 +249,7 @@ func (o *Operations) putIfVersionRemote(ctx context.Context, key string, data []
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Hop count limit exceeded for PutIfVersion")
 		return 0, err
 	}
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key for PutIfVersion")
 		return 0, err
@@ -278,7 +278,7 @@ func (o *Operations) deleteIfVersionRemote(ctx context.Context, key string, expe
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Hop count limit exceeded for DeleteIfVersion")
 		return err
 	}
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key for DeleteIfVersion")
 		return err

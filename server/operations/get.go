@@ -84,7 +84,7 @@ func (o *Operations) getRemote(ctx context.Context, key string, start, end int64
 		return nil, false, err
 	}
 
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key")
 		return nil, false, err

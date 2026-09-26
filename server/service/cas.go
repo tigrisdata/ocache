@@ -290,7 +290,7 @@ func (s *CacheService) GetStreamWithVersion(req *pb.GetRequest, stream pb.CacheS
 
 // forwardStreamingPutIfVersion forwards a streaming CAS put to the owner node.
 func (s *CacheService) forwardStreamingPutIfVersion(localStream pb.CacheService_PutStreamIfVersionServer, first *pb.PutIfVersionRequest) error {
-	client, err := s.coordinator.Route(first.Key)
+	client, err := s.coordinator.RouteContext(localStream.Context(), first.Key)
 	if err != nil {
 		return status.Error(codes.Unavailable, fmt.Sprintf("routing error: %v", err))
 	}
@@ -336,7 +336,7 @@ func (s *CacheService) forwardStreamingPutIfVersion(localStream pb.CacheService_
 
 // forwardStreamingGetWithVersion forwards a streaming CAS read from the owner.
 func (s *CacheService) forwardStreamingGetWithVersion(req *pb.GetRequest, localStream pb.CacheService_GetStreamWithVersionServer) error {
-	client, err := s.coordinator.Route(req.Key)
+	client, err := s.coordinator.RouteContext(localStream.Context(), req.Key)
 	if err != nil {
 		return status.Error(codes.Unavailable, fmt.Sprintf("routing error: %v", err))
 	}

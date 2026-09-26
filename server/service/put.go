@@ -124,7 +124,7 @@ func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 	key := firstChunk.Key
 
 	// Forward to the correct node
-	client, err := s.coordinator.Route(key)
+	client, err := s.coordinator.RouteContext(localStream.Context(), key)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Put", "routing_error").Inc()
 		return localStream.SendAndClose(&pb.PutResponse{

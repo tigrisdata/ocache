@@ -79,13 +79,28 @@ func DefaultRouterConfig() *RouterConfig {
 
 // clientState tracks the state of a client connection
 type clientState struct {
-	client          pb.CacheServiceClient
-	conn            *grpc.ClientConn
+	client          pb.CacheServiceClient // guarded by mu
+	conn            *grpc.ClientConn      // guarded by mu
 	failureCount    int32
 	circuitOpenTime time.Time
 	circuitOpen     int32 // atomic: 0=closed, 1=open
 	lastFailure     time.Time
 	mu              sync.RWMutex
+	// dialMu serializes dials to this one node. It is never held together
+	// with Router.mu, so a slow dial to one node cannot stall routing to any
+	// other node (see getClient).
+	dialMu sync.Mutex
+}
+
+// closeConn closes the node's current connection, if any.
+func (s *clientState) closeConn() error {
+	s.mu.RLock()
+	conn := s.conn
+	s.mu.RUnlock()
+	if conn == nil {
+		return nil
+	}
+	return conn.Close()
 }
 
 // ConnectionStats represents statistics for a single connection
@@ -127,13 +142,25 @@ func NewRouterWithConfig(ring Ring, localID string, config *RouterConfig) *Route
 // Route returns a client for routing requests for the given key
 // Returns an error if the key should be handled locally (defensive check)
 func (r *Router) Route(key string) (pb.CacheServiceClient, error) {
-	return r.RouteWithRetry(key, r.config.MaxRetries)
+	return r.RouteContext(context.Background(), key)
+}
+
+// RouteContext is Route bound to the caller's context. A cancelled or expired
+// ctx ends the retry backoff and any in-flight dial promptly, so an abandoned
+// request does not keep dialing and backing off against the owner on the
+// caller's behalf.
+func (r *Router) RouteContext(ctx context.Context, key string) (pb.CacheServiceClient, error) {
+	return r.routeWithRetry(ctx, key, r.config.MaxRetries)
 }
 
 // RouteWithRetry returns a client for routing with configurable retry attempts
 // Returns an error if the key maps to the local node (this should not happen
 // as callers should check IsLocal first, but we check defensively)
 func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClient, error) {
+	return r.routeWithRetry(context.Background(), key, maxRetries)
+}
+
+func (r *Router) routeWithRetry(ctx context.Context, key string, maxRetries int) (pb.CacheServiceClient, error) {
 	node, err := r.ring.GetNode(key)
 	if err != nil {
 		metrics.ClusterRouteRequests.WithLabelValues("error").Inc()
@@ -160,8 +187,15 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 		if attempt > 0 {
 			// Wait before retry with jittered exponential backoff. Jitter spreads
 			// retries so a degraded ring's survivors don't all reconnect to a
-			// recovered node in lockstep (thundering herd, issue #164).
-			time.Sleep(jittered(backoff))
+			// recovered node in lockstep (thundering herd, issue #164). The wait
+			// ends early if the caller gives up.
+			timer := time.NewTimer(jittered(backoff))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
 			backoff = r.calculateBackoff(backoff)
 
 			metrics.ClusterRetryAttempts.WithLabelValues(node.ID).Inc()
@@ -173,7 +207,7 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 				Msg("Retrying connection after failure")
 		}
 
-		client, err := r.getClient(node.ID)
+		client, err := r.getClient(ctx, node.ID)
 		if err == nil {
 			zlog.Debug().
 				Str("node_id", node.ID).
@@ -184,6 +218,12 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 		}
 
 		lastErr = err
+
+		// The caller gave up: report its own context error rather than
+		// spending the retry budget it no longer wants.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 
 		// Don't retry if it's not a retryable error
 		if !IsRetryableError(err) {
@@ -196,8 +236,16 @@ func (r *Router) RouteWithRetry(key string, maxRetries int) (pb.CacheServiceClie
 	return nil, NewMaxRetriesExceededError(node.ID, key, maxRetries+1, lastErr)
 }
 
-// getClient returns a client for the given node, creating one if necessary
-func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
+// getClient returns a client for the given node, creating one if necessary.
+//
+// Router.mu guards only the clients map and is never held across a dial. A
+// blocking dial can take up to ConnectionTimeout, and holding the router-wide
+// write lock for that long stalled every route to every other node behind one
+// unreachable peer, so a single restarting node froze all forwarding on the
+// cluster. Dials to one node are serialized on that node's own dialMu
+// instead: concurrent callers for the same node share one attempt, and callers
+// for other nodes are unaffected.
+func (r *Router) getClient(ctx context.Context, nodeID string) (pb.CacheServiceClient, error) {
 	// Fast path: check if client exists and is healthy
 	r.mu.RLock()
 	state, exists := r.clients[nodeID]
@@ -208,30 +256,39 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		Msg("Checking if client exists and is healthy")
 
 	if exists && state != nil {
-		if err := r.getConnectionHealth(state, nodeID); err == nil {
-			return state.client, nil
+		client, err := r.healthyClient(state, nodeID)
+		if err == nil {
+			return client, nil
 		} else if errors.Is(err, ErrCircuitBreakerOpen) {
 			metrics.ClusterRoutingErrors.WithLabelValues("circuit_breaker_open").Inc()
 			return nil, err
 		}
 	}
 
-	// Slow path: create new client or reconnect
+	// Slow path: create new client or reconnect. Register the node's state
+	// under Router.mu, then dial under the node's own lock only.
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	state = r.clients[nodeID]
+	if state == nil {
+		state = &clientState{}
+		r.clients[nodeID] = state
+	}
+	r.mu.Unlock()
+
+	state.dialMu.Lock()
+	defer state.dialMu.Unlock()
 
 	zlog.Debug().
 		Str("node_id", nodeID).
 		Msg("Creating new client or reconnecting")
 
-	// Double-check after acquiring write lock
-	state, exists = r.clients[nodeID]
-	if exists && state != nil {
-		if err := r.getConnectionHealth(state, nodeID); err == nil {
-			return state.client, nil
-		} else if errors.Is(err, ErrCircuitBreakerOpen) {
-			return nil, err
-		}
+	// Double-check after acquiring the dial lock: a concurrent caller for the
+	// same node may have just connected.
+	client, err := r.healthyClient(state, nodeID)
+	if err == nil {
+		return client, nil
+	} else if errors.Is(err, ErrCircuitBreakerOpen) {
+		return nil, err
 	}
 
 	// Get node listen address from ring
@@ -254,20 +311,14 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		return nil, NewNodeNotFoundError(nodeID, "")
 	}
 
-	// Create or update client state
-	if state == nil {
-		state = &clientState{}
-		r.clients[nodeID] = state
-	}
-
-	// Close existing connection if any
-	if state.conn != nil {
-		state.conn.Close()
-	}
-
 	// Create new connection with keepalive
-	conn, err := r.createConnection(nodeAddr)
+	conn, err := r.createConnection(ctx, nodeAddr)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The caller gave up mid-dial; that says nothing about the node,
+			// so it must not count toward its circuit breaker.
+			return nil, ctx.Err()
+		}
 		r.recordFailureAndOpenCircuit(state, nodeID)
 
 		logsample.DegradedRing().
@@ -280,9 +331,27 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 		return nil, NewConnectionFailedError(nodeID, nodeAddr, err)
 	}
 
-	client := pb.NewCacheServiceClient(conn)
+	client = pb.NewCacheServiceClient(conn)
+	state.mu.Lock()
+	old := state.conn
 	state.client = client
 	state.conn = conn
+	state.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+
+	// RemoveClient or RefreshConnections may have dropped this node while the
+	// dial was in flight. They closed the connection they could see, so close
+	// this one too rather than hand out a connection nothing will ever close.
+	r.mu.RLock()
+	current := r.clients[nodeID]
+	r.mu.RUnlock()
+	if current != state {
+		conn.Close()
+		metrics.ClusterRoutingErrors.WithLabelValues("node_not_found").Inc()
+		return nil, NewNodeNotFoundError(nodeID, nodeAddr)
+	}
 
 	atomic.StoreInt32(&state.failureCount, 0) // Reset failure count on successful connection
 	metrics.ClusterConnectionsActive.WithLabelValues(nodeID).Set(1)
@@ -295,9 +364,21 @@ func (r *Router) getClient(nodeID string) (pb.CacheServiceClient, error) {
 	return client, nil
 }
 
+// healthyClient returns the node's client when its connection is usable, or
+// the reason it is not.
+func (r *Router) healthyClient(state *clientState, nodeID string) (pb.CacheServiceClient, error) {
+	if err := r.getConnectionHealth(state, nodeID); err != nil {
+		return nil, err
+	}
+	state.mu.RLock()
+	client := state.client
+	state.mu.RUnlock()
+	return client, nil
+}
+
 // createConnection creates a new gRPC connection with configured parameters
-func (r *Router) createConnection(address string) (*grpc.ClientConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), r.config.ConnectionTimeout)
+func (r *Router) createConnection(ctx context.Context, address string) (*grpc.ClientConn, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.config.ConnectionTimeout)
 	defer cancel()
 
 	zlog.Debug().
@@ -346,9 +427,12 @@ func (r *Router) getConnectionHealth(state *clientState, nodeID string) error {
 	}
 
 	// Check connection state
+	state.mu.RLock()
+	conn := state.conn
+	state.mu.RUnlock()
 	error := fmt.Errorf("client state not set for node %s", nodeID)
-	if state.conn != nil {
-		connState := state.conn.GetState()
+	if conn != nil {
+		connState := conn.GetState()
 		if connState != connectivity.Shutdown && connState != connectivity.TransientFailure {
 			return nil
 		}
@@ -444,7 +528,7 @@ func (r *Router) GetClientForNode(nodeID string) (pb.CacheServiceClient, error) 
 		return nil, NewLocalRoutingError(r.localID, "")
 	}
 
-	return r.getClient(nodeID)
+	return r.getClient(context.Background(), nodeID)
 }
 
 // RemoveClient removes and closes the client connection for a node
@@ -453,9 +537,7 @@ func (r *Router) RemoveClient(nodeID string) {
 	defer r.mu.Unlock()
 
 	if state, exists := r.clients[nodeID]; exists {
-		if state.conn != nil {
-			state.conn.Close()
-		}
+		state.closeConn()
 		delete(r.clients, nodeID)
 		metrics.ClusterConnectionsActive.WithLabelValues(nodeID).Set(0)
 
@@ -471,13 +553,14 @@ func (r *Router) Close() error {
 	defer r.mu.Unlock()
 
 	for nodeID, state := range r.clients {
-		if state != nil && state.conn != nil {
-			if err := state.conn.Close(); err != nil {
-				zlog.Error().
-					Err(err).
-					Str("node_id", nodeID).
-					Msg("Error closing connection")
-			}
+		if state == nil {
+			continue
+		}
+		if err := state.closeConn(); err != nil {
+			zlog.Error().
+				Err(err).
+				Str("node_id", nodeID).
+				Msg("Error closing connection")
 		}
 	}
 
@@ -507,8 +590,8 @@ func (r *Router) RefreshConnections() {
 	// Remove connections to inactive nodes
 	for nodeID, state := range r.clients {
 		if !activeNodeMap[nodeID] {
-			if state != nil && state.conn != nil {
-				state.conn.Close()
+			if state != nil {
+				state.closeConn()
 			}
 			delete(r.clients, nodeID)
 
@@ -527,12 +610,11 @@ func (r *Router) GetConnectionStats() map[string]ConnectionStats {
 			continue
 		}
 
+		state.mu.RLock()
 		var connState connectivity.State
 		if state.conn != nil {
 			connState = state.conn.GetState()
 		}
-
-		state.mu.RLock()
 		lastFailure := state.lastFailure
 		circuitOpenTime := state.circuitOpenTime
 		state.mu.RUnlock()
