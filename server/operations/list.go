@@ -263,17 +263,20 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 	return merged, newToken, hasMore, nil
 }
 
-// fetchFromAllNodes fetches keys (or key-value pairs) from all nodes in parallel.
 // maxListNodeFanout bounds the number of concurrent per-node list RPCs issued
 // by a single cluster-wide List. Clusters smaller than this fan out fully.
 const maxListNodeFanout = 32
 
+// fetchFromAllNodes fetches keys (or key-value pairs) from all nodes in parallel.
+// Value pages fail if any node cannot be queried; keys-only pages retain their
+// existing best-effort handling.
 func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, nodeCursors map[string]string, withValues bool) (map[string]*NodeResponse, error) {
 	localNodeID := o.GetLocalNodeID()
 	router := o.GetRouter()
 
 	responses := make(map[string]*NodeResponse)
 	var mu sync.Mutex
+	var firstErr error
 	var wg sync.WaitGroup
 
 	// Bound how many peer list RPCs run concurrently per List so a large cluster
@@ -324,6 +327,13 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 				client, clientErr := router.GetClientForNode(ctx, n.ID)
 				if clientErr != nil {
 					logsample.DegradedRing().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
+					if withValues {
+						mu.Lock()
+						if firstErr == nil {
+							firstErr = fmt.Errorf("failed to get client for node %s: %w", n.ID, clientErr)
+						}
+						mu.Unlock()
+					}
 					return
 				}
 
@@ -356,6 +366,13 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 
 			if err != nil {
 				logsample.DegradedRing().Err(err).Str("node_id", n.ID).Msg("Failed to list from node, skipping")
+				if withValues {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("failed to list from node %s: %w", n.ID, err)
+					}
+					mu.Unlock()
+				}
 				return
 			}
 
@@ -371,9 +388,19 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 	// been skipped — queued behind the fan-out limit, or their RPC aborted — so
 	// the response set is incomplete. Surface the cancellation rather than
 	// returning a partial result that a downstream merge would treat as complete.
-	// (Individual node failures with a live context remain best-effort skips.)
+	// Value lists also surface individual node failures; keys-only lists retain
+	// their existing best-effort behavior.
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+
+	if withValues {
+		mu.Lock()
+		err := firstErr
+		mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	zlog.Debug().Int("response_count", len(responses)).Int("node_count", len(nodes)).Msg("Fetched from nodes")
