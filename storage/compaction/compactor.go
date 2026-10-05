@@ -433,12 +433,8 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 					Msg("compactor: skipping corrupted file")
 				continue
 			}
-			if errors.Is(err, errEntryExceedsSegmentCapacity) {
-				// Keep this raw file and its index row until the configured segment
-				// capacity can hold its complete encoded record.
-				continue
-			}
-			// Log other errors and continue with next entry
+			// Other errors, including records that do not fit the configured
+			// segment capacity, retain their index rows for a later run.
 			continue
 		}
 
@@ -794,7 +790,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 		zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
 	}
 
-	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
+	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, needed)
 	if err != nil {
 		return err
 	}

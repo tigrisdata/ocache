@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/keys"
 	pb "github.com/tigrisdata/ocache/storage/proto"
+	"github.com/tigrisdata/ocache/storage/segment"
 	"github.com/tigrisdata/ocache/storage/utils"
 )
 
@@ -46,6 +47,7 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 	// Keep the pending row in RocksDB until startup recovery runs.
 	first.compactor.Close()
 	value := bytes.Repeat([]byte("m"), 2*DefaultInlineThreshold)
+	require.LessOrEqual(t, segment.CalculateValueHeaderSize(key)+int64(len(value)), int64(DefaultSegmentSize))
 	require.NoError(t, first.Put(key, bytes.NewReader(value), 0))
 
 	beforeRestart, err := utils.GetMetadata(first.meta, string(keys.MakeMetadataKey(key)))
@@ -129,7 +131,7 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 	}
 }
 
-func TestRecoveryRestartDefersPendingCompactionUntilCapacityFits(t *testing.T) {
+func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	const smallSegmentSize = int64(256 * 1024)
 	const largeSegmentSize = int64(4 * 1024 * 1024)
 	const largeCompactThreshold = int64(2 * 1024 * 1024)
