@@ -171,7 +171,6 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	fitValue := bytes.Repeat([]byte("f"), 2*DefaultInlineThreshold)
 	require.NoError(t, first.Put(largeKey, bytes.NewReader(largeValue), 0))
 	require.NoError(t, first.Put(boundaryKey, bytes.NewReader(boundaryValue), 0))
-	require.NoError(t, first.Put(fitKey, bytes.NewReader(fitValue), 0))
 
 	largeMetadata, err := utils.GetMetadata(first.meta, string(keys.MakeMetadataKey(largeKey)))
 	require.NoError(t, err)
@@ -183,7 +182,7 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	require.Equal(t, pb.ValueType_RAW_FILE, boundaryMetadata.ValueType)
 	boundaryRawPath := boundaryMetadata.RawFilePath
 	require.FileExists(t, boundaryRawPath)
-	require.Equal(t, 3, recoveryRestartCompactionRows(t, first))
+	require.Equal(t, 2, recoveryRestartCompactionRows(t, first))
 
 	first.Close()
 	current = nil
@@ -192,6 +191,11 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	require.NoError(t, err)
 	current = second
 	second.compactor.Close()
+
+	// Add the fitting row only after the reopened compactor is stopped. The
+	// worker may scan the unfit recovered rows during construction, but cannot
+	// win the manual-processing assertion for this new row.
+	require.NoError(t, second.Put(fitKey, bytes.NewReader(fitValue), 0))
 
 	// This payload is below the clamped threshold and its encoded record fits,
 	// but the footer would exceed the configured segment capacity.
@@ -207,6 +211,7 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	require.Equal(t, pb.ValueType_RAW_FILE, sameConfigMetadata.ValueType)
 	sameConfigRawPath := sameConfigMetadata.RawFilePath
 	require.FileExists(t, sameConfigRawPath)
+	require.Equal(t, 3, recoveryRestartCompactionRows(t, second))
 
 	processed, bytesCopied := second.compactor.CompactFiles(context.Background(), 0)
 	assert.Equal(t, 1, processed, "only the record that fits including its footer should be compacted")
@@ -220,7 +225,7 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	fitMetadata, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(fitKey)))
 	require.NoError(t, err)
 	assert.Equal(t, pb.ValueType_SEGMENT, fitMetadata.ValueType)
-	assert.Equal(t, 3, recoveryRestartCompactionRows(t, second))
+	assert.Equal(t, 2, recoveryRestartCompactionRows(t, second))
 	for _, rawPath := range []string{largeRawPath, boundaryRawPath, sameConfigRawPath} {
 		assert.FileExists(t, rawPath)
 	}
