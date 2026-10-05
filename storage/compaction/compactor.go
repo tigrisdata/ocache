@@ -737,18 +737,19 @@ func (c *Compactor) queueCompactedSources(pending *[]string) {
 	*pending = (*pending)[:0]
 }
 
-// ensureCapacity verifies the encoded record fits a configured segment and
-// finalizes/acquires a fresh segment when the current one lacks room.
+// ensureCapacity verifies the encoded record and footer fit a configured segment
+// and finalizes/acquires a fresh segment when the current one lacks room.
 func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64, advice *cacheAdvice, wb *grocksdb.WriteBatch, pendingDeletes *[]string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	neededWithFooter := needed + int64(segment.SegmentFooterSize)
 	capacity := (*seg).GetSize() + (*seg).Remaining()
-	if needed > capacity {
-		return fmt.Errorf("%w: need %d bytes, segment capacity %d", errEntryExceedsSegmentCapacity, needed, capacity)
+	if neededWithFooter > capacity {
+		return fmt.Errorf("%w: need %d bytes including footer, segment capacity %d", errEntryExceedsSegmentCapacity, neededWithFooter, capacity)
 	}
-	if (*seg).Remaining() >= needed {
+	if (*seg).Remaining() >= neededWithFooter {
 		return nil
 	}
 
@@ -790,7 +791,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 		zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
 	}
 
-	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, needed)
+	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, neededWithFooter)
 	if err != nil {
 		return err
 	}

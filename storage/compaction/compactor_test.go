@@ -259,9 +259,10 @@ func TestEnsureCapacityAcquiresSegmentWithEnoughRemaining(t *testing.T) {
 
 	pendingValue := bytes.Repeat([]byte("p"), 512*1024)
 	needed := segment.CalculateValueHeaderSize("pending-key") + int64(len(pendingValue))
-	require.Less(t, current.Remaining(), needed)
-	require.Less(t, other.Remaining(), needed)
-	require.LessOrEqual(t, needed, current.GetSize()+current.Remaining())
+	required := needed + int64(segment.SegmentFooterSize)
+	require.Less(t, current.Remaining(), required)
+	require.Less(t, other.Remaining(), required)
+	require.LessOrEqual(t, required, current.GetSize()+current.Remaining())
 	currentPath := current.Path()
 
 	wb := grocksdb.NewWriteBatch()
@@ -276,10 +277,10 @@ func TestEnsureCapacityAcquiresSegmentWithEnoughRemaining(t *testing.T) {
 		ValueType:   pb.ValueType_RAW_FILE,
 	})
 	require.NoError(t, err)
-	require.LessOrEqual(t, current.GetSize(), capacity)
+	require.LessOrEqual(t, current.GetSize()+int64(segment.SegmentFooterSize), capacity)
 	require.NotEqual(t, currentPath, current.Path())
 	require.NotEqual(t, otherPath, current.Path(), "rotation must not choose an open segment without enough remaining space")
-	require.GreaterOrEqual(t, current.Remaining(), int64(0))
+	require.GreaterOrEqual(t, current.Remaining(), int64(segment.SegmentFooterSize))
 }
 
 func TestCopyFileIntoSegment(t *testing.T) {

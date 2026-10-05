@@ -13,6 +13,7 @@ import (
 	"time"
 
 	grocksdb "github.com/linxGnu/grocksdb"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/keys"
 	pb "github.com/tigrisdata/ocache/storage/proto"
@@ -47,7 +48,8 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 	// Keep the pending row in RocksDB until startup recovery runs.
 	first.compactor.Close()
 	value := bytes.Repeat([]byte("m"), 2*DefaultInlineThreshold)
-	require.LessOrEqual(t, segment.CalculateValueHeaderSize(key)+int64(len(value)), int64(DefaultSegmentSize))
+	recordAndFooterSize := segment.CalculateValueHeaderSize(key) + int64(len(value)) + int64(segment.SegmentFooterSize)
+	require.LessOrEqual(t, recordAndFooterSize, int64(DefaultSegmentSize))
 	require.NoError(t, first.Put(key, bytes.NewReader(value), 0))
 
 	beforeRestart, err := utils.GetMetadata(first.meta, string(keys.MakeMetadataKey(key)))
@@ -194,9 +196,14 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	current = second
 	second.compactor.Close()
 
-	// The clamped payload threshold still admits a segment-size-minus-one
-	// payload, although its encoded key header makes the full record too large.
-	sameConfigBoundaryValue := bytes.Repeat([]byte("s"), int(smallSegmentSize-1))
+	// This payload is below the clamped threshold and its encoded record fits,
+	// but the footer would exceed the configured segment capacity.
+	sameConfigHeaderSize := segment.CalculateValueHeaderSize(sameConfigBoundaryKey)
+	sameConfigValueSize := smallSegmentSize - int64(segment.SegmentFooterSize) - sameConfigHeaderSize + 1
+	sameConfigBoundaryValue := bytes.Repeat([]byte("s"), int(sameConfigValueSize))
+	sameConfigRecordSize := sameConfigHeaderSize + int64(len(sameConfigBoundaryValue))
+	require.LessOrEqual(t, sameConfigRecordSize, smallSegmentSize)
+	require.Greater(t, sameConfigRecordSize+int64(segment.SegmentFooterSize), smallSegmentSize)
 	require.NoError(t, second.Put(sameConfigBoundaryKey, bytes.NewReader(sameConfigBoundaryValue), 0))
 	sameConfigMetadata, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(sameConfigBoundaryKey)))
 	require.NoError(t, err)
@@ -205,24 +212,20 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	require.FileExists(t, sameConfigRawPath)
 
 	processed, bytesCopied := second.compactor.CompactFiles(context.Background(), 0)
-	require.LessOrEqual(t, processed, 1)
-	if processed == 1 {
-		require.Equal(t, int64(len(fitValue)), bytesCopied)
-	} else {
-		require.Zero(t, bytesCopied)
-	}
+	assert.Equal(t, 1, processed, "only the record that fits including its footer should be compacted")
+	assert.Equal(t, int64(len(fitValue)), bytesCopied)
 
 	for _, key := range []string{largeKey, boundaryKey, sameConfigBoundaryKey} {
 		metadata, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(key)))
 		require.NoError(t, err)
-		require.Equal(t, pb.ValueType_RAW_FILE, metadata.ValueType)
+		assert.Equal(t, pb.ValueType_RAW_FILE, metadata.ValueType)
 	}
 	fitMetadata, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(fitKey)))
 	require.NoError(t, err)
-	require.Equal(t, pb.ValueType_SEGMENT, fitMetadata.ValueType)
-	require.Equal(t, 3, recoveryRestartCompactionRows(t, second))
+	assert.Equal(t, pb.ValueType_SEGMENT, fitMetadata.ValueType)
+	assert.Equal(t, 3, recoveryRestartCompactionRows(t, second))
 	for _, rawPath := range []string{largeRawPath, boundaryRawPath, sameConfigRawPath} {
-		require.FileExists(t, rawPath)
+		assert.FileExists(t, rawPath)
 	}
 	for key, value := range map[string][]byte{
 		largeKey:              largeValue,
@@ -232,6 +235,28 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	} {
 		recoveryRestartAssertValue(t, second, key, value)
 	}
+
+	// Finalize every segment produced by this pass so the footer's physical
+	// bytes are included in the configured-capacity assertion below.
+	segmentPaths := map[string]struct{}{fitMetadata.SegmentPath: {}}
+	for _, key := range []string{largeKey, boundaryKey, sameConfigBoundaryKey} {
+		metadata, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(key)))
+		require.NoError(t, err)
+		if metadata.ValueType == pb.ValueType_SEGMENT {
+			segmentPaths[metadata.SegmentPath] = struct{}{}
+		}
+	}
+	for path := range segmentPaths {
+		seg := second.segmentManager.GetSegmentByPath(path)
+		require.NotNil(t, seg)
+		require.NoError(t, second.segmentManager.FinalizeSegment(seg))
+	}
+
+	// Finalization can grow a physical file past its preallocated size, so
+	// check the on-disk limit after closing storage.
+	second.Close()
+	second = nil
+	current = nil
 
 	segmentDir := filepath.Join(diskPath, "segments")
 	segmentFiles, err := os.ReadDir(segmentDir)
