@@ -83,7 +83,7 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 		pendingRows := recoveryRestartCompactionRows(t, second)
 		current, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(key)))
 		if err != nil {
-			t.Errorf("recovery-observation: could not read reopened metadata during compaction: %v", err)
+			t.Errorf("could not read reopened metadata during compaction: %v", err)
 			return
 		}
 
@@ -91,12 +91,9 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 		case pb.ValueType_SEGMENT:
 			migrated = true
 		case pb.ValueType_RAW_FILE:
-			if pendingRows == 0 {
-				t.Errorf("recovery-claim: reopened RAW_FILE has no pending compaction row")
-				return
-			}
+			require.NotZero(t, pendingRows)
 		default:
-			t.Errorf("recovery-observation: unexpected reopened value type %s", current.ValueType)
+			t.Errorf("unexpected reopened value type %s", current.ValueType)
 			return
 		}
 		if migrated {
@@ -105,7 +102,7 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !migrated {
-		t.Errorf("recovery-observation: segment migration was not observed before the test window ended")
+		t.Errorf("segment migration was not observed before the test window ended")
 		return
 	}
 
@@ -123,13 +120,13 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 			break
 		}
 		if err != nil {
-			t.Errorf("recovery-observation: could not stat raw source: %v", err)
+			t.Errorf("could not stat raw source: %v", err)
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !reclaimed {
-		t.Errorf("recovery-observation: raw source was not observed reclaimed before the test window ended")
+		t.Errorf("raw source was not observed reclaimed before the test window ended")
 	}
 }
 
@@ -272,18 +269,9 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 	t.Helper()
 
 	reader, found, err := s.Get(key, 0, 0)
-	if err != nil {
-		t.Errorf("recovery-observation: Get after restart failed: %v", err)
-		return
-	}
-	if !found {
-		t.Errorf("recovery-claim: Get after restart reported the stored value absent")
-		return
-	}
-	if reader == nil {
-		t.Errorf("recovery-observation: Get after restart returned no reader")
-		return
-	}
+	require.NoError(t, err)
+	require.True(t, found)
+	require.NotNil(t, reader)
 
 	got, readErr := io.ReadAll(reader)
 	if closer, ok := reader.(io.Closer); ok {
@@ -292,12 +280,10 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 		}
 	}
 	if readErr != nil {
-		t.Errorf("recovery-observation: reading Get result failed: %v", readErr)
+		t.Errorf("reading Get result failed: %v", readErr)
 		return
 	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("recovery-claim: Get after restart returned bytes different from the Put payload")
-	}
+	require.Equal(t, want, got)
 }
 
 func recoveryRestartCompactionRows(t testing.TB, s *Storage) int {
