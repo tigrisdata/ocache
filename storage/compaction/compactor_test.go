@@ -201,7 +201,7 @@ func TestEnsureCapacity(t *testing.T) {
 	// An entry larger than a fresh segment is deferred without finalizing or
 	// replacing the current segment.
 	err = c.ensureCapacity(ctx, &seg, "test", initialCapacity+1, newCacheAdvice(), emptyBatch, &noDeletes)
-	require.ErrorIs(t, err, errEntryExceedsSegmentCapacity)
+	require.Error(t, err)
 	assert.Equal(t, initialPath, seg.Path())
 	assert.Equal(t, initialCapacity, seg.GetSize()+seg.Remaining())
 

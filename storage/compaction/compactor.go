@@ -84,8 +84,6 @@ func (e *ErrFileSizeMismatch) Error() string {
 	return fmt.Sprintf("file size mismatch for key %s: actual=%d expected=%d", e.Key, e.ActualSize, e.ExpectedSize)
 }
 
-var errEntryExceedsSegmentCapacity = errors.New("entry exceeds configured segment capacity")
-
 type Compactor struct {
 	fm                   *files.FileManager
 	sm                   *segment.Manager
@@ -747,7 +745,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 	neededWithFooter := needed + int64(segment.SegmentFooterSize)
 	capacity := (*seg).GetSize() + (*seg).Remaining()
 	if neededWithFooter > capacity {
-		return fmt.Errorf("%w: need %d bytes including footer, segment capacity %d", errEntryExceedsSegmentCapacity, neededWithFooter, capacity)
+		return fmt.Errorf("entry exceeds configured segment capacity: need %d bytes including footer, segment capacity %d", neededWithFooter, capacity)
 	}
 	if (*seg).Remaining() >= neededWithFooter {
 		return nil
