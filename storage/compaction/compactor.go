@@ -84,6 +84,8 @@ func (e *ErrFileSizeMismatch) Error() string {
 	return fmt.Sprintf("file size mismatch for key %s: actual=%d expected=%d", e.Key, e.ActualSize, e.ExpectedSize)
 }
 
+var errEntryExceedsSegmentCapacity = errors.New("entry exceeds configured segment capacity")
+
 type Compactor struct {
 	fm                   *files.FileManager
 	sm                   *segment.Manager
@@ -431,6 +433,11 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 					Msg("compactor: skipping corrupted file")
 				continue
 			}
+			if errors.Is(err, errEntryExceedsSegmentCapacity) {
+				// Keep this raw file and its index row until the configured segment
+				// capacity can hold its complete encoded record.
+				continue
+			}
 			// Log other errors and continue with next entry
 			continue
 		}
@@ -734,9 +741,17 @@ func (c *Compactor) queueCompactedSources(pending *[]string) {
 	*pending = (*pending)[:0]
 }
 
-// ensureCapacity ensures that the segment has at least the needed bytes
-// available, finalising and acquiring a fresh segment when necessary.
+// ensureCapacity verifies the encoded record fits a configured segment and
+// finalizes/acquires a fresh segment when the current one lacks room.
 func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64, advice *cacheAdvice, wb *grocksdb.WriteBatch, pendingDeletes *[]string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	capacity := (*seg).GetSize() + (*seg).Remaining()
+	if needed > capacity {
+		return fmt.Errorf("%w: need %d bytes, segment capacity %d", errEntryExceedsSegmentCapacity, needed, capacity)
+	}
 	if (*seg).Remaining() >= needed {
 		return nil
 	}

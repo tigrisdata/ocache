@@ -210,18 +210,18 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		config.SegmentSize = DefaultSegmentSize
 	}
 
-	// Guardrail: an object larger than a segment cannot be compacted into one, so
-	// CompactThreshold (the size at/below which objects are compaction-eligible)
-	// must stay below SegmentSize. Clamp + warn on a misconfiguration rather than
-	// failing to start; objects at/above SegmentSize then correctly remain
-	// permanent raw files (#165).
+	// Guardrail: payloads at or above a segment's capacity cannot fit in one
+	// segment, so CompactThreshold (the payload threshold for recording work)
+	// must stay below SegmentSize. Clamp + warn rather than failing to start;
+	// the file compactor checks the encoded record size because its key header
+	// can make an otherwise eligible payload too large for the segment.
 	if config.CompactThreshold >= config.SegmentSize {
 		clamped := config.SegmentSize - 1
 		zlog.Warn().
 			Int64("compact_threshold", config.CompactThreshold).
 			Int64("segment_size", config.SegmentSize).
 			Int64("clamped_to", clamped).
-			Msg("storage: compact-threshold >= segment-size; clamping compact-threshold below segment-size so compaction-eligible objects always fit a segment")
+			Msg("storage: compact-threshold >= segment-size; clamping below segment-size so oversized payloads stay raw")
 		config.CompactThreshold = clamped
 	}
 
