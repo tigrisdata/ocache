@@ -300,6 +300,8 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 	recovery := files.NewRecoveryManager(meta, config.DiskPath, config.RecoveryWorkers)
 	if err := recovery.RecoverOnStartup(); err != nil {
 		zlog.Error().Err(err).Msg("storage: file recovery failed")
+		segmentManager.Close()
+		meta.Close()
 		return nil, storageErrors.NewInternalError("Init", err)
 	}
 
