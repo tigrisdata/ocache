@@ -269,9 +269,18 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 	t.Helper()
 
 	reader, found, err := s.Get(key, 0, 0)
-	require.NoError(t, err)
-	require.True(t, found)
-	require.NotNil(t, reader)
+	if err != nil {
+		t.Errorf("Get after restart failed: %v", err)
+		return
+	}
+	if !found {
+		require.True(t, found)
+		return
+	}
+	if reader == nil {
+		t.Errorf("Get after restart returned no reader")
+		return
+	}
 
 	got, readErr := io.ReadAll(reader)
 	if closer, ok := reader.(io.Closer); ok {
