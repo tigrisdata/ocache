@@ -44,6 +44,10 @@ type RecoveryManager struct {
 	meta       *metadata.MetaDB
 	filesPath  string
 	numWorkers int
+	// Validation dependencies default to the real operations and are replaced
+	// only by tests that inject lookup or stat failures.
+	getMetadata func(*metadata.MetaDB, string) (*pb.ValueMessage, error)
+	statFile    func(string) (os.FileInfo, error)
 }
 
 // NewRecoveryManager creates a new recovery manager. numWorkers sets the number
@@ -53,9 +57,11 @@ func NewRecoveryManager(meta *metadata.MetaDB, filesPath string, numWorkers int)
 		numWorkers = MaxWorkers
 	}
 	return &RecoveryManager{
-		meta:       meta,
-		filesPath:  filesPath,
-		numWorkers: numWorkers,
+		meta:        meta,
+		filesPath:   filesPath,
+		numWorkers:  numWorkers,
+		getMetadata: utils.GetMetadata,
+		statFile:    os.Stat,
 	}
 }
 
@@ -169,7 +175,7 @@ func (r *RecoveryManager) validateEntry(entry *compactionEntryInfo) *ValidationR
 	metadataKey := string(keys.MakeMetadataKey(entry.UserKey))
 
 	// Fetch metadata
-	metadata, err := utils.GetMetadata(r.meta, metadataKey)
+	metadata, err := r.getMetadata(r.meta, metadataKey)
 	if err != nil {
 		// Check if it's specifically metadata not found
 		if errors.Is(err, utils.ErrMetadataNotFound) {
@@ -213,7 +219,7 @@ func (r *RecoveryManager) validateEntry(entry *compactionEntryInfo) *ValidationR
 	}
 
 	// Validate physical file
-	stat, err := os.Stat(entry.FilePath)
+	stat, err := r.statFile(entry.FilePath)
 	if err != nil {
 		zlog.Warn().
 			Str("filepath", entry.FilePath).
