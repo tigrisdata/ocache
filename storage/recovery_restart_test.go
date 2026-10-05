@@ -280,7 +280,7 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 		return
 	}
 	if reader == nil {
-		t.Errorf("Get after restart returned no reader")
+		require.NotNil(t, reader)
 		return
 	}
 
@@ -291,7 +291,7 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 		}
 	}
 	if readErr != nil {
-		t.Errorf("reading Get result failed: %v", readErr)
+		require.NoError(t, readErr)
 		return
 	}
 	require.Equal(t, want, got)
