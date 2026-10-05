@@ -211,7 +211,7 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	require.Equal(t, pb.ValueType_RAW_FILE, sameConfigMetadata.ValueType)
 	sameConfigRawPath := sameConfigMetadata.RawFilePath
 	require.FileExists(t, sameConfigRawPath)
-	require.Equal(t, 3, recoveryRestartCompactionRows(t, second))
+	require.Equal(t, 4, recoveryRestartCompactionRows(t, second))
 
 	processed, bytesCopied := second.compactor.CompactFiles(context.Background(), 0)
 	assert.Equal(t, 1, processed, "only the record that fits including its footer should be compacted")
@@ -225,7 +225,7 @@ func TestRecoveryRestartDefersUnfitPendingCompaction(t *testing.T) {
 	fitMetadata, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(fitKey)))
 	require.NoError(t, err)
 	assert.Equal(t, pb.ValueType_SEGMENT, fitMetadata.ValueType)
-	assert.Equal(t, 2, recoveryRestartCompactionRows(t, second))
+	assert.Equal(t, 3, recoveryRestartCompactionRows(t, second))
 	for _, rawPath := range []string{largeRawPath, boundaryRawPath, sameConfigRawPath} {
 		assert.FileExists(t, rawPath)
 	}
