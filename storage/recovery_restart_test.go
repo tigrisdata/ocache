@@ -67,27 +67,47 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 
 	recoveryRestartAssertValue(t, second, key, value)
 
-	// The reopened storage's normal background compactor must consume the
-	// durable row without another Put and publish the segment metadata.
+	// A successful compaction publishes SEGMENT metadata and deletes the
+	// compaction row in one RocksDB batch. Read the index first, then metadata:
+	// an empty index followed by RAW_FILE metadata is a stable missing-work
+	// counterexample, not a slow worker observation.
 	migrated := false
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
+		pendingRows := recoveryRestartCompactionRows(t, second)
 		current, err := utils.GetMetadata(second.meta, string(keys.MakeMetadataKey(key)))
-		if err == nil && current.ValueType == pb.ValueType_SEGMENT {
+		if err != nil {
+			t.Errorf("recovery-observation: could not read reopened metadata during compaction: %v", err)
+			return
+		}
+
+		switch current.ValueType {
+		case pb.ValueType_SEGMENT:
 			migrated = true
+		case pb.ValueType_RAW_FILE:
+			if pendingRows == 0 {
+				t.Errorf("recovery-claim: reopened RAW_FILE has no pending compaction row")
+				return
+			}
+		default:
+			t.Errorf("recovery-observation: unexpected reopened value type %s", current.ValueType)
+			return
+		}
+		if migrated {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !migrated {
-		t.Errorf("recovery-claim: reopened value did not migrate from RAW_FILE to SEGMENT")
+		t.Errorf("recovery-observation: segment migration was not observed before the test window ended")
 		return
 	}
 
 	recoveryRestartAssertValue(t, second, key, value)
 
 	// Compaction publishes the segment before the deletion queue reclaims the
-	// old raw source.
+	// old raw source. Waiting observes progress; a timeout is inconclusive, not
+	// evidence that recovery erased work.
 	reclaimed := false
 	deadline = time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -96,10 +116,14 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 			reclaimed = true
 			break
 		}
+		if err != nil {
+			t.Errorf("recovery-observation: could not stat raw source: %v", err)
+			return
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	if !reclaimed {
-		t.Errorf("recovery-claim: raw source was not reclaimed after segment publication")
+		t.Errorf("recovery-observation: raw source was not observed reclaimed before the test window ended")
 	}
 }
 
@@ -107,11 +131,16 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 	t.Helper()
 
 	reader, found, err := s.Get(key, 0, 0)
-	if err != nil || !found {
-		if closer, ok := reader.(io.Closer); ok {
-			_ = closer.Close()
-		}
-		t.Errorf("recovery-claim: Get after restart did not return the value (found=%t, err=%v)", found, err)
+	if err != nil {
+		t.Errorf("recovery-observation: Get after restart failed: %v", err)
+		return
+	}
+	if !found {
+		t.Errorf("recovery-claim: Get after restart reported the stored value absent")
+		return
+	}
+	if reader == nil {
+		t.Errorf("recovery-observation: Get after restart returned no reader")
 		return
 	}
 
@@ -122,7 +151,7 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 		}
 	}
 	if readErr != nil {
-		t.Errorf("recovery-claim: Get after restart could not read the value: %v", readErr)
+		t.Errorf("recovery-observation: reading Get result failed: %v", readErr)
 		return
 	}
 	if !bytes.Equal(got, want) {
