@@ -140,6 +140,13 @@ func (r *RecoveryManager) processEntriesStreaming() (*RecoveryStats, error) {
 		workerWg.Wait()
 		close(proc.results)
 		<-collectorDone
+		select {
+		case collectorErr := <-proc.errChan:
+			if collectorErr != nil {
+				return nil, errors.Join(err, collectorErr)
+			}
+		default:
+		}
 		return nil, err
 	}
 
@@ -155,7 +162,7 @@ func (r *RecoveryManager) processEntriesStreaming() (*RecoveryStats, error) {
 	// Wait for results collector to finish
 	<-collectorDone
 
-	// Check for any errors from workers
+	// Check for validation or deletion errors from the collector.
 	select {
 	case err := <-proc.errChan:
 		return proc.stats, err
@@ -192,7 +199,7 @@ func (r *RecoveryManager) validateEntry(entry *compactionEntryInfo) *ValidationR
 			Str("userKey", entry.UserKey).
 			Err(err).
 			Msg("files.recovery: failed to fetch metadata")
-		result.Status = StatusCorrupted
+		result.Status = statusInconclusive
 		result.Error = err
 		return result
 	}
@@ -221,13 +228,18 @@ func (r *RecoveryManager) validateEntry(entry *compactionEntryInfo) *ValidationR
 	// Validate physical file
 	stat, err := r.statFile(entry.FilePath)
 	if err != nil {
-		zlog.Warn().
+		event := zlog.Warn().
 			Str("filepath", entry.FilePath).
 			Str("userKey", entry.UserKey).
 			Str("key", metadataKey).
-			Err(err).
-			Msg("files.recovery: file missing")
-		result.Status = StatusMissing
+			Err(err)
+		if errors.Is(err, os.ErrNotExist) {
+			event.Msg("files.recovery: file missing")
+			result.Status = StatusMissing
+		} else {
+			event.Msg("files.recovery: failed to stat file")
+			result.Status = statusInconclusive
+		}
 		result.MetadataKey = metadataKey
 		result.Error = err
 		return result
@@ -262,7 +274,7 @@ type streamingProcessor struct {
 	entries chan *compactionEntryInfo
 	results chan *ValidationResult
 	stats   *RecoveryStats
-	errChan chan error
+	errChan chan error // resultsCollector sends one aggregate error after all batches
 }
 
 // streamEntries reads compaction entries from RocksDB and sends them to the processing channel
@@ -332,6 +344,7 @@ func (proc *streamingProcessor) validationWorker() {
 // resultsCollector collects validation results and processes deletions
 func (proc *streamingProcessor) resultsCollector() {
 	batch := make([]*ValidationResult, 0, 100)
+	var batchErrors error
 
 	for result := range proc.results {
 		// Update stats
@@ -349,36 +362,28 @@ func (proc *streamingProcessor) resultsCollector() {
 			proc.stats.Missing++
 		}
 
-		// Add ALL results to deletion batch
-		// After recovery, we remove all compaction entries regardless of status
-		// Valid entries mean files are good and can be safely tracked for compaction
-		// Invalid entries need cleanup
+		// Keep all results in the batch so inconclusive validation errors can
+		// be returned without deleting the affected entry.
 		batch = append(batch, result)
 
 		// Process batch when it reaches the size limit
 		if len(batch) >= 100 {
-			if err := proc.processDeletionBatch(batch); err != nil {
-				select {
-				case proc.errChan <- err:
-				default:
-				}
-			}
+			batchErrors = errors.Join(batchErrors, proc.processDeletionBatch(batch))
 			batch = batch[:0] // Reset batch
 		}
 	}
 
 	// Process any remaining items in the batch
 	if len(batch) > 0 {
-		if err := proc.processDeletionBatch(batch); err != nil {
-			select {
-			case proc.errChan <- err:
-			default:
-			}
-		}
+		batchErrors = errors.Join(batchErrors, proc.processDeletionBatch(batch))
+	}
+	if batchErrors != nil {
+		proc.errChan <- batchErrors
 	}
 }
 
-// processDeletionBatch processes a batch of deletions
+// processDeletionBatch cleans up confirmed invalid entries and removes compaction rows
+// for results that were validated. Inconclusive results are left untouched and returned.
 func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) error {
 	if len(batch) == 0 {
 		return nil
@@ -390,9 +395,17 @@ func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) 
 	writeBatch := grocksdb.NewWriteBatch()
 	defer writeBatch.Destroy()
 
+	var validationErr error
+	var hasWrites bool
 	for _, result := range batch {
-		// Always remove compaction entry
+		if result.Status == statusInconclusive {
+			validationErr = errors.Join(validationErr, fmt.Errorf("validation failed for %q: %w", result.FilePath, result.Error))
+			continue
+		}
+
+		// Remove the compaction entry after validation completed.
 		writeBatch.Delete(result.SyncKey) // SyncKey field repurposed to hold compaction key
+		hasWrites = true
 
 		switch result.Status {
 		case StatusCorrupted, StatusOrphaned, StatusMissing:
@@ -417,9 +430,12 @@ func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) 
 		}
 	}
 
-	if err := proc.r.meta.Handle().Write(wo, writeBatch); err != nil {
-		return fmt.Errorf("failed to write deletion batch: %w", err)
+	var writeErr error
+	if hasWrites {
+		if err := proc.r.meta.Handle().Write(wo, writeBatch); err != nil {
+			writeErr = fmt.Errorf("failed to write deletion batch: %w", err)
+		}
 	}
 
-	return nil
+	return errors.Join(validationErr, writeErr)
 }
