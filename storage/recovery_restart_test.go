@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tigrisdata/ocache/storage/keys"
+	"github.com/tigrisdata/ocache/storage/merge"
 	pb "github.com/tigrisdata/ocache/storage/proto"
 	"github.com/tigrisdata/ocache/storage/segment"
 	"github.com/tigrisdata/ocache/storage/utils"
@@ -127,6 +129,212 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 	}
 	if !reclaimed {
 		t.Errorf("raw source was not observed reclaimed before the test window ended")
+	}
+}
+
+func TestValueReadersCoordinateWithCompactionPublication(t *testing.T) {
+	type readResult struct {
+		value        []byte
+		version      uint64
+		found        bool
+		valueOmitted bool
+		err          error
+	}
+	type compactResult struct {
+		processed   int
+		bytesCopied int64
+	}
+
+	readStream := func(reader io.Reader) ([]byte, error) {
+		if reader == nil {
+			return nil, nil
+		}
+		value, err := io.ReadAll(reader)
+		if closer, ok := reader.(io.Closer); ok {
+			if closeErr := closer.Close(); err == nil {
+				err = closeErr
+			}
+		}
+		return value, err
+	}
+	operations := []struct {
+		name         string
+		read         func(*Storage, string) readResult
+		wantVersion  uint64
+		checkVersion bool
+	}{
+		{
+			name: "Get",
+			read: func(s *Storage, key string) readResult {
+				reader, found, err := s.Get(key, 0, 0)
+				if err != nil || !found || reader == nil {
+					return readResult{found: found, err: err}
+				}
+				value, err := readStream(reader)
+				return readResult{value: value, found: found, err: err}
+			},
+		},
+		{
+			name: "GetWithVersion",
+			read: func(s *Storage, key string) readResult {
+				reader, version, found, err := s.GetWithVersion(key)
+				if err != nil || !found || reader == nil {
+					return readResult{version: version, found: found, err: err}
+				}
+				value, err := readStream(reader)
+				return readResult{value: value, version: version, found: found, err: err}
+			},
+			wantVersion:  merge.VersionLegacy,
+			checkVersion: true,
+		},
+		{
+			name: "ListKeyValuesWithPagination",
+			read: func(s *Storage, key string) readResult {
+				entries, _, _, err := s.ListKeyValuesWithPagination(key, "", 10)
+				if err != nil {
+					return readResult{err: err}
+				}
+				for _, entry := range entries {
+					if entry.Key == key {
+						return readResult{value: entry.Value, found: true, valueOmitted: entry.ValueOmitted}
+					}
+				}
+				return readResult{}
+			},
+		},
+	}
+
+	for _, operation := range operations {
+		operation := operation
+		t.Run(operation.name, func(t *testing.T) {
+			const key = "compaction-publication-reader-handoff"
+			diskPath := t.TempDir()
+			s, err := NewStorageWithConfig(&StorageConfig{
+				DiskPath:            diskPath,
+				InlineThreshold:     DefaultInlineThreshold,
+				CompactThreshold:    DefaultCompactThreshold,
+				SegmentSize:         DefaultSegmentSize,
+				MaxDiskUsage:        0,
+				TTL:                 0,
+				DisableRecompaction: true,
+				CompactionThreads:   1,
+			})
+			require.NoError(t, err)
+
+			readDone := make(chan readResult, 1)
+			compactDone := make(chan compactResult, 1)
+			readStarted, readFinished := false, false
+			compactStarted, compactFinished := false, false
+			entered := make(chan struct{})
+			resume := make(chan struct{})
+			var enterOnce, resumeOnce sync.Once
+			releaseRead := func() {
+				resumeOnce.Do(func() { close(resume) })
+			}
+			t.Cleanup(func() {
+				releaseRead()
+				if readStarted && !readFinished {
+					select {
+					case <-readDone:
+					case <-time.After(10 * time.Second):
+						t.Errorf("value reader did not finish during cleanup")
+					}
+				}
+				if compactStarted && !compactFinished {
+					select {
+					case <-compactDone:
+					case <-time.After(10 * time.Second):
+						t.Errorf("compaction did not finish during cleanup")
+					}
+				}
+				s.Close()
+			})
+
+			// Keep the record pending so the test controls exactly when the
+			// compactor reaches its metadata publication.
+			s.compactor.Close()
+			value := bytes.Repeat([]byte("r"), 2*DefaultInlineThreshold)
+			recordAndFooterSize := segment.CalculateValueHeaderSize(key) + int64(len(value)) + int64(segment.SegmentFooterSize)
+			require.LessOrEqual(t, recordAndFooterSize, int64(DefaultSegmentSize))
+			require.NoError(t, s.Put(key, bytes.NewReader(value), 0))
+
+			before, err := utils.GetMetadata(s.meta, string(keys.MakeMetadataKey(key)))
+			require.NoError(t, err)
+			require.Equal(t, pb.ValueType_RAW_FILE, before.ValueType)
+			require.FileExists(t, before.RawFilePath)
+
+			s.beforeRawFileRead = func() {
+				enterOnce.Do(func() {
+					close(entered)
+					<-resume
+				})
+			}
+			readStarted = true
+			go func() { readDone <- operation.read(s, key) }()
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("reader did not reach the raw-file open")
+			}
+
+			publicationGate := s.compactionPublicationGate()
+			if publicationGate.TryLock() {
+				publicationGate.Unlock()
+				t.Fatal("reader did not hold the compaction-publication read gate")
+			}
+
+			compactStarted = true
+			go func() {
+				processed, bytesCopied := s.compactor.CompactFiles(context.Background(), 0)
+				compactDone <- compactResult{processed: processed, bytesCopied: bytesCopied}
+			}()
+
+			// A failed TryRLock while the storage reader holds RLock proves the
+			// compactor has reached and is waiting at its exclusive publication
+			// gate; without that writer the call would succeed alongside readers.
+			writerWaiting := false
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				if !publicationGate.TryRLock() {
+					writerWaiting = true
+					break
+				}
+				publicationGate.RUnlock()
+				current, err := utils.GetMetadata(s.meta, string(keys.MakeMetadataKey(key)))
+				require.NoError(t, err)
+				if current.ValueType != pb.ValueType_RAW_FILE {
+					t.Fatalf("compactor published %v before the raw reader opened", current.ValueType)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			require.True(t, writerWaiting, "compactor did not wait for the reader's publication gate")
+
+			current, err := utils.GetMetadata(s.meta, string(keys.MakeMetadataKey(key)))
+			require.NoError(t, err)
+			require.Equal(t, pb.ValueType_RAW_FILE, current.ValueType)
+			require.FileExists(t, current.RawFilePath)
+
+			releaseRead()
+			got := <-readDone
+			readFinished = true
+			require.NoError(t, got.err)
+			require.True(t, got.found)
+			require.Equal(t, value, got.value)
+			if operation.checkVersion {
+				require.Equal(t, operation.wantVersion, got.version)
+			}
+			if operation.name == "ListKeyValuesWithPagination" {
+				require.False(t, got.valueOmitted)
+			}
+
+			compacted := <-compactDone
+			compactFinished = true
+			require.Equal(t, 1, compacted.processed)
+			require.Equal(t, int64(len(value)), compacted.bytesCopied)
+			after, err := utils.GetMetadata(s.meta, string(keys.MakeMetadataKey(key)))
+			require.NoError(t, err)
+			require.Equal(t, pb.ValueType_SEGMENT, after.ValueType)
+		})
 	}
 }
 

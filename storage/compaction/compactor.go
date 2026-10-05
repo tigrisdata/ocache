@@ -711,8 +711,15 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	if err := c.meta.Handle().Write(wo, wb); err != nil {
-		return err
+	// Serialize metadata publication with readers that observed a RAW_FILE row
+	// but have not opened its source yet. The segment is synced above, and source
+	// deletion is queued only after this write returns.
+	publicationGate := fd.GetFileLockManager().GetFileLock(c.meta.Handle().Name())
+	publicationGate.Lock()
+	writeErr := c.meta.Handle().Write(wo, wb)
+	publicationGate.Unlock()
+	if writeErr != nil {
+		return writeErr
 	}
 
 	return nil

@@ -190,11 +190,22 @@ type Storage struct {
 	// before the metadata batch is written, and a non-nil error stands in for a
 	// RocksDB write failure so the callers' failure paths can be exercised.
 	beforeMetaCommit func() error
-	evictionPolicy   string        // "lru" or "fifo"; governs whether reads refresh access time
-	closed           atomic.Bool   // True when storage has been closed
-	lastVersion      atomic.Uint64 // Last issued version stamp (see nextVersion)
-	versionHi        atomic.Uint64 // Durably reserved stamp ceiling (see nextVersion)
-	versionMu        sync.Mutex    // Serializes reservation extension (rare)
+	// beforeRawFileRead is set only by package tests: it runs after a RAW_FILE
+	// metadata read and before the backing file is opened.
+	beforeRawFileRead func()
+	evictionPolicy    string        // "lru" or "fifo"; governs whether reads refresh access time
+	closed            atomic.Bool   // True when storage has been closed
+	lastVersion       atomic.Uint64 // Last issued version stamp (see nextVersion)
+	versionHi         atomic.Uint64 // Durably reserved stamp ceiling (see nextVersion)
+	versionMu         sync.Mutex    // Serializes reservation extension (rare)
+}
+
+// compactionPublicationGate orders storage readers' metadata lookups and raw-file
+// opens with the compactor's RAW_FILE-to-SEGMENT metadata publication. The
+// database path key is shared across Storage and Compactor instances and remains
+// stable when the same database is reopened.
+func (s *Storage) compactionPublicationGate() *sync.RWMutex {
+	return fd.GetFileLockManager().GetFileLock(s.meta.Handle().Name())
 }
 
 // NewStorageWithConfig creates a new isolated Storage instance with the given config.
@@ -627,6 +638,13 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 		metrics.StorageOperationDuration.WithLabelValues("list_kv_paginated", storageType).Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
+	// The iterator can retain RAW_FILE metadata while compaction publishes a
+	// segment and reclaims its source. Hold the read side for the iterator and
+	// all backing-file reads in this page.
+	publicationGate := s.compactionPublicationGate()
+	publicationGate.RLock()
+	defer publicationGate.RUnlock()
+
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
 	it := s.meta.Handle().NewIterator(ro)
@@ -721,6 +739,9 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 						}
 					}
 				case pb.ValueType_RAW_FILE:
+					if s.beforeRawFileRead != nil {
+						s.beforeRawFileRead()
+					}
 					r, readErr := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
 					if readErr == nil && r != nil {
 						data, readErr = io.ReadAll(r)
@@ -876,6 +897,15 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	defer func() {
 		metrics.StorageOperationDuration.WithLabelValues("get", storageType).Observe(float64(time.Since(startTime).Milliseconds()))
 	}()
+	publicationGate := s.compactionPublicationGate()
+	publicationGate.RLock()
+	publicationGateHeld := true
+	defer func() {
+		if publicationGateHeld {
+			publicationGate.RUnlock()
+		}
+	}()
+
 	ro := metadata.CreateReadOptions(false, true)
 	defer ro.Destroy()
 	metaKey := keys.MakeMetadataKey(key)
@@ -913,6 +943,10 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		// This avoids race conditions with the cleaner
 		return nil, false, nil
 	}
+	if valueMsg.ValueType != pb.ValueType_RAW_FILE {
+		publicationGate.RUnlock()
+		publicationGateHeld = false
+	}
 
 	// Refresh access time for LRU tracking. The updater is only present when
 	// eviction is active and the policy is LRU; in FIFO mode it is nil, so reads
@@ -940,7 +974,12 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			return nil, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
+		if s.beforeRawFileRead != nil {
+			s.beforeRawFileRead()
+		}
 		r, err := s.fileManager.Read(valueMsg.RawFilePath, valueMsg.ValueLength)
+		publicationGate.RUnlock()
+		publicationGateHeld = false
 		if err != nil {
 			// A missing backing file for a never-compacted (large) object is a
 			// dangling reference: the write did not survive an unclean shutdown
@@ -954,10 +993,11 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 			// dangling key. We do not count this as an "error" because it is an
 			// expected, self-healing condition, not a failure.
 			//
-			// Restricted to large objects (> compactThreshold): medium objects
-			// are migrated to segments by the compactor, which briefly unlinks
-			// the raw file before its RAW_FILE→SEGMENT CAS lands, so their ENOENT
-			// is transient and a retry recovers the value from the segment.
+			// Restricted to large objects (> compactThreshold): these are not
+			// entered in the compaction index, so the normal compactor cannot
+			// recreate a missing source. For eligible medium objects, the shared
+			// publication gate prevents compaction from reclaiming the raw file
+			// between this metadata read and its open.
 			if errors.Is(err, os.ErrNotExist) && valueMsg.ValueLength > s.compactThreshold {
 				zlog.Warn().Str("key", key).Str("file", valueMsg.RawFilePath).
 					Msg("storage.Get: raw file missing for large object, purging dangling key")

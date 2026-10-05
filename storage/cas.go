@@ -30,7 +30,8 @@ import (
 // A CAS is a merge operand on the key's metadata row, resolved deterministically
 // by mergeMetadataCAS against whatever base precedes it in RocksDB's per-key
 // sequence order. That ordering is the serialization point: there is no
-// read-check-write window and therefore no lock — on this path or any other.
+// read-check-write window or per-key CAS lock. The shared compaction-publication
+// gate only protects a RAW_FILE reader handoff; it does not change CAS ordering.
 // The outcome is learned by reading the row back (read-your-writes): the winner
 // sees its own stamp, a loser sees whoever beat it.
 //
@@ -190,12 +191,23 @@ func (s *Storage) readRowForCASRetry(metaKey []byte) (vm *pb.ValueMessage, found
 // reports merge.VersionLegacy; mixing plain writes and CAS on one key is
 // unsupported.
 func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
+	publicationGate := s.compactionPublicationGate()
+	publicationGate.RLock()
+	publicationGateHeld := true
+	defer func() {
+		if publicationGateHeld {
+			publicationGate.RUnlock()
+		}
+	}()
+
 	vm, hasPrev, err := s.readRowForCAS(keys.MakeMetadataKey(key))
 	if err != nil {
 		return nil, 0, false, mapRocksDBError("GetWithVersion", key, err)
 	}
 	state, cur := casClassify(vm, hasPrev)
 	if state != casLive {
+		publicationGate.RUnlock()
+		publicationGateHeld = false
 		token, err := s.absenceToken(state, cur)
 		if err != nil {
 			return nil, 0, false, storageErrors.NewInternalError("GetWithVersion", err)
@@ -203,6 +215,10 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 		return nil, token, false, nil
 	}
 	version := cur
+	if vm.ValueType != pb.ValueType_RAW_FILE {
+		publicationGate.RUnlock()
+		publicationGateHeld = false
+	}
 
 	// Refresh LRU recency exactly as Get does — a CAS read is still a read, and
 	// a key read only via GetWithVersion must not be treated as cold and evicted
@@ -229,7 +245,12 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 		}
 		reader = r
 	case pb.ValueType_RAW_FILE:
+		if s.beforeRawFileRead != nil {
+			s.beforeRawFileRead()
+		}
 		r, rerr := s.fileManager.Read(vm.RawFilePath, vm.ValueLength)
+		publicationGate.RUnlock()
+		publicationGateHeld = false
 		if rerr != nil {
 			if rerr == files.ErrFileLocked {
 				return nil, 0, false, storageErrors.NewLockError("GetWithVersion", key, rerr)
