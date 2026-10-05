@@ -343,10 +343,8 @@ func (proc *streamingProcessor) resultsCollector() {
 			proc.stats.Missing++
 		}
 
-		// Add ALL results to deletion batch
-		// After recovery, we remove all compaction entries regardless of status
-		// Valid entries mean files are good and can be safely tracked for compaction
-		// Invalid entries need cleanup
+		// Apply recovery decisions to every parsed entry. Valid rows remain
+		// indexed for the normal compactor; other statuses are removed below.
 		batch = append(batch, result)
 
 		// Process batch when it reaches the size limit
@@ -372,21 +370,21 @@ func (proc *streamingProcessor) resultsCollector() {
 	}
 }
 
-// processDeletionBatch processes a batch of deletions
+// processDeletionBatch applies recovery decisions for a batch of compaction rows.
 func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) error {
 	if len(batch) == 0 {
 		return nil
 	}
 
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
-
 	writeBatch := grocksdb.NewWriteBatch()
 	defer writeBatch.Destroy()
 
 	for _, result := range batch {
-		// Always remove compaction entry
-		writeBatch.Delete(result.SyncKey) // SyncKey field repurposed to hold compaction key
+		// Keep valid work indexed for the background compactor. Every other
+		// parsed status is stale or needs cleanup, so remove its compaction key.
+		if result.Status != StatusValid {
+			writeBatch.Delete(result.SyncKey) // SyncKey field repurposed to hold compaction key
+		}
 
 		switch result.Status {
 		case StatusCorrupted, StatusOrphaned, StatusMissing:
@@ -410,6 +408,13 @@ func (proc *streamingProcessor) processDeletionBatch(batch []*ValidationResult) 
 			}
 		}
 	}
+
+	if writeBatch.Count() == 0 {
+		return nil
+	}
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
 
 	if err := proc.r.meta.Handle().Write(wo, writeBatch); err != nil {
 		return fmt.Errorf("failed to write deletion batch: %w", err)

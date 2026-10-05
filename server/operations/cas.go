@@ -26,9 +26,8 @@ import (
 
 // GetWithVersion returns key's value bytes and current CAS version. A read is
 // idempotent, so the local open is wrapped in the same retry as GetLocal — the
-// storage read path returns retryable lock/IO errors (file locks, the brief
-// raw->segment compaction unlink window, a dangling-file self-heal) that a
-// re-read recovers from; without this a CAS read would spuriously miss a key a
+// storage read path can still return retryable lock/IO errors that a re-read
+// recovers from; without this a CAS read could spuriously miss a key a
 // plain Get would return. (The CAS *writes* still skip retry — they are not
 // idempotent.)
 func (o *Operations) GetWithVersion(ctx context.Context, key string) ([]byte, uint64, bool, error) {
