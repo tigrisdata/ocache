@@ -93,7 +93,7 @@ func TestRecoveryRestartPreservesPendingCompaction(t *testing.T) {
 		case pb.ValueType_RAW_FILE:
 			require.NotZero(t, pendingRows)
 		default:
-			t.Errorf("unexpected reopened value type %s", current.ValueType)
+			require.Equal(t, pb.ValueType_SEGMENT, current.ValueType)
 			return
 		}
 		if migrated {
@@ -269,10 +269,7 @@ func recoveryRestartAssertValue(t *testing.T, s *Storage, key string, want []byt
 	t.Helper()
 
 	reader, found, err := s.Get(key, 0, 0)
-	if err != nil {
-		t.Errorf("Get after restart failed: %v", err)
-		return
-	}
+	require.NoError(t, err)
 	if !found {
 		require.True(t, found)
 		return
