@@ -79,6 +79,19 @@ var (
 		[]string{"operation", "storage_type", "status"},
 	)
 
+	// StorageGetMisses counts not-found Gets by why the key is absent: evicted,
+	// expired, or deleted (recorded when the store last removed it), else cold
+	// (never stored, or forgotten by the bounded per-process reason table, so
+	// cold is an upper bound). key_type is the key prefix before the first '|'
+	// when it is 1-8 lowercase letters, else "other".
+	StorageGetMisses = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ocache_storage_get_misses_total",
+			Help: "Not-found storage Gets by miss reason (cold, evicted, expired, deleted) and key type",
+		},
+		[]string{"reason", "key_type"},
+	)
+
 	StorageOperationDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "ocache_storage_operation_duration_ms",

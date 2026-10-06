@@ -143,6 +143,10 @@ type StorageConfig struct {
 
 	CompactionBytesPerSecond int64 // Shared file/recompaction payload-byte limit (<= 0 = unthrottled)
 
+	// MissReasonEntries sizes the per-process table that attributes Get misses
+	// to evicted/expired/deleted (<= 0 = DefaultMissReasonEntries).
+	MissReasonEntries int
+
 	// RocksDB-specific configuration
 	MetadataCacheSize      int64 // RocksDB Block cache size in bytes (0 = use default)
 	MetadataBackgroundJobs int   // Max concurrent RocksDB background jobs, compactions+flushes (0 = use default)
@@ -180,6 +184,7 @@ type Storage struct {
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
+	missReasons      *missReasonTable      // Why removed keys left; attributes Get misses
 	// inflightRaw holds the raw-file paths that have been written but whose
 	// metadata is not yet committed (or, on failure, not yet queued for
 	// reclaim). The orphan sweep never touches a path in it: the file lock
@@ -246,6 +251,9 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 			Str("fallback", DefaultEvictionPolicy).
 			Msg("storage: unknown eviction policy, falling back to default")
 		config.EvictionPolicy = DefaultEvictionPolicy
+	}
+	if config.MissReasonEntries <= 0 {
+		config.MissReasonEntries = DefaultMissReasonEntries
 	}
 
 	// Create the data directory if it doesn't exist
@@ -364,6 +372,7 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		deletionQueue:    deletionQueue,
 		compactor:        compactor,
 		evictionPolicy:   config.EvictionPolicy,
+		missReasons:      newMissReasonTable(config.MissReasonEntries),
 	}
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
@@ -856,6 +865,7 @@ func (s *Storage) DeleteKey(key string) error {
 		// RocksDB errors are typically temporary
 		return mapRocksDBError("DeleteKey", key, err)
 	}
+	s.missReasons.record(key, missReasonDeleted)
 
 	// Queue raw-file reclaim only after the metadata delete is durable (the
 	// discipline evictByIndex and putLow use).
@@ -892,6 +902,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 	if !slice.Exists() {
 		metrics.StorageOperations.WithLabelValues("get", storageType, "not_found").Inc()
 		zlog.Debug().Str("key", key).Msg("storage.Get: not found in DB")
+		recordGetMiss(key, s.missReasons.lookup(key))
 		return nil, false, nil
 	}
 	v := slice.Data()
@@ -911,6 +922,13 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		zlog.Debug().Str("key", key).Msg("storage.Get: key has expired, returning not found")
 		// Don't delete the key here - let the background cleaner handle it
 		// This avoids race conditions with the cleaner
+		if valueMsg.Expiry == merge.TombstoneExpiry {
+			// A tombstone is a CAS delete or a dangling-file purge, not a TTL
+			// expiry: report what was recorded when it was written.
+			recordGetMiss(key, s.missReasons.lookup(key))
+		} else {
+			recordGetMiss(key, missReasonExpired)
+		}
 		return nil, false, nil
 	}
 
@@ -937,6 +955,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		} else if r != nil {
 			reader = r
 		} else {
+			recordGetMiss(key, s.missReasons.lookup(key))
 			return nil, false, nil
 		}
 	case pb.ValueType_RAW_FILE:
@@ -977,6 +996,7 @@ func (s *Storage) Get(key string, start, end int64) (io.Reader, bool, error) {
 		} else if r != nil {
 			reader = r
 		} else {
+			recordGetMiss(key, s.missReasons.lookup(key))
 			return nil, false, nil
 		}
 	default:
@@ -1223,6 +1243,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 			metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(bytesWritten))
 			metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
 			s.notifyPut(bytesWritten - prevSize)
+			s.missReasons.clear(key)
 		} else {
 			metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 			metrics.Errors.WithLabelValues("rocksdb", "put").Inc()
@@ -1263,6 +1284,7 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 		metrics.StorageBytes.WithLabelValues("put", storageType).Add(float64(n))
 		metrics.ObjectSize.WithLabelValues("put").Observe(float64(valueMsg.ValueLength))
 		s.notifyPut(int64(n) - prevSize)
+		s.missReasons.clear(key)
 	} else {
 		metrics.StorageOperations.WithLabelValues("put", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "put").Inc()

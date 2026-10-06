@@ -75,6 +75,9 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 	// pendingFiles holds the value metadata of keys deleted in the current batch,
 	// so their backing files are reclaimed only after the batch's write succeeds.
 	var pendingFiles []*pb.ValueMessage
+	// pendingKeys holds the user keys evicted in the current batch; their miss
+	// reason is recorded only after the batch's write succeeds.
+	var pendingKeys []string
 
 	ro := metadata.CreateReadOptions(true, false)
 	defer ro.Destroy()
@@ -103,12 +106,16 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 			for _, vm := range pendingFiles {
 				c.storage.stageFileDeletion(vm)
 			}
+			for _, k := range pendingKeys {
+				c.storage.missReasons.record(k, missReasonEvicted)
+			}
 			committedBytes += pendingBytes
 			evictedCount += pendingCount
 		}
 		pendingBytes = 0
 		pendingCount = 0
 		pendingFiles = pendingFiles[:0]
+		pendingKeys = pendingKeys[:0]
 		batch.Clear()
 	}
 
@@ -259,6 +266,7 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 		pendingBytes += valueMsg.ValueLength
 		pendingCount++
 		pendingFiles = append(pendingFiles, valueMsg)
+		pendingKeys = append(pendingKeys, originalKey)
 
 		it.Key().Free()
 		it.Value().Free()
