@@ -611,6 +611,7 @@ func (s *Storage) finishWonCASPut(key string, metaKey []byte, newVM *pb.ValueMes
 	}
 
 	s.notifyPut(newVM.ValueLength - prevSize)
+	s.missReasons.clear(key)
 }
 
 // DeleteIfVersion deletes the key only if it admits expected: a live key needs
@@ -773,6 +774,7 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		// read on every pass. Drop that generation, and nothing that could
 		// belong to a recreate.
 		s.dropDeadEvictionGeneration(key, cutoff, deadEntry)
+		s.missReasons.record(key, missReasonDeleted)
 		return nil
 	default:
 		return storageErrors.NewVersionMismatchError("DeleteIfVersion", key, currentVersionOf(got, gotFound))

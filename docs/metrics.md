@@ -27,6 +27,14 @@ When the ring is degraded (a node down), the high-frequency failure-path log lin
 | `ocache_storage_operation_duration_ms` | Histogram | `operation`, `storage_type`           | Storage operation duration in milliseconds. Measures the latency of storage operations by type.                                                            |
 | `ocache_storage_bytes_total`           | Counter   | `operation`, `storage_type`           | Total bytes stored or retrieved. Tracks data volume by operation (put/get) and storage type.                                                               |
 | `ocache_object_size_bytes`             | Histogram | `operation`                           | Distribution of object sizes in bytes. Buckets range from 1KB to 1GB to understand object size patterns.                                                   |
+| `ocache_storage_get_misses_total`      | Counter   | `reason`, `key_type`                  | Not-found storage Gets by why the key is absent. `reason` is `evicted` (disk-cap eviction), `expired` (TTL), `deleted` (explicit or CAS delete), or `cold` (never stored, or no longer remembered). `key_type` is the key prefix before the first `\|` when it is 1-8 lowercase letters, else `other`. See caveats below. |
+
+`ocache_storage_get_misses_total` caveats:
+
+- It counts every not-found `Get`, including presence probes and re-reads of the same key, so it is a count of lookups, not of distinct keys.
+- The reason comes from a fixed-size, per-process table (`StorageConfig.MissReasonEntries`, default `1<<22` slots = 32 MiB). A key whose slot was overwritten by a colliding key reads as `cold`, so `cold` is an upper bound and the other reasons are lower bounds.
+- The table is in memory only: a restart clears it, and every miss for a key removed before the restart counts as `cold`.
+- A reason is recorded only after the removal commits, and a successful put clears it.
 
 ### Segment Storage Metrics
 

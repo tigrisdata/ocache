@@ -283,6 +283,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	// deletion. They are re-read in flush, immediately before the batch is
 	// written, and deleted only if still the row the scan saw (issue #256).
 	var candidates []expiryCandidate
+	// pendingExpired holds the user keys expired in the current batch; their
+	// miss reason is recorded only after the batch's write succeeds.
+	var pendingExpired []string
 
 	// Track cleaner run
 	metrics.CleanerRuns.WithLabelValues("ttl").Inc()
@@ -371,6 +374,10 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			batch.Delete(cand.metaKey)
 			c.storage.stageEvictionIndexDeletes(batch, ro, cand.key)
 			pendingCleaned++
+			if cand.expiry != merge.TombstoneExpiry {
+				// An aged-out fence was a delete, already recorded as such.
+				pendingExpired = append(pendingExpired, cand.key)
+			}
 			if !decoded {
 				continue
 			}
@@ -401,6 +408,9 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			for _, vm := range pendingFiles {
 				c.storage.stageFileDeletion(vm)
 			}
+			for _, k := range pendingExpired {
+				c.storage.missReasons.record(k, missReasonExpired)
+			}
 			committedCleaned += pendingCleaned
 			committedBytes += pendingBytes
 			if pendingBytes > 0 {
@@ -410,6 +420,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		pendingCleaned = 0
 		pendingBytes = 0
 		pendingFiles = pendingFiles[:0]
+		pendingExpired = pendingExpired[:0]
 		batch.Clear()
 	}
 
