@@ -45,12 +45,13 @@ func mismatchWith(t *testing.T, err error) uint64 {
 // older stamp to merge after a newer invalidation. A refill holding the token
 // observed between the two deletes must still lose to the newer fence.
 func TestCAS_Fence_DelayedDeleteMustNotLowerFence(t *testing.T) {
-	s, cleanup := createCASTestStorage(t)
+	s, cleanup := createCASTestStorage(t, func(config *StorageConfig) {
+		config.FenceRetention = time.Hour
+	})
 	defer cleanup()
 
 	// Keep the fence well inside its retention horizon throughout this schedule.
 	started := time.Now()
-	s.cleaner.fenceRetention = time.Hour
 
 	const key = "delayed-delete"
 	deleteAAtMerge := make(chan uint64, 1)
