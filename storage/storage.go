@@ -186,9 +186,9 @@ type Storage struct {
 	// covers a file only while it is being written, and this covers the gap
 	// from that unlock to the commit that makes the file referenced (#156).
 	inflightRaw sync.Map
-	// beforeMetaCommit is set only by package tests: it runs inside putLow just
-	// before the metadata batch is written, and a non-nil error stands in for a
-	// RocksDB write failure so the callers' failure paths can be exercised.
+	// beforeMetaCommit is set only by package tests: it runs before putLow's
+	// metadata batch and DeleteIfVersion's metadata merge, and a non-nil error
+	// stands in for a RocksDB write failure so failure paths can be exercised.
 	beforeMetaCommit func() error
 	evictionPolicy   string        // "lru" or "fifo"; governs whether reads refresh access time
 	closed           atomic.Bool   // True when storage has been closed

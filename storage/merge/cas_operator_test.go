@@ -232,6 +232,48 @@ func TestMergeCAS_FenceBump(t *testing.T) {
 	assert.Equal(t, uint64(400), got.Version)
 }
 
+// TestMergeCAS_DelayedDeleteDoesNotLowerFence covers a later database arrival
+// whose CAS_DELETE stamp was issued before the tombstone it meets. The older
+// delete must not lower the fence and admit a refill that observed the interval.
+func TestMergeCAS_DelayedDeleteDoesNotLowerFence(t *testing.T) {
+	op := NewMultiplexOperator()
+	operands := [][]byte{
+		casDeleteOperand(t, 0, 300),         // B: newer invalidation arrives first
+		casDeleteOperand(t, 0, 100),         // A: earlier stamp arrives later
+		casPutOperand(t, 200, 400, "stale"), // refill observed between A and B
+	}
+
+	allAtOnce, ok := op.FullMerge(casMetaKey, nil, operands)
+	require.True(t, ok)
+	fence := mustUnmarshal(t, allAtOnce)
+	require.True(t, IsTombstone(fence))
+	assert.Equal(t, uint64(300), fence.Version, "the delayed delete must not lower B's fence")
+
+	// RocksDB may resolve the same sequence with a prefix folded into a base.
+	// Every split must agree with FullMerge over the full operand sequence.
+	for split := 1; split < len(operands); split++ {
+		folded, ok := op.FullMerge(casMetaKey, nil, operands[:split])
+		require.True(t, ok)
+		rest, ok := op.FullMerge(casMetaKey, folded, operands[split:])
+		require.True(t, ok)
+		assert.Equal(t, allAtOnce, rest, "split at %d diverged from single-pass resolution", split)
+	}
+
+	// A newer delete still advances the fence; a fresh or explicitly unordered
+	// refill retains its existing behavior.
+	advanced, ok := op.FullMerge(casMetaKey, allAtOnce, [][]byte{casDeleteOperand(t, 0, 500)})
+	require.True(t, ok)
+	assert.Equal(t, uint64(500), mustUnmarshal(t, advanced).Version)
+
+	fresh, ok := op.FullMerge(casMetaKey, allAtOnce, [][]byte{casPutOperand(t, 300, 600, "fresh")})
+	require.True(t, ok)
+	assert.Equal(t, []byte("fresh"), mustUnmarshal(t, fresh).Data)
+
+	unordered, ok := op.FullMerge(casMetaKey, allAtOnce, [][]byte{casPutOperand(t, 0, 700, "unordered")})
+	require.True(t, ok)
+	assert.Equal(t, []byte("unordered"), mustUnmarshal(t, unordered).Data)
+}
+
 // TestMergeCAS_Determinism asserts read-time and compaction-time resolution
 // agree: folding a prefix of operands into a new base and then applying the
 // rest must produce byte-identical results to applying all operands at once.

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +39,115 @@ func mismatchWith(t *testing.T, err error) uint64 {
 	vm, ok := storageErrors.IsVersionMismatch(err)
 	require.True(t, ok, "expected a version mismatch, got %v", err)
 	return vm.CurrentVersion
+}
+
+// TestCAS_Fence_DelayedDeleteMustNotLowerFence forces a delete that issued an
+// older stamp to merge after a newer invalidation. A refill holding the token
+// observed between the two deletes must still lose to the newer fence.
+func TestCAS_Fence_DelayedDeleteMustNotLowerFence(t *testing.T) {
+	s, cleanup := createCASTestStorage(t)
+	defer cleanup()
+
+	// Keep the fence well inside its retention horizon throughout this schedule.
+	started := time.Now()
+	s.cleaner.fenceRetention = time.Hour
+
+	const key = "delayed-delete"
+	deleteAAtMerge := make(chan uint64, 1)
+	resumeDeleteA := make(chan struct{})
+	resumed := false
+	resumeA := func() {
+		if !resumed {
+			close(resumeDeleteA)
+			resumed = true
+		}
+	}
+	var firstDelete atomic.Bool
+	s.beforeMetaCommit = func() error {
+		if firstDelete.CompareAndSwap(false, true) {
+			// Delete A has issued its stamp and built its operand, but has not
+			// submitted the metadata merge yet.
+			deleteAAtMerge <- s.lastVersion.Load()
+			<-resumeDeleteA
+		}
+		return nil
+	}
+
+	deleteAResult := make(chan error, 1)
+	go func() { deleteAResult <- s.DeleteIfVersion(key, 0) }()
+	deleteAJoined := false
+	defer func() {
+		resumeA()
+		if !deleteAJoined {
+			<-deleteAResult
+		}
+	}()
+
+	var a uint64
+	select {
+	case a = <-deleteAAtMerge:
+	case err := <-deleteAResult:
+		deleteAJoined = true
+		t.Fatalf("Delete A returned before reaching the merge barrier: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Delete A did not reach the merge barrier")
+	}
+	require.NotZero(t, a)
+
+	// A is paused before Merge, so this absent read receives a fresh token b.
+	b := absentToken(t, s, key)
+	require.Greater(t, b, a)
+
+	// B must commit before A resumes. Its tombstone carries the newer fence c.
+	require.NoError(t, s.DeleteIfVersion(key, 0))
+	c := absentToken(t, s, key)
+	require.Greater(t, c, b)
+	row, found, err := s.readRowForCAS(keys.MakeMetadataKey(key))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), row.Expiry)
+	require.Equal(t, c, row.Version)
+	require.Empty(t, row.RawFilePath)
+	require.Empty(t, row.SegmentPath)
+
+	resumeA()
+	errA := <-deleteAResult
+	deleteAJoined = true
+	aMismatch, aLost := storageErrors.IsVersionMismatch(errA)
+	if errA != nil && !aLost {
+		t.Fatalf("Delete A returned an unexpected operation error: %v", errA)
+	}
+	aCurrent := uint64(0)
+	if aLost {
+		aCurrent = aMismatch.CurrentVersion
+	}
+
+	retainedToken := absentToken(t, s, key)
+	row, found, err = s.readRowForCAS(keys.MakeMetadataKey(key))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), row.Expiry)
+	require.Empty(t, row.RawFilePath)
+	require.Empty(t, row.SegmentPath)
+
+	_, refillErr := s.PutIfVersion(key, bytes.NewReader([]byte("stale")), 0, b)
+	refillMismatch, refillLost := storageErrors.IsVersionMismatch(refillErr)
+	if refillErr != nil && !refillLost {
+		t.Fatalf("the ordered refill returned an unexpected operation error: %v", refillErr)
+	}
+	refillCurrent := uint64(0)
+	if refillLost {
+		refillCurrent = refillMismatch.CurrentVersion
+	}
+	_, finalToken, found, err := s.GetWithVersion(key)
+	require.NoError(t, err)
+	require.Less(t, time.Since(started), s.cleaner.fenceRetention, "the fence must remain within its retention horizon")
+
+	if !(aLost && aCurrent == c && retainedToken == c && row.Version == c &&
+		refillLost && refillCurrent == c && finalToken == c && !found) {
+		t.Errorf("delayed CAS delete must preserve the newer retained fence: a=%d b=%d c=%d, delete mismatch=%t current=%d, retained=%d, refill mismatch=%t current=%d, final=%d found=%t",
+			a, b, c, aLost, aCurrent, retainedToken, refillLost, refillCurrent, finalToken, found)
+	}
 }
 
 // TestCAS_Fence_PopulateThatObservedAbsenceBeforeDeleteLoses: the invalidate-
