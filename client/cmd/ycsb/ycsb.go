@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -135,7 +136,9 @@ func hashKey(keyNum int) string {
 		h *= prime64
 		n >>= 8
 	}
-	return fmt.Sprintf("user%x", h)
+	// "user" plus at most 16 hexadecimal digits fits in this stack buffer.
+	key := [20]byte{'u', 's', 'e', 'r'}
+	return string(strconv.AppendUint(key[:4], h, 16))
 }
 
 // casKey names the CAS-guarded twin of key number keyNum. CAS keys live in
