@@ -14,6 +14,9 @@ import (
 	"github.com/tigrisdata/ocache/common/metrics"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/operations"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Streaming Put for large values
@@ -59,20 +62,25 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 	errCh := make(chan error, 1)
 
 	// Start the put operation in a goroutine so it can consume the pipe as we write to it
+	opts := operations.PutOptions{ShedOverBudget: firstChunk.ShedOverBudget}
 	go func() {
 		// Note: PutLocal auto-detects that io.PipeReader is not seekable,
 		// so it won't attempt retries. The client would need to resend the entire stream.
-		errCh <- s.ops.PutLocal(stream.Context(), key, pr, ttl)
+		err := s.ops.PutLocalWithOptions(stream.Context(), key, pr, ttl, opts)
+		if err != nil {
+			// A refused (shed) or failed put stops reading; unblock the writer
+			// below with the real cause so it is what the client sees.
+			pr.CloseWithError(err)
+		}
+		errCh <- err
 	}()
 
 	// Write the first chunk's data if any
 	if len(firstChunk.Data) > 0 {
 		if _, err := pw.Write(firstChunk.Data); err != nil {
 			pw.CloseWithError(err)
-			<-errCh // wait for storage.Put to finish
-			metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
-			metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+			putErr := <-errCh // wait for storage.Put to finish
+			return stream.SendAndClose(putFailure(firstErr(putErr, err)))
 		}
 		metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(firstChunk.Data)))
 	}
@@ -85,20 +93,14 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 		}
 		if err != nil {
 			pw.CloseWithError(err)
-			<-errCh // wait for storage.Put to finish
-
-			metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
-			metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-			return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+			putErr := <-errCh // wait for storage.Put to finish
+			return stream.SendAndClose(putFailure(firstErr(putErr, err)))
 		}
 		if len(chunk.Data) > 0 {
 			if _, err := pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
-				<-errCh // wait for storage.Put to finish
-
-				metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
-				metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-				return stream.SendAndClose(&pb.PutResponse{Success: false, Error: err.Error()})
+				putErr := <-errCh // wait for storage.Put to finish
+				return stream.SendAndClose(putFailure(firstErr(putErr, err)))
 			}
 			metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(chunk.Data)))
 		}
@@ -107,11 +109,7 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 
 	err := <-errCh // wait for storage.Put to finish
 	if err != nil {
-		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
-		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
-		// Convert storage error to user-friendly message
-		userErr := mapStorageErrorToGRPC(err)
-		return stream.SendAndClose(&pb.PutResponse{Success: false, Error: userErr.Error()})
+		return stream.SendAndClose(putFailure(err))
 	}
 
 	zlog.Debug().Str("key", key).Msg("Streaming put completed successfully")
@@ -195,4 +193,31 @@ func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 
 	metrics.RPCRequests.WithLabelValues("Put", "forwarded").Inc()
 	return localStream.SendAndClose(resp)
+}
+
+// firstErr prefers the put's own error over the pipe/stream error it caused.
+func firstErr(primary, fallback error) error {
+	if primary != nil {
+		return primary
+	}
+	return fallback
+}
+
+// putFailure builds the failure response for a streaming Put: the storage error
+// mapped to its user-facing gRPC status, with the code carried alongside the
+// message so a forwarding node and the caller can act on it (a refused
+// sheddable write is ResourceExhausted; see operations.IsOverBudget).
+func putFailure(err error) *pb.PutResponse {
+	userErr := mapStorageErrorToGRPC(err)
+	code := codes.Unknown
+	if st, ok := status.FromError(userErr); ok {
+		code = st.Code()
+	}
+	if code == codes.ResourceExhausted {
+		metrics.RPCRequests.WithLabelValues("Put", "shed").Inc()
+	} else {
+		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+	}
+	return &pb.PutResponse{Success: false, Error: userErr.Error(), Code: int32(code)}
 }

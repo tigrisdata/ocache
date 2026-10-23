@@ -90,6 +90,20 @@ func NewInvalidRequestError(op, message string) *StorageError {
 }
 
 // NewStorageFullError creates a new storage full error
+// ErrOverBudget is the underlying cause when a sheddable write is refused
+// because the store is over its disk shed ratio (see Storage.OverShedRatio).
+var ErrOverBudget = errors.New("store over disk shed ratio")
+
+// NewOverBudgetError builds the StorageFull error for a refused sheddable write.
+func NewOverBudgetError(op string) *StorageError {
+	return NewStorageFullError(op, ErrOverBudget)
+}
+
+// IsOverBudget reports whether err is (or wraps) a refused sheddable write.
+func IsOverBudget(err error) bool {
+	return errors.Is(err, ErrOverBudget)
+}
+
 func NewStorageFullError(op string, underlying error) *StorageError {
 	return &StorageError{
 		Type:       TypeStorageFull,

@@ -69,11 +69,16 @@ message PutRequest {
   string key = 1; // the cache key; only required in the first message
   int64 ttl_seconds = 2; // optional TTL; only used in the first message
   bytes data = 3; // raw chunk of the object
+  // Only in the first message: refuse the write (ResourceExhausted) instead of
+  // storing it while the owning node is over its disk shed ratio. For bodies a
+  // caller can serve without caching; never set it on metadata the caller needs.
+  bool shed_over_budget = 4;
 }
 
 message PutResponse {
   bool success = 1;
   string error  = 2; // nonempty if something went wrong
+  int32 code = 3; // gRPC status code of the failure (0 = OK), so callers can act on it
 }
 
 message GetRequest {

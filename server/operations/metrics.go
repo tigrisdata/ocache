@@ -29,6 +29,12 @@ func recordOperationStart(operation string) func(err error, statusOverride ...st
 	}
 }
 
+// recordShed counts a sheddable write refused because the store is over its
+// disk shed ratio, as its own RPC status so it never reads as an error.
+func recordShed(operation string) {
+	metrics.RPCRequests.WithLabelValues(operation, "shed").Inc()
+}
+
 // recordBytesTransferred records bytes transferred for streaming operations.
 func recordBytesTransferred(direction string, bytes int64) {
 	metrics.StreamBytesTransferred.WithLabelValues(direction).Add(float64(bytes))

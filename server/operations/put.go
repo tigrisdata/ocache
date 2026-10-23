@@ -13,7 +13,10 @@ import (
 	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"github.com/tigrisdata/ocache/storage/retry"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -21,20 +24,35 @@ const (
 	DefaultStreamBufferSize = 1 << 20 // 1 MiB
 )
 
+// PutOptions tunes a single Put.
+type PutOptions struct {
+	// ShedOverBudget refuses the write with an over-budget error (gRPC
+	// ResourceExhausted; see IsOverBudget) instead of storing it when the OWNING
+	// node is at or over its disk shed ratio — evaluated at the owner, so a
+	// forwarding node cannot fill an overloaded peer. Meant for bodies the caller
+	// can serve without caching; never for metadata the caller relies on.
+	ShedOverBudget bool
+}
+
 // Put stores data for the given key with automatic routing.
 // If the key is local, it stores directly in storage.
 // If the key is remote, it sends via gRPC to the appropriate node.
 func (o *Operations) Put(ctx context.Context, key string, body io.Reader, ttl int) error {
+	return o.PutWithOptions(ctx, key, body, ttl, PutOptions{})
+}
+
+// PutWithOptions is Put with per-call options.
+func (o *Operations) PutWithOptions(ctx context.Context, key string, body io.Reader, ttl int, opts PutOptions) error {
 	done := recordOperationStart("Operations.Put")
 
 	zlog.Debug().Str("key", key).Int("ttl", ttl).Msg("Operations.Put called")
 
 	var err error
 	if o.IsLocal(key) {
-		err = o.PutLocal(ctx, key, body, ttl)
+		err = o.PutLocalWithOptions(ctx, key, body, ttl, opts)
 	} else {
 		// Remote key - send via gRPC
-		err = o.putRemote(ctx, key, body, ttl)
+		err = o.putRemote(ctx, key, body, ttl, opts)
 	}
 
 	done(err)
@@ -46,6 +64,17 @@ func (o *Operations) Put(ctx context.Context, key string, body io.Reader, ttl in
 // For non-seekable readers (e.g., io.PipeReader from streaming), no retries are attempted
 // since the reader cannot be rewound.
 func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, ttl int) error {
+	return o.PutLocalWithOptions(ctx, key, body, ttl, PutOptions{})
+}
+
+// PutLocalWithOptions is PutLocal with per-call options. A sheddable write is
+// refused BEFORE the body is read, so the caller still holds its bytes.
+func (o *Operations) PutLocalWithOptions(ctx context.Context, key string, body io.Reader, ttl int, opts PutOptions) error {
+	if opts.ShedOverBudget && o.storage.OverShedRatio() {
+		recordShed("Put")
+		return storageErrors.NewOverBudgetError("Put")
+	}
+
 	// Check if we can retry (reader is seekable)
 	seeker, canRetry := body.(io.Seeker)
 
@@ -64,7 +93,7 @@ func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, t
 }
 
 // putRemote sends data to a remote node via gRPC streaming.
-func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, ttl int) error {
+func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, ttl int, opts PutOptions) error {
 	// Increment hop count for forwarding loop detection
 	ctx, err := coordinator.IncrementHopCount(ctx, o.GetLocalNodeID())
 	if err != nil {
@@ -89,8 +118,9 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 
 	// Always send the first message with key and TTL, even if data is empty
 	firstReq := &pb.PutRequest{
-		Key:        key,
-		TtlSeconds: int64(ttl),
+		Key:            key,
+		TtlSeconds:     int64(ttl),
+		ShedOverBudget: opts.ShedOverBudget,
 	}
 
 	// Read first chunk of data
@@ -141,9 +171,21 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 		return err
 	}
 	if resp != nil && !resp.Success {
-		return &PutError{Message: resp.Error}
+		return &PutError{Message: resp.Error, Code: codes.Code(resp.Code)}
 	}
 	return nil
+}
+
+// IsOverBudget reports whether err is a refused sheddable write, whether it
+// came from the local store or from the owning node over gRPC.
+func IsOverBudget(err error) bool {
+	if err == nil {
+		return false
+	}
+	if storageErrors.IsOverBudget(err) {
+		return true
+	}
+	return status.Code(err) == codes.ResourceExhausted
 }
 
 // PutBytes stores a byte slice for the given key with automatic routing.
@@ -152,11 +194,23 @@ func (o *Operations) PutBytes(ctx context.Context, key string, data []byte, ttl 
 	return o.Put(ctx, key, bytes.NewReader(data), ttl)
 }
 
-// PutError represents an error from a Put operation.
+// PutError represents an error from a Put operation on a remote node.
 type PutError struct {
 	Message string
+	// Code is the owner's gRPC status code for the failure (OK when the owner
+	// predates the field); GRPCStatus exposes it to status.Code.
+	Code codes.Code
 }
 
 func (e *PutError) Error() string {
 	return e.Message
+}
+
+// GRPCStatus lets status.Code(err) see the owner's code through the
+// PutResponse relay, which stringifies the original status.
+func (e *PutError) GRPCStatus() *status.Status {
+	if e.Code == codes.OK {
+		return status.New(codes.Unknown, e.Message)
+	}
+	return status.New(e.Code, e.Message)
 }
