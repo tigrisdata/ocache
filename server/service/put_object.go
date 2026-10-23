@@ -38,12 +38,7 @@ func (s *CacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 	opts := operations.PutOptions{ShedOverBudget: req.ShedOverBudget}
 	err := s.ops.PutWithOptions(ctx, req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds), opts)
 	if err != nil {
-		resp := putFailure(err)
-		if resp.Code != int32(codes.ResourceExhausted) {
-			// putFailure counted the streaming RPC; attribute to the unary one too.
-			metrics.Errors.WithLabelValues("grpc", "PutObject").Inc()
-		}
-		return resp, nil
+		return putFailure("PutObject", err), nil
 	}
 	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
 	return &pb.PutResponse{Success: true}, nil

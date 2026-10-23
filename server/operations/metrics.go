@@ -20,19 +20,17 @@ func recordOperationStart(operation string) func(err error, statusOverride ...st
 		status := "success"
 		if err != nil {
 			status = "error"
-			metrics.Errors.WithLabelValues("operations", operation).Inc()
 		}
 		if len(statusOverride) > 0 {
 			status = statusOverride[0]
 		}
+		// A non-error outcome with an error value (a shed refusal) is counted
+		// under its own status and never as an error.
+		if status == "error" {
+			metrics.Errors.WithLabelValues("operations", operation).Inc()
+		}
 		metrics.RPCRequests.WithLabelValues(operation, status).Inc()
 	}
-}
-
-// recordShed counts a sheddable write refused because the store is over its
-// disk shed ratio, as its own RPC status so it never reads as an error.
-func recordShed(operation string) {
-	metrics.RPCRequests.WithLabelValues(operation, "shed").Inc()
 }
 
 // recordBytesTransferred records bytes transferred for streaming operations.

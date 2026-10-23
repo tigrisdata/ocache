@@ -79,6 +79,7 @@ message PutResponse {
   bool success = 1;
   string error  = 2; // nonempty if something went wrong
   int32 code = 3; // gRPC status code of the failure (0 = OK), so callers can act on it
+  bool shed = 4;  // the write was refused by shed_over_budget (owner over its disk shed ratio), not a failure
 }
 
 message GetRequest {

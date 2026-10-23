@@ -15,6 +15,7 @@ import (
 	"github.com/tigrisdata/ocache/coordinator"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/operations"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -58,11 +59,17 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 	key := firstChunk.Key
 	ttl := int(firstChunk.TtlSeconds)
 
+	// Decide a sheddable write up front, before the body is read, so a client
+	// that sends the key first and waits is answered instead of left blocking.
+	opts := operations.PutOptions{ShedOverBudget: firstChunk.ShedOverBudget}
+	if opts.ShedOverBudget && s.ops.OverBudget() {
+		return stream.SendAndClose(putFailure("Put", storageErrors.NewOverBudgetError("Put")))
+	}
+
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 
 	// Start the put operation in a goroutine so it can consume the pipe as we write to it
-	opts := operations.PutOptions{ShedOverBudget: firstChunk.ShedOverBudget}
 	go func() {
 		// Note: PutLocal auto-detects that io.PipeReader is not seekable,
 		// so it won't attempt retries. The client would need to resend the entire stream.
@@ -80,7 +87,7 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 		if _, err := pw.Write(firstChunk.Data); err != nil {
 			pw.CloseWithError(err)
 			putErr := <-errCh // wait for storage.Put to finish
-			return stream.SendAndClose(putFailure(firstErr(putErr, err)))
+			return stream.SendAndClose(putFailure("Put", firstErr(putErr, err)))
 		}
 		metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(firstChunk.Data)))
 	}
@@ -94,13 +101,13 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 		if err != nil {
 			pw.CloseWithError(err)
 			putErr := <-errCh // wait for storage.Put to finish
-			return stream.SendAndClose(putFailure(firstErr(putErr, err)))
+			return stream.SendAndClose(putFailure("Put", firstErr(putErr, err)))
 		}
 		if len(chunk.Data) > 0 {
 			if _, err := pw.Write(chunk.Data); err != nil {
 				pw.CloseWithError(err)
 				putErr := <-errCh // wait for storage.Put to finish
-				return stream.SendAndClose(putFailure(firstErr(putErr, err)))
+				return stream.SendAndClose(putFailure("Put", firstErr(putErr, err)))
 			}
 			metrics.StreamBytesTransferred.WithLabelValues("upload").Add(float64(len(chunk.Data)))
 		}
@@ -109,7 +116,7 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 
 	err := <-errCh // wait for storage.Put to finish
 	if err != nil {
-		return stream.SendAndClose(putFailure(err))
+		return stream.SendAndClose(putFailure("Put", err))
 	}
 
 	zlog.Debug().Str("key", key).Msg("Streaming put completed successfully")
@@ -152,16 +159,19 @@ func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 		})
 	}
 
-	// Send the first chunk we already received
-	if err := remoteStream.Send(firstChunk); err != nil {
+	// Send the first chunk we already received. A Send returning io.EOF means
+	// the owner ended the RPC early (a sheddable write it refused); stop
+	// forwarding and relay its response rather than a transport error.
+	sendErr := remoteStream.Send(firstChunk)
+	if sendErr != nil && sendErr != io.EOF {
 		return localStream.SendAndClose(&pb.PutResponse{
 			Success: false,
-			Error:   fmt.Sprintf("failed to forward to remote node: %v", err),
+			Error:   fmt.Sprintf("failed to forward to remote node: %v", sendErr),
 		})
 	}
 
 	// Forward remaining chunks
-	for {
+	for sendErr == nil {
 		chunk, err := localStream.Recv()
 		if err == io.EOF {
 			break
@@ -174,10 +184,10 @@ func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 			})
 		}
 
-		if err := remoteStream.Send(chunk); err != nil {
+		if sendErr = remoteStream.Send(chunk); sendErr != nil && sendErr != io.EOF {
 			return localStream.SendAndClose(&pb.PutResponse{
 				Success: false,
-				Error:   fmt.Sprintf("failed to forward chunk to remote node: %v", err),
+				Error:   fmt.Sprintf("failed to forward chunk to remote node: %v", sendErr),
 			})
 		}
 	}
@@ -203,21 +213,23 @@ func firstErr(primary, fallback error) error {
 	return fallback
 }
 
-// putFailure builds the failure response for a streaming Put: the storage error
-// mapped to its user-facing gRPC status, with the code carried alongside the
-// message so a forwarding node and the caller can act on it (a refused
-// sheddable write is ResourceExhausted; see operations.IsOverBudget).
-func putFailure(err error) *pb.PutResponse {
+// putFailure builds the failure response for a put received as RPC method
+// (Put or PutObject): the storage error mapped to its user-facing gRPC status,
+// with the code carried alongside the message so a forwarding node and the
+// caller can act on it. A refused sheddable write is marked shed and counted
+// under its own status, never as an error (see operations.IsOverBudget).
+func putFailure(method string, err error) *pb.PutResponse {
 	userErr := mapStorageErrorToGRPC(err)
 	code := codes.Unknown
 	if st, ok := status.FromError(userErr); ok {
 		code = st.Code()
 	}
-	if code == codes.ResourceExhausted {
-		metrics.RPCRequests.WithLabelValues("Put", "shed").Inc()
+	shed := storageErrors.IsOverBudget(err)
+	if shed {
+		metrics.RPCRequests.WithLabelValues(method, "shed").Inc()
 	} else {
-		metrics.RPCRequests.WithLabelValues("Put", "error").Inc()
-		metrics.Errors.WithLabelValues("grpc", "Put").Inc()
+		metrics.RPCRequests.WithLabelValues(method, "error").Inc()
+		metrics.Errors.WithLabelValues("grpc", method).Inc()
 	}
-	return &pb.PutResponse{Success: false, Error: userErr.Error(), Code: int32(code)}
+	return &pb.PutResponse{Success: false, Error: userErr.Error(), Code: int32(code), Shed: shed}
 }

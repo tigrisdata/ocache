@@ -6,6 +6,7 @@ package operations
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 
 	zlog "github.com/rs/zerolog/log"
@@ -55,8 +56,18 @@ func (o *Operations) PutWithOptions(ctx context.Context, key string, body io.Rea
 		err = o.putRemote(ctx, key, body, ttl, opts)
 	}
 
-	done(err)
+	if IsOverBudget(err) {
+		done(err, "shed") // a refusal the caller asked for, not a failure
+	} else {
+		done(err)
+	}
 	return err
+}
+
+// OverBudget reports whether this node's store is at or over its disk shed
+// ratio, i.e. whether a sheddable write would be refused right now.
+func (o *Operations) OverBudget() bool {
+	return o.storage.OverShedRatio()
 }
 
 // PutLocal stores data in local storage directly.
@@ -71,7 +82,6 @@ func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, t
 // refused BEFORE the body is read, so the caller still holds its bytes.
 func (o *Operations) PutLocalWithOptions(ctx context.Context, key string, body io.Reader, ttl int, opts PutOptions) error {
 	if opts.ShedOverBudget && o.storage.OverShedRatio() {
-		recordShed("Put")
 		return storageErrors.NewOverBudgetError("Put")
 	}
 
@@ -112,72 +122,63 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 		return err
 	}
 
+	resp, err := SendPutStream(stream, &pb.PutRequest{
+		Key:            key,
+		TtlSeconds:     int64(ttl),
+		ShedOverBudget: opts.ShedOverBudget,
+	}, body)
+	if err != nil {
+		return err
+	}
+	if resp != nil && !resp.Success {
+		return &PutError{Message: resp.Error, Code: codes.Code(resp.Code), Shed: resp.Shed}
+	}
+	return nil
+}
+
+// SendPutStream streams first (key, ttl, options) and then body in chunks over
+// an open Put call and returns the owner's response. A Send returning io.EOF
+// means the owner ended the RPC early — a sheddable write it refused before
+// consuming the body — so sending stops and CloseAndRecv surfaces the in-band
+// outcome instead of the send error that would hide it.
+func SendPutStream(stream pb.CacheService_PutClient, first *pb.PutRequest, body io.Reader) (*pb.PutResponse, error) {
 	// Get buffer from pool
 	buf, release := bufferpool.AcquireBuffer(DefaultStreamBufferSize)
 	defer release()
 
 	// Always send the first message with key and TTL, even if data is empty
-	firstReq := &pb.PutRequest{
-		Key:            key,
-		TtlSeconds:     int64(ttl),
-		ShedOverBudget: opts.ShedOverBudget,
-	}
-
-	// Read first chunk of data
-	n, err := body.Read(buf)
+	n, readErr := body.Read(buf)
 	if n > 0 {
-		firstReq.Data = buf[:n]
+		first.Data = buf[:n]
 	}
-	if sendErr := stream.Send(firstReq); sendErr != nil {
-		return sendErr
-	}
-	if n > 0 {
+	sendErr := stream.Send(first)
+	if sendErr == nil && n > 0 {
 		recordBytesTransferred("upload", int64(n))
 	}
-
-	// If first read hit EOF, we're done (handles empty data case)
-	if err == io.EOF {
-		// Continue to CloseAndRecv below
-	} else if err != nil {
-		return err
-	} else {
-		// Stream remaining data
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-
-			n, err := body.Read(buf)
-			if n > 0 {
-				req := &pb.PutRequest{Data: buf[:n]}
-				if sendErr := stream.Send(req); sendErr != nil {
-					return sendErr
-				}
+	if readErr != nil && readErr != io.EOF {
+		return nil, readErr // local read failure — not a stream/server issue
+	}
+	for sendErr == nil && readErr != io.EOF {
+		n, readErr = body.Read(buf)
+		if n > 0 {
+			if sendErr = stream.Send(&pb.PutRequest{Data: buf[:n]}); sendErr == nil {
 				recordBytesTransferred("upload", int64(n))
 			}
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return err
-			}
+		}
+		if readErr != nil && readErr != io.EOF {
+			return nil, readErr
 		}
 	}
-
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return err
+	if sendErr != nil && sendErr != io.EOF {
+		return nil, sendErr
 	}
-	if resp != nil && !resp.Success {
-		return &PutError{Message: resp.Error, Code: codes.Code(resp.Code)}
-	}
-	return nil
+	return stream.CloseAndRecv()
 }
 
-// IsOverBudget reports whether err is a refused sheddable write, whether it
-// came from the local store or from the owning node over gRPC.
+// IsOverBudget reports whether err is a sheddable write refused by its owner,
+// whether that owner was the local store or a peer over gRPC. Only the explicit
+// refusal marker counts: a genuine storage-full or hop-limit failure also maps
+// to ResourceExhausted and must stay an error.
 func IsOverBudget(err error) bool {
 	if err == nil {
 		return false
@@ -185,7 +186,8 @@ func IsOverBudget(err error) bool {
 	if storageErrors.IsOverBudget(err) {
 		return true
 	}
-	return status.Code(err) == codes.ResourceExhausted
+	var pe *PutError
+	return errors.As(err, &pe) && pe.Shed
 }
 
 // PutBytes stores a byte slice for the given key with automatic routing.
@@ -200,6 +202,8 @@ type PutError struct {
 	// Code is the owner's gRPC status code for the failure (OK when the owner
 	// predates the field); GRPCStatus exposes it to status.Code.
 	Code codes.Code
+	// Shed marks a refused sheddable write (see PutOptions.ShedOverBudget).
+	Shed bool
 }
 
 func (e *PutError) Error() string {

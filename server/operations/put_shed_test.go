@@ -53,11 +53,17 @@ func TestPutLocal_ShedOverBudget(t *testing.T) {
 	require.NoError(t, ops.PutLocal(ctx, "meta", bytes.NewReader([]byte("marker")), 0))
 }
 
-// The remote relay carries the owner's code so status.Code sees it.
-func TestPutError_CarriesCode(t *testing.T) {
-	err := error(&PutError{Message: "storage capacity exceeded", Code: codes.ResourceExhausted})
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
-	require.True(t, IsOverBudget(err))
+// The remote relay carries the owner's code and the explicit shed marker; the
+// code alone (a genuine storage-full also maps to ResourceExhausted) is not a
+// refusal.
+func TestPutError_CarriesCodeAndShed(t *testing.T) {
+	shed := error(&PutError{Message: "storage capacity exceeded", Code: codes.ResourceExhausted, Shed: true})
+	require.Equal(t, codes.ResourceExhausted, status.Code(shed))
+	require.True(t, IsOverBudget(shed))
+
+	full := error(&PutError{Message: "storage capacity exceeded", Code: codes.ResourceExhausted})
+	require.Equal(t, codes.ResourceExhausted, status.Code(full))
+	require.False(t, IsOverBudget(full), "a real storage-full failure is not a shed")
 
 	legacy := error(&PutError{Message: "boom"})
 	require.Equal(t, codes.Unknown, status.Code(legacy))
