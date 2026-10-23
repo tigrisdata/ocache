@@ -159,50 +159,95 @@ func (s *CacheService) forwardStreamingPut(localStream pb.CacheService_PutServer
 		})
 	}
 
-	// Send the first chunk we already received. A Send returning io.EOF means
-	// the owner ended the RPC early (a sheddable write it refused); stop
-	// forwarding and relay its response rather than a transport error.
-	sendErr := remoteStream.Send(firstChunk)
-	if sendErr != nil && sendErr != io.EOF {
-		return localStream.SendAndClose(&pb.PutResponse{
-			Success: false,
-			Error:   fmt.Sprintf("failed to forward to remote node: %v", sendErr),
-		})
+	return relayPut(localStream, remoteStream, firstChunk)
+}
+
+// relayPut pumps the client's chunks to the owner while listening for the
+// owner's reply at the same time, so an owner that answers early (a sheddable
+// write it refused on the first message) is relayed at once instead of after
+// the client's next chunk — which a client waiting for that answer never sends.
+func relayPut(localStream pb.CacheService_PutServer, remoteStream pb.CacheService_PutClient, firstChunk *pb.PutRequest) error {
+	type reply struct {
+		resp *pb.PutResponse
+		err  error
+	}
+	replyCh := make(chan reply, 1)
+	go func() {
+		var resp pb.PutResponse
+		err := remoteStream.RecvMsg(&resp)
+		replyCh <- reply{resp: &resp, err: err}
+	}()
+	relay := func(r reply) error {
+		if r.err != nil {
+			return localStream.SendAndClose(&pb.PutResponse{
+				Success: false,
+				Error:   fmt.Sprintf("error from remote node: %v", r.err),
+			})
+		}
+		metrics.RPCRequests.WithLabelValues("Put", "forwarded").Inc()
+		return localStream.SendAndClose(r.resp)
 	}
 
-	// Forward remaining chunks
-	for sendErr == nil {
-		chunk, err := localStream.Recv()
+	// A Send returning io.EOF means the owner ended the RPC early; its reply
+	// is on replyCh.
+	if err := remoteStream.Send(firstChunk); err != nil {
 		if err == io.EOF {
-			break
+			return relay(<-replyCh)
 		}
-		if err != nil {
-			remoteStream.CloseSend()
-			return localStream.SendAndClose(&pb.PutResponse{
-				Success: false,
-				Error:   fmt.Sprintf("error receiving chunk: %v", err),
-			})
-		}
-
-		if sendErr = remoteStream.Send(chunk); sendErr != nil && sendErr != io.EOF {
-			return localStream.SendAndClose(&pb.PutResponse{
-				Success: false,
-				Error:   fmt.Sprintf("failed to forward chunk to remote node: %v", sendErr),
-			})
-		}
-	}
-
-	// Close the remote stream and get the response
-	resp, err := remoteStream.CloseAndRecv()
-	if err != nil {
 		return localStream.SendAndClose(&pb.PutResponse{
 			Success: false,
-			Error:   fmt.Sprintf("error from remote node: %v", err),
+			Error:   fmt.Sprintf("failed to forward to remote node: %v", err),
 		})
 	}
 
-	metrics.RPCRequests.WithLabelValues("Put", "forwarded").Inc()
-	return localStream.SendAndClose(resp)
+	type chunk struct {
+		req *pb.PutRequest
+		err error
+	}
+	chunkCh := make(chan chunk)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			req, err := localStream.Recv()
+			select {
+			case chunkCh <- chunk{req: req, err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case r := <-replyCh:
+			return relay(r)
+		case c := <-chunkCh:
+			if c.err == io.EOF {
+				_ = remoteStream.CloseSend()
+				return relay(<-replyCh)
+			}
+			if c.err != nil {
+				_ = remoteStream.CloseSend()
+				return localStream.SendAndClose(&pb.PutResponse{
+					Success: false,
+					Error:   fmt.Sprintf("error receiving chunk: %v", c.err),
+				})
+			}
+			if err := remoteStream.Send(c.req); err != nil {
+				if err == io.EOF {
+					return relay(<-replyCh)
+				}
+				return localStream.SendAndClose(&pb.PutResponse{
+					Success: false,
+					Error:   fmt.Sprintf("failed to forward chunk to remote node: %v", err),
+				})
+			}
+		}
+	}
 }
 
 // firstErr prefers the put's own error over the pipe/stream error it caused.
@@ -224,7 +269,9 @@ func putFailure(method string, err error) *pb.PutResponse {
 	if st, ok := status.FromError(userErr); ok {
 		code = st.Code()
 	}
-	shed := storageErrors.IsOverBudget(err)
+	// Local refusals wrap ErrOverBudget; refusals relayed from a remote owner
+	// arrive as a PutError with Shed set. operations.IsOverBudget covers both.
+	shed := operations.IsOverBudget(err)
 	if shed {
 		metrics.RPCRequests.WithLabelValues(method, "shed").Inc()
 	} else {

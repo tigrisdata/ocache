@@ -88,3 +88,68 @@ func codesOf(err error) codes.Code {
 	}
 	return status.Code(err)
 }
+
+// A refusal relayed from a remote owner keeps its marker and code in the unary
+// response, and is not counted as an error.
+func TestPutFailure_RemoteShedKeepsMarker(t *testing.T) {
+	resp := putFailure("PutObject", &operations.PutError{Message: "storage capacity exceeded", Code: codes.ResourceExhausted, Shed: true})
+	require.False(t, resp.Success)
+	require.True(t, resp.Shed)
+	require.Equal(t, int32(codes.ResourceExhausted), resp.Code)
+
+	full := putFailure("PutObject", &operations.PutError{Message: "storage capacity exceeded", Code: codes.ResourceExhausted})
+	require.False(t, full.Shed, "a real storage-full relayed from a peer stays an error")
+}
+
+// waitingPutServer is the client side of a relay whose caller sent the key and
+// is waiting for an answer before sending more: Recv blocks until released.
+type waitingPutServer struct {
+	grpc.ServerStream
+	ctx     context.Context
+	release chan struct{}
+	resp    *pb.PutResponse
+	done    chan struct{}
+}
+
+func (w *waitingPutServer) Context() context.Context { return w.ctx }
+func (w *waitingPutServer) Recv() (*pb.PutRequest, error) {
+	<-w.release
+	return nil, io.EOF
+}
+func (w *waitingPutServer) SendAndClose(r *pb.PutResponse) error {
+	w.resp = r
+	close(w.done)
+	return nil
+}
+
+// The relay must deliver an owner's early refusal even though the client has
+// sent nothing after the first message.
+func TestRelayPut_EarlyRefusalWithoutMoreChunks(t *testing.T) {
+	owner := setupShedStorage(t)
+	ownerClient := startBufconnService(t, NewCacheService(nil, owner))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	fill, err := ownerClient.Put(ctx)
+	require.NoError(t, err)
+	resp, err := operations.SendPutStream(fill, &pb.PutRequest{Key: "fill"}, bytes.NewReader(make([]byte, 8192)))
+	require.NoError(t, err)
+	require.True(t, resp.Success)
+	require.True(t, owner.OverShedRatio())
+
+	remote, err := ownerClient.Put(ctx)
+	require.NoError(t, err)
+	local := &waitingPutServer{ctx: ctx, release: make(chan struct{}), done: make(chan struct{})}
+	defer close(local.release)
+
+	go func() { _ = relayPut(local, remote, &pb.PutRequest{Key: "shed", ShedOverBudget: true}) }()
+
+	select {
+	case <-local.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay did not deliver the owner's refusal while the client was waiting")
+	}
+	require.False(t, local.resp.Success)
+	require.True(t, local.resp.Shed, "resp=%+v", local.resp)
+	require.Equal(t, int32(codes.ResourceExhausted), local.resp.Code)
+}
