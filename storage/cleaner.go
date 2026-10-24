@@ -413,7 +413,15 @@ func (c *Cleaner) cleanupExpiredKeys() {
 		batch.Clear()
 	}
 
-	for it.SeekToFirst(); it.Valid(); it.Next() {
+	// Walk only the metadata rows. The eviction indexes, back-references,
+	// compaction and deletion queues share this database, and under LRU those
+	// rows outnumber the metadata rows two to one, so walking the whole
+	// keyspace read three rows for every one this sweep could act on, every
+	// tick, on a cache whose row count grows with its size.
+	metaPrefix := []byte(keys.MetadataPrefix)
+	scanned := 0
+	defer func() { metrics.CleanerRowsScanned.WithLabelValues("ttl").Add(float64(scanned)) }()
+	for it.Seek(metaPrefix); it.ValidForPrefix(metaPrefix); it.Next() {
 		// Check if we're shutting down
 		select {
 		case <-c.closeCh:
@@ -421,15 +429,8 @@ func (c *Cleaner) cleanupExpiredKeys() {
 			return
 		default:
 		}
+		scanned++
 		keyBytes := it.Key().Data()
-
-		// Only process user metadata keys
-		if !keys.IsMetadataKey(keyBytes) {
-			// Skip all non-metadata keys (including other internal keys)
-			it.Key().Free()
-			it.Value().Free()
-			continue
-		}
 
 		// Extract the original user key
 		key := keys.ExtractUserKey(keyBytes)
@@ -510,6 +511,7 @@ func (c *Cleaner) cleanupExpiredKeys() {
 	metrics.CleanerBytesFreed.WithLabelValues("ttl").Add(float64(committedBytes))
 
 	zlog.Info().
+		Int("scanned", scanned).
 		Int("cleaned", committedCleaned).
 		Int64("bytes_freed", committedBytes).
 		Dur("duration_ms", duration).
@@ -615,7 +617,12 @@ func (c *Cleaner) reconcileFromMetadata() {
 		referencedRaw = make(map[string]int64)
 	}
 
-	for it.SeekToFirst(); it.Valid(); it.Next() {
+	// Metadata rows only, for the same reason as the TTL sweep: the other
+	// keyspaces would otherwise be read and discarded row by row.
+	metaPrefix := []byte(keys.MetadataPrefix)
+	scanned := 0
+	defer func() { metrics.CleanerRowsScanned.WithLabelValues("reconcile").Add(float64(scanned)) }()
+	for it.Seek(metaPrefix); it.ValidForPrefix(metaPrefix); it.Next() {
 		// Check if we're shutting down
 		select {
 		case <-c.closeCh:
@@ -624,15 +631,8 @@ func (c *Cleaner) reconcileFromMetadata() {
 			return
 		default:
 		}
+		scanned++
 		keyBytes := it.Key().Data()
-
-		// Only process user metadata keys
-		if !keys.IsMetadataKey(keyBytes) {
-			// Skip all non-metadata keys (including other internal keys)
-			it.Key().Free()
-			it.Value().Free()
-			continue
-		}
 
 		// This scan sums only value_length across every metadata row, so read
 		// it directly off the wire rather than fully decoding each message —
@@ -703,6 +703,7 @@ func (c *Cleaner) reconcileFromMetadata() {
 	c.refreshSizeMetrics()
 
 	event := zlog.Info().
+		Int("scanned", scanned).
 		Int64("total_size", totalSize).
 		Int64("drift", tracked-totalSize).
 		Dur("duration_ms", time.Since(start))

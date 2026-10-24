@@ -80,7 +80,7 @@ func (s *CacheService) Get(req *pb.GetRequest, stream pb.CacheService_GetServer)
 // forwardStreamingGet forwards a streaming Get request to a remote node
 func (s *CacheService) forwardStreamingGet(req *pb.GetRequest, localStream pb.CacheService_GetServer) error {
 	// Forward to the correct node
-	client, err := s.coordinator.Route(req.Key)
+	client, err := s.coordinator.RouteContext(localStream.Context(), req.Key)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("Get", "routing_error").Inc()
 		return status.Errorf(codes.Unavailable, "routing error: %v", err)

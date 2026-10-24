@@ -20,10 +20,14 @@ func recordOperationStart(operation string) func(err error, statusOverride ...st
 		status := "success"
 		if err != nil {
 			status = "error"
-			metrics.Errors.WithLabelValues("operations", operation).Inc()
 		}
 		if len(statusOverride) > 0 {
 			status = statusOverride[0]
+		}
+		// A non-error outcome with an error value (a shed refusal) is counted
+		// under its own status and never as an error.
+		if status == "error" {
+			metrics.Errors.WithLabelValues("operations", operation).Inc()
 		}
 		metrics.RPCRequests.WithLabelValues(operation, status).Inc()
 	}

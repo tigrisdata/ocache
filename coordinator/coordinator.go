@@ -340,6 +340,11 @@ func (c *Coordinator) Route(key string) (pb.CacheServiceClient, error) {
 	return c.router.Route(key)
 }
 
+// RouteContext is Route bound to the caller's context; see Router.RouteContext.
+func (c *Coordinator) RouteContext(ctx context.Context, key string) (pb.CacheServiceClient, error) {
+	return c.router.RouteContext(ctx, key)
+}
+
 // GetNodeForKey returns the node for the given key
 func (c *Coordinator) GetNodeForKey(key string) (*ring.NodeInfo, error) {
 	return c.ringManager.GetNode(key)

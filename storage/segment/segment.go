@@ -325,7 +325,19 @@ func (s *Segment) WriteEntry(key string, r io.Reader, vm *pb.ValueMessage) (int6
 	buf, release := bufferpool.AcquireBuffer(64 * 1024)
 	defer release()
 
-	bytesWritten, err := io.CopyBuffer(s.file, r, buf)
+	var bytesWritten int64
+	if _, ok := r.(io.WriterTo); ok {
+		// Keep the source-owned fast path, such as *os.File.WriteTo, when it is
+		// available. It can use zero-copy file operations on supported systems.
+		bytesWritten, err = io.CopyBuffer(s.file, r, buf)
+	} else {
+		// *os.File implements io.ReaderFrom, and io.CopyBuffer prefers that over
+		// buf; its generic fallback then allocates a fresh 32 KiB buffer per
+		// call. Hiding the method behind a plain io.Writer makes CopyBuffer use
+		// the pooled buffer for SectionReader and rate-limited recompaction
+		// readers.
+		bytesWritten, err = io.CopyBuffer(struct{ io.Writer }{s.file}, r, buf)
+	}
 	if err != nil {
 		return rollback(utils.WrapError("copy value to segment", key, err))
 	}

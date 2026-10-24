@@ -56,8 +56,7 @@ func (s *CacheService) PutObjectIfVersion(ctx context.Context, req *pb.PutIfVers
 		metrics.RPCDuration.WithLabelValues("PutObjectIfVersion").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	// Info level while CAS is in initial production testing (new feature).
-	zlog.Info().Str("key", req.Key).Uint64("expected", req.ExpectedVersion).Int("data_len", len(req.Data)).Msg("PutObjectIfVersion called")
+	zlog.Debug().Str("key", req.Key).Uint64("expected", req.ExpectedVersion).Int("data_len", len(req.Data)).Msg("PutObjectIfVersion called")
 
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("PutObjectIfVersion", "invalid").Inc()
@@ -90,8 +89,7 @@ func (s *CacheService) DeleteIfVersion(ctx context.Context, req *pb.DeleteIfVers
 		metrics.RPCDuration.WithLabelValues("DeleteIfVersion").Observe(float64(time.Since(start).Milliseconds()))
 	}()
 
-	// Info level while CAS is in initial production testing (new feature).
-	zlog.Info().Str("key", req.Key).Uint64("expected", req.ExpectedVersion).Msg("DeleteIfVersion called")
+	zlog.Debug().Str("key", req.Key).Uint64("expected", req.ExpectedVersion).Msg("DeleteIfVersion called")
 
 	if req.Key == "" {
 		metrics.RPCRequests.WithLabelValues("DeleteIfVersion", "invalid").Inc()
@@ -292,7 +290,7 @@ func (s *CacheService) GetStreamWithVersion(req *pb.GetRequest, stream pb.CacheS
 
 // forwardStreamingPutIfVersion forwards a streaming CAS put to the owner node.
 func (s *CacheService) forwardStreamingPutIfVersion(localStream pb.CacheService_PutStreamIfVersionServer, first *pb.PutIfVersionRequest) error {
-	client, err := s.coordinator.Route(first.Key)
+	client, err := s.coordinator.RouteContext(localStream.Context(), first.Key)
 	if err != nil {
 		return status.Error(codes.Unavailable, fmt.Sprintf("routing error: %v", err))
 	}
@@ -338,7 +336,7 @@ func (s *CacheService) forwardStreamingPutIfVersion(localStream pb.CacheService_
 
 // forwardStreamingGetWithVersion forwards a streaming CAS read from the owner.
 func (s *CacheService) forwardStreamingGetWithVersion(req *pb.GetRequest, localStream pb.CacheService_GetStreamWithVersionServer) error {
-	client, err := s.coordinator.Route(req.Key)
+	client, err := s.coordinator.RouteContext(localStream.Context(), req.Key)
 	if err != nil {
 		return status.Error(codes.Unavailable, fmt.Sprintf("routing error: %v", err))
 	}

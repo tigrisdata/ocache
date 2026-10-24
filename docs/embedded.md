@@ -35,6 +35,10 @@ type Config struct {
     // MaxDiskUsage is the maximum disk usage in bytes (0 = unlimited)
     MaxDiskUsage int64
 
+    // ShedDiskRatio refuses PutStreamSheddable writes while this node is at or
+    // over ShedDiskRatio × MaxDiskUsage (eviction behind ingest). 0 never sheds.
+    ShedDiskRatio float64
+
     // InlineThreshold is the size threshold for inline vs file storage (default: 64KB)
     // Objects smaller than this are stored in RocksDB, larger ones as files.
     InlineThreshold int

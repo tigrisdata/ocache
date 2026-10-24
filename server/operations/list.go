@@ -321,7 +321,7 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 					resp.Keys, resp.ContinuationToken, resp.HasMore, err = o.ListLocal(ctx, prefix, limit, startKey)
 				}
 			} else {
-				client, clientErr := router.GetClientForNode(n.ID)
+				client, clientErr := router.GetClientForNode(ctx, n.ID)
 				if clientErr != nil {
 					logsample.DegradedRing().Err(clientErr).Str("node_id", n.ID).Msg("Failed to get client for node, skipping")
 					return

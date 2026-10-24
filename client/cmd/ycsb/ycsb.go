@@ -12,7 +12,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pterm/pterm"
@@ -209,26 +208,102 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand
 		expectedPuts += cfg.NumKeys
 	}
 
-	var preloadErrors int32
-	var successCount int32
-	errorCh := make(chan error, 100)
+	useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
+	workerCount := max(1, min(cfg.Concurrency, max(expectedPuts, 1)))
 
-	for i := range cfg.NumKeys {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			if spinner != nil {
-				spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d keys", i, cfg.NumKeys))
+	// The preload runs the configured concurrency: one deterministic producer
+	// generates keys and values in the same order as before (so the RNG state
+	// after preload is unchanged), a bounded worker pool performs the puts, and
+	// one collector owns the accounting and spinner output. The job queue is
+	// bounded so values are released as their put completes instead of holding
+	// the whole corpus in memory.
+	type preloadJob struct {
+		seq   int // generation order, for a stable "first error"
+		key   string
+		value []byte
+		cas   bool
+	}
+	type preloadResult struct {
+		seq int
+		key string
+		err error
+	}
+	jobs := make(chan preloadJob, workerCount)
+	results := make(chan preloadResult, workerCount)
+
+	var workerWg sync.WaitGroup
+	workerWg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					// Plain read/update keys and CAS keys live in disjoint namespaces
+					// so a key is never both plain-written and CAS-guarded (an
+					// unsupported mix). CAS keys are created with put-if-absent; a
+					// mismatch there means the key survived from an earlier run and
+					// is already CAS-owned, which is fine.
+					var err error
+					switch {
+					case job.cas && useStreaming:
+						_, err = client.PutStreamIfVersion(ctx, job.key, bytes.NewReader(job.value), 0, 0)
+					case job.cas:
+						_, err = client.PutIfVersion(ctx, job.key, job.value, 0, 0)
+					case useStreaming:
+						err = client.PutStream(ctx, job.key, bytes.NewReader(job.value), 0)
+					default:
+						err = client.Put(ctx, job.key, job.value, 0)
+					}
+					if outcome, _ := ClassifyCASResult(err); outcome == CASMismatch {
+						err = nil // already present from an earlier run: fine
+					}
+					results <- preloadResult{seq: job.seq, key: job.key, err: err}
+				}
 			}
-			return ctx.Err()
-		default:
-		}
+		}()
+	}
 
-		useStreaming := cfg.ForceStreaming || cfg.ValueSize > StreamingThreshold
-		// Plain read/update keys and CAS keys live in disjoint namespaces so a key
-		// is never both plain-written and CAS-guarded (an unsupported mix). CAS
-		// keys are created with put-if-absent; a mismatch there means the key
-		// survived from an earlier run and is already CAS-owned, which is fine.
+	// Completion order is independent of generation order, so keep the
+	// lowest-sequence error for the same first-error message the serial loop
+	// produced.
+	var collectWg sync.WaitGroup
+	collectWg.Add(1)
+	successCount, totalErrors, completedCount := 0, 0, 0
+	firstErrorSeq := -1
+	var firstError error
+	go func() {
+		defer collectWg.Done()
+		for result := range results {
+			completedCount++
+			if result.err != nil {
+				totalErrors++
+				if firstErrorSeq < 0 || result.seq < firstErrorSeq {
+					firstErrorSeq = result.seq
+					firstError = fmt.Errorf("key %s: %w", result.key, result.err)
+				}
+			} else {
+				successCount++
+			}
+			if spinner != nil && (completedCount == 1 || completedCount%100 == 0) {
+				spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)",
+					completedCount, expectedPuts, totalErrors))
+			}
+		}
+	}()
+
+	cancelled := false
+	seq := 0
+produce:
+	for i := range cfg.NumKeys {
 		for _, p := range []struct {
 			enabled bool
 			key     string
@@ -240,58 +315,42 @@ func preloadKeys(ctx context.Context, cfg YCSBConfig, ws WorkloadSpec, rng *rand
 			if !p.enabled {
 				continue
 			}
+			// Check for cancellation before generating the next owned value.
+			if ctx.Err() != nil {
+				cancelled = true
+				break produce
+			}
 			val := generateValue(rng, cfg.ValueSize)
-			var err error
-			switch {
-			case p.cas && useStreaming:
-				_, err = client.PutStreamIfVersion(ctx, p.key, bytes.NewReader(val), 0, 0)
-			case p.cas:
-				_, err = client.PutIfVersion(ctx, p.key, val, 0, 0)
-			case useStreaming:
-				err = client.PutStream(ctx, p.key, bytes.NewReader(val), 0)
-			default:
-				err = client.Put(ctx, p.key, val, 0)
+			select {
+			case <-ctx.Done():
+				cancelled = true
+				break produce
+			case jobs <- preloadJob{seq: seq, key: p.key, value: val, cas: p.cas}:
+				seq++
 			}
-			if outcome, _ := ClassifyCASResult(err); outcome == CASMismatch {
-				err = nil // already present from an earlier run: fine
-			}
-
-			if err != nil {
-				atomic.AddInt32(&preloadErrors, 1)
-				select {
-				case errorCh <- fmt.Errorf("key %s: %w", p.key, err):
-				default: // Don't block on error channel
-				}
-			} else {
-				atomic.AddInt32(&successCount, 1)
-			}
-		}
-
-		if spinner != nil && i%100 == 0 {
-			spinner.UpdateText(fmt.Sprintf("Preloading keys: %d/%d (errors: %d)",
-				i+1, cfg.NumKeys, atomic.LoadInt32(&preloadErrors)))
 		}
 	}
 
-	close(errorCh)
+	close(jobs)
+	workerWg.Wait()
+	close(results)
+	collectWg.Wait()
 
-	// Collect sample of errors
-	var sampleErrors []error
-	for err := range errorCh {
-		if len(sampleErrors) < 5 {
-			sampleErrors = append(sampleErrors, err)
+	if cancelled || ctx.Err() != nil {
+		if spinner != nil {
+			spinner.Warning(fmt.Sprintf("Preload cancelled after %d/%d puts", completedCount, expectedPuts))
 		}
+		return ctx.Err()
 	}
 
-	totalErrors := atomic.LoadInt32(&preloadErrors)
 	if totalErrors > 0 {
 		if spinner != nil {
 			spinner.Warning(fmt.Sprintf("Preloaded %d/%d puts (%d errors)",
-				atomic.LoadInt32(&successCount), expectedPuts, totalErrors))
+				successCount, expectedPuts, totalErrors))
 		}
-		if int(totalErrors) > expectedPuts/10 { // If more than 10% failed, consider it a failure
-			if len(sampleErrors) > 0 {
-				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, sampleErrors[0])
+		if totalErrors > expectedPuts/10 { // If more than 10% failed, consider it a failure
+			if firstError != nil {
+				return fmt.Errorf("preload failed with %d errors, first error: %w", totalErrors, firstError)
 			}
 		}
 	} else {

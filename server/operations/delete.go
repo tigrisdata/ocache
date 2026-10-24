@@ -49,7 +49,7 @@ func (o *Operations) deleteRemote(ctx context.Context, key string) error {
 		return err
 	}
 
-	client, err := o.Route(key)
+	client, err := o.RouteContext(ctx, key)
 	if err != nil {
 		logsample.DegradedRing().Err(err).Str("key", key).Msg("Failed to route key for delete")
 		return err

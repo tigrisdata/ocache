@@ -39,6 +39,11 @@ type Config struct {
 	// MaxDiskUsage is the maximum disk usage in bytes (0 = unlimited)
 	MaxDiskUsage int64
 
+	// ShedDiskRatio refuses sheddable writes (PutStreamSheddable) while this
+	// node's tracked usage is at or over ShedDiskRatio × MaxDiskUsage, i.e. while
+	// eviction is behind ingest. 0 never sheds. Requires MaxDiskUsage.
+	ShedDiskRatio float64
+
 	// InlineThreshold is the size threshold for inline vs file storage (default: 64KB)
 	// Objects smaller than this are stored in RocksDB, larger ones as files.
 	InlineThreshold int
@@ -132,6 +137,9 @@ func (c *Config) buildStorageConfig() stor.StorageConfig {
 	sc.TTL = int(c.TTL.Seconds())
 	if c.MaxDiskUsage != 0 {
 		sc.MaxDiskUsage = c.MaxDiskUsage
+	}
+	if c.ShedDiskRatio != 0 {
+		sc.ShedDiskRatio = c.ShedDiskRatio
 	}
 	if c.InlineThreshold > 0 {
 		sc.InlineThreshold = c.InlineThreshold
@@ -412,6 +420,30 @@ func (c *Client) ListPageWithValues(ctx context.Context, prefix string, limit in
 // PutStream stores data from a reader for the given key.
 func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
 	return c.ops.Put(ctx, key, r, int(ttlSeconds))
+}
+
+// PutStreamSheddable is PutStream for a body the caller can serve without
+// caching: the OWNING node refuses it with an over-budget error (IsOverBudget)
+// instead of storing it while that node is over its ShedDiskRatio. A local
+// owner refuses before the body is read; a remote owner answers over the
+// stream, so part of r may already have been consumed when the refusal
+// arrives. Treat a refusal as "not stored" and never replay r.
+func (c *Client) PutStreamSheddable(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
+	return c.ops.PutWithOptions(ctx, key, r, int(ttlSeconds), operations.PutOptions{ShedOverBudget: true})
+}
+
+// DiskUsageRatio returns this node's tracked usage as a fraction of
+// MaxDiskUsage; ok is false without a disk cap.
+func (c *Client) DiskUsageRatio() (ratio float64, ok bool) {
+	if c.storage == nil {
+		return 0, false
+	}
+	return c.storage.DiskUsageRatio()
+}
+
+// IsOverBudget reports whether err is a sheddable write refused by its owner.
+func IsOverBudget(err error) bool {
+	return operations.IsOverBudget(err)
 }
 
 // GetStream retrieves data and writes it to the provided writer.

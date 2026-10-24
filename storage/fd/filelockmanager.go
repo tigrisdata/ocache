@@ -46,7 +46,15 @@ func GetFileLockManager() *FileLockManager {
 // access to writers (Write/Delete), which is exactly the behaviour we need for
 // raw files.
 func (flm *FileLockManager) GetFileLock(path string) *sync.RWMutex {
-	lock, _ := flm.fileLocks.LoadOrStore(path, &sync.RWMutex{})
+	if lock, ok := flm.fileLocks.Load(path); ok {
+		return lock.(*sync.RWMutex)
+	}
+
+	newLock := &sync.RWMutex{}
+	lock, loaded := flm.fileLocks.LoadOrStore(path, newLock)
+	if !loaded {
+		return newLock
+	}
 	return lock.(*sync.RWMutex)
 }
 
