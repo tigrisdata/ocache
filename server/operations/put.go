@@ -27,11 +27,14 @@ const (
 
 // PutOptions tunes a single Put.
 type PutOptions struct {
-	// ShedOverBudget refuses the write with an over-budget error (gRPC
-	// ResourceExhausted; see IsOverBudget) instead of storing it when the OWNING
-	// node is at or over its disk shed ratio — evaluated at the owner, so a
-	// forwarding node cannot fill an overloaded peer. Meant for bodies the caller
-	// can serve without caching; never for metadata the caller relies on.
+	// ShedOverBudget refuses the write with an over-budget error (see
+	// IsOverBudget) instead of storing it when the OWNING node is at or over its
+	// disk shed ratio — evaluated at the owner, so a forwarding node cannot fill
+	// an overloaded peer. Meant for bodies the caller can serve without caching;
+	// never for metadata the caller relies on. A LOCAL owner refuses before the
+	// body is read; a REMOTE owner answers over the stream, so part of the body
+	// may already have been read and sent when the refusal arrives. Treat a
+	// refusal as "not stored" and never replay the reader.
 	ShedOverBudget bool
 }
 
@@ -78,8 +81,8 @@ func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, t
 	return o.PutLocalWithOptions(ctx, key, body, ttl, PutOptions{})
 }
 
-// PutLocalWithOptions is PutLocal with per-call options. A sheddable write is
-// refused BEFORE the body is read, so the caller still holds its bytes.
+// PutLocalWithOptions is PutLocal with per-call options. A sheddable write the
+// local store refuses is refused BEFORE the body is read.
 func (o *Operations) PutLocalWithOptions(ctx context.Context, key string, body io.Reader, ttl int, opts PutOptions) error {
 	if opts.ShedOverBudget && o.storage.OverShedRatio() {
 		return storageErrors.NewOverBudgetError("Put")
@@ -122,7 +125,7 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 		return err
 	}
 
-	resp, err := SendPutStream(stream, &pb.PutRequest{
+	resp, err := SendPutStream(ctx, stream, &pb.PutRequest{
 		Key:            key,
 		TtlSeconds:     int64(ttl),
 		ShedOverBudget: opts.ShedOverBudget,
@@ -137,36 +140,53 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 }
 
 // SendPutStream streams first (key, ttl, options) and then body in chunks over
-// an open Put call and returns the owner's response. A Send returning io.EOF
-// means the owner ended the RPC early — a sheddable write it refused before
-// consuming the body — so sending stops and CloseAndRecv surfaces the in-band
-// outcome instead of the send error that would hide it.
-func SendPutStream(stream pb.CacheService_PutClient, first *pb.PutRequest, body io.Reader) (*pb.PutResponse, error) {
+// an open Put call and returns the owner's response. A sheddable first message
+// carries no body, so the owner can refuse on the key alone before any body
+// byte is on the wire. A Send returning io.EOF means the owner ended the RPC
+// early (such a refusal), so sending stops and CloseAndRecv surfaces the
+// in-band outcome instead of the send error that would hide it. ctx is checked
+// before every body read; cancellation does not interrupt a read already in
+// progress, so a caller with a blocking reader must also close that reader.
+func SendPutStream(ctx context.Context, stream pb.CacheService_PutClient, first *pb.PutRequest, body io.Reader) (*pb.PutResponse, error) {
 	// Get buffer from pool
 	buf, release := bufferpool.AcquireBuffer(DefaultStreamBufferSize)
 	defer release()
 
-	// Always send the first message with key and TTL, even if data is empty
-	n, readErr := body.Read(buf)
-	if n > 0 {
-		first.Data = buf[:n]
+	readChunk := func() (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		n, err := body.Read(buf)
+		if err != nil && err != io.EOF {
+			return n, err // local read failure — not a stream/server issue
+		}
+		return n, err
+	}
+
+	// Always send the first message with key and TTL. It carries the first
+	// chunk too, except for a sheddable write, whose owner decides on the key.
+	var n int
+	var readErr error
+	if !first.ShedOverBudget {
+		if n, readErr = readChunk(); readErr != nil && readErr != io.EOF {
+			return nil, readErr
+		}
+		if n > 0 {
+			first.Data = buf[:n]
+		}
 	}
 	sendErr := stream.Send(first)
 	if sendErr == nil && n > 0 {
 		recordBytesTransferred("upload", int64(n))
 	}
-	if readErr != nil && readErr != io.EOF {
-		return nil, readErr // local read failure — not a stream/server issue
-	}
 	for sendErr == nil && readErr != io.EOF {
-		n, readErr = body.Read(buf)
+		if n, readErr = readChunk(); readErr != nil && readErr != io.EOF {
+			return nil, readErr
+		}
 		if n > 0 {
 			if sendErr = stream.Send(&pb.PutRequest{Data: buf[:n]}); sendErr == nil {
 				recordBytesTransferred("upload", int64(n))
 			}
-		}
-		if readErr != nil && readErr != io.EOF {
-			return nil, readErr
 		}
 	}
 	if sendErr != nil && sendErr != io.EOF {

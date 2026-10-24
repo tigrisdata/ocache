@@ -50,7 +50,7 @@ func TestCacheService_Put_ShedOverGRPC(t *testing.T) {
 	// Fill past the cap with a plain streamed put.
 	stream, err := client.Put(ctx)
 	require.NoError(t, err)
-	resp, err := operations.SendPutStream(stream, &pb.PutRequest{Key: "fill"}, bytes.NewReader(make([]byte, 8192)))
+	resp, err := operations.SendPutStream(ctx, stream, &pb.PutRequest{Key: "fill"}, bytes.NewReader(make([]byte, 8192)))
 	require.NoError(t, err)
 	require.True(t, resp.Success, "plain put must land: %+v", resp)
 	require.True(t, s.OverShedRatio())
@@ -59,7 +59,7 @@ func TestCacheService_Put_ShedOverGRPC(t *testing.T) {
 	// later Sends fail with EOF; the response must still come back marked shed.
 	stream, err = client.Put(ctx)
 	require.NoError(t, err)
-	resp, err = operations.SendPutStream(stream, &pb.PutRequest{Key: "shed", ShedOverBudget: true}, bytes.NewReader(make([]byte, 4<<20)))
+	resp, err = operations.SendPutStream(ctx, stream, &pb.PutRequest{Key: "shed", ShedOverBudget: true}, bytes.NewReader(make([]byte, 4<<20)))
 	require.NoError(t, err)
 	require.False(t, resp.Success)
 	require.True(t, resp.Shed, "resp=%+v", resp)
@@ -132,7 +132,7 @@ func TestRelayPut_EarlyRefusalWithoutMoreChunks(t *testing.T) {
 
 	fill, err := ownerClient.Put(ctx)
 	require.NoError(t, err)
-	resp, err := operations.SendPutStream(fill, &pb.PutRequest{Key: "fill"}, bytes.NewReader(make([]byte, 8192)))
+	resp, err := operations.SendPutStream(ctx, fill, &pb.PutRequest{Key: "fill"}, bytes.NewReader(make([]byte, 8192)))
 	require.NoError(t, err)
 	require.True(t, resp.Success)
 	require.True(t, owner.OverShedRatio())
