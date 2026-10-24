@@ -145,7 +145,8 @@ func (o *Operations) putRemote(ctx context.Context, key string, body io.Reader, 
 // byte is on the wire. A Send returning io.EOF means the owner ended the RPC
 // early (such a refusal), so sending stops and CloseAndRecv surfaces the
 // in-band outcome instead of the send error that would hide it. ctx is checked
-// before every body read so an abandoned put does not sit in a blocked Read.
+// before every body read; cancellation does not interrupt a read already in
+// progress, so a caller with a blocking reader must also close that reader.
 func SendPutStream(ctx context.Context, stream pb.CacheService_PutClient, first *pb.PutRequest, body io.Reader) (*pb.PutResponse, error) {
 	// Get buffer from pool
 	buf, release := bufferpool.AcquireBuffer(DefaultStreamBufferSize)
