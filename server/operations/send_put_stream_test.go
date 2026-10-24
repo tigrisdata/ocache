@@ -22,9 +22,13 @@ type recordingPutClient struct {
 }
 
 func (r *recordingPutClient) Send(req *pb.PutRequest) error {
-	cp := *req
-	cp.Data = append([]byte(nil), req.Data...)
-	r.sent = append(r.sent, &cp)
+	// Copy the fields, not the message (proto messages carry a mutex).
+	r.sent = append(r.sent, &pb.PutRequest{
+		Key:            req.Key,
+		TtlSeconds:     req.TtlSeconds,
+		ShedOverBudget: req.ShedOverBudget,
+		Data:           append([]byte(nil), req.Data...),
+	})
 	return nil
 }
 func (r *recordingPutClient) CloseAndRecv() (*pb.PutResponse, error) { return r.resp, nil }
