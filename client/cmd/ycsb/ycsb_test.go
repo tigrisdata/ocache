@@ -403,6 +403,12 @@ func TestPreloadKeysWaitsForWorkersOnCancellation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("preload did not return after cancellation")
 	}
+	// preloadKeys waits for its own workers, not for the server to observe the
+	// cancellation and run its deferred decrement, so let the handlers settle.
+	deadline = time.Now().Add(time.Second)
+	for cacheServer.activePuts.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if got := cacheServer.activePuts.Load(); got != 0 {
 		t.Fatalf("active puts after preload returned = %d, want 0", got)
 	}
