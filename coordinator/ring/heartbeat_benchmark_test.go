@@ -22,6 +22,9 @@ const (
 	heartbeatBenchmarkMembers       = 8
 	heartbeatBenchmarkTokensPerNode = 1
 	heartbeatBenchmarkStep          = 100 * time.Millisecond
+	// heartbeatBenchmarkSettle bounds the wait for at least one heartbeat after
+	// a short run (-benchtime=1x is a single step, shorter than one period).
+	heartbeatBenchmarkSettle = 5 * time.Second
 )
 
 type heartbeatBenchmarkDelegate struct {
@@ -205,6 +208,12 @@ func BenchmarkRingHeartbeat(b *testing.B) {
 	// endpoint before stopping so failed teardown CAS attempts cannot be folded
 	// into the heartbeat-attempt calculation.
 	after := heartbeatBenchmarkSnapshot(b, fixture)
+	// A run shorter than the heartbeat period may end between ticks; wait for
+	// one so the per-heartbeat ratios below are defined instead of failing.
+	for deadline := time.Now().Add(heartbeatBenchmarkSettle); after.heartbeats <= before.heartbeats && time.Now().Before(deadline); {
+		time.Sleep(heartbeatBenchmarkStep)
+		after = heartbeatBenchmarkSnapshot(b, fixture)
+	}
 	fixture.stop()
 
 	heartbeats := after.heartbeats - before.heartbeats
