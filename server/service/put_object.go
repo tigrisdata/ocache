@@ -6,7 +6,9 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"github.com/tigrisdata/ocache/server/operations"
 	"time"
 
 	zlog "github.com/rs/zerolog/log"
@@ -33,13 +35,10 @@ func (s *CacheService) PutObject(ctx context.Context, req *pb.PutRequest) (*pb.P
 
 	// Use operations layer for routing and storage
 	// Operations.PutBytes handles routing internally (local vs remote)
-	err := s.ops.PutBytes(ctx, req.Key, req.Data, int(req.TtlSeconds))
+	opts := operations.PutOptions{ShedOverBudget: req.ShedOverBudget}
+	err := s.ops.PutWithOptions(ctx, req.Key, bytes.NewReader(req.Data), int(req.TtlSeconds), opts)
 	if err != nil {
-		metrics.RPCRequests.WithLabelValues("PutObject", "error").Inc()
-		metrics.Errors.WithLabelValues("grpc", "PutObject").Inc()
-		// Convert storage error to user-friendly message
-		userErr := mapStorageErrorToGRPC(err)
-		return &pb.PutResponse{Success: false, Error: userErr.Error()}, nil
+		return putFailure("PutObject", err), nil
 	}
 	metrics.RPCRequests.WithLabelValues("PutObject", "success").Inc()
 	return &pb.PutResponse{Success: true}, nil

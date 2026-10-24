@@ -128,6 +128,7 @@ type StorageConfig struct {
 	SegmentSize          int64         // Segment size (bytes)
 	FdCacheSize          int           // Size of the file descriptor cache
 	MaxDiskUsage         int64         // Maximum disk usage in bytes (0 = unlimited)
+	ShedDiskRatio        float64       // Refuse sheddable writes while tracked usage >= ShedDiskRatio*MaxDiskUsage (0 = never)
 	CompactionThreads    int           // Number of compaction threads
 	FragThreshold        float64       // Fragmentation threshold for segment recompaction (0.0-1.0)
 	MinSegmentAge        time.Duration // Minimum age for segment recompaction
@@ -179,6 +180,8 @@ type Storage struct {
 	deletionQueue    *deletion.Queue       // Centralized file deletion queue
 	compactor        *compaction.Compactor // Background compactor for raw → segment migration
 	cleaner          *Cleaner              // Background TTL cleanup and eviction
+	maxDiskUsage     int64                 // Disk cap the cleaner evicts against (0 = none)
+	shedDiskRatio    float64               // See StorageConfig.ShedDiskRatio
 	accessUpdater    *accessUpdater        // Async access time updater for LRU tracking (nil in FIFO mode)
 	// inflightRaw holds the raw-file paths that have been written but whose
 	// metadata is not yet committed (or, on failure, not yet queued for
@@ -364,6 +367,8 @@ func NewStorageWithConfig(config *StorageConfig) (*Storage, error) {
 		deletionQueue:    deletionQueue,
 		compactor:        compactor,
 		evictionPolicy:   config.EvictionPolicy,
+		maxDiskUsage:     config.MaxDiskUsage,
+		shedDiskRatio:    config.ShedDiskRatio,
 	}
 
 	// Initialize and start the cleaner (always enabled for TTL cleanup)
@@ -464,6 +469,27 @@ func (s *Storage) TotalSize() int64 {
 		return 0
 	}
 	return s.cleaner.TotalSize()
+}
+
+// DiskUsageRatio returns the tracked total as a fraction of MaxDiskUsage. ok is
+// false when there is no disk cap, so callers never act on a meaningless ratio.
+func (s *Storage) DiskUsageRatio() (ratio float64, ok bool) {
+	if s.maxDiskUsage <= 0 {
+		return 0, false
+	}
+	return float64(s.TotalSize()) / float64(s.maxDiskUsage), true
+}
+
+// OverShedRatio reports whether a sheddable write must be refused: the store is
+// at or over ShedDiskRatio of its cap, meaning eviction has fallen behind ingest
+// and a new body would be evicted before it is read. Always false when either
+// the cap or the ratio is unset.
+func (s *Storage) OverShedRatio() bool {
+	if s.shedDiskRatio <= 0 {
+		return false
+	}
+	ratio, ok := s.DiskUsageRatio()
+	return ok && ratio >= s.shedDiskRatio
 }
 
 // IsClosed returns true if this storage instance has been closed.
