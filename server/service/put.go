@@ -59,12 +59,16 @@ func (s *CacheService) handleLocalPut(stream pb.CacheService_PutServer, firstChu
 	key := firstChunk.Key
 	ttl := int(firstChunk.TtlSeconds)
 
-	// Decide a sheddable write up front, before the body is read, so a client
-	// that sends the key first and waits is answered instead of left blocking.
-	opts := operations.PutOptions{ShedOverBudget: firstChunk.ShedOverBudget}
-	if opts.ShedOverBudget && s.ops.OverBudget() {
+	// Decide a sheddable write ONCE, up front, before the body is read, so a
+	// client that sends the key first and waits is answered instead of left
+	// blocking. The local write below is then unconditional: a second check in
+	// the writer could refuse after we are already waiting in Recv, with no way
+	// to wake that wait. Crossing the ratio mid-write is tolerated; eviction
+	// catches up.
+	if firstChunk.ShedOverBudget && s.ops.OverBudget() {
 		return stream.SendAndClose(putFailure("Put", storageErrors.NewOverBudgetError("Put")))
 	}
+	opts := operations.PutOptions{}
 
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)

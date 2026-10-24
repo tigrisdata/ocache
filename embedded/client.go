@@ -424,8 +424,10 @@ func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeco
 
 // PutStreamSheddable is PutStream for a body the caller can serve without
 // caching: the OWNING node refuses it with an over-budget error (IsOverBudget)
-// instead of storing it while that node is over its ShedDiskRatio. The refusal
-// happens before the body is read.
+// instead of storing it while that node is over its ShedDiskRatio. A local
+// owner refuses before the body is read; a remote owner answers over the
+// stream, so part of r may already have been consumed when the refusal
+// arrives. Treat a refusal as "not stored" and never replay r.
 func (c *Client) PutStreamSheddable(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
 	return c.ops.PutWithOptions(ctx, key, r, int(ttlSeconds), operations.PutOptions{ShedOverBudget: true})
 }
