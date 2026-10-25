@@ -191,9 +191,9 @@ than waiting on kernel connect timeouts against the old address:
 | `dead_node_reclaim_time` | 5s | How soon a dead node's name may be reused by an announcement from a new address (avoids "Conflicting address" refusals) |
 | `rejoin_interval` | 1m | Re-resolves the seeds and rejoins, so a node that has lost every peer finds the cluster again |
 
-Watch `memberlist_client_cluster_members_count` and `ring_members{state="Unhealthy"}`
-on each node during a rolling restart; both should return to the full node count
-shortly after the last node is ready.
+Watch each node during a rolling restart: `memberlist_client_cluster_members_count`
+should return to the full node count and `ring_members{state="Unhealthy"}` should
+fall back to zero shortly after the last node is ready.
 
 ### Future Enhancements
 
