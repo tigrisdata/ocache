@@ -6,6 +6,7 @@ package storage
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -212,9 +213,10 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 	}
 
 	// Build the reader from the SAME ValueMessage the version came from. This
-	// deliberately does not reuse plain Get (a second, divergent metadata read);
-	// it also forgoes Get's dangling-raw-file self-heal — a CAS caller instead
-	// gets a retryable error and re-reads.
+	// deliberately does not call plain Get for bytes after reading the version:
+	// a second metadata lookup could pair different generations. For a missing,
+	// never-compacted raw file, use Get's path-checked purge and return retryable
+	// I/O so the caller re-reads the authoritative row.
 	var reader io.Reader
 	switch vm.ValueType {
 	case pb.ValueType_INLINE:
@@ -233,6 +235,11 @@ func (s *Storage) GetWithVersion(key string) (io.Reader, uint64, bool, error) {
 		if rerr != nil {
 			if rerr == files.ErrFileLocked {
 				return nil, 0, false, storageErrors.NewLockError("GetWithVersion", key, rerr)
+			}
+			if errors.Is(rerr, os.ErrNotExist) && vm.ValueLength > s.compactThreshold {
+				zlog.Warn().Str("key", key).Str("file", vm.RawFilePath).
+					Msg("storage.GetWithVersion: raw file missing for large object, purging dangling key")
+				s.purgeDanglingRawFile(key, vm.RawFilePath)
 			}
 			return nil, 0, false, storageErrors.NewIORetryableError("GetWithVersion", key, rerr)
 		}
