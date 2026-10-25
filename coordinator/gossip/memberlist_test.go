@@ -25,29 +25,44 @@ func TestMemberlistConfig_ApplyDefaults(t *testing.T) {
 			name:  "empty config gets gossip defaults only",
 			input: memberlistConfig{},
 			expected: memberlistConfig{
-				GossipInterval:   DefaultGossipInterval,
-				GossipNodes:      DefaultGossipNodes,
-				PushPullInterval: DefaultPushPullInterval,
-				LeaveTimeout:     DefaultLeaveTimeout,
+				GossipInterval:      DefaultGossipInterval,
+				GossipNodes:         DefaultGossipNodes,
+				PushPullInterval:    DefaultPushPullInterval,
+				LeaveTimeout:        DefaultLeaveTimeout,
+				PacketDialTimeout:   DefaultPacketDialTimeout,
+				PacketWriteTimeout:  DefaultPacketWriteTimeout,
+				GossipToTheDeadTime: DefaultGossipToTheDeadTime,
+				DeadNodeReclaimTime: DefaultDeadNodeReclaimTime,
+				RejoinInterval:      DefaultRejoinInterval,
 			},
 		},
 		{
 			name: "custom values are preserved",
 			input: memberlistConfig{
-				BindAddr:         "0.0.0.0",
-				BindPort:         8000,
-				GossipInterval:   500 * time.Millisecond,
-				GossipNodes:      5,
-				PushPullInterval: 1 * time.Minute,
-				LeaveTimeout:     10 * time.Second,
+				BindAddr:            "0.0.0.0",
+				BindPort:            8000,
+				GossipInterval:      500 * time.Millisecond,
+				GossipNodes:         5,
+				PushPullInterval:    1 * time.Minute,
+				LeaveTimeout:        10 * time.Second,
+				PacketDialTimeout:   time.Second,
+				PacketWriteTimeout:  3 * time.Second,
+				GossipToTheDeadTime: 10 * time.Second,
+				DeadNodeReclaimTime: time.Second,
+				RejoinInterval:      2 * time.Minute,
 			},
 			expected: memberlistConfig{
-				BindAddr:         "0.0.0.0",
-				BindPort:         8000,
-				GossipInterval:   500 * time.Millisecond,
-				GossipNodes:      5,
-				PushPullInterval: 1 * time.Minute,
-				LeaveTimeout:     10 * time.Second,
+				BindAddr:            "0.0.0.0",
+				BindPort:            8000,
+				GossipInterval:      500 * time.Millisecond,
+				GossipNodes:         5,
+				PushPullInterval:    1 * time.Minute,
+				LeaveTimeout:        10 * time.Second,
+				PacketDialTimeout:   time.Second,
+				PacketWriteTimeout:  3 * time.Second,
+				GossipToTheDeadTime: 10 * time.Second,
+				DeadNodeReclaimTime: time.Second,
+				RejoinInterval:      2 * time.Minute,
 			},
 		},
 	}
@@ -63,6 +78,11 @@ func TestMemberlistConfig_ApplyDefaults(t *testing.T) {
 			assert.Equal(t, tt.expected.GossipNodes, cfg.GossipNodes)
 			assert.Equal(t, tt.expected.PushPullInterval, cfg.PushPullInterval)
 			assert.Equal(t, tt.expected.LeaveTimeout, cfg.LeaveTimeout)
+			assert.Equal(t, tt.expected.PacketDialTimeout, cfg.PacketDialTimeout)
+			assert.Equal(t, tt.expected.PacketWriteTimeout, cfg.PacketWriteTimeout)
+			assert.Equal(t, tt.expected.GossipToTheDeadTime, cfg.GossipToTheDeadTime)
+			assert.Equal(t, tt.expected.DeadNodeReclaimTime, cfg.DeadNodeReclaimTime)
+			assert.Equal(t, tt.expected.RejoinInterval, cfg.RejoinInterval)
 		})
 	}
 }
@@ -136,6 +156,12 @@ func TestMemberlistConfig_ToKVConfig(t *testing.T) {
 		LeaveTimeout:      5 * time.Second,
 		NodeName:          "test-node",
 		RandomizeNodeName: false,
+
+		PacketDialTimeout:   2 * time.Second,
+		PacketWriteTimeout:  5 * time.Second,
+		GossipToTheDeadTime: 30 * time.Second,
+		DeadNodeReclaimTime: 5 * time.Second,
+		RejoinInterval:      time.Minute,
 	}
 
 	mlCfg := cfg.ToKVConfig()
@@ -149,6 +175,28 @@ func TestMemberlistConfig_ToKVConfig(t *testing.T) {
 	assert.Equal(t, cfg.LeaveTimeout, mlCfg.LeaveTimeout)
 	assert.Equal(t, cfg.NodeName, mlCfg.NodeName)
 	assert.Equal(t, cfg.RandomizeNodeName, mlCfg.RandomizeNodeName)
+	assert.Equal(t, cfg.PacketDialTimeout, mlCfg.TCPTransport.PacketDialTimeout)
+	assert.Equal(t, cfg.PacketWriteTimeout, mlCfg.TCPTransport.PacketWriteTimeout)
+	assert.Equal(t, cfg.GossipToTheDeadTime, mlCfg.GossipToTheDeadTime)
+	assert.Equal(t, cfg.DeadNodeReclaimTime, mlCfg.DeadNodeReclaimTime)
+	assert.Equal(t, cfg.RejoinInterval, mlCfg.RejoinInterval)
+}
+
+// A restarted node keeps its name but gets a new address. The defaults must
+// never leave dskit's zero values in place: a zero dial timeout blocks the
+// probe loop for the kernel connect timeout against a black-holed address, and
+// zero reclaim/rejoin leave a split cluster with no way back together.
+func TestNewMemberlistConfig_ConvergenceDefaultsAreNonZero(t *testing.T) {
+	cfg := newMemberlistConfig("node-1", "0.0.0.0:7946", []string{"seed:7946"})
+	mlCfg := cfg.ToKVConfig()
+
+	assert.Positive(t, mlCfg.TCPTransport.PacketDialTimeout)
+	assert.Positive(t, mlCfg.TCPTransport.PacketWriteTimeout)
+	assert.Positive(t, mlCfg.GossipToTheDeadTime)
+	assert.Positive(t, mlCfg.DeadNodeReclaimTime)
+	assert.Positive(t, mlCfg.RejoinInterval)
+	assert.Less(t, mlCfg.DeadNodeReclaimTime, mlCfg.GossipToTheDeadTime,
+		"reclaim must happen before the dead entry is reaped, or it never applies")
 }
 
 func TestSimpleDNSProvider_Resolve_IPAddresses(t *testing.T) {
