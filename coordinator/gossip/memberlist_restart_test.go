@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"testing"
 	"time"
 
@@ -17,16 +16,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
-
-// freePort reserves and releases a loopback port.
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := l.Addr().(*net.TCPAddr).Port
-	require.NoError(t, l.Close())
-	return port
-}
 
 // membersCount reads memberlist_client_cluster_members_count from a node's registry.
 func membersCount(t *testing.T, reg *prometheus.Registry) int {
@@ -64,12 +53,13 @@ func waitMembers(t *testing.T, want int, timeout time.Duration, nodes map[string
 	}
 }
 
-func startNode(t *testing.T, ctx context.Context, name string, port int, seeds []string) (*Memberlist, *prometheus.Registry) {
+// startNode binds to an ephemeral loopback port and returns the port it got.
+func startNode(t *testing.T, ctx context.Context, name string, seeds []string) (int, *prometheus.Registry) {
 	t.Helper()
 	cfg := memberlistConfig{
 		JoinMembers:      seeds,
 		BindAddr:         "127.0.0.1",
-		BindPort:         port,
+		BindPort:         0,
 		NodeName:         name,
 		PushPullInterval: time.Second,
 		LeaveTimeout:     time.Second,
@@ -85,7 +75,7 @@ func startNode(t *testing.T, ctx context.Context, name string, port int, seeds [
 	require.NoError(t, err)
 	require.NoError(t, ml.Start(ctx))
 	t.Cleanup(func() { _ = ml.Stop(context.Background()) })
-	return ml, reg
+	return ml.GetKV().GetListeningPort(), reg
 }
 
 // A node that dies without leaving and comes back under the same name on a
@@ -94,41 +84,42 @@ func startNode(t *testing.T, ctx context.Context, name string, port int, seeds [
 // address as a conflict until the stale entry is reaped.
 func TestMemberlist_RestartedNodeOnNewAddressRejoins(t *testing.T) {
 	ctx := context.Background()
-	portA, portB := freePort(t), freePort(t)
-	seedA := []string{fmt.Sprintf("127.0.0.1:%d", portA)}
 
-	_, regA := startNode(t, ctx, "node-a", portA, seedA)
-	_, regB := startNode(t, ctx, "node-b", portB, seedA)
+	portA, regA := startNode(t, ctx, "node-a", nil)
+	seedA := []string{fmt.Sprintf("127.0.0.1:%d", portA)}
+	_, regB := startNode(t, ctx, "node-b", seedA)
 	peers := map[string]*prometheus.Registry{"a": regA, "b": regB}
 	waitMembers(t, 2, 30*time.Second, peers)
 
 	// node-c joins through dskit's TCP transport, then dies without leaving.
-	portC1 := freePort(t)
 	transport, err := dskitmemberlist.NewTCPTransport(dskitmemberlist.TCPTransportConfig{
 		BindAddrs:          []string{"127.0.0.1"},
-		BindPort:           portC1,
+		BindPort:           0,
 		PacketDialTimeout:  DefaultPacketDialTimeout,
 		PacketWriteTimeout: DefaultPacketWriteTimeout,
 	}, log.NewNopLogger(), nil)
 	require.NoError(t, err)
+	portC1 := transport.GetAutoBindPort()
 	zombieCfg := hashicorpmemberlist.DefaultLANConfig()
 	zombieCfg.Name = "node-c"
 	zombieCfg.Transport = transport
+	zombieCfg.AdvertiseAddr = "127.0.0.1"
+	zombieCfg.AdvertisePort = portC1
 	zombieCfg.DisableTcpPings = true
 	zombieCfg.LogOutput = io.Discard
 	zombie, err := hashicorpmemberlist.Create(zombieCfg)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = zombie.Shutdown() }) // idempotent; covers early failures
 	_, err = zombie.Join(seedA)
 	require.NoError(t, err)
 	waitMembers(t, 3, 30*time.Second, peers)
 
 	require.NoError(t, zombie.Shutdown()) // no Leave: peers must detect the death
-	waitMembers(t, 2, 90*time.Second, peers)
+	waitMembers(t, 2, 60*time.Second, peers)
 
 	// Same name, new address, inside the gossip-to-dead window.
-	portC2 := freePort(t)
-	require.NotEqual(t, portC1, portC2)
-	_, regC := startNode(t, ctx, "node-c", portC2, seedA)
+	portC2, regC := startNode(t, ctx, "node-c", seedA)
+	require.NotEqual(t, portC1, portC2, "ephemeral bind handed back the dead node's port")
 	peers["c"] = regC
 	waitMembers(t, 3, 20*time.Second, peers)
 }
