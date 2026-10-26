@@ -8,6 +8,7 @@ require (
 	// Upgrading to latest requires resolving google.golang.org/genproto conflicts
 	// at the workspace level (see go.work.sum).
 	github.com/grafana/dskit v0.0.0-20240104111617-ea101a3b86eb
+	github.com/hashicorp/memberlist v0.3.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.34.0
 	github.com/stretchr/testify v1.11.1
@@ -43,7 +44,6 @@ require (
 	github.com/hashicorp/go-rootcerts v1.0.2 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.2 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
-	github.com/hashicorp/memberlist v0.3.1 // indirect
 	github.com/hashicorp/serf v0.9.7 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
