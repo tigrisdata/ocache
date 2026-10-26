@@ -101,6 +101,10 @@ func putLocalWithRetry(ctx context.Context, key string, body io.Reader, put func
 	if !ok {
 		return put()
 	}
+	if ctx.Err() != nil {
+		// Match DoWithKey's pre-attempt check before calling a caller-supplied Seek.
+		return storageErrors.NewTimeoutError("Put", key)
+	}
 
 	start, err := seeker.Seek(0, io.SeekCurrent)
 	if err != nil || start < 0 {
