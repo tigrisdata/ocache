@@ -28,8 +28,13 @@ type Memberlist struct {
 
 // NewMemberlist creates a new memberlist gossip service.
 func NewMemberlist(nodeID, clusterAddr string, seeds []string, logger log.Logger, reg prometheus.Registerer) (*Memberlist, error) {
-	cfg := newMemberlistConfig(nodeID, clusterAddr, seeds)
+	return newMemberlistFromConfig(newMemberlistConfig(nodeID, clusterAddr, seeds), logger, reg)
+}
 
+// newMemberlistFromConfig builds the service from an explicit config; tests use
+// it to shorten the convergence timers.
+func newMemberlistFromConfig(cfg memberlistConfig, logger log.Logger, reg prometheus.Registerer) (*Memberlist, error) {
+	cfg.ApplyDefaults()
 	mlCfg := cfg.ToKVConfig()
 
 	// Create DNS provider for resolving seed addresses

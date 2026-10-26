@@ -43,7 +43,7 @@ func (p *simpleDNSProvider) Resolve(ctx context.Context, addrs []string) error {
 	var resolved []string
 	var resolveErrors []error
 
-	zlog.Info().Strs("addrs", addrs).Msg("Resolving DNS addresses")
+	zlog.Debug().Strs("addrs", addrs).Msg("Resolving DNS addresses")
 
 	for _, addr := range addrs {
 		// Parse host and port
@@ -105,7 +105,7 @@ func (p *simpleDNSProvider) Resolve(ctx context.Context, addrs []string) error {
 	p.resolvedAddrs = resolved
 	p.mu.Unlock()
 
-	zlog.Info().Strs("resolved", resolved).Msg("DNS addresses resolved")
+	zlog.Debug().Strs("resolved", resolved).Msg("DNS addresses resolved")
 
 	// If all addresses failed to resolve, return an aggregated error.
 	// Partial success is acceptable - memberlist can work with a subset of seeds.
