@@ -9,9 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// createTestStorage creates a new storage instance for testing and returns a cleanup function
+// createTestStorage creates a new storage instance for testing and returns a cleanup function.
+// Options customize StorageConfig before construction starts background workers.
 func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThreshold int64,
-	segmentSize int64, fdCacheSize int, maxDiskUsage int64,
+	segmentSize int64, fdCacheSize int, maxDiskUsage int64, options ...func(*StorageConfig),
 ) (*Storage, func()) {
 	dir := t.TempDir()
 
@@ -25,6 +26,9 @@ func createTestStorage(t testing.TB, ttl int, inlineThreshold int, compactThresh
 		MaxDiskUsage:        maxDiskUsage,
 		FragThreshold:       DefaultFragmentationThreshold,
 		DisableRecompaction: true,
+	}
+	for _, option := range options {
+		option(config)
 	}
 	s, err := NewStorageWithConfig(config)
 	require.NoError(t, err, "failed to create storage")
