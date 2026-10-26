@@ -33,6 +33,7 @@ const (
 	StatusStale
 	StatusOrphaned
 	StatusMissing
+	statusInconclusive
 )
 
 func (s ValidationStatus) String() string {
@@ -47,6 +48,8 @@ func (s ValidationStatus) String() string {
 		return "orphaned"
 	case StatusMissing:
 		return "missing"
+	case statusInconclusive:
+		return "inconclusive"
 	default:
 		return "unknown"
 	}
