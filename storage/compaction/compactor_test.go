@@ -182,27 +182,105 @@ func TestEnsureCapacity(t *testing.T) {
 		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
 	})
 
-	// Get initial segment
 	seg, err := sm.AcquireOpenSegmentWithReservation("test", 0)
 	require.NoError(t, err)
 	require.NotNil(t, seg)
 
 	initialPath := seg.Path()
-	initialRemaining := seg.Remaining()
-
-	// Test 1: When segment has enough capacity
+	initialCapacity := seg.GetSize() + seg.Remaining()
 	ctx := context.Background()
 	emptyBatch := grocksdb.NewWriteBatch()
 	defer emptyBatch.Destroy()
 	var noDeletes []string
-	err = c.ensureCapacity(ctx, &seg, "test", 100, newCacheAdvice(), emptyBatch, &noDeletes)
-	assert.NoError(t, err)
-	assert.Equal(t, initialPath, seg.Path()) // Same segment
 
-	// Test 2: When segment needs rotation
-	err = c.ensureCapacity(ctx, &seg, "test", initialRemaining+1, newCacheAdvice(), emptyBatch, &noDeletes)
-	assert.NoError(t, err)
-	assert.NotEqual(t, initialPath, seg.Path()) // New segment
+	// An entry that fits in the current segment does not rotate it.
+	err = c.ensureCapacity(ctx, &seg, "test", 100, newCacheAdvice(), emptyBatch, &noDeletes)
+	require.NoError(t, err)
+	assert.Equal(t, initialPath, seg.Path())
+
+	// An entry larger than a fresh segment is deferred without finalizing or
+	// replacing the current segment.
+	err = c.ensureCapacity(ctx, &seg, "test", initialCapacity+1, newCacheAdvice(), emptyBatch, &noDeletes)
+	require.Error(t, err)
+	assert.Equal(t, initialPath, seg.Path())
+	assert.Equal(t, initialCapacity, seg.GetSize()+seg.Remaining())
+
+	// A record that fits a fresh segment but not the partially used segment
+	// still rotates to a new segment.
+	_, err = seg.WriteEntry("test-key", bytes.NewReader([]byte("x")), &pb.ValueMessage{
+		ValueLength: 1,
+		ValueType:   pb.ValueType_RAW_FILE,
+	})
+	require.NoError(t, err)
+	capacity := seg.GetSize() + seg.Remaining()
+	needed := seg.Remaining() + 1
+	require.LessOrEqual(t, needed, capacity)
+
+	err = c.ensureCapacity(ctx, &seg, "test", needed, newCacheAdvice(), emptyBatch, &noDeletes)
+	require.NoError(t, err)
+	assert.NotEqual(t, initialPath, seg.Path())
+}
+
+func TestEnsureCapacityAcquiresSegmentWithEnoughRemaining(t *testing.T) {
+	_, meta, fm, sm, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+	defer sm.Close()
+
+	c := NewCompactorWithConfig(&CompactorConfig{
+		MetaDB:         meta,
+		FileManager:    fm,
+		SegmentManager: sm,
+		DeletionQueue:  deletion.NewQueue(meta, defaultDeletionQueueConfig()),
+	})
+
+	current, err := sm.AcquireOpenSegmentWithReservation("worker-a", 0)
+	require.NoError(t, err)
+	defer func() {
+		if current != nil {
+			current.Release("worker-a")
+		}
+	}()
+	other, err := sm.AcquireOpenSegmentWithReservation("worker-b", 0)
+	require.NoError(t, err)
+	otherPath := other.Path()
+
+	filler := bytes.Repeat([]byte("f"), 600*1024)
+	_, err = other.WriteEntry("other-filler", bytes.NewReader(filler), &pb.ValueMessage{
+		ValueLength: int64(len(filler)),
+		ValueType:   pb.ValueType_RAW_FILE,
+	})
+	require.NoError(t, err)
+	require.NoError(t, other.Release("worker-b"))
+	_, err = current.WriteEntry("current-filler", bytes.NewReader(filler), &pb.ValueMessage{
+		ValueLength: int64(len(filler)),
+		ValueType:   pb.ValueType_RAW_FILE,
+	})
+	require.NoError(t, err)
+
+	pendingValue := bytes.Repeat([]byte("p"), 512*1024)
+	needed := segment.CalculateValueHeaderSize("pending-key") + int64(len(pendingValue))
+	required := needed + int64(segment.SegmentFooterSize)
+	require.Less(t, current.Remaining(), required)
+	require.Less(t, other.Remaining(), required)
+	require.LessOrEqual(t, required, current.GetSize()+current.Remaining())
+	currentPath := current.Path()
+
+	wb := grocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	var pendingDeletes []string
+	err = c.ensureCapacity(context.Background(), &current, "worker-a", needed, newCacheAdvice(), wb, &pendingDeletes)
+	require.NoError(t, err)
+	capacity := current.GetSize() + current.Remaining()
+
+	_, err = current.WriteEntry("pending-key", bytes.NewReader(pendingValue), &pb.ValueMessage{
+		ValueLength: int64(len(pendingValue)),
+		ValueType:   pb.ValueType_RAW_FILE,
+	})
+	require.NoError(t, err)
+	require.LessOrEqual(t, current.GetSize()+int64(segment.SegmentFooterSize), capacity)
+	require.NotEqual(t, currentPath, current.Path())
+	require.NotEqual(t, otherPath, current.Path(), "rotation must not choose an open segment without enough remaining space")
+	require.GreaterOrEqual(t, current.Remaining(), int64(segment.SegmentFooterSize))
 }
 
 func TestCopyFileIntoSegment(t *testing.T) {
