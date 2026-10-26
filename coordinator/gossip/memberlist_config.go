@@ -26,6 +26,30 @@ const (
 
 	// DefaultLeaveTimeout is the default timeout for leave announcements
 	DefaultLeaveTimeout = 5 * time.Second
+
+	// DefaultPacketDialTimeout bounds the TCP connect for each gossip packet.
+	// Zero (dskit's zero value) falls through to the kernel SYN timeout, which
+	// is minutes against an address that black-holes (a pod IP that no longer
+	// exists), and the probe loop is serialized behind it.
+	DefaultPacketDialTimeout = 2 * time.Second
+
+	// DefaultPacketWriteTimeout bounds the write of a gossip packet (dskit's
+	// flag default); zero means no deadline.
+	DefaultPacketWriteTimeout = 5 * time.Second
+
+	// DefaultGossipToTheDeadTime is how long a dead node is still gossiped to so
+	// it can refute its death (memberlist's LAN default).
+	DefaultGossipToTheDeadTime = 30 * time.Second
+
+	// DefaultDeadNodeReclaimTime is how soon a dead node's name may be reused by
+	// an alive announcement from a different address. Node names are stable and
+	// addresses change on restart, so a restarted node must not be refused with
+	// "Conflicting address" until its old entry is reaped.
+	DefaultDeadNodeReclaimTime = 5 * time.Second
+
+	// DefaultRejoinInterval re-resolves the seeds and rejoins periodically so a
+	// node that has lost every peer finds the cluster again.
+	DefaultRejoinInterval = time.Minute
 )
 
 // memberlistConfig holds configuration for the memberlist KV store
@@ -55,6 +79,21 @@ type memberlistConfig struct {
 
 	// LeaveTimeout is the timeout for leave announcements
 	LeaveTimeout time.Duration `yaml:"leave_timeout"`
+
+	// PacketDialTimeout bounds the TCP connect for each gossip packet
+	PacketDialTimeout time.Duration `yaml:"packet_dial_timeout"`
+
+	// PacketWriteTimeout bounds the write of each gossip packet
+	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout"`
+
+	// GossipToTheDeadTime is how long dead nodes are still gossiped to
+	GossipToTheDeadTime time.Duration `yaml:"gossip_to_dead_nodes_time"`
+
+	// DeadNodeReclaimTime is how soon a dead node's name can be reused by a new address
+	DeadNodeReclaimTime time.Duration `yaml:"dead_node_reclaim_time"`
+
+	// RejoinInterval is how often to re-resolve the seeds and rejoin the cluster
+	RejoinInterval time.Duration `yaml:"rejoin_interval"`
 
 	// NodeName is the unique name for this node (defaults to hostname)
 	NodeName string `yaml:"node_name"`
@@ -109,6 +148,21 @@ func (c *memberlistConfig) ApplyDefaults() {
 	if c.LeaveTimeout <= 0 {
 		c.LeaveTimeout = DefaultLeaveTimeout
 	}
+	if c.PacketDialTimeout <= 0 {
+		c.PacketDialTimeout = DefaultPacketDialTimeout
+	}
+	if c.PacketWriteTimeout <= 0 {
+		c.PacketWriteTimeout = DefaultPacketWriteTimeout
+	}
+	if c.GossipToTheDeadTime <= 0 {
+		c.GossipToTheDeadTime = DefaultGossipToTheDeadTime
+	}
+	if c.DeadNodeReclaimTime <= 0 {
+		c.DeadNodeReclaimTime = DefaultDeadNodeReclaimTime
+	}
+	if c.RejoinInterval <= 0 {
+		c.RejoinInterval = DefaultRejoinInterval
+	}
 }
 
 // ToKVConfig converts to dskit memberlist.KVConfig
@@ -122,6 +176,11 @@ func (c *memberlistConfig) ToKVConfig() memberlist.KVConfig {
 		PushPullInterval:  c.PushPullInterval,
 		NodeName:          c.NodeName,
 		RandomizeNodeName: c.RandomizeNodeName,
+		// Failure detection and re-convergence after restarts; see the
+		// Default* constants for why each is set.
+		GossipToTheDeadTime: c.GossipToTheDeadTime,
+		DeadNodeReclaimTime: c.DeadNodeReclaimTime,
+		RejoinInterval:      c.RejoinInterval,
 		// RetransmitMult is the multiplier for number of retransmissions.
 		// Default hashicorp memberlist uses 4, dskit uses 2. We use 4 for faster convergence.
 		RetransmitMult: 4,
@@ -133,8 +192,10 @@ func (c *memberlistConfig) ToKVConfig() memberlist.KVConfig {
 
 	// Configure TCP transport
 	cfg.TCPTransport = memberlist.TCPTransportConfig{
-		BindAddrs: flagext.StringSlice{c.BindAddr},
-		BindPort:  c.BindPort,
+		BindAddrs:          flagext.StringSlice{c.BindAddr},
+		BindPort:           c.BindPort,
+		PacketDialTimeout:  c.PacketDialTimeout,
+		PacketWriteTimeout: c.PacketWriteTimeout,
 	}
 
 	return cfg
