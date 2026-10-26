@@ -73,10 +73,10 @@ func (o *Operations) OverBudget() bool {
 	return o.storage.OverShedRatio()
 }
 
-// PutLocal stores data in local storage directly.
-// If the body implements io.Seeker (e.g., bytes.Reader), retries are enabled with automatic reset.
-// For non-seekable readers (e.g., io.PipeReader from streaming), no retries are attempted
-// since the reader cannot be rewound.
+// PutLocal stores data in local storage directly. If the reader's current
+// position can be obtained through io.Seeker, retryable failures restart from
+// that call-entry position. Otherwise, storage is attempted once from the
+// reader's current position.
 func (o *Operations) PutLocal(ctx context.Context, key string, body io.Reader, ttl int) error {
 	return o.PutLocalWithOptions(ctx, key, body, ttl, PutOptions{})
 }
@@ -88,20 +88,46 @@ func (o *Operations) PutLocalWithOptions(ctx context.Context, key string, body i
 		return storageErrors.NewOverBudgetError("Put")
 	}
 
-	// Check if we can retry (reader is seekable)
-	seeker, canRetry := body.(io.Seeker)
-
-	if !canRetry {
-		// Non-seekable reader (e.g., io.PipeReader) - no retry possible
+	return putLocalWithRetry(ctx, key, body, func() error {
 		return o.storage.Put(key, body, ttl)
+	})
+}
+
+// putLocalWithRetry attempts an unpositionable reader once. When its initial
+// offset is available, the first attempt reads from the current position and
+// each retry restores that same offset.
+func putLocalWithRetry(ctx context.Context, key string, body io.Reader, put func() error) error {
+	seeker, ok := body.(io.Seeker)
+	if !ok {
+		return put()
+	}
+	if ctx.Err() != nil {
+		// Match DoWithKey's pre-attempt check before calling a caller-supplied Seek.
+		return storageErrors.NewTimeoutError("Put", key)
 	}
 
-	// Seekable reader (e.g., bytes.Reader) - retry with reset
+	start, err := seeker.Seek(0, io.SeekCurrent)
+	if err != nil || start < 0 {
+		// Keep DoWithKey's pre-attempt cancellation check, but do not retry a
+		// reader whose original position cannot be restored.
+		cfg := retry.DefaultConfig()
+		cfg.MaxRetries = 0
+		return retry.DoWithKey(ctx, cfg, "Put", key, put)
+	}
+
+	attempt := 0
 	return retry.DoWithKey(ctx, retry.DefaultConfig(), "Put", key, func() error {
-		if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-			return err
+		if attempt > 0 {
+			if _, err := seeker.Seek(start, io.SeekStart); err != nil {
+				if storageErrors.IsRetryable(err) {
+					// A failed reposition is terminal even if its error resembles a storage error.
+					return errors.New(err.Error())
+				}
+				return err
+			}
 		}
-		return o.storage.Put(key, body, ttl)
+		attempt++
+		return put()
 	})
 }
 

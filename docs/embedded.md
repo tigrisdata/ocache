@@ -269,7 +269,11 @@ keys, nextToken, hasMore, err = cache.ListPage(ctx, prefix, limit, continuationT
 
 ### Streaming Operations
 
-For large values, use streaming to avoid loading everything into memory:
+For large values, use streaming to avoid loading everything into memory.
+`PutStream` reads from the reader's current position through EOF. A local
+retryable failure restarts from that call-entry position when it can be obtained
+through `io.Seeker`; otherwise the local write is attempted once. A failed
+retry seek returns an error.
 
 ```go
 // Stream data to cache
