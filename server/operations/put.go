@@ -104,7 +104,11 @@ func putLocalWithRetry(ctx context.Context, key string, body io.Reader, put func
 
 	start, err := seeker.Seek(0, io.SeekCurrent)
 	if err != nil || start < 0 {
-		return put()
+		// Keep DoWithKey's pre-attempt cancellation check, but do not retry a
+		// reader whose original position cannot be restored.
+		cfg := retry.DefaultConfig()
+		cfg.MaxRetries = 0
+		return retry.DoWithKey(ctx, cfg, "Put", key, put)
 	}
 
 	attempt := 0

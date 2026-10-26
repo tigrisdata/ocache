@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	stor "github.com/tigrisdata/ocache/storage"
+	storageErrors "github.com/tigrisdata/ocache/storage/errors"
 )
 
 const putStreamReaderPositionInlineThreshold = 8
@@ -116,5 +117,32 @@ func TestPutStreamReaderPosition(t *testing.T) {
 		got, err := client.Get(ctx, "pipe-file")
 		require.NoError(t, err)
 		require.Equal(t, data, got)
+	})
+
+	t.Run("canceled request does not consume or store an unpositionable seeker", func(t *testing.T) {
+		data := []byte("already-canceled pipe payload")
+		readEnd, writeEnd, err := os.Pipe()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = readEnd.Close() })
+		t.Cleanup(func() { _ = writeEnd.Close() })
+
+		n, err := writeEnd.Write(data)
+		require.NoError(t, err)
+		require.Equal(t, len(data), n)
+		require.NoError(t, writeEnd.Close())
+
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		putErr := client.PutStream(canceled, "canceled-pipe", readEnd, 0)
+		gotType, ok := storageErrors.GetType(putErr)
+		require.True(t, ok, "a canceled seekable input must retain its timeout error")
+		require.Equal(t, storageErrors.TypeTimeout, gotType)
+
+		remaining, err := io.ReadAll(readEnd)
+		require.NoError(t, err)
+		require.Equal(t, data, remaining, "cancellation before the storage attempt must not consume the reader")
+		got, err := client.Get(ctx, "canceled-pipe")
+		require.NoError(t, err)
+		require.Nil(t, got, "cancellation before the storage attempt must not create the key")
 	})
 }

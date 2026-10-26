@@ -16,6 +16,17 @@ import (
 
 var errRetryPosition = errors.New("injected retry reposition failure")
 
+type unavailablePositionReader struct {
+	*bytes.Reader
+}
+
+func (r *unavailablePositionReader) Seek(offset int64, whence int) (int64, error) {
+	if whence == io.SeekCurrent && offset == 0 {
+		return 0, errRetryPosition
+	}
+	return r.Reader.Seek(offset, whence)
+}
+
 type failRetrySeekReader struct {
 	*bytes.Reader
 	start      int64
@@ -65,6 +76,35 @@ func TestPutLocalReaderRetryPosition(t *testing.T) {
 	require.Equal(t, 2, attempts)
 	require.Equal(t, data[start:start+5], firstAttempt, "the initial attempt must read from the call-entry position")
 	require.Equal(t, data[start:], retryAttempt, "the retry must replay the full unread suffix")
+}
+
+func TestPutLocalReaderWithoutPositionAttemptsOnce(t *testing.T) {
+	data := []byte("already-consumed|read-once-suffix")
+	start := int64(len("already-consumed|"))
+	reader := bytes.NewReader(data)
+	_, err := reader.Seek(start, io.SeekStart)
+	require.NoError(t, err)
+	body := &unavailablePositionReader{Reader: reader}
+
+	var attempts int
+	var firstRead []byte
+	storageFailure := errors.New("injected storage failure")
+	put := func() error {
+		attempts++
+		buf := make([]byte, 5)
+		n, err := body.Read(buf)
+		require.NoError(t, err)
+		if attempts == 1 {
+			firstRead = append([]byte(nil), buf[:n]...)
+			return storageErrors.NewTemporaryError("Put", "key", storageFailure)
+		}
+		return nil
+	}
+
+	err = putLocalWithRetry(context.Background(), "key", body, put)
+	require.ErrorIs(t, err, storageFailure)
+	require.Equal(t, 1, attempts, "an unavailable starting position must disable retries")
+	require.Equal(t, data[start:start+5], firstRead, "the single attempt must read from the current position")
 }
 
 func TestPutLocalReaderRetrySeekFailure(t *testing.T) {
