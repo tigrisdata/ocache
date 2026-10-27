@@ -514,6 +514,17 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 // - lastKey: The last key in this page (for continuation)
 // - hasMore: True if more keys exist beyond this page
 func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, limit int) ([]string, string, bool, error) {
+	var cursor *string
+	if startKey != "" {
+		cursor = &startKey
+	}
+	return s.ListKeysWithPaginationCursor(userPrefix, cursor, limit)
+}
+
+// ListKeysWithPaginationCursor is the explicit-cursor form of
+// ListKeysWithPagination. A nil cursor starts at the beginning; a non-nil cursor
+// is exclusive even when its value is the empty key.
+func (s *Storage) ListKeysWithPaginationCursor(userPrefix string, startKey *string, limit int) ([]string, string, bool, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -530,9 +541,9 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 
 	// Determine where to start iteration
 	var seekKey []byte
-	if startKey != "" {
+	if startKey != nil && *startKey != "" {
 		// Start after the given key
-		seekKey = keys.MakeMetadataKey(startKey)
+		seekKey = keys.MakeMetadataKey(*startKey)
 	} else if userPrefix != "" {
 		// Start at the prefix
 		seekKey = keys.MakeMetadataKey(userPrefix)
@@ -553,10 +564,10 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	it.Seek(seekKey)
 
 	// If we have a startKey, skip it (pagination is exclusive)
-	if startKey != "" && it.Valid() {
+	if startKey != nil && it.Valid() {
 		k := it.Key().Data()
 		currentUserKey := keys.ExtractUserKey(k)
-		if currentUserKey == startKey {
+		if currentUserKey == *startKey {
 			it.Key().Free()
 			it.Value().Free()
 			it.Next()
@@ -647,6 +658,17 @@ type KeyValue struct {
 // For inline values the data is returned directly; for file/segment values the data is
 // read from disk. Returns: (entries, lastKey, hasMore, error).
 func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string, limit int) ([]KeyValue, string, bool, error) {
+	var cursor *string
+	if startKey != "" {
+		cursor = &startKey
+	}
+	return s.ListKeyValuesWithPaginationCursor(userPrefix, cursor, limit)
+}
+
+// ListKeyValuesWithPaginationCursor is the explicit-cursor form of
+// ListKeyValuesWithPagination. A nil cursor starts at the beginning; a non-nil
+// cursor is exclusive even when its value is the empty key.
+func (s *Storage) ListKeyValuesWithPaginationCursor(userPrefix string, startKey *string, limit int) ([]KeyValue, string, bool, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -663,8 +685,8 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 
 	// Determine where to start iteration
 	var seekKey []byte
-	if startKey != "" {
-		seekKey = keys.MakeMetadataKey(startKey)
+	if startKey != nil && *startKey != "" {
+		seekKey = keys.MakeMetadataKey(*startKey)
 	} else if userPrefix != "" {
 		seekKey = keys.MakeMetadataKey(userPrefix)
 	} else {
@@ -683,10 +705,10 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	it.Seek(seekKey)
 
 	// If we have a startKey, skip it (pagination is exclusive)
-	if startKey != "" && it.Valid() {
+	if startKey != nil && it.Valid() {
 		k := it.Key().Data()
 		currentUserKey := keys.ExtractUserKey(k)
-		if currentUserKey == startKey {
+		if currentUserKey == *startKey {
 			it.Key().Free()
 			it.Value().Free()
 			it.Next()

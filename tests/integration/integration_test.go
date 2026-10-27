@@ -71,6 +71,11 @@ func TestIntegration_Cluster(t *testing.T) {
 	t.Run("ClusterSuite", func(t *testing.T) {
 		TestIntegrationCluster(t)
 	})
+	t.Run("ListWithValuesPagination", testClusterListWithValuesPagination)
+	t.Run("ListPartialFailureRecovery", testClusterListPartialFailureRecovery)
+	t.Run("ListRawStartKeyCompatibility", testClusterListRawStartKey)
+	t.Run("ListContinuationTokenSize", testClusterListContinuationTokenSize)
+	t.Run("ListPartialCursorAtResponseLimit", testClusterListPartialCursorAtResponseLimit)
 }
 
 // TestIntegration_All runs all Integration test suites

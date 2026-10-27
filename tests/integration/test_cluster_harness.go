@@ -114,19 +114,20 @@ func (n *ClusterServerNode) IsRunning() bool {
 
 // ClusterTestHarness provides a test harness for multi-node cluster testing with full servers
 type ClusterTestHarness struct {
-	T               testing.TB
-	Nodes           map[string]*ClusterServerNode
-	Client          cacheclient.CacheClient
-	NodeCount       int
-	Config          IntegrationTestConfig
-	Metrics         *TestMetrics
-	NodeMetrics     map[string]*NodeMetrics // Per-node metrics
-	grpcPorts       []int                   // Dynamically allocated gRPC ports
-	memberlistPorts []int                   // Dynamically allocated memberlist ports
-	mu              sync.RWMutex
-	stopMetrics     chan struct{}
-	cleanupOnce     sync.Once // Ensures Cleanup only runs once
-	clientAddrs     []string
+	T                       testing.TB
+	Nodes                   map[string]*ClusterServerNode
+	Client                  cacheclient.CacheClient
+	NodeCount               int
+	Config                  IntegrationTestConfig
+	Metrics                 *TestMetrics
+	NodeMetrics             map[string]*NodeMetrics // Per-node metrics
+	grpcPorts               []int                   // Dynamically allocated gRPC ports
+	memberlistPorts         []int                   // Dynamically allocated memberlist ports
+	mu                      sync.RWMutex
+	stopMetrics             chan struct{}
+	cleanupOnce             sync.Once // Ensures Cleanup only runs once
+	clientAddrs             []string
+	unaryInterceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor
 }
 
 // NewClusterTestHarness creates a new cluster test harness with full cache servers
@@ -250,10 +251,14 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 	}
 
 	// Create gRPC server with metrics interceptors and cache service
+	unaryInterceptor := metricsUnaryInterceptor(nodeMetrics)
+	if h.unaryInterceptorFactory != nil {
+		unaryInterceptor = h.unaryInterceptorFactory(nodeID, unaryInterceptor)
+	}
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(128*1024*1024),
 		grpc.MaxSendMsgSize(128*1024*1024),
-		grpc.UnaryInterceptor(metricsUnaryInterceptor(nodeMetrics)),
+		grpc.UnaryInterceptor(unaryInterceptor),
 		grpc.StreamInterceptor(metricsStreamInterceptor(nodeMetrics)),
 	)
 

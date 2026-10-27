@@ -12,6 +12,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/internal/listinput"
 )
 
 // ListWithValues implements the public ListWithValues RPC.
@@ -31,9 +32,9 @@ func (s *CacheService) ListWithValues(ctx context.Context, req *pb.ListRequest) 
 
 	continuationToken := req.ContinuationToken
 	if continuationToken == "" && req.StartKey != "" {
-		continuationToken = req.StartKey
+		// Preserve the raw StartKey; it may have the shape of an opaque token.
+		ctx = listinput.WithStartKey(ctx, req.StartKey)
 	}
-
 	entries, token, hasMore, err := s.ops.ListPageWithValues(ctx, req.Prefix, int(req.Limit), continuationToken)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("ListWithValues", "error").Inc()
@@ -66,6 +67,9 @@ func (s *CacheService) ListLocalWithValues(ctx context.Context, req *pb.ListRequ
 	continuationToken := req.ContinuationToken
 	if continuationToken == "" && req.StartKey != "" {
 		continuationToken = req.StartKey
+	}
+	if continuationToken == "" && req.StartKey == "" && listinput.HasEmptyStartKeyCursor(ctx) {
+		ctx = listinput.WithStartKey(ctx, "")
 	}
 
 	entries, token, hasMore, err := s.ops.ListLocalWithValues(ctx, req.Prefix, int(req.Limit), continuationToken)

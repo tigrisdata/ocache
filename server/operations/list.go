@@ -15,6 +15,7 @@ import (
 	"github.com/tigrisdata/ocache/common/logsample"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/internal/listinput"
 	"github.com/tigrisdata/ocache/storage/retry"
 )
 
@@ -25,11 +26,25 @@ const (
 	DefaultListLimit = 1000
 )
 
-// ContinuationToken represents the state for resuming a paginated list operation
+// ContinuationToken represents the state for resuming a paginated list operation.
 type ContinuationToken struct {
-	NodeCursors map[string]string `json:"node_cursors"` // nodeID -> last_key_from_node
+	NodeCursors map[string]string `json:"node_cursors"` // Per-node cursors; an empty ID carries the global key or peer-mode prefix.
 	Prefix      string            `json:"prefix"`       // Original prefix filter
 }
+
+type peerContinuationToken struct {
+	NodeCursors map[string]string `json:"node_cursors"`
+}
+
+type continuationTokenFields struct {
+	NodeCursors json.RawMessage `json:"node_cursors"`
+	Prefix      string          `json:"prefix"`
+}
+
+// The empty node ID is reserved: a one-entry map carries a global cursor; a
+// multi-entry map uses its value for the prefix and the remaining entries for
+// peer cursors. Coordinator node IDs are non-empty.
+const clusterGlobalCursorNodeID = ""
 
 // heapNode represents a key from a specific node for the K-way merge
 type heapNode struct {
@@ -157,7 +172,8 @@ func (o *Operations) ListPage(ctx context.Context, prefix string, limit int, con
 		return merged.Keys, token, hasMore, nil
 	}
 
-	// Single-node mode: query local storage directly
+	// Single-node mode: query local storage directly. ListLocal handles an
+	// explicitly supplied StartKey in ctx as well as the continuation token.
 	keys, token, hasMore, err := o.ListLocal(ctx, prefix, limit, continuationToken)
 	done(err)
 	return keys, token, hasMore, err
@@ -173,8 +189,16 @@ func (o *Operations) ListLocal(ctx context.Context, prefix string, limit int, co
 		limit = MaxListLimit
 	}
 
-	// Determine start key from continuation token
-	startKey := continuationToken
+	// Resolve cursor presence separately so an explicit empty key is exclusive.
+	startKey, hasStartKey := listinput.StartKey(ctx)
+	if !hasStartKey {
+		startKey = continuationToken
+		hasStartKey = startKey != ""
+	}
+	var cursor *string
+	if hasStartKey {
+		cursor = &startKey
+	}
 
 	// Query local storage with pagination
 	var keys []string
@@ -183,7 +207,7 @@ func (o *Operations) ListLocal(ctx context.Context, prefix string, limit int, co
 
 	err := retry.Do(ctx, retry.DefaultConfig(), "ListKeysWithPagination", func() error {
 		var listErr error
-		keys, lastKey, hasMore, listErr = o.storage.ListKeysWithPagination(prefix, startKey, limit)
+		keys, lastKey, hasMore, listErr = o.storage.ListKeysWithPaginationCursor(prefix, cursor, limit)
 		return listErr
 	})
 	if err != nil {
@@ -211,31 +235,33 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 		return nil, "", false, fmt.Errorf("no active nodes in cluster")
 	}
 
-	// Parse continuation token if provided
-	nodeCursors, isPlainStartKey, err := o.parseContinuationToken(continuationToken, prefix)
-	if err != nil {
-		return nil, "", false, fmt.Errorf("invalid continuation token: %w", err)
-	}
-
-	// If the token is a plain start key (for backwards compatibility with single-node mode),
-	// initialize all nodes to start from this key
-	if isPlainStartKey && continuationToken != "" {
-		nodeCursors = make(map[string]string)
-		for _, node := range nodes {
-			nodeCursors[node.ID] = continuationToken
+	// An explicit StartKey is already a raw exclusive key. Otherwise parse the
+	// opaque continuation token, including legacy per-node cursors.
+	startKey, hasStartKey := listinput.StartKey(ctx)
+	var peerCursors map[string]string
+	var err error
+	if !hasStartKey {
+		startKey, hasStartKey, peerCursors, err = o.parseContinuationToken(continuationToken, prefix)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("invalid continuation token: %w", err)
 		}
 	}
+
+	// Complete fan-outs use one global cursor. Partial fan-outs retain the
+	// successful peers' cursors so a recovered peer is not skipped.
 
 	zlog.Debug().
 		Str("prefix", prefix).
 		Int("node_count", len(nodes)).
 		Int("limit", limit).
 		Bool("with_values", withValues).
-		Interface("node_cursors", nodeCursors).
+		Str("start_key", startKey).
+		Bool("has_start_key", hasStartKey).
+		Bool("has_peer_cursors", peerCursors != nil).
 		Msg("Starting cluster-wide List with K-way merge")
 
 	// Fetch from all nodes
-	nodeResponses, err := o.fetchFromAllNodes(ctx, nodes, prefix, limit, nodeCursors, withValues)
+	nodeResponses, err := o.fetchFromAllNodesWithCursorPresence(ctx, nodes, prefix, limit, startKey, hasStartKey, peerCursors, withValues)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -244,31 +270,43 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 		return &mergeResult{Keys: []string{}}, "", false, nil
 	}
 
-	// Perform K-way merge
-	merged, newCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit, withValues)
+	// Partial fan-outs keep the responding peers' progress in peer-cursor tokens.
+	partialFanout := len(nodeResponses) < len(nodes)
+	trackPeerCursors := partialFanout || peerCursors != nil
+	merged, pagePeerCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit, withValues, trackPeerCursors, peerCursors)
 	if err != nil {
 		return nil, "", false, err
 	}
 
-	// Build continuation token if needed
 	var newToken string
 	if hasMore {
-		newToken, err = o.encodeContinuationToken(newCursors, prefix)
+		switch {
+		case partialFanout:
+			newToken, err = o.encodePeerContinuationToken(pagePeerCursors, prefix)
+		case len(merged.Keys) > 0:
+			newToken, err = o.encodeContinuationToken(merged.Keys[len(merged.Keys)-1], prefix)
+		case peerCursors != nil:
+			newToken, err = o.encodePeerContinuationToken(pagePeerCursors, prefix)
+		}
+		if err == nil && newToken == "" {
+			err = fmt.Errorf("list has more results but no continuation token")
+		}
 		if err != nil {
 			zlog.Warn().Err(err).Msg("Failed to encode continuation token")
-			// Continue without token rather than failing the request
+			return nil, "", false, err
 		}
 	}
 
 	return merged, newToken, hasMore, nil
 }
 
-// fetchFromAllNodes fetches keys (or key-value pairs) from all nodes in parallel.
 // maxListNodeFanout bounds the number of concurrent per-node list RPCs issued
 // by a single cluster-wide List. Clusters smaller than this fan out fully.
 const maxListNodeFanout = 32
 
-func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, nodeCursors map[string]string, withValues bool) (map[string]*NodeResponse, error) {
+// fetchFromAllNodesWithCursorPresence fetches keys (or key-value pairs) from
+// every node, preserving whether the resume cursor is present when it is empty.
+func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, nodes []*ring.NodeInfo, prefix string, limit int, startKey string, hasStartKey bool, peerCursors map[string]string, withValues bool) (map[string]*NodeResponse, error) {
 	localNodeID := o.GetLocalNodeID()
 	router := o.GetRouter()
 
@@ -305,20 +343,31 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 				return
 			}
 
-			// Determine start key for this node
-			startKey := ""
-			if cursor, exists := nodeCursors[n.ID]; exists && cursor != "" {
-				startKey = cursor
+			// Determine this node's exclusive cursor. Partial-page tokens carry
+			// only successful peers' cursors; absent peers start from the beginning.
+			// Cursor presence stays separate so an empty key remains exclusive.
+			nodeStartKey := startKey
+			cursorPresent := hasStartKey
+			if peerCursors != nil {
+				nodeStartKey, cursorPresent = peerCursors[n.ID]
 			}
+			if !cursorPresent {
+				nodeStartKey = ""
+			}
+			emptyCursorPresent := cursorPresent && nodeStartKey == ""
 
 			resp := &NodeResponse{NodeID: n.ID}
 			var err error
 
 			if n.ID == localNodeID {
+				localCtx := ctx
+				if cursorPresent {
+					localCtx = listinput.WithStartKey(ctx, nodeStartKey)
+				}
 				if withValues {
-					resp.Entries, resp.ContinuationToken, resp.HasMore, err = o.ListLocalWithValues(ctx, prefix, limit, startKey)
+					resp.Entries, _, resp.HasMore, err = o.ListLocalWithValues(localCtx, prefix, limit, nodeStartKey)
 				} else {
-					resp.Keys, resp.ContinuationToken, resp.HasMore, err = o.ListLocal(ctx, prefix, limit, startKey)
+					resp.Keys, _, resp.HasMore, err = o.ListLocal(localCtx, prefix, limit, nodeStartKey)
 				}
 			} else {
 				client, clientErr := router.GetClientForNode(ctx, n.ID)
@@ -329,26 +378,25 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 
 				req := &pb.ListRequest{
 					Prefix:   prefix,
-					StartKey: startKey,
+					StartKey: nodeStartKey,
 					Limit:    int32(limit),
 				}
 
+				rpcCtx := listinput.WithEmptyStartKeyCursor(ctx, emptyCursorPresent)
 				if withValues {
-					pbResp, respErr := client.ListLocalWithValues(ctx, req)
+					pbResp, respErr := client.ListLocalWithValues(rpcCtx, req)
 					if respErr != nil {
 						err = respErr
 					} else {
 						resp.Entries = pbResp.Entries
-						resp.ContinuationToken = pbResp.ContinuationToken
 						resp.HasMore = pbResp.HasMore
 					}
 				} else {
-					pbResp, respErr := client.ListLocal(ctx, req)
+					pbResp, respErr := client.ListLocal(rpcCtx, req)
 					if respErr != nil {
 						err = respErr
 					} else {
 						resp.Keys = pbResp.Keys
-						resp.ContinuationToken = pbResp.ContinuationToken
 						resp.HasMore = pbResp.HasMore
 					}
 				}
@@ -382,13 +430,10 @@ func (o *Operations) fetchFromAllNodes(ctx context.Context, nodes []*ring.NodeIn
 
 // kWayMerge performs K-way merge of sorted responses from nodes using a min-heap.
 // Works for both keys-only and withValues modes via NodeResponse.keyAt/itemCount.
-func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int, withValues bool) (*mergeResult, map[string]string, bool, error) {
+func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int, withValues bool, trackPeerCursors bool, previousCursors map[string]string) (*mergeResult, map[string]string, bool, error) {
 	// Initialize min-heap
 	h := &keyHeap{}
 	heap.Init(h)
-
-	// Track node cursors (last key from each node)
-	nodeCursors := make(map[string]string)
 
 	// Track key indices for each node
 	nodeIndices := make(map[string]int)
@@ -415,7 +460,18 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 	if withValues {
 		result.Entries = make([]*pb.KeyValue, 0, limit)
 	}
-	seenKeys := make(map[string]bool) // Deduplication (defensive)
+	// Deduplicate keys returned by multiple shards on this page. A peer that
+	// resumes after a partial page may legitimately return a key below another
+	// peer's cursor, so do not seed this set from prior-page cursors.
+	seenKeys := make(map[string]bool)
+	var peerCursors map[string]string
+	if trackPeerCursors {
+		// Keep prior progress for peers that did not advance on this page.
+		peerCursors = make(map[string]string, len(nodeResponses)+len(previousCursors))
+		for nodeID, key := range previousCursors {
+			peerCursors[nodeID] = key
+		}
+	}
 
 	// Merge until we have enough keys or heap is empty
 	for h.Len() > 0 && len(result.Keys) < limit {
@@ -427,12 +483,12 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 
 		// Pop minimum key
 		minNode := heap.Pop(h).(*heapNode)
-
-		// Always update cursor for this node (even if duplicate)
-		nodeCursors[minNode.nodeID] = minNode.key
+		if trackPeerCursors {
+			// Record consumption even when this key is a duplicate across shards.
+			peerCursors[minNode.nodeID] = minNode.key
+		}
 
 		// Deduplicate (shouldn't happen with proper partitioning, but handle it)
-		addedToResult := false
 		if !seenKeys[minNode.key] {
 			result.Keys = append(result.Keys, minNode.key)
 			if withValues {
@@ -441,7 +497,6 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 				result.Entries = append(result.Entries, nodeResp.Entries[idx])
 			}
 			seenKeys[minNode.key] = true
-			addedToResult = true
 		}
 
 		// Try to get next key from this node's response
@@ -458,11 +513,6 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 			})
 			nodeIndices[minNode.nodeID] = nextIndex
 		}
-
-		// If we hit limit due to a duplicate key, continue to fill up to limit
-		if !addedToResult && len(result.Keys) >= limit {
-			break
-		}
 	}
 
 	// Determine if there are more keys available
@@ -475,58 +525,76 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 				idx := nodeIndices[nodeID]
 				if idx >= nodeResp.itemCount()-1 {
 					hasMore = true
-					if nodeResp.ContinuationToken != "" {
-						nodeCursors[nodeID] = nodeResp.ContinuationToken
-					}
 				}
 			}
 		}
 	}
 
-	return result, nodeCursors, hasMore, nil
+	return result, peerCursors, hasMore, nil
 }
 
-// parseContinuationToken decodes the continuation token.
-// Returns (nodeCursors, isPlainStartKey, error).
-// If the token is not a valid cluster token (e.g., a plain start key for backwards compatibility),
-// returns (nil, true, nil) to indicate the token should be treated as a plain start key.
-func (o *Operations) parseContinuationToken(token string, prefix string) (map[string]string, bool, error) {
+// parseContinuationToken returns the global exclusive resume key, whether it is
+// present, and any peer cursors. Plain start keys remain accepted; unmarked
+// legacy per-node maps resume globally at their greatest saved key.
+func (o *Operations) parseContinuationToken(token string, prefix string) (string, bool, map[string]string, error) {
 	if token == "" {
-		return make(map[string]string), false, nil
+		return "", false, nil, nil
 	}
 
-	// Decode base64
 	decoded, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
-		// Not a valid cluster token - treat as plain start key for backwards compatibility
 		zlog.Debug().Str("token", token).Msg("Token is not base64, treating as plain start key")
-		return nil, true, nil
+		return token, true, nil, nil
 	}
 
-	// Parse JSON
-	var ct ContinuationToken
-	if err := json.Unmarshal(decoded, &ct); err != nil {
-		// Valid base64 but not valid JSON - treat as plain start key
+	var fields continuationTokenFields
+	if err := json.Unmarshal(decoded, &fields); err != nil {
 		zlog.Debug().Str("token", token).Msg("Token is not valid JSON, treating as plain start key")
-		return nil, true, nil
+		return token, true, nil, nil
+	}
+	if len(fields.NodeCursors) == 0 {
+		zlog.Debug().Str("token", token).Msg("Token has no recognized cluster cursor, treating as plain start key")
+		return token, true, nil, nil
 	}
 
-	// Validate prefix matches
-	if ct.Prefix != prefix {
-		return nil, false, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", ct.Prefix, prefix)
+	var nodeCursors map[string]string
+	if err := json.Unmarshal(fields.NodeCursors, &nodeCursors); err != nil || len(nodeCursors) == 0 {
+		zlog.Debug().Str("token", token).Msg("Token has no recognized cluster cursor, treating as plain start key")
+		return token, true, nil, nil
 	}
 
-	return ct.NodeCursors, false, nil
+	if peerPrefix, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor && len(nodeCursors) > 1 {
+		if peerPrefix != prefix {
+			return "", false, nil, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", peerPrefix, prefix)
+		}
+		delete(nodeCursors, clusterGlobalCursorNodeID)
+		return "", false, nodeCursors, nil
+	}
+
+	if fields.Prefix != prefix {
+		return "", false, nil, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
+	}
+	if lastKey, hasGlobalCursor := nodeCursors[clusterGlobalCursorNodeID]; hasGlobalCursor {
+		return lastKey, true, nil, nil
+	}
+
+	// Legacy per-node tokens lack a fan-out marker and page history. Resume at
+	// their greatest cursor to preserve complete-page ordering.
+	var lastKey string
+	for _, cursor := range nodeCursors {
+		if cursor > lastKey {
+			lastKey = cursor
+		}
+	}
+	return lastKey, true, nil, nil
 }
 
-// encodeContinuationToken creates a continuation token from node cursors
-func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, prefix string) (string, error) {
-	if len(nodeCursors) == 0 {
-		return "", nil
-	}
-
+// encodeContinuationToken creates a compact continuation token from the last emitted key.
+func (o *Operations) encodeContinuationToken(lastKey string, prefix string) (string, error) {
+	// Reuse the legacy envelope with one global cursor. The empty node ID is
+	// reserved, so this entry cannot be confused with a real shard cursor.
 	ct := ContinuationToken{
-		NodeCursors: nodeCursors,
+		NodeCursors: map[string]string{clusterGlobalCursorNodeID: lastKey},
 		Prefix:      prefix,
 	}
 
@@ -537,5 +605,28 @@ func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, pref
 	}
 
 	// Encode as base64
+	return base64.StdEncoding.EncodeToString(jsonBytes), nil
+}
+
+func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, prefix string) (string, error) {
+	if len(peerCursors) == 0 {
+		return "", nil
+	}
+
+	// The empty node ID is reserved. Store the prefix there so the partial
+	// cursor envelope needs no additional top-level fields.
+	cursors := make(map[string]string, len(peerCursors)+1)
+	cursors[clusterGlobalCursorNodeID] = prefix
+	for nodeID, key := range peerCursors {
+		if nodeID == clusterGlobalCursorNodeID {
+			return "", fmt.Errorf("node ID cannot be empty")
+		}
+		cursors[nodeID] = key
+	}
+	ct := peerContinuationToken{NodeCursors: cursors}
+	jsonBytes, err := json.Marshal(ct)
+	if err != nil {
+		return "", err
+	}
 	return base64.StdEncoding.EncodeToString(jsonBytes), nil
 }

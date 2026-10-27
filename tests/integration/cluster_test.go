@@ -4,11 +4,27 @@
 package integration
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"math/rand"
+	"sort"
+	"sync/atomic"
+	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	pb "github.com/tigrisdata/ocache/proto"
+	serveroperations "github.com/tigrisdata/ocache/server/operations"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // CoordinatorObjectsSuite uses the same tests as ObjectsSuite since they share
@@ -579,4 +595,539 @@ func keysFromMap(m map[string]bool) []string {
 		keys = append(keys, k)
 	}
 	return keys
+}
+
+type clusterListPaginationFixture struct {
+	nodeA  *ClusterServerNode
+	nodeB  *ClusterServerNode
+	nodeC  *ClusterServerNode
+	client pb.CacheServiceClient
+}
+
+func newClusterListPaginationFixture(t *testing.T) *clusterListPaginationFixture {
+	return newClusterListPaginationFixtureWithInterceptor(t, nil)
+}
+
+func newClusterListPaginationFixtureWithInterceptor(
+	t *testing.T,
+	interceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor,
+) *clusterListPaginationFixture {
+	return newClusterListPaginationFixtureWithNodeCount(t, 2, interceptorFactory)
+}
+
+func newClusterListPaginationFixtureWithNodeCount(
+	t *testing.T,
+	nodeCount int,
+	interceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor,
+) *clusterListPaginationFixture {
+	t.Helper()
+
+	config := DefaultIntegrationTestConfig()
+	config.CleanupInterval = time.Hour
+	config.RecompactionInterval = time.Hour
+	harness := NewClusterTestHarness(t, nodeCount, config)
+	harness.unaryInterceptorFactory = interceptorFactory
+	t.Cleanup(harness.Cleanup)
+	if err := harness.StartAllNodes(); err != nil {
+		t.Fatalf("start %d-node cluster: %v", nodeCount, err)
+	}
+
+	nodeIDs := make([]string, 0, len(harness.Nodes))
+	for nodeID := range harness.Nodes {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+	require.Len(t, nodeIDs, nodeCount)
+
+	nodeA := harness.Nodes[nodeIDs[0]]
+	nodeB := harness.Nodes[nodeIDs[1]]
+	var nodeC *ClusterServerNode
+	if nodeCount > 2 {
+		nodeC = harness.Nodes[nodeIDs[2]]
+	}
+	return &clusterListPaginationFixture{
+		nodeA:  nodeA,
+		nodeB:  nodeB,
+		nodeC:  nodeC,
+		client: pb.NewCacheServiceClient(nodeA.ClusterConn),
+	}
+}
+
+func listFailureInterceptorFactory(
+	targetNodeID string,
+	failList *atomic.Bool,
+	failListWithValues *atomic.Bool,
+	failureCount *atomic.Int32,
+) func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+	return func(nodeID string, next grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+		return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+			shouldFail := false
+			if nodeID == targetNodeID {
+				switch info.FullMethod {
+				case pb.CacheService_ListLocal_FullMethodName:
+					shouldFail = failList.CompareAndSwap(true, false)
+				case pb.CacheService_ListLocalWithValues_FullMethodName:
+					shouldFail = failListWithValues.CompareAndSwap(true, false)
+				}
+			}
+			if shouldFail {
+				failureCount.Add(1)
+				return nil, status.Error(codes.Unavailable, "temporary list RPC failure")
+			}
+			return next(ctx, req, info, handler)
+		}
+	}
+}
+
+func newLargeListPaginationClient(t *testing.T, node *ClusterServerNode) pb.CacheServiceClient {
+	t.Helper()
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(dialCtx, node.ListenAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(128*1024*1024)),
+		grpc.WithBlock(),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { conn.Close() })
+	return pb.NewCacheServiceClient(conn)
+}
+
+func putClusterListFixtureValue(t *testing.T, node *ClusterServerNode, key string) []byte {
+	t.Helper()
+	value := []byte("value-" + key)
+	// Write directly to each node's real store so the two shards have fixed,
+	// deliberately interleaved key sets throughout the pagination exercise.
+	require.NoError(t, node.Storage.Put(key, bytes.NewReader(value), 0))
+	return value
+}
+
+func checkClusterPaginationPages(
+	t *testing.T,
+	ctx context.Context,
+	client pb.CacheServiceClient,
+	scenario, prefix, initialToken, startKey, previousKey string,
+	previousKeySet bool,
+	firstLimit, continuationLimit int,
+	want []string,
+	values map[string][]byte,
+	violation func(format string, args ...interface{}),
+) {
+	t.Helper()
+
+	var got []string
+	lastKey := previousKey
+	hasLastKey := previousKeySet
+	seenKeys := make(map[string]struct{}, len(want)+1)
+	if previousKeySet {
+		seenKeys[previousKey] = struct{}{}
+	}
+	seenTokens := make(map[string]struct{})
+	if initialToken != "" {
+		seenTokens[initialToken] = struct{}{}
+	}
+	token := initialToken
+	complete := false
+
+	for page := 0; page < len(want)+1; page++ {
+		pageLimit := firstLimit
+		if page > 0 {
+			pageLimit = continuationLimit
+		}
+		response, err := client.ListWithValues(ctx, &pb.ListRequest{
+			Prefix:            prefix,
+			StartKey:          startKey,
+			Limit:             int32(pageLimit),
+			ContinuationToken: token,
+		})
+		require.NoErrorf(t, err, "%s page %d RPC", scenario, page+1)
+		require.NotNilf(t, response, "%s page %d response", scenario, page+1)
+		if len(response.Entries) > pageLimit {
+			violation("page %d returned %d entries for limit %d", page+1, len(response.Entries), pageLimit)
+		}
+		for _, entry := range response.Entries {
+			if entry == nil {
+				violation("page %d returned a nil entry", page+1)
+				continue
+			}
+			wantValue, exists := values[entry.Key]
+			if !exists || !bytes.Equal(entry.Value, wantValue) {
+				violation("key %q returned an unexpected value", entry.Key)
+			}
+			if _, exists := seenKeys[entry.Key]; exists {
+				violation("key %q was repeated", entry.Key)
+			}
+			if hasLastKey && entry.Key <= lastKey {
+				violation("key %q did not follow %q in strict global order", entry.Key, lastKey)
+			}
+			seenKeys[entry.Key] = struct{}{}
+			lastKey = entry.Key
+			hasLastKey = true
+			got = append(got, entry.Key)
+		}
+
+		if !response.HasMore {
+			if response.ContinuationToken != "" {
+				violation("final page returned a continuation token")
+			}
+			complete = true
+			break
+		}
+		if len(got) >= len(want) {
+			violation("HasMore remained true after all expected keys")
+		}
+		if response.ContinuationToken == "" {
+			violation("page %d reported HasMore without a continuation token", page+1)
+			break
+		}
+		if _, exists := seenTokens[response.ContinuationToken]; exists {
+			violation("continuation token repeated after page %d", page+1)
+			break
+		}
+		seenTokens[response.ContinuationToken] = struct{}{}
+		token = response.ContinuationToken
+		startKey = ""
+	}
+
+	if !complete {
+		violation("pagination did not reach HasMore=false")
+	}
+	if len(got) != len(want) {
+		violation("returned %d keys, want %d", len(got), len(want))
+		return
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			violation("key at page order index %d differed", i)
+			return
+		}
+	}
+}
+
+func testClusterListWithValuesPagination(t *testing.T) {
+	testClusterListWithValuesPaginationPages(t)
+}
+
+func testClusterListWithValuesPaginationPages(t *testing.T) {
+	fixture := newClusterListPaginationFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	values := make(map[string][]byte)
+	for _, key := range []string{"a", "z"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeA, key)
+	}
+	for _, key := range []string{"b", "c"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeB, key)
+	}
+	checkPages := func(scenario, prefix, initialToken, startKey, previousKey string, previousKeySet bool, firstLimit, continuationLimit int, want []string) {
+		t.Helper()
+		violation := func(format string, args ...interface{}) {
+			t.Errorf("%s: %s", scenario, fmt.Sprintf(format, args...))
+		}
+		checkClusterPaginationPages(t, ctx, fixture.client, scenario, prefix, initialToken, startKey, previousKey, previousKeySet, firstLimit, continuationLimit, want, values, violation)
+	}
+
+	want := []string{"a", "b", "c", "z"}
+	checkPages("fresh token", "", "", "", "", false, 1, 1, want)
+
+	legacyBytes, err := json.Marshal(struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+		Prefix      string            `json:"prefix"`
+	}{
+		NodeCursors: map[string]string{fixture.nodeA.NodeID: "a"},
+	})
+	require.NoError(t, err)
+	legacyToken := base64.StdEncoding.EncodeToString(legacyBytes)
+	checkPages("legacy per-node token", "", legacyToken, "", "a", true, 1, 1, []string{"b", "c", "z"})
+	checkPages("plain start key", "", "", "a", "a", true, 1, 1, []string{"b", "c", "z"})
+	checkPages("plain continuation token", "", "a", "", "a", true, 1, 1, []string{"b", "c", "z"})
+
+	// Duplicate keys on different shards are returned once, including when a
+	// larger page consumes more than one key from each shard.
+	values["b"] = putClusterListFixtureValue(t, fixture.nodeA, "b")
+	values["a"] = putClusterListFixtureValue(t, fixture.nodeB, "a")
+	checkPages("duplicate keys", "", "", "", "", false, 1, 1, want)
+	checkPages("duplicate keys with larger pages", "", "", "", "", false, 2, 2, want)
+	checkPages("legacy token with duplicate keys", "", legacyToken, "", "a", true, 1, 1, []string{"b", "c", "z"})
+
+	legacyShapedBytes, err := json.Marshal(struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+		Prefix      string            `json:"prefix"`
+	}{
+		NodeCursors: map[string]string{"": "zzzz"},
+	})
+	require.NoError(t, err)
+	legacyShapedStartKey := base64.StdEncoding.EncodeToString(legacyShapedBytes)
+	values[legacyShapedStartKey] = putClusterListFixtureValue(t, fixture.nodeA, legacyShapedStartKey)
+	response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{StartKey: legacyShapedStartKey, Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, response.Entries, 1)
+	require.Equal(t, "z", response.Entries[0].Key)
+	require.False(t, response.HasMore)
+
+	for _, key := range []string{"p:a", "p:z"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeA, key)
+	}
+	for _, key := range []string{"p:b", "p:c"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeB, key)
+	}
+	checkPages("nonempty prefix token", "p:", "", "", "", false, 1, 1, []string{"p:a", "p:b", "p:c", "p:z"})
+
+	values["\x00"] = putClusterListFixtureValue(t, fixture.nodeB, "\x00")
+	values[""] = putClusterListFixtureValue(t, fixture.nodeA, "")
+	allKeys := []string{"", "\x00", "a", "b", "c", legacyShapedStartKey, "p:a", "p:b", "p:c", "p:z", "z"}
+	checkPages("empty key", "", "", "", "", false, 1, 1, allKeys)
+
+	legacyEmptyBytes, err := json.Marshal(struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+		Prefix      string            `json:"prefix"`
+	}{
+		NodeCursors: map[string]string{fixture.nodeA.NodeID: ""},
+	})
+	require.NoError(t, err)
+	legacyEmptyToken := base64.StdEncoding.EncodeToString(legacyEmptyBytes)
+	checkPages("legacy empty-key token", "", legacyEmptyToken, "", "", true, 1, 1, allKeys[1:])
+}
+
+func testClusterListRawStartKey(t *testing.T) {
+	fixture := newClusterListPaginationFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for _, key := range []string{"a", "z"} {
+		putClusterListFixtureValue(t, fixture.nodeA, key)
+	}
+	for _, key := range []string{"b", "c"} {
+		putClusterListFixtureValue(t, fixture.nodeB, key)
+	}
+	legacyShapedBytes, err := json.Marshal(struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+		Prefix      string            `json:"prefix"`
+	}{
+		NodeCursors: map[string]string{"": "zzzz"},
+	})
+	require.NoError(t, err)
+	rawStartKey := base64.StdEncoding.EncodeToString(legacyShapedBytes)
+	putClusterListFixtureValue(t, fixture.nodeA, rawStartKey)
+
+	response, err := fixture.client.List(ctx, &pb.ListRequest{StartKey: rawStartKey, Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, []string{"z"}, response.Keys)
+	require.False(t, response.HasMore)
+	require.Empty(t, response.ContinuationToken)
+}
+
+func testClusterListPartialFailureRecovery(t *testing.T) {
+	var failList atomic.Bool
+	var failListWithValues atomic.Bool
+	var failureCount atomic.Int32
+	fixture := newClusterListPaginationFixtureWithInterceptor(
+		t,
+		listFailureInterceptorFactory("cluster-node-2", &failList, &failListWithValues, &failureCount),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	values := make(map[string][]byte, 5)
+	for _, key := range []string{"m", "x", "z"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeA, key)
+	}
+	for _, key := range []string{"m", "n", "o"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeB, key)
+	}
+
+	listPage := func(withValues bool, token string, limit int32) ([]string, string, bool) {
+		t.Helper()
+		if withValues {
+			response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: limit, ContinuationToken: token})
+			require.NoError(t, err)
+			keys := make([]string, 0, len(response.Entries))
+			for _, entry := range response.Entries {
+				require.NotNil(t, entry)
+				require.Equal(t, values[entry.Key], entry.Value)
+				keys = append(keys, entry.Key)
+			}
+			return keys, response.ContinuationToken, response.HasMore
+		}
+		response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: limit, ContinuationToken: token})
+		require.NoError(t, err)
+		return response.Keys, response.ContinuationToken, response.HasMore
+	}
+
+	for _, withValues := range []bool{true, false} {
+		name := "List"
+		if withValues {
+			name = "ListWithValues"
+			failListWithValues.Store(true)
+		} else {
+			failList.Store(true)
+		}
+		t.Run(name, func(t *testing.T) {
+			failuresBefore := failureCount.Load()
+			token := ""
+			var got []string
+			complete := false
+			for page := 0; page < 10; page++ {
+				limit := int32(1)
+				if page > 0 {
+					limit = 2
+				}
+				keys, nextToken, hasMore := listPage(withValues, token, limit)
+				got = append(got, keys...)
+				if page == 0 {
+					require.Equal(t, []string{"m"}, keys)
+					require.True(t, hasMore)
+					require.NotEmpty(t, nextToken)
+					require.Equal(t, failuresBefore+1, failureCount.Load(), "one peer page RPC should fail")
+				}
+				if !hasMore {
+					complete = true
+					break
+				}
+				require.NotEmpty(t, nextToken)
+				token = nextToken
+			}
+			require.True(t, complete, "pagination should finish after the peer recovers")
+			seen := make(map[string]bool, len(got))
+			for _, key := range got {
+				seen[key] = true
+			}
+			for _, key := range []string{"m", "n", "o", "x", "z"} {
+				require.True(t, seen[key], "recovery omitted key %q", key)
+			}
+			require.Equal(t, failuresBefore+1, failureCount.Load())
+		})
+	}
+}
+
+func testClusterListPartialCursorAtResponseLimit(t *testing.T) {
+	oldLogLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	defer zerolog.SetGlobalLevel(oldLogLevel)
+
+	var failList atomic.Bool
+	var failListWithValues atomic.Bool
+	var failureCount atomic.Int32
+	fixture := newClusterListPaginationFixtureWithInterceptor(
+		t,
+		listFailureInterceptorFactory("cluster-node-2", &failList, &failListWithValues, &failureCount),
+	)
+	client := newLargeListPaginationClient(t, fixture.nodeA)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	const valueSize = 1 << 20
+	largeValue := bytes.Repeat([]byte{'v'}, valueSize)
+	lastValue := bytes.Repeat([]byte{'v'}, 1_046_196)
+	for i := 0; i < 127; i++ {
+		key := fmt.Sprintf("m%03d", i)
+		require.NoError(t, fixture.nodeA.Storage.Put(key, bytes.NewReader(largeValue), 0))
+	}
+	require.NoError(t, fixture.nodeA.Storage.Put("m127", bytes.NewReader(lastValue), 0))
+	require.NoError(t, fixture.nodeA.Storage.Put("z", bytes.NewReader([]byte("z")), 0))
+	for _, key := range []string{"a", "b"} {
+		require.NoError(t, fixture.nodeB.Storage.Put(key, bytes.NewReader([]byte(key)), 0))
+	}
+
+	failListWithValues.Store(true)
+	first, err := client.ListWithValues(ctx, &pb.ListRequest{Limit: 128})
+	require.NoError(t, err)
+	require.Len(t, first.Entries, 128)
+	require.Equal(t, "m000", first.Entries[0].Key)
+	require.Equal(t, "m127", first.Entries[len(first.Entries)-1].Key)
+	require.True(t, first.HasMore)
+	require.NotEmpty(t, first.ContinuationToken)
+	require.Equal(t, int32(1), failureCount.Load())
+
+	const maxGRPCMessageSize = 128 << 20
+	responseSize := proto.Size(first)
+	require.LessOrEqual(t, responseSize, maxGRPCMessageSize)
+	require.GreaterOrEqual(t, responseSize, maxGRPCMessageSize-4096, "fixture should exercise a near-limit page")
+
+	second, err := client.ListWithValues(ctx, &pb.ListRequest{Limit: 128, ContinuationToken: first.ContinuationToken})
+	require.NoError(t, err)
+	got := make([]string, len(second.Entries))
+	for i, entry := range second.Entries {
+		require.NotNil(t, entry)
+		got[i] = entry.Key
+	}
+	require.Equal(t, []string{"a", "b", "z"}, got)
+	require.False(t, second.HasMore)
+}
+
+func testClusterListContinuationTokenSize(t *testing.T) {
+	oldLogLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	defer zerolog.SetGlobalLevel(oldLogLevel)
+
+	var failList atomic.Bool
+	var failListWithValues atomic.Bool
+	var failureCount atomic.Int32
+	fixture := newClusterListPaginationFixtureWithNodeCount(
+		t,
+		3,
+		listFailureInterceptorFactory("cluster-node-2", &failList, &failListWithValues, &failureCount),
+	)
+	client := newLargeListPaginationClient(t, fixture.nodeA)
+	// A high-entropy cursor can make a public page plus its token exceed the
+	// gRPC message limit even though the key and page each fit by themselves.
+	const highEntropyKeySize = 72 << 20
+	const prefix = "oversized/"
+	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
+	keyBytes := make([]byte, highEntropyKeySize)
+	highEntropyPrefix := []byte(prefix + "z-a/")
+	copy(keyBytes, highEntropyPrefix)
+	random := rand.New(rand.NewSource(20260622))
+	for i := len(highEntropyPrefix); i < len(keyBytes); i++ {
+		keyBytes[i] = alphabet[random.Intn(len(alphabet))]
+	}
+	highEntropyKey := string(keyBytes)
+	keyBytes = nil
+	lastSmallKey := ""
+	for i := 0; i < serveroperations.MaxListLimit-1; i++ {
+		key := fmt.Sprintf("%sa%04d", prefix, i)
+		lastSmallKey = key
+		require.NoError(t, fixture.nodeA.Storage.Put(key, bytes.NewReader([]byte("v")), 0))
+	}
+	tailKey := prefix + "zz"
+	require.NoError(t, fixture.nodeA.Storage.Put(highEntropyKey, bytes.NewReader([]byte("v")), 0))
+	require.NoError(t, fixture.nodeA.Storage.Put(tailKey, bytes.NewReader([]byte("v")), 0))
+
+	highEntropyCtx, cancelHighEntropy := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancelHighEntropy()
+	for _, withValues := range []bool{false, true} {
+		failuresBefore := failureCount.Load()
+		var err error
+		if withValues {
+			failListWithValues.Store(true)
+			_, err = client.ListWithValues(highEntropyCtx, &pb.ListRequest{Prefix: prefix, StartKey: lastSmallKey, Limit: 1})
+		} else {
+			failList.Store(true)
+			_, err = client.List(highEntropyCtx, &pb.ListRequest{Prefix: prefix, StartKey: lastSmallKey, Limit: 1})
+		}
+		require.Equal(t, codes.ResourceExhausted, status.Code(err), "public list must fail rather than return HasMore without a cursor")
+		require.Equal(t, failuresBefore+1, failureCount.Load(), "one peer page RPC should fail")
+	}
+
+	// The embedded operation has no outer gRPC page response. It keeps the
+	// continuation internally and must not truncate its all-keys result.
+	ops := serveroperations.New(fixture.nodeA.Storage, fixture.nodeA.Coordinator)
+	failuresBefore := failureCount.Load()
+	failList.Store(true)
+	got, err := ops.List(highEntropyCtx, prefix)
+	require.NoError(t, err)
+	require.Equal(t, failuresBefore+1, failureCount.Load(), "one peer page RPC should fail")
+	wantAll := make([]string, 0, serveroperations.MaxListLimit+1)
+	for i := 0; i < serveroperations.MaxListLimit-1; i++ {
+		wantAll = append(wantAll, fmt.Sprintf("%sa%04d", prefix, i))
+	}
+	wantAll = append(wantAll, highEntropyKey, tailKey)
+	require.Len(t, got, len(wantAll))
+	for i, want := range wantAll {
+		if got[i] != want {
+			t.Fatalf("List returned an unexpected key at index %d (got %d bytes, want %d bytes)", i, len(got[i]), len(want))
+		}
+	}
 }
