@@ -832,6 +832,19 @@ func testClusterListWithValuesPaginationPages(t *testing.T) {
 	want := []string{"a", "b", "c", "z"}
 	checkPages("fresh token", "", "", "", "", false, 1, 1, want)
 
+	previousGlobalBytes, err := json.Marshal(struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+		Prefix      string            `json:"prefix"`
+	}{
+		NodeCursors: map[string]string{"": "a"},
+	})
+	require.NoError(t, err)
+	previousGlobalToken := base64.StdEncoding.EncodeToString(previousGlobalBytes)
+	checkPages(
+		"previous global cursor token", "", previousGlobalToken, "", "a", true, 1, 1,
+		[]string{"b", "c", "z"},
+	)
+
 	legacyBytes, err := json.Marshal(struct {
 		NodeCursors map[string]string `json:"node_cursors"`
 		Prefix      string            `json:"prefix"`
@@ -875,6 +888,18 @@ func testClusterListWithValuesPaginationPages(t *testing.T) {
 	}
 	checkPages("nonempty prefix token", "p:", "", "", "", false, 1, 1, []string{"p:a", "p:b", "p:c", "p:z"})
 
+	previousPartialBytes, err := json.Marshal(struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+	}{
+		NodeCursors: map[string]string{"": "p:", fixture.nodeA.NodeID: "p:a"},
+	})
+	require.NoError(t, err)
+	previousPartialToken := base64.StdEncoding.EncodeToString(previousPartialBytes)
+	checkPages(
+		"previous partial token without top-level prefix", "p:", previousPartialToken, "", "p:a", true, 1, 1,
+		[]string{"p:b", "p:c", "p:z"},
+	)
+
 	values["\x00"] = putClusterListFixtureValue(t, fixture.nodeB, "\x00")
 	values[""] = putClusterListFixtureValue(t, fixture.nodeA, "")
 	allKeys := []string{"", "\x00", "a", "b", "c", legacyShapedStartKey, "p:a", "p:b", "p:c", "p:z", "z"}
@@ -889,6 +914,140 @@ func testClusterListWithValuesPaginationPages(t *testing.T) {
 	require.NoError(t, err)
 	legacyEmptyToken := base64.StdEncoding.EncodeToString(legacyEmptyBytes)
 	checkPages("legacy empty-key token", "", legacyEmptyToken, "", "", true, 1, 1, allKeys[1:])
+}
+
+// testClusterListLegacyReaderCompatibility models the base coordinator's
+// two-field token decoder and per-node cursor lookup, then calls the real
+// node-local RPCs. It is a token-contract test, not an old-server process test.
+func testClusterListLegacyReaderCompatibility(t *testing.T) {
+	var failList atomic.Bool
+	var failListWithValues atomic.Bool
+	var failureCount atomic.Int32
+	fixture := newClusterListPaginationFixtureWithInterceptor(
+		t,
+		listFailureInterceptorFactory("cluster-node-2", &failList, &failListWithValues, &failureCount),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const prefix = "legacy-reader:"
+	values := make(map[string][]byte, 4)
+	for _, key := range []string{prefix + "a", prefix + "z"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeA, key)
+	}
+	for _, key := range []string{prefix + "b", prefix + "c"} {
+		values[key] = putClusterListFixtureValue(t, fixture.nodeB, key)
+	}
+
+	newPage := func(withValues bool, token string) ([]string, string, bool) {
+		t.Helper()
+		if withValues {
+			response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{
+				Prefix:            prefix,
+				Limit:             1,
+				ContinuationToken: token,
+			})
+			require.NoError(t, err)
+			keys := make([]string, 0, len(response.Entries))
+			for _, entry := range response.Entries {
+				require.NotNil(t, entry)
+				require.Equal(t, values[entry.Key], entry.Value)
+				keys = append(keys, entry.Key)
+			}
+			return keys, response.ContinuationToken, response.HasMore
+		}
+		response, err := fixture.client.List(ctx, &pb.ListRequest{
+			Prefix:            prefix,
+			Limit:             1,
+			ContinuationToken: token,
+		})
+		require.NoError(t, err)
+		return response.Keys, response.ContinuationToken, response.HasMore
+	}
+
+	for _, withValues := range []bool{false, true} {
+		name := "List"
+		if withValues {
+			name = "ListWithValues"
+		}
+		t.Run(name, func(t *testing.T) {
+			token := ""
+			for page, want := range []string{prefix + "a", prefix + "b"} {
+				keys, nextToken, hasMore := newPage(withValues, token)
+				require.Equal(t, []string{want}, keys)
+				require.True(t, hasMore)
+				require.NotEmpty(t, nextToken)
+				if page == 0 {
+					require.Equal(t, prefix+"b", listNextKeyUsingLegacyToken(t, ctx, fixture, values, prefix, nextToken, withValues))
+				}
+				token = nextToken
+			}
+			require.Equal(t, prefix+"c", listNextKeyUsingLegacyToken(t, ctx, fixture, values, prefix, token, withValues))
+		})
+	}
+
+	for _, withValues := range []bool{false, true} {
+		name := "partial List"
+		fail := &failList
+		if withValues {
+			name = "partial ListWithValues"
+			fail = &failListWithValues
+		}
+		t.Run(name, func(t *testing.T) {
+			fail.Store(true)
+			keys, token, hasMore := newPage(withValues, "")
+			require.Equal(t, []string{prefix + "a"}, keys)
+			require.True(t, hasMore)
+			require.NotEmpty(t, token)
+			require.Equal(t, prefix+"b", listNextKeyUsingLegacyToken(t, ctx, fixture, values, prefix, token, withValues))
+		})
+	}
+	require.Equal(t, int32(2), failureCount.Load())
+}
+
+// The base coordinator decoded only NodeCursors and Prefix, then selected each
+// node's StartKey by its real ID. This mirrors that read path over live RPCs.
+func listNextKeyUsingLegacyToken(
+	t *testing.T,
+	ctx context.Context,
+	fixture *clusterListPaginationFixture,
+	values map[string][]byte,
+	prefix, token string,
+	withValues bool,
+) string {
+	t.Helper()
+
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	require.NoError(t, err)
+	var legacyToken struct {
+		NodeCursors map[string]string `json:"node_cursors"`
+		Prefix      string            `json:"prefix"`
+	}
+	require.NoError(t, json.Unmarshal(decoded, &legacyToken))
+	require.Equal(t, prefix, legacyToken.Prefix)
+
+	var candidates []string
+	for _, node := range []*ClusterServerNode{fixture.nodeA, fixture.nodeB} {
+		client := pb.NewCacheServiceClient(node.ClusterConn)
+		startKey := legacyToken.NodeCursors[node.NodeID]
+		request := &pb.ListRequest{Prefix: legacyToken.Prefix, StartKey: startKey, Limit: 1}
+		if withValues {
+			response, err := client.ListLocalWithValues(ctx, request)
+			require.NoError(t, err)
+			for _, entry := range response.Entries {
+				require.NotNil(t, entry)
+				require.Equal(t, values[entry.Key], entry.Value)
+				candidates = append(candidates, entry.Key)
+			}
+			continue
+		}
+		response, err := client.ListLocal(ctx, request)
+		require.NoError(t, err)
+		candidates = append(candidates, response.Keys...)
+	}
+	sort.Strings(candidates)
+	require.NotEmpty(t, candidates)
+	return candidates[0]
 }
 
 func testClusterListRawStartKey(t *testing.T) {
@@ -970,17 +1129,19 @@ func testClusterListPartialFailureRecovery(t *testing.T) {
 			var got []string
 			complete := false
 			for page := 0; page < 10; page++ {
-				limit := int32(1)
-				if page > 0 {
-					limit = 2
+				limit := int32(2)
+				if page == 1 {
+					limit = 1
 				}
 				keys, nextToken, hasMore := listPage(withValues, token, limit)
 				got = append(got, keys...)
 				if page == 0 {
-					require.Equal(t, []string{"m"}, keys)
+					require.Equal(t, []string{"m", "x"}, keys)
 					require.True(t, hasMore)
 					require.NotEmpty(t, nextToken)
 					require.Equal(t, failuresBefore+1, failureCount.Load(), "one peer page RPC should fail")
+				} else if page == 1 {
+					require.Equal(t, []string{"m"}, keys)
 				}
 				if !hasMore {
 					complete = true

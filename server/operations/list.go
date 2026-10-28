@@ -28,23 +28,33 @@ const (
 
 // ContinuationToken represents the state for resuming a paginated list operation.
 type ContinuationToken struct {
-	NodeCursors map[string]string `json:"node_cursors"` // Per-node cursors; an empty ID carries the global key or peer-mode prefix.
-	Prefix      string            `json:"prefix"`       // Original prefix filter
-}
-
-type peerContinuationToken struct {
-	NodeCursors map[string]string `json:"node_cursors"`
+	NodeCursors map[string]string `json:"node_cursors"`          // Per-node cursors; an empty ID marks a partial-page token.
+	Prefix      string            `json:"prefix,omitempty"`      // Original prefix; empty is the legacy zero value.
+	CursorMode  string            `json:"cursor_mode,omitempty"` // New global mode; legacy readers ignore it.
 }
 
 type continuationTokenFields struct {
 	NodeCursors json.RawMessage `json:"node_cursors"`
 	Prefix      string          `json:"prefix"`
+	CursorMode  string          `json:"cursor_mode"`
 }
 
-// The empty node ID is reserved: a one-entry map carries a global cursor; a
-// multi-entry map uses its value for the prefix and the remaining entries for
-// peer cursors. Coordinator node IDs are non-empty.
+// The empty node ID is reserved for partial-page tokens. Coordinator node IDs
+// are non-empty, so older readers ignore this marker and keep using the real
+// per-node cursors in the same envelope.
 const clusterGlobalCursorNodeID = ""
+
+const globalCursorMode = "global-v1"
+
+type listCursorState struct {
+	startKey    string
+	hasStartKey bool
+	nodeCursors map[string]string
+	peerCursors bool
+	// knownProgress marks a cursor map emitted by the current format; unmarked
+	// raw and legacy cursors need active-node seeding before a new token is built.
+	knownProgress bool
+}
 
 // heapNode represents a key from a specific node for the K-way merge
 type heapNode struct {
@@ -237,31 +247,48 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 
 	// An explicit StartKey is already a raw exclusive key. Otherwise parse the
 	// opaque continuation token, including legacy per-node cursors.
-	startKey, hasStartKey := listinput.StartKey(ctx)
-	var peerCursors map[string]string
-	var err error
-	if !hasStartKey {
-		startKey, hasStartKey, peerCursors, err = o.parseContinuationToken(continuationToken, prefix)
+	cursor := listCursorState{}
+	if startKey, hasStartKey := listinput.StartKey(ctx); hasStartKey {
+		cursor.startKey = startKey
+		cursor.hasStartKey = true
+	} else {
+		var err error
+		cursor, err = o.parseContinuationToken(continuationToken, prefix)
 		if err != nil {
 			return nil, "", false, fmt.Errorf("invalid continuation token: %w", err)
 		}
 	}
 
-	// Complete fan-outs use one global cursor. Partial fan-outs retain the
+	// Unmarked legacy tokens and raw start keys do not carry enough provenance
+	// to preserve per-node state. Seed each active peer at the global start so a
+	// token emitted after this page remains readable by older coordinators.
+	previousCursors := cursor.nodeCursors
+	if !cursor.peerCursors && cursor.hasStartKey && !cursor.knownProgress {
+		previousCursors = make(map[string]string, len(nodes))
+		for _, node := range nodes {
+			previousCursors[node.ID] = cursor.startKey
+		}
+	}
+
+	// Complete pages resume from one global cursor. Partial pages retain the
 	// successful peers' cursors so a recovered peer is not skipped.
+	var peerCursors map[string]string
+	if cursor.peerCursors {
+		peerCursors = previousCursors
+	}
 
 	zlog.Debug().
 		Str("prefix", prefix).
 		Int("node_count", len(nodes)).
 		Int("limit", limit).
 		Bool("with_values", withValues).
-		Str("start_key", startKey).
-		Bool("has_start_key", hasStartKey).
-		Bool("has_peer_cursors", peerCursors != nil).
+		Str("start_key", cursor.startKey).
+		Bool("has_start_key", cursor.hasStartKey).
+		Bool("has_peer_cursors", cursor.peerCursors).
 		Msg("Starting cluster-wide List with K-way merge")
 
 	// Fetch from all nodes
-	nodeResponses, err := o.fetchFromAllNodesWithCursorPresence(ctx, nodes, prefix, limit, startKey, hasStartKey, peerCursors, withValues)
+	nodeResponses, err := o.fetchFromAllNodesWithCursorPresence(ctx, nodes, prefix, limit, cursor.startKey, cursor.hasStartKey, peerCursors, withValues)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -272,21 +299,21 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 
 	// Partial fan-outs keep the responding peers' progress in peer-cursor tokens.
 	partialFanout := len(nodeResponses) < len(nodes)
-	trackPeerCursors := partialFanout || peerCursors != nil
-	merged, pagePeerCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit, withValues, trackPeerCursors, peerCursors)
+	merged, pageCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit, withValues, previousCursors)
 	if err != nil {
 		return nil, "", false, err
 	}
 
 	var newToken string
 	if hasMore {
-		switch {
-		case partialFanout:
-			newToken, err = o.encodePeerContinuationToken(pagePeerCursors, prefix)
-		case len(merged.Keys) > 0:
-			newToken, err = o.encodeContinuationToken(merged.Keys[len(merged.Keys)-1], prefix)
-		case peerCursors != nil:
-			newToken, err = o.encodePeerContinuationToken(pagePeerCursors, prefix)
+		peerPage := partialFanout
+		if !peerPage && cursor.peerCursors {
+			peerPage = !canResumeGlobally(nodeResponses, previousCursors, merged.Keys)
+		}
+		if peerPage {
+			newToken, err = o.encodePeerContinuationToken(pageCursors, prefix)
+		} else {
+			newToken, err = o.encodeContinuationToken(pageCursors, prefix)
 		}
 		if err == nil && newToken == "" {
 			err = fmt.Errorf("list has more results but no continuation token")
@@ -430,7 +457,7 @@ func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, no
 
 // kWayMerge performs K-way merge of sorted responses from nodes using a min-heap.
 // Works for both keys-only and withValues modes via NodeResponse.keyAt/itemCount.
-func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int, withValues bool, trackPeerCursors bool, previousCursors map[string]string) (*mergeResult, map[string]string, bool, error) {
+func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int, withValues bool, previousCursors map[string]string) (*mergeResult, map[string]string, bool, error) {
 	// Initialize min-heap
 	h := &keyHeap{}
 	heap.Init(h)
@@ -464,13 +491,12 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 	// resumes after a partial page may legitimately return a key below another
 	// peer's cursor, so do not seed this set from prior-page cursors.
 	seenKeys := make(map[string]bool)
-	var peerCursors map[string]string
-	if trackPeerCursors {
-		// Keep prior progress for peers that did not advance on this page.
-		peerCursors = make(map[string]string, len(nodeResponses)+len(previousCursors))
-		for nodeID, key := range previousCursors {
-			peerCursors[nodeID] = key
-		}
+	// Keep the per-node cursors cumulative. New readers resume from their
+	// maximum as a global frontier; older readers still need the individual
+	// shard positions to avoid restarting a peer omitted from the latest page.
+	nodeCursors := make(map[string]string, len(nodeResponses)+len(previousCursors))
+	for nodeID, key := range previousCursors {
+		nodeCursors[nodeID] = key
 	}
 
 	// Merge until we have enough keys or heap is empty
@@ -483,10 +509,8 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 
 		// Pop minimum key
 		minNode := heap.Pop(h).(*heapNode)
-		if trackPeerCursors {
-			// Record consumption even when this key is a duplicate across shards.
-			peerCursors[minNode.nodeID] = minNode.key
-		}
+		// Record consumption even when this key is a duplicate across shards.
+		nodeCursors[minNode.nodeID] = minNode.key
 
 		// Deduplicate (shouldn't happen with proper partitioning, but handle it)
 		if !seenKeys[minNode.key] {
@@ -530,81 +554,157 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		}
 	}
 
-	return result, peerCursors, hasMore, nil
-}
-
-// parseContinuationToken returns the global exclusive resume key, whether it is
-// present, and any peer cursors. Plain start keys remain accepted; unmarked
-// legacy per-node maps resume globally at their greatest saved key.
-func (o *Operations) parseContinuationToken(token string, prefix string) (string, bool, map[string]string, error) {
-	if token == "" {
-		return "", false, nil, nil
+	if len(result.Keys) > 0 {
+		lastEmittedKey := result.Keys[len(result.Keys)-1]
+		// The local pages are sorted. Advance a peer through every key at or
+		// below the global cutoff, including duplicate copies the merge did not
+		// need to pop before filling the requested page.
+		for nodeID, nodeResp := range nodeResponses {
+			for i := 0; i < nodeResp.itemCount(); i++ {
+				key := nodeResp.keyAt(i)
+				if key > lastEmittedKey {
+					break
+				}
+				nodeCursors[nodeID] = key
+			}
+		}
 	}
 
+	return result, nodeCursors, hasMore, nil
+}
+
+// parseContinuationToken preserves the original raw-start and per-node token
+// forms while recognizing the new explicit global and peer modes.
+func (o *Operations) parseContinuationToken(token string, prefix string) (listCursorState, error) {
+	if token == "" {
+		return listCursorState{}, nil
+	}
+
+	plainStartKey := func() (listCursorState, error) {
+		return listCursorState{startKey: token, hasStartKey: true}, nil
+	}
 	decoded, err := base64.StdEncoding.DecodeString(token)
 	if err != nil {
 		zlog.Debug().Str("token", token).Msg("Token is not base64, treating as plain start key")
-		return token, true, nil, nil
+		return plainStartKey()
 	}
 
 	var fields continuationTokenFields
 	if err := json.Unmarshal(decoded, &fields); err != nil {
 		zlog.Debug().Str("token", token).Msg("Token is not valid JSON, treating as plain start key")
-		return token, true, nil, nil
+		return plainStartKey()
 	}
 	if len(fields.NodeCursors) == 0 {
 		zlog.Debug().Str("token", token).Msg("Token has no recognized cluster cursor, treating as plain start key")
-		return token, true, nil, nil
+		return plainStartKey()
 	}
 
 	var nodeCursors map[string]string
 	if err := json.Unmarshal(fields.NodeCursors, &nodeCursors); err != nil || len(nodeCursors) == 0 {
 		zlog.Debug().Str("token", token).Msg("Token has no recognized cluster cursor, treating as plain start key")
-		return token, true, nil, nil
+		return plainStartKey()
+	}
+
+	if fields.CursorMode != "" {
+		if fields.Prefix != prefix {
+			return listCursorState{}, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
+		}
+		switch fields.CursorMode {
+		case globalCursorMode:
+			if _, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor {
+				return listCursorState{}, fmt.Errorf("global token contains reserved node cursor")
+			}
+			lastKey, hasCursor := maxNodeCursor(nodeCursors)
+			return listCursorState{
+				startKey:      lastKey,
+				hasStartKey:   hasCursor,
+				nodeCursors:   nodeCursors,
+				knownProgress: true,
+			}, nil
+		default:
+			return listCursorState{}, fmt.Errorf("unsupported continuation cursor mode %q", fields.CursorMode)
+		}
 	}
 
 	if peerPrefix, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor && len(nodeCursors) > 1 {
+		// Current-format partial tokens did not set top-level Prefix. Accept
+		// them during migration, but require the new marker and any present
+		// top-level prefix to agree with the request.
+		if fields.Prefix != "" && fields.Prefix != prefix {
+			return listCursorState{}, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
+		}
 		if peerPrefix != prefix {
-			return "", false, nil, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", peerPrefix, prefix)
+			return listCursorState{}, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", peerPrefix, prefix)
 		}
 		delete(nodeCursors, clusterGlobalCursorNodeID)
-		return "", false, nodeCursors, nil
+		return listCursorState{nodeCursors: nodeCursors, peerCursors: true}, nil
 	}
 
 	if fields.Prefix != prefix {
-		return "", false, nil, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
+		return listCursorState{}, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
 	}
 	if lastKey, hasGlobalCursor := nodeCursors[clusterGlobalCursorNodeID]; hasGlobalCursor {
-		return lastKey, true, nil, nil
+		// Earlier global tokens used a singleton empty-ID cursor. Decode it, then
+		// seed real node IDs before writing the next token.
+		return listCursorState{startKey: lastKey, hasStartKey: true}, nil
 	}
 
-	// Legacy per-node tokens lack a fan-out marker and page history. Resume at
-	// their greatest cursor to preserve complete-page ordering.
-	var lastKey string
-	for _, cursor := range nodeCursors {
-		if cursor > lastKey {
-			lastKey = cursor
-		}
-	}
-	return lastKey, true, nil, nil
+	// Base-revision per-node tokens have no mode marker. Their greatest cursor
+	// remains the exclusive global resume point, while the per-node map is used
+	// to seed an old-reader-compatible token after this page.
+	lastKey, hasCursor := maxNodeCursor(nodeCursors)
+	return listCursorState{startKey: lastKey, hasStartKey: hasCursor, nodeCursors: nodeCursors}, nil
 }
 
-// encodeContinuationToken creates a compact continuation token from the last emitted key.
-func (o *Operations) encodeContinuationToken(lastKey string, prefix string) (string, error) {
-	// Reuse the legacy envelope with one global cursor. The empty node ID is
-	// reserved, so this entry cannot be confused with a real shard cursor.
-	ct := ContinuationToken{
-		NodeCursors: map[string]string{clusterGlobalCursorNodeID: lastKey},
-		Prefix:      prefix,
+func maxNodeCursor(nodeCursors map[string]string) (string, bool) {
+	var lastKey string
+	hasCursor := false
+	for _, cursor := range nodeCursors {
+		if !hasCursor || cursor > lastKey {
+			lastKey = cursor
+			hasCursor = true
+		}
 	}
+	return lastKey, hasCursor
+}
 
-	// Encode as JSON
+// canResumeGlobally reports whether a successful page after peer-mode recovery
+// has re-established a single frontier. Every earlier peer cursor must be at
+// or before the cutoff, and each response must cover through it or be exhausted.
+func canResumeGlobally(nodeResponses map[string]*NodeResponse, previousCursors map[string]string, keys []string) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	lastEmittedKey := keys[len(keys)-1]
+	if previousKey, hasPrevious := maxNodeCursor(previousCursors); hasPrevious && previousKey > lastEmittedKey {
+		return false
+	}
+	for _, nodeResp := range nodeResponses {
+		if nodeResp.HasMore && (nodeResp.itemCount() == 0 || nodeResp.keyAt(nodeResp.itemCount()-1) < lastEmittedKey) {
+			return false
+		}
+	}
+	return true
+}
+
+// encodeContinuationToken creates a global-resume token while retaining
+// per-node cursors for older coordinators that read the legacy envelope.
+func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, prefix string) (string, error) {
+	if len(nodeCursors) == 0 {
+		return "", nil
+	}
+	if _, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor {
+		return "", fmt.Errorf("node ID cannot be empty")
+	}
+	ct := ContinuationToken{
+		NodeCursors: nodeCursors,
+		Prefix:      prefix,
+		CursorMode:  globalCursorMode,
+	}
 	jsonBytes, err := json.Marshal(ct)
 	if err != nil {
 		return "", err
 	}
-
-	// Encode as base64
 	return base64.StdEncoding.EncodeToString(jsonBytes), nil
 }
 
@@ -613,8 +713,8 @@ func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, 
 		return "", nil
 	}
 
-	// The empty node ID is reserved. Store the prefix there so the partial
-	// cursor envelope needs no additional top-level fields.
+	// Older readers ignore the empty ID but keep the real node cursors. A
+	// nonempty top-level Prefix is required by their legacy token decoder.
 	cursors := make(map[string]string, len(peerCursors)+1)
 	cursors[clusterGlobalCursorNodeID] = prefix
 	for nodeID, key := range peerCursors {
@@ -623,7 +723,10 @@ func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, 
 		}
 		cursors[nodeID] = key
 	}
-	ct := peerContinuationToken{NodeCursors: cursors}
+	ct := ContinuationToken{
+		NodeCursors: cursors,
+		Prefix:      prefix,
+	}
 	jsonBytes, err := json.Marshal(ct)
 	if err != nil {
 		return "", err
