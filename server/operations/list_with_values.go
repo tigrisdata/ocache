@@ -41,7 +41,11 @@ func (o *Operations) ListPageWithValues(ctx context.Context, prefix string, limi
 		return merged.Entries, token, hasMore, nil
 	}
 
-	entries, token, hasMore, err := o.ListLocalWithValues(ctx, prefix, limit, continuationToken)
+	var cursor *string
+	if continuationToken != "" {
+		cursor = &continuationToken
+	}
+	entries, token, hasMore, err := o.listLocalWithValuesCursor(ctx, prefix, limit, cursor)
 	done(err)
 	return entries, token, hasMore, err
 }
@@ -65,6 +69,10 @@ func (o *Operations) ListLocalWithValues(ctx context.Context, prefix string, lim
 		cursor = &startKey
 	}
 
+	return o.listLocalWithValuesCursor(ctx, prefix, limit, cursor)
+}
+
+func (o *Operations) listLocalWithValuesCursor(ctx context.Context, prefix string, limit int, cursor *string) ([]*pb.KeyValue, string, bool, error) {
 	var storageEntries []stor.KeyValue
 	var lastKey string
 	var hasMore bool
