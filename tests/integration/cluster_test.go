@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -902,6 +903,23 @@ func testClusterListWithValuesPaginationPages(t *testing.T) {
 
 	values["\x00"] = putClusterListFixtureValue(t, fixture.nodeB, "\x00")
 	values[""] = putClusterListFixtureValue(t, fixture.nodeA, "")
+	firstEmptyPage, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Len(t, firstEmptyPage.Entries, 1)
+	require.Empty(t, firstEmptyPage.Entries[0].Key)
+	require.True(t, firstEmptyPage.HasMore)
+	emptyTokenBytes, err := base64.StdEncoding.DecodeString(firstEmptyPage.ContinuationToken)
+	require.NoError(t, err)
+	var emptyCursorToken serveroperations.ContinuationToken
+	require.NoError(t, json.Unmarshal(emptyTokenBytes, &emptyCursorToken))
+	require.Equal(t, "global-empty-v1", emptyCursorToken.CursorMode)
+	require.NotNil(t, emptyCursorToken.CursorPrefix)
+	require.Empty(t, *emptyCursorToken.CursorPrefix)
+	var oldReaderEmptyToken struct {
+		Prefix string `json:"prefix"`
+	}
+	require.NoError(t, json.Unmarshal(emptyTokenBytes, &oldReaderEmptyToken))
+	require.NotEqual(t, "", oldReaderEmptyToken.Prefix, "legacy readers must reject rather than replay an empty cursor")
 	allKeys := []string{"", "\x00", "a", "b", "c", legacyShapedStartKey, "p:a", "p:b", "p:c", "p:z", "z"}
 	checkPages("empty key", "", "", "", "", false, 1, 1, allKeys)
 
@@ -1048,6 +1066,70 @@ func listNextKeyUsingLegacyToken(
 	sort.Strings(candidates)
 	require.NotEmpty(t, candidates)
 	return candidates[0]
+}
+
+const emptyCursorCapabilityHeaderName = "x-ocache-empty-start-key-cursor-capability"
+
+type stripEmptyCursorCapabilityStream struct {
+	grpc.ServerTransportStream
+}
+
+func (s stripEmptyCursorCapabilityStream) SetHeader(md metadata.MD) error {
+	return s.ServerTransportStream.SetHeader(withoutEmptyCursorCapability(md))
+}
+
+func (s stripEmptyCursorCapabilityStream) SendHeader(md metadata.MD) error {
+	return s.ServerTransportStream.SendHeader(withoutEmptyCursorCapability(md))
+}
+
+func withoutEmptyCursorCapability(md metadata.MD) metadata.MD {
+	filtered := md.Copy()
+	filtered.Delete(emptyCursorCapabilityHeaderName)
+	return filtered
+}
+
+func emptyCursorCapabilityMissingOnNode(targetNodeID string) func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+	return func(nodeID string, next grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+		return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+			if nodeID == targetNodeID && (info.FullMethod == pb.CacheService_ListLocal_FullMethodName || info.FullMethod == pb.CacheService_ListLocalWithValues_FullMethodName) {
+				if stream := grpc.ServerTransportStreamFromContext(ctx); stream != nil {
+					ctx = grpc.NewContextWithServerTransportStream(ctx, stripEmptyCursorCapabilityStream{ServerTransportStream: stream})
+				}
+			}
+			return next(ctx, req, info, handler)
+		}
+	}
+}
+
+func testClusterListEmptyCursorCompatibilityGate(t *testing.T) {
+	fixture := newClusterListPaginationFixtureWithInterceptor(t, emptyCursorCapabilityMissingOnNode("cluster-node-2"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	putClusterListFixtureValue(t, fixture.nodeA, "")
+	putClusterListFixtureValue(t, fixture.nodeA, "z")
+	putClusterListFixtureValue(t, fixture.nodeB, "\x00")
+	putClusterListFixtureValue(t, fixture.nodeB, "a")
+
+	for _, withValues := range []bool{false, true} {
+		name := "List"
+		if withValues {
+			name = "ListWithValues"
+		}
+		t.Run(name, func(t *testing.T) {
+			if withValues {
+				response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: 1})
+				require.Error(t, err)
+				require.Nil(t, response)
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				return
+			}
+			response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: 1})
+			require.Error(t, err)
+			require.Nil(t, response)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+		})
+	}
 }
 
 func testClusterListRawStartKey(t *testing.T) {

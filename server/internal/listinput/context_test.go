@@ -10,6 +10,18 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+func TestEmptyStartKeyCursorCapability(t *testing.T) {
+	if HasEmptyStartKeyCursorCapability(nil) {
+		t.Fatal("missing capability header must not advertise support")
+	}
+	if !HasEmptyStartKeyCursorCapability(metadata.Pairs(emptyStartKeyCursorCapabilityMetadata, emptyStartKeyCursorCapabilityVersion)) {
+		t.Fatal("recognized capability header was not accepted")
+	}
+	if HasEmptyStartKeyCursorCapability(metadata.Pairs(emptyStartKeyCursorCapabilityMetadata, "other")) {
+		t.Fatal("unknown capability version must not be accepted")
+	}
+}
+
 func TestEmptyStartKeyCursorMetadataReplacesMarker(t *testing.T) {
 	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs(
 		"x-existing", "preserved",

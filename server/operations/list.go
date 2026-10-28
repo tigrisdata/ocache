@@ -17,6 +17,10 @@ import (
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/internal/listinput"
 	"github.com/tigrisdata/ocache/storage/retry"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -28,15 +32,17 @@ const (
 
 // ContinuationToken represents the state for resuming a paginated list operation.
 type ContinuationToken struct {
-	NodeCursors map[string]string `json:"node_cursors"`          // Per-node cursors; an empty ID marks a partial-page token.
-	Prefix      string            `json:"prefix,omitempty"`      // Original prefix; empty is the legacy zero value.
-	CursorMode  string            `json:"cursor_mode,omitempty"` // New global mode; legacy readers ignore it.
+	NodeCursors  map[string]string `json:"node_cursors"`            // Per-node cursors; an empty ID marks a partial-page token.
+	Prefix       string            `json:"prefix,omitempty"`        // Legacy prefix; empty is the zero value.
+	CursorMode   string            `json:"cursor_mode,omitempty"`   // New cursor mode; legacy readers ignore it.
+	CursorPrefix *string           `json:"cursor_prefix,omitempty"` // Actual prefix for empty-cursor formats.
 }
 
 type continuationTokenFields struct {
-	NodeCursors json.RawMessage `json:"node_cursors"`
-	Prefix      string          `json:"prefix"`
-	CursorMode  string          `json:"cursor_mode"`
+	NodeCursors  json.RawMessage `json:"node_cursors"`
+	Prefix       string          `json:"prefix"`
+	CursorMode   string          `json:"cursor_mode"`
+	CursorPrefix *string         `json:"cursor_prefix"`
 }
 
 // The empty node ID is reserved for partial-page tokens. Coordinator node IDs
@@ -44,7 +50,17 @@ type continuationTokenFields struct {
 // per-node cursors in the same envelope.
 const clusterGlobalCursorNodeID = ""
 
-const globalCursorMode = "global-v1"
+const (
+	globalCursorMode      = "global-v1"
+	globalEmptyCursorMode = "global-empty-v1"
+	peerEmptyCursorMode   = "peers-empty-v1"
+)
+
+// legacyRejectingPrefix makes a base decoder fail its prefix check instead of
+// silently treating an empty cursor as a fresh scan.
+func legacyRejectingPrefix(prefix string) string {
+	return prefix + "\x00"
+}
 
 type listCursorState struct {
 	startKey    string
@@ -85,11 +101,12 @@ func (h *keyHeap) Pop() interface{} {
 // NodeResponse holds the response from a single node.
 // In keys-only mode, Keys is populated. In withValues mode, Entries is populated.
 type NodeResponse struct {
-	NodeID            string
-	Keys              []string       // populated in keys-only mode
-	Entries           []*pb.KeyValue // populated in withValues mode
-	ContinuationToken string
-	HasMore           bool
+	NodeID                      string
+	Keys                        []string       // populated in keys-only mode
+	Entries                     []*pb.KeyValue // populated in withValues mode
+	ContinuationToken           string
+	HasMore                     bool
+	supportsEmptyStartKeyCursor bool
 }
 
 // itemCount returns the number of items in this response.
@@ -297,6 +314,16 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 		return &mergeResult{Keys: []string{}}, "", false, nil
 	}
 
+	allNodesSupportEmptyCursor := allActiveNodesSupportEmptyCursor(nodes, nodeResponses)
+	// A legacy local handler treats an empty StartKey as a fresh scan. Do not
+	// consume or expose an empty-cursor continuation unless every active peer
+	// advertises support for the explicit cursor marker.
+	needsEmptyCursor := (cursor.hasStartKey && cursor.startKey == "") ||
+		(cursor.peerCursors && hasEmptyNodeCursor(previousCursors))
+	if needsEmptyCursor && !allNodesSupportEmptyCursor {
+		return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every active node to support explicit empty cursors")
+	}
+
 	// Partial fan-outs keep the responding peers' progress in peer-cursor tokens.
 	partialFanout := len(nodeResponses) < len(nodes)
 	merged, pageCursors, hasMore, err := o.kWayMerge(ctx, nodeResponses, limit, withValues, previousCursors)
@@ -310,10 +337,21 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 		if !peerPage && cursor.peerCursors {
 			peerPage = !canResumeGlobally(nodeResponses, previousCursors, merged.Keys)
 		}
+		if !peerPage && len(merged.Keys) > 0 {
+			frontier := merged.Keys[len(merged.Keys)-1]
+			if frontier != "" {
+				advanceEmptyNodeCursors(pageCursors, frontier)
+			}
+		}
+		// If the page still needs an empty per-node cursor, fail closed when any
+		// active peer is old or did not answer the capability check.
+		if hasEmptyNodeCursor(pageCursors) && !allNodesSupportEmptyCursor {
+			return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every active node to support explicit empty cursors")
+		}
 		if peerPage {
-			newToken, err = o.encodePeerContinuationToken(pageCursors, prefix)
+			newToken, err = o.encodePeerContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
 		} else {
-			newToken, err = o.encodeContinuationToken(pageCursors, prefix)
+			newToken, err = o.encodeContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
 		}
 		if err == nil && newToken == "" {
 			err = fmt.Errorf("list has more results but no continuation token")
@@ -387,6 +425,7 @@ func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, no
 			var err error
 
 			if n.ID == localNodeID {
+				resp.supportsEmptyStartKeyCursor = true
 				localCtx := ctx
 				if cursorPresent {
 					localCtx = listinput.WithStartKey(ctx, nodeStartKey)
@@ -410,8 +449,9 @@ func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, no
 				}
 
 				rpcCtx := listinput.WithEmptyStartKeyCursor(ctx, emptyCursorPresent)
+				var responseHeaders metadata.MD
 				if withValues {
-					pbResp, respErr := client.ListLocalWithValues(rpcCtx, req)
+					pbResp, respErr := client.ListLocalWithValues(rpcCtx, req, grpc.Header(&responseHeaders))
 					if respErr != nil {
 						err = respErr
 					} else {
@@ -419,7 +459,7 @@ func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, no
 						resp.HasMore = pbResp.HasMore
 					}
 				} else {
-					pbResp, respErr := client.ListLocal(rpcCtx, req)
+					pbResp, respErr := client.ListLocal(rpcCtx, req, grpc.Header(&responseHeaders))
 					if respErr != nil {
 						err = respErr
 					} else {
@@ -427,6 +467,7 @@ func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, no
 						resp.HasMore = pbResp.HasMore
 					}
 				}
+				resp.supportsEmptyStartKeyCursor = listinput.HasEmptyStartKeyCursorCapability(responseHeaders)
 			}
 
 			if err != nil {
@@ -455,7 +496,39 @@ func (o *Operations) fetchFromAllNodesWithCursorPresence(ctx context.Context, no
 	return responses, nil
 }
 
-// kWayMerge performs K-way merge of sorted responses from nodes using a min-heap.
+// allActiveNodesSupportEmptyCursor requires a positive response from every
+// active shard; a missing response or header is not evidence of support.
+func allActiveNodesSupportEmptyCursor(nodes []*ring.NodeInfo, responses map[string]*NodeResponse) bool {
+	if len(responses) != len(nodes) {
+		return false
+	}
+	for _, node := range nodes {
+		response, ok := responses[node.ID]
+		if !ok || !response.supportsEmptyStartKeyCursor {
+			return false
+		}
+	}
+	return true
+}
+
+func hasEmptyNodeCursor(cursors map[string]string) bool {
+	for _, cursor := range cursors {
+		if cursor == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func advanceEmptyNodeCursors(cursors map[string]string, frontier string) {
+	for nodeID, cursor := range cursors {
+		if nodeID != clusterGlobalCursorNodeID && cursor == "" {
+			cursors[nodeID] = frontier
+		}
+	}
+}
+
+// kWayMerge performs K-way merge of responses from nodes using a min-heap.
 // Works for both keys-only and withValues modes via NodeResponse.keyAt/itemCount.
 func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*NodeResponse, limit int, withValues bool, previousCursors map[string]string) (*mergeResult, map[string]string, bool, error) {
 	// Initialize min-heap
@@ -606,11 +679,11 @@ func (o *Operations) parseContinuationToken(token string, prefix string) (listCu
 	}
 
 	if fields.CursorMode != "" {
-		if fields.Prefix != prefix {
-			return listCursorState{}, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
-		}
 		switch fields.CursorMode {
 		case globalCursorMode:
+			if fields.Prefix != prefix {
+				return listCursorState{}, fmt.Errorf("prefix mismatch: token has '%s', request has '%s'", fields.Prefix, prefix)
+			}
 			if _, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor {
 				return listCursorState{}, fmt.Errorf("global token contains reserved node cursor")
 			}
@@ -621,6 +694,30 @@ func (o *Operations) parseContinuationToken(token string, prefix string) (listCu
 				nodeCursors:   nodeCursors,
 				knownProgress: true,
 			}, nil
+		case globalEmptyCursorMode:
+			if fields.CursorPrefix == nil || *fields.CursorPrefix != prefix || fields.Prefix != legacyRejectingPrefix(prefix) {
+				return listCursorState{}, fmt.Errorf("empty-cursor token prefix mismatch")
+			}
+			if _, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor {
+				return listCursorState{}, fmt.Errorf("global token contains reserved node cursor")
+			}
+			lastKey, hasCursor := maxNodeCursor(nodeCursors)
+			return listCursorState{
+				startKey:      lastKey,
+				hasStartKey:   hasCursor,
+				nodeCursors:   nodeCursors,
+				knownProgress: true,
+			}, nil
+		case peerEmptyCursorMode:
+			if fields.CursorPrefix == nil || *fields.CursorPrefix != prefix || fields.Prefix != legacyRejectingPrefix(prefix) {
+				return listCursorState{}, fmt.Errorf("empty-peer token prefix mismatch")
+			}
+			peerPrefix, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]
+			if !hasReservedCursor || len(nodeCursors) <= 1 || peerPrefix != prefix {
+				return listCursorState{}, fmt.Errorf("empty-peer token is missing valid per-node cursors")
+			}
+			delete(nodeCursors, clusterGlobalCursorNodeID)
+			return listCursorState{nodeCursors: nodeCursors, peerCursors: true, knownProgress: true}, nil
 		default:
 			return listCursorState{}, fmt.Errorf("unsupported continuation cursor mode %q", fields.CursorMode)
 		}
@@ -689,17 +786,24 @@ func canResumeGlobally(nodeResponses map[string]*NodeResponse, previousCursors m
 
 // encodeContinuationToken creates a global-resume token while retaining
 // per-node cursors for older coordinators that read the legacy envelope.
-func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, prefix string) (string, error) {
+func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, prefix string, allNodesSupportEmptyCursor bool) (string, error) {
 	if len(nodeCursors) == 0 {
 		return "", nil
 	}
 	if _, hasReservedCursor := nodeCursors[clusterGlobalCursorNodeID]; hasReservedCursor {
 		return "", fmt.Errorf("node ID cannot be empty")
 	}
-	ct := ContinuationToken{
-		NodeCursors: nodeCursors,
-		Prefix:      prefix,
-		CursorMode:  globalCursorMode,
+	ct := ContinuationToken{NodeCursors: nodeCursors, Prefix: prefix}
+	if hasEmptyNodeCursor(nodeCursors) {
+		if !allNodesSupportEmptyCursor {
+			return "", status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every active node to support explicit empty cursors")
+		}
+		cursorPrefix := prefix
+		ct.Prefix = legacyRejectingPrefix(prefix)
+		ct.CursorMode = globalEmptyCursorMode
+		ct.CursorPrefix = &cursorPrefix
+	} else if allNodesSupportEmptyCursor {
+		ct.CursorMode = globalCursorMode
 	}
 	jsonBytes, err := json.Marshal(ct)
 	if err != nil {
@@ -708,7 +812,7 @@ func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, pref
 	return base64.StdEncoding.EncodeToString(jsonBytes), nil
 }
 
-func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, prefix string) (string, error) {
+func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, prefix string, allNodesSupportEmptyCursor bool) (string, error) {
 	if len(peerCursors) == 0 {
 		return "", nil
 	}
@@ -723,9 +827,15 @@ func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, 
 		}
 		cursors[nodeID] = key
 	}
-	ct := ContinuationToken{
-		NodeCursors: cursors,
-		Prefix:      prefix,
+	ct := ContinuationToken{NodeCursors: cursors, Prefix: prefix}
+	if hasEmptyNodeCursor(peerCursors) {
+		if !allNodesSupportEmptyCursor {
+			return "", status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every active node to support explicit empty cursors")
+		}
+		cursorPrefix := prefix
+		ct.Prefix = legacyRejectingPrefix(prefix)
+		ct.CursorMode = peerEmptyCursorMode
+		ct.CursorPrefix = &cursorPrefix
 	}
 	jsonBytes, err := json.Marshal(ct)
 	if err != nil {

@@ -73,6 +73,7 @@ func TestIntegration_Cluster(t *testing.T) {
 	})
 	t.Run("ListWithValuesPagination", testClusterListWithValuesPagination)
 	t.Run("ListLegacyReaderCompatibility", testClusterListLegacyReaderCompatibility)
+	t.Run("ListEmptyCursorCompatibilityGate", testClusterListEmptyCursorCompatibilityGate)
 	t.Run("ListPartialFailureRecovery", testClusterListPartialFailureRecovery)
 	t.Run("ListRawStartKeyCompatibility", testClusterListRawStartKey)
 	t.Run("ListContinuationTokenSize", testClusterListContinuationTokenSize)

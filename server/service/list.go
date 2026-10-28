@@ -85,6 +85,7 @@ func (s *CacheService) ListLocal(ctx context.Context, req *pb.ListRequest) (*pb.
 	}
 
 	metrics.RPCRequests.WithLabelValues("ListLocal", "success").Inc()
+	listinput.AdvertiseEmptyStartKeyCursorCapability(ctx)
 	return &pb.ListResponse{
 		Keys:              keys,
 		ContinuationToken: token,

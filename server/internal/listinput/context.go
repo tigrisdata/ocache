@@ -8,10 +8,15 @@ package listinput
 import (
 	"context"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
 
-const emptyStartKeyCursorMetadata = "x-ocache-empty-start-key-cursor"
+const (
+	emptyStartKeyCursorMetadata           = "x-ocache-empty-start-key-cursor"
+	emptyStartKeyCursorCapabilityMetadata = "x-ocache-empty-start-key-cursor-capability"
+	emptyStartKeyCursorCapabilityVersion  = "v1"
+)
 
 type startKeyContextKey struct{}
 
@@ -51,6 +56,23 @@ func HasEmptyStartKeyCursor(ctx context.Context) bool {
 	}
 	for _, value := range md.Get(emptyStartKeyCursorMetadata) {
 		if value == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+// AdvertiseEmptyStartKeyCursorCapability reports that this node-local handler
+// preserves explicit empty exclusive cursors. Older handlers omit the header.
+func AdvertiseEmptyStartKeyCursorCapability(ctx context.Context) {
+	_ = grpc.SendHeader(ctx, metadata.Pairs(emptyStartKeyCursorCapabilityMetadata, emptyStartKeyCursorCapabilityVersion))
+}
+
+// HasEmptyStartKeyCursorCapability reports whether a node-local response came
+// from a handler that understands explicit empty exclusive cursors.
+func HasEmptyStartKeyCursorCapability(md metadata.MD) bool {
+	for _, value := range md.Get(emptyStartKeyCursorCapabilityMetadata) {
+		if value == emptyStartKeyCursorCapabilityVersion {
 			return true
 		}
 	}
