@@ -119,6 +119,7 @@ type ClusterTestHarness struct {
 	Client                  cacheclient.CacheClient
 	NodeCount               int
 	Config                  IntegrationTestConfig
+	replicationFactor       int
 	Metrics                 *TestMetrics
 	NodeMetrics             map[string]*NodeMetrics // Per-node metrics
 	grpcPorts               []int                   // Dynamically allocated gRPC ports
@@ -216,8 +217,9 @@ func (h *ClusterTestHarness) StartNode(nodeIndex int) (*ClusterServerNode, error
 			MinReadyDuration:     0,                      // No minimum ready duration for testing
 			UnregisterOnShutdown: true,                   // Remove from ring on shutdown for clean departure
 			RingConfig: ring.Config{
-				HeartbeatPeriod:  100 * time.Millisecond, // Fast heartbeat for testing
-				HeartbeatTimeout: 10 * time.Second,       // Longer timeout to account for gossip delay
+				HeartbeatPeriod:   100 * time.Millisecond, // Fast heartbeat for testing
+				HeartbeatTimeout:  10 * time.Second,       // Longer timeout to account for gossip delay
+				ReplicationFactor: h.replicationFactor,
 			},
 		},
 		Registerer: prometheus.NewRegistry(), // Use fresh registry to avoid duplicate registration

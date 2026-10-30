@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	serveroperations "github.com/tigrisdata/ocache/server/operations"
 	"google.golang.org/grpc"
@@ -621,12 +622,22 @@ func newClusterListPaginationFixtureWithNodeCount(
 	nodeCount int,
 	interceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor,
 ) *clusterListPaginationFixture {
+	return newClusterListPaginationFixtureWithReplicationFactor(t, nodeCount, 0, interceptorFactory)
+}
+
+func newClusterListPaginationFixtureWithReplicationFactor(
+	t *testing.T,
+	nodeCount int,
+	replicationFactor int,
+	interceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor,
+) *clusterListPaginationFixture {
 	t.Helper()
 
 	config := DefaultIntegrationTestConfig()
 	config.CleanupInterval = time.Hour
 	config.RecompactionInterval = time.Hour
 	harness := NewClusterTestHarness(t, nodeCount, config)
+	harness.replicationFactor = replicationFactor
 	harness.unaryInterceptorFactory = interceptorFactory
 	t.Cleanup(harness.Cleanup)
 	if err := harness.StartAllNodes(); err != nil {
@@ -1111,6 +1122,50 @@ func testClusterListEmptyCursorCompatibilityGate(t *testing.T) {
 	putClusterListFixtureValue(t, fixture.nodeB, "\x00")
 	putClusterListFixtureValue(t, fixture.nodeB, "a")
 
+	requireClusterListEmptyCursorGate(t, fixture, ctx)
+}
+
+func testClusterListLeavingNodeCompatibilityGate(t *testing.T) {
+	fixture := newClusterListPaginationFixtureWithReplicationFactor(t, 3, 2, emptyCursorCapabilityMissingOnNode("cluster-node-3"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	putClusterListFixtureValue(t, fixture.nodeA, "")
+	putClusterListFixtureValue(t, fixture.nodeA, "z")
+	putClusterListFixtureValue(t, fixture.nodeB, "b")
+	putClusterListFixtureValue(t, fixture.nodeB, "c")
+	putClusterListFixtureValue(t, fixture.nodeC, "\x00")
+	putClusterListFixtureValue(t, fixture.nodeC, "a")
+
+	// Keep two active shards while node 3 leaves. The harness keeps the public
+	// listener alive through Coordinator.Stop; AnnounceLeaving exposes that window
+	// without stopping gRPC.
+	require.NoError(t, fixture.nodeC.Coordinator.GetRing().AnnounceLeaving(ctx))
+	require.Eventually(t, func() bool {
+		for _, node := range fixture.nodeA.Coordinator.GetRing().GetAllNodes() {
+			if node.ID == fixture.nodeC.NodeID {
+				return node.Status == ring.NodeStatusLeaving
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+	activeNodes := fixture.nodeA.Coordinator.GetRing().GetActiveNodes()
+	require.Len(t, activeNodes, 2)
+	for _, node := range activeNodes {
+		require.NotEqual(t, fixture.nodeC.NodeID, node.ID)
+	}
+
+	var headers metadata.MD
+	localClient := pb.NewCacheServiceClient(fixture.nodeC.ClusterConn)
+	_, err := localClient.ListLocal(ctx, &pb.ListRequest{Limit: 1}, grpc.Header(&headers))
+	require.NoError(t, err)
+	require.Empty(t, headers.Get(emptyCursorCapabilityHeaderName))
+
+	requireClusterListEmptyCursorGate(t, fixture, ctx)
+}
+
+func requireClusterListEmptyCursorGate(t *testing.T, fixture *clusterListPaginationFixture, ctx context.Context) {
+	t.Helper()
 	for _, withValues := range []bool{false, true} {
 		name := "List"
 		if withValues {
@@ -1121,13 +1176,13 @@ func testClusterListEmptyCursorCompatibilityGate(t *testing.T) {
 				response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: 1})
 				require.Error(t, err)
 				require.Nil(t, response)
-				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Equal(t, codes.FailedPrecondition, status.Code(err), "ListWithValues error: %v", err)
 				return
 			}
 			response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: 1})
 			require.Error(t, err)
 			require.Nil(t, response)
-			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.Equal(t, codes.FailedPrecondition, status.Code(err), "List error: %v", err)
 		})
 	}
 }
