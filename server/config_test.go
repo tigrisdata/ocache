@@ -23,3 +23,20 @@ func TestLoadConfig_CompactionBytesPerSecond(t *testing.T) {
 
 	require.Equal(t, limit, AppConfig.CompactionBytesPerSecond)
 }
+
+func TestLoadConfig_EnableEmptyKeyListPagination(t *testing.T) {
+	originalFlag := *enableEmptyKeyListPagination
+	originalConfig := AppConfig
+	t.Cleanup(func() {
+		*enableEmptyKeyListPagination = originalFlag
+		AppConfig = originalConfig
+	})
+
+	*enableEmptyKeyListPagination = false
+	LoadConfig()
+	require.False(t, AppConfig.EnableEmptyKeyListPagination)
+
+	*enableEmptyKeyListPagination = true
+	LoadConfig()
+	require.True(t, AppConfig.EnableEmptyKeyListPagination)
+}

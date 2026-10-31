@@ -317,18 +317,19 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 	allNodesSupportEmptyCursor := allActiveNodesSupportEmptyCursor(nodes, nodeResponses)
 	emptyCursorCapabilityChecked := false
 	// A legacy local handler treats an empty StartKey as a fresh scan. Check
-	// every healthy ring member, not only active shards: LEAVING nodes continue
-	// serving their public listener until shutdown.
+	// the currently healthy ring view, including LEAVING nodes. The separate
+	// operator option below gates issuance because this view cannot inventory
+	// every endpoint that may receive a public continuation token.
 	needsEmptyCursor := (cursor.hasStartKey && cursor.startKey == "") ||
 		(cursor.peerCursors && hasEmptyNodeCursor(previousCursors))
 	if needsEmptyCursor {
-		allNodesSupportEmptyCursor, err = o.allRingNodesSupportEmptyCursor(ctx, ringMgr.GetAllNodes(), nodes, nodeResponses, prefix)
+		allNodesSupportEmptyCursor, err = o.allHealthyRingNodesSupportEmptyCursor(ctx, ringMgr.GetAllNodes(), nodes, nodeResponses, prefix)
 		if err != nil {
 			return nil, "", false, err
 		}
 		emptyCursorCapabilityChecked = true
 		if !allNodesSupportEmptyCursor {
-			return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every serving ring member to support explicit empty cursors")
+			return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
 		}
 	}
 
@@ -351,15 +352,20 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 				advanceEmptyNodeCursors(pageCursors, frontier)
 			}
 		}
-		if hasEmptyNodeCursor(pageCursors) && !emptyCursorCapabilityChecked {
-			allNodesSupportEmptyCursor, err = o.allRingNodesSupportEmptyCursor(ctx, ringMgr.GetAllNodes(), nodes, nodeResponses, prefix)
-			if err != nil {
-				return nil, "", false, err
+		if hasEmptyNodeCursor(pageCursors) {
+			if !o.coordinator.AllowsEmptyKeyListPagination() {
+				return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key is disabled; enable the cluster empty-key pagination option only after every endpoint that may receive continuation tokens supports explicit empty cursors")
 			}
-			emptyCursorCapabilityChecked = true
-		}
-		if hasEmptyNodeCursor(pageCursors) && !allNodesSupportEmptyCursor {
-			return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every serving ring member to support explicit empty cursors")
+			if !emptyCursorCapabilityChecked {
+				allNodesSupportEmptyCursor, err = o.allHealthyRingNodesSupportEmptyCursor(ctx, ringMgr.GetAllNodes(), nodes, nodeResponses, prefix)
+				if err != nil {
+					return nil, "", false, err
+				}
+				emptyCursorCapabilityChecked = true
+			}
+			if !allNodesSupportEmptyCursor {
+				return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
+			}
 		}
 		if peerPage {
 			newToken, err = o.encodePeerContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
@@ -524,32 +530,33 @@ func allActiveNodesSupportEmptyCursor(nodes []*ring.NodeInfo, responses map[stri
 	return true
 }
 
-// allRingNodesSupportEmptyCursor checks non-active members because their public
-// listeners can keep serving while they are JOINING or LEAVING.
-func (o *Operations) allRingNodesSupportEmptyCursor(
+// allHealthyRingNodesSupportEmptyCursor checks non-active members in the current
+// healthy ring view. This view is not an inventory of public endpoints; the
+// explicit operator option gates issuance for endpoints outside that view.
+func (o *Operations) allHealthyRingNodesSupportEmptyCursor(
 	ctx context.Context,
-	allNodes, activeNodes []*ring.NodeInfo,
+	healthyNodes, activeNodes []*ring.NodeInfo,
 	responses map[string]*NodeResponse,
 	prefix string,
 ) (bool, error) {
-	if !allActiveNodesSupportEmptyCursor(activeNodes, responses) || len(allNodes) == 0 {
+	if !allActiveNodesSupportEmptyCursor(activeNodes, responses) || len(healthyNodes) == 0 {
 		return false, nil
 	}
 
 	activeNodeIDs := make(map[string]struct{}, len(activeNodes))
-	allNodeIDs := make(map[string]struct{}, len(allNodes))
-	for _, node := range allNodes {
+	healthyNodeIDs := make(map[string]struct{}, len(healthyNodes))
+	for _, node := range healthyNodes {
 		if node == nil || node.ID == "" {
 			return false, nil
 		}
-		allNodeIDs[node.ID] = struct{}{}
+		healthyNodeIDs[node.ID] = struct{}{}
 	}
 	for _, node := range activeNodes {
 		if node == nil {
 			return false, nil
 		}
 		activeNodeIDs[node.ID] = struct{}{}
-		if _, found := allNodeIDs[node.ID]; !found {
+		if _, found := healthyNodeIDs[node.ID]; !found {
 			return false, nil
 		}
 	}
@@ -565,7 +572,7 @@ func (o *Operations) allRingNodesSupportEmptyCursor(
 	}
 	sem := make(chan struct{}, maxListNodeFanout)
 	var wg sync.WaitGroup
-	for _, node := range allNodes {
+	for _, node := range healthyNodes {
 		if _, active := activeNodeIDs[node.ID]; active || node.ID == localNodeID {
 			continue
 		}
@@ -889,7 +896,7 @@ func (o *Operations) encodeContinuationToken(nodeCursors map[string]string, pref
 	ct := ContinuationToken{NodeCursors: nodeCursors, Prefix: prefix}
 	if hasEmptyNodeCursor(nodeCursors) {
 		if !allNodesSupportEmptyCursor {
-			return "", status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every serving ring member to support explicit empty cursors")
+			return "", status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
 		}
 		cursorPrefix := prefix
 		ct.Prefix = legacyRejectingPrefix(prefix)
@@ -923,7 +930,7 @@ func (o *Operations) encodePeerContinuationToken(peerCursors map[string]string, 
 	ct := ContinuationToken{NodeCursors: cursors, Prefix: prefix}
 	if hasEmptyNodeCursor(peerCursors) {
 		if !allNodesSupportEmptyCursor {
-			return "", status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every serving ring member to support explicit empty cursors")
+			return "", status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
 		}
 		cursorPrefix := prefix
 		ct.Prefix = legacyRejectingPrefix(prefix)

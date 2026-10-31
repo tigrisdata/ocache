@@ -109,15 +109,29 @@ OCache can be configured through command-line flags when starting the server.
 
 ### Cluster Configuration
 
-| Flag                  | Type     | Default | Description                                                                    |
-| --------------------- | -------- | ------- | ------------------------------------------------------------------------------ |
-| `-cluster-enabled`    | bool     | false   | Enable cluster mode for distributed caching                                    |
-| `-node-id`            | string   | ""      | Unique node identifier (required in cluster mode)                              |
-| `-cluster-addr`       | string   | `:7000` | Address for internal cluster communication                                     |
-| `-seeds`              | string   | ""      | Comma-separated seed nodes for cluster discovery (e.g., node1:7000,node2:7000) |
-| `-partition-count`    | int      | 16384   | Number of partitions in the consistent hash ring                               |
-| `-heartbeat-interval` | duration | 5s      | Interval between heartbeat messages                                            |
-| `-failure-threshold`  | int      | 3       | Number of missed heartbeats before marking a node as down                      |
+| Flag                                         | Type     | Default | Description                                                                    |
+| -------------------------------------------- | -------- | ------- | ------------------------------------------------------------------------------ |
+| `-cluster-enabled`                           | bool     | false   | Enable cluster mode for distributed caching                                    |
+| `-enable-cluster-list-empty-key-pagination`  | bool     | false   | Allow cluster list continuation after an empty key; requires an explicit rollout |
+| `-node-id`                                   | string   | ""      | Unique node identifier (required in cluster mode)                              |
+| `-cluster-addr`                              | string   | `:7000` | Address for internal cluster communication                                     |
+| `-seeds`                                     | string   | ""      | Comma-separated seed nodes for cluster discovery (e.g., node1:7000,node2:7000) |
+| `-partition-count`                           | int      | 16384   | Number of partitions in the consistent hash ring                               |
+| `-heartbeat-interval`                        | duration | 5s      | Interval between heartbeat messages                                            |
+| `-failure-threshold`                          | int      | 3       | Number of missed heartbeats before marking a node as down                      |
+
+**Empty-key pagination rollout.** The empty-key continuation format cannot be
+resumed by older servers. Keep `-enable-cluster-list-empty-key-pagination`
+disabled until every public `List` and `ListWithValues` endpoint that may
+receive continuation tokens supports explicit empty-key cursors; this includes
+endpoints outside the healthy ring view. Then enable it on every coordinator
+that may issue tokens. The flag is read at startup, so changing it requires a
+restart. Keep it enabled while those tokens may still be submitted. Ring
+capability checks are an additional guard, not an inventory of public endpoints.
+With the setting disabled, a page that needs an empty-key continuation returns
+`FailedPrecondition` without a page.
+The embedded client has the equivalent `Config.EnableEmptyKeyListPagination`
+option, also disabled by default.
 
 ### Logging
 

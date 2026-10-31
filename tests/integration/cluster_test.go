@@ -631,6 +631,16 @@ func newClusterListPaginationFixtureWithReplicationFactor(
 	replicationFactor int,
 	interceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor,
 ) *clusterListPaginationFixture {
+	return newClusterListPaginationFixtureWithOptions(t, nodeCount, replicationFactor, interceptorFactory, true)
+}
+
+func newClusterListPaginationFixtureWithOptions(
+	t *testing.T,
+	nodeCount int,
+	replicationFactor int,
+	interceptorFactory func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor,
+	enableEmptyKeyListPagination bool,
+) *clusterListPaginationFixture {
 	t.Helper()
 
 	config := DefaultIntegrationTestConfig()
@@ -638,6 +648,7 @@ func newClusterListPaginationFixtureWithReplicationFactor(
 	config.RecompactionInterval = time.Hour
 	harness := NewClusterTestHarness(t, nodeCount, config)
 	harness.replicationFactor = replicationFactor
+	harness.enableEmptyKeyListPagination = enableEmptyKeyListPagination
 	harness.unaryInterceptorFactory = interceptorFactory
 	t.Cleanup(harness.Cleanup)
 	if err := harness.StartAllNodes(); err != nil {
@@ -1125,6 +1136,39 @@ func testClusterListEmptyCursorCompatibilityGate(t *testing.T) {
 	requireClusterListEmptyCursorGate(t, fixture, ctx)
 }
 
+func testClusterListEmptyCursorRolloutGate(t *testing.T) {
+	fixture := newClusterListPaginationFixtureWithOptions(t, 2, 0, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	putClusterListFixtureValue(t, fixture.nodeA, "")
+	putClusterListFixtureValue(t, fixture.nodeA, "z")
+	putClusterListFixtureValue(t, fixture.nodeB, "\x00")
+	putClusterListFixtureValue(t, fixture.nodeB, "a")
+
+	for _, withValues := range []bool{false, true} {
+		name := "List"
+		if withValues {
+			name = "ListWithValues"
+		}
+		t.Run(name, func(t *testing.T) {
+			if withValues {
+				response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: 1})
+				require.Error(t, err)
+				require.Nil(t, response)
+				require.Equal(t, codes.FailedPrecondition, status.Code(err))
+				require.Contains(t, err.Error(), "is disabled")
+				return
+			}
+			response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: 1})
+			require.Error(t, err)
+			require.Nil(t, response)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.Contains(t, err.Error(), "is disabled")
+		})
+	}
+}
+
 func testClusterListLeavingNodeCompatibilityGate(t *testing.T) {
 	fixture := newClusterListPaginationFixtureWithReplicationFactor(t, 3, 2, emptyCursorCapabilityMissingOnNode("cluster-node-3"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1177,12 +1221,14 @@ func requireClusterListEmptyCursorGate(t *testing.T, fixture *clusterListPaginat
 				require.Error(t, err)
 				require.Nil(t, response)
 				require.Equal(t, codes.FailedPrecondition, status.Code(err), "ListWithValues error: %v", err)
+				require.Contains(t, err.Error(), "currently healthy ring member")
 				return
 			}
 			response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: 1})
 			require.Error(t, err)
 			require.Nil(t, response)
 			require.Equal(t, codes.FailedPrecondition, status.Code(err), "List error: %v", err)
+			require.Contains(t, err.Error(), "currently healthy ring member")
 		})
 	}
 }
