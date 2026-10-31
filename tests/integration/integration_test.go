@@ -71,6 +71,9 @@ func TestIntegration_Cluster(t *testing.T) {
 	t.Run("ClusterSuite", func(t *testing.T) {
 		TestIntegrationCluster(t)
 	})
+	if testing.Short() {
+		return
+	}
 	t.Run("ListWithValuesPagination", testClusterListWithValuesPagination)
 	t.Run("ListLegacyReaderCompatibility", testClusterListLegacyReaderCompatibility)
 	t.Run("ListEmptyCursorCompatibilityGate", testClusterListEmptyCursorCompatibilityGate)
