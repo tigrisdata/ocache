@@ -41,11 +41,7 @@ func (o *Operations) ListPageWithValues(ctx context.Context, prefix string, limi
 		return merged.Entries, token, hasMore, nil
 	}
 
-	var cursor *string
-	if continuationToken != "" {
-		cursor = &continuationToken
-	}
-	entries, token, hasMore, err := o.listLocalWithValuesCursor(ctx, prefix, limit, cursor)
+	entries, token, hasMore, err := o.ListLocalWithValues(ctx, prefix, limit, continuationToken)
 	done(err)
 	return entries, token, hasMore, err
 }

@@ -75,6 +75,8 @@ func TestIntegration_Cluster(t *testing.T) {
 	t.Run("ListLegacyReaderCompatibility", testClusterListLegacyReaderCompatibility)
 	t.Run("ListEmptyCursorCompatibilityGate", testClusterListEmptyCursorCompatibilityGate)
 	t.Run("ListEmptyCursorRolloutGate", testClusterListEmptyCursorRolloutGate)
+	t.Run("ListDuplicateEmptyKeyTerminalPage", testClusterListDuplicateEmptyKeyTerminalPage)
+	t.Run("ListEmptyCursorCapabilityProbeTimeout", testClusterListEmptyCursorCapabilityProbeTimeout)
 	t.Run("ListLeavingNodeCompatibilityGate", testClusterListLeavingNodeCompatibilityGate)
 	t.Run("ListPartialFailureRecovery", testClusterListPartialFailureRecovery)
 	t.Run("ListRawStartKeyCompatibility", testClusterListRawStartKey)

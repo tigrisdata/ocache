@@ -1169,6 +1169,100 @@ func testClusterListEmptyCursorRolloutGate(t *testing.T) {
 	}
 }
 
+func testClusterListDuplicateEmptyKeyTerminalPage(t *testing.T) {
+	fixture := newClusterListPaginationFixtureWithOptions(t, 2, 0, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	valueA := putClusterListFixtureValue(t, fixture.nodeA, "")
+	valueB := putClusterListFixtureValue(t, fixture.nodeB, "")
+	require.Equal(t, valueA, valueB)
+	require.Eventually(t, func() bool {
+		return len(fixture.nodeA.Coordinator.GetRing().GetActiveNodes()) == 2
+	}, 5*time.Second, 10*time.Millisecond)
+
+	t.Run("List", func(t *testing.T) {
+		response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: 1})
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Equal(t, []string{""}, response.Keys)
+		require.False(t, response.HasMore)
+		require.Empty(t, response.ContinuationToken)
+	})
+	t.Run("ListWithValues", func(t *testing.T) {
+		response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: 1})
+		require.NoError(t, err)
+		require.NotNil(t, response)
+		require.Len(t, response.Entries, 1)
+		require.Equal(t, "", response.Entries[0].Key)
+		require.Equal(t, valueA, response.Entries[0].Value)
+		require.False(t, response.HasMore)
+		require.Empty(t, response.ContinuationToken)
+	})
+
+	// Embedded list methods call these same operations methods directly.
+	ops := serveroperations.New(fixture.nodeA.Storage, fixture.nodeA.Coordinator)
+	t.Run("embedded List", func(t *testing.T) {
+		keys, err := ops.List(ctx, "")
+		require.NoError(t, err)
+		require.Equal(t, []string{""}, keys)
+	})
+	t.Run("embedded ListPageWithValues", func(t *testing.T) {
+		entries, token, hasMore, err := ops.ListPageWithValues(ctx, "", 1, "")
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+		require.Equal(t, "", entries[0].Key)
+		require.Equal(t, valueA, entries[0].Value)
+		require.False(t, hasMore)
+		require.Empty(t, token)
+	})
+}
+
+func blockListLocalUntilContextDoneOnNode(targetNodeID string) func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+	return func(nodeID string, next grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+		return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+			if nodeID == targetNodeID && (info.FullMethod == pb.CacheService_ListLocal_FullMethodName || info.FullMethod == pb.CacheService_ListLocalWithValues_FullMethodName) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			return next(ctx, req, info, handler)
+		}
+	}
+}
+
+func testClusterListEmptyCursorCapabilityProbeTimeout(t *testing.T) {
+	fixture := newClusterListPaginationFixtureWithReplicationFactor(t, 3, 2, blockListLocalUntilContextDoneOnNode("cluster-node-3"))
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer setupCancel()
+
+	putClusterListFixtureValue(t, fixture.nodeA, "")
+	putClusterListFixtureValue(t, fixture.nodeA, "z")
+	putClusterListFixtureValue(t, fixture.nodeB, "b")
+	putClusterListFixtureValue(t, fixture.nodeB, "c")
+	require.NoError(t, fixture.nodeC.Coordinator.GetRing().AnnounceLeaving(setupCtx))
+	require.Eventually(t, func() bool {
+		for _, node := range fixture.nodeA.Coordinator.GetRing().GetAllNodes() {
+			if node.ID == fixture.nodeC.NodeID {
+				return node.Status == ring.NodeStatusLeaving
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+	activeNodes := fixture.nodeA.Coordinator.GetRing().GetActiveNodes()
+	require.Len(t, activeNodes, 2)
+	for _, node := range activeNodes {
+		require.NotEqual(t, fixture.nodeC.NodeID, node.ID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	response, err := fixture.client.ListWithValues(ctx, &pb.ListRequest{Limit: 1})
+	require.Error(t, err)
+	require.Nil(t, response)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err), "a stalled non-active probe must fail closed before the caller deadline")
+	require.NoError(t, ctx.Err(), "the capability probe should be bounded independently of the caller deadline")
+}
+
 func testClusterListLeavingNodeCompatibilityGate(t *testing.T) {
 	fixture := newClusterListPaginationFixtureWithReplicationFactor(t, 3, 2, emptyCursorCapabilityMissingOnNode("cluster-node-3"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

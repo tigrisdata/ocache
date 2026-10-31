@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/logsample"
@@ -386,7 +387,10 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 
 // maxListNodeFanout bounds the number of concurrent per-node list RPCs issued
 // by a single cluster-wide List. Clusters smaller than this fan out fully.
-const maxListNodeFanout = 32
+const (
+	maxListNodeFanout                 = 32
+	emptyCursorCapabilityProbeTimeout = 5 * time.Second
+)
 
 // fetchFromAllNodesWithCursorPresence fetches keys (or key-value pairs) from
 // every node, preserving whether the resume cursor is present when it is empty.
@@ -532,7 +536,8 @@ func allActiveNodesSupportEmptyCursor(nodes []*ring.NodeInfo, responses map[stri
 
 // allHealthyRingNodesSupportEmptyCursor checks non-active members in the current
 // healthy ring view. This view is not an inventory of public endpoints; the
-// explicit operator option gates issuance for endpoints outside that view.
+// explicit operator option gates issuance for endpoints outside that view. The
+// supplemental probe is time-bounded and fails closed for a stalled member.
 func (o *Operations) allHealthyRingNodesSupportEmptyCursor(
 	ctx context.Context,
 	healthyNodes, activeNodes []*ring.NodeInfo,
@@ -563,6 +568,8 @@ func (o *Operations) allHealthyRingNodesSupportEmptyCursor(
 
 	localNodeID := o.GetLocalNodeID()
 	router := o.GetRouter()
+	probeCtx, cancel := context.WithTimeout(ctx, emptyCursorCapabilityProbeTimeout)
+	defer cancel()
 	unsupported := make(chan struct{}, 1)
 	markUnsupported := func() {
 		select {
@@ -585,20 +592,20 @@ func (o *Operations) allHealthyRingNodesSupportEmptyCursor(
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
-			case <-ctx.Done():
+			case <-probeCtx.Done():
 				return
 			}
-			if ctx.Err() != nil {
+			if probeCtx.Err() != nil {
 				return
 			}
 
-			client, err := router.GetClientForNode(ctx, n.ID)
+			client, err := router.GetClientForNode(probeCtx, n.ID)
 			if err != nil {
 				markUnsupported()
 				return
 			}
 			var headers metadata.MD
-			_, err = client.ListLocal(ctx, &pb.ListRequest{Prefix: prefix, Limit: 1}, grpc.Header(&headers))
+			_, err = client.ListLocal(probeCtx, &pb.ListRequest{Prefix: prefix, Limit: 1}, grpc.Header(&headers))
 			if err != nil || !listinput.HasEmptyStartKeyCursorCapability(headers) {
 				markUnsupported()
 			}
@@ -607,6 +614,9 @@ func (o *Operations) allHealthyRingNodesSupportEmptyCursor(
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
 		return false, err
+	}
+	if probeCtx.Err() != nil {
+		return false, nil
 	}
 	return len(unsupported) == 0, nil
 }
@@ -672,8 +682,14 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		nodeCursors[nodeID] = key
 	}
 
-	// Merge until we have enough keys or heap is empty
-	for h.Len() > 0 && len(result.Keys) < limit {
+	// Merge until the page limit is full and every duplicate of its last key
+	// has been consumed, or the heap is empty. Duplicate rows are not more keys.
+	for h.Len() > 0 {
+		if len(result.Keys) >= limit {
+			if len(result.Keys) == 0 || (*h)[0].key != result.Keys[len(result.Keys)-1] {
+				break
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return nil, nil, false, ctx.Err()
@@ -712,7 +728,7 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		}
 	}
 
-	// Determine if there are more keys available
+	// Determine if there are more distinct keys available.
 	hasMore := h.Len() > 0
 
 	if !hasMore {
@@ -729,9 +745,8 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 
 	if len(result.Keys) > 0 {
 		lastEmittedKey := result.Keys[len(result.Keys)-1]
-		// The local pages are sorted. Advance a peer through every key at or
-		// below the global cutoff, including duplicate copies the merge did not
-		// need to pop before filling the requested page.
+		// The local pages are sorted. Advance each peer through every key at or
+		// below the global cutoff to preserve its legacy per-node cursor.
 		for nodeID, nodeResp := range nodeResponses {
 			for i := 0; i < nodeResp.itemCount(); i++ {
 				key := nodeResp.keyAt(i)
