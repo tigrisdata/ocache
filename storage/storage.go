@@ -1148,12 +1148,15 @@ func (r *prefixWriterToReader) WriteTo(writer io.Writer) (int64, error) {
 }
 
 // joinPrefix returns the already-read prefix followed by reader. Non-WriterTo
-// streams stay reader-only so FileManager's pooled buffer drives the remainder.
-// A WriterTo remainder keeps its direct-write path, which is used by unary
-// byte-backed Puts.
+// streams and *os.File remainders stay reader-only so FileManager's pooled
+// buffer controls the copy granularity. Other WriterTo remainders keep their
+// direct-write path, which is used by unary byte-backed Puts.
 func joinPrefix(prefix []byte, reader io.Reader) io.Reader {
 	prefixed := prefixReader{prefix: prefix, reader: reader}
 	if writerTo, ok := reader.(io.WriterTo); ok {
+		if _, ok := reader.(*os.File); ok {
+			return &prefixed
+		}
 		return &prefixWriterToReader{prefixReader: prefixed, writerTo: writerTo}
 	}
 	return &prefixed
@@ -1206,9 +1209,9 @@ func (s *Storage) Put(key string, body io.Reader, ttl int) error {
 	// the value length exceeds the small-value threshold.
 	if n > s.inlineThreshold {
 		storageType = "raw_file"
-		// Join the bytes already read with the remaining stream. A non-WriterTo
-		// stream uses FileManager's pooled copy buffer, while byte-backed unary
-		// readers retain their direct-write path.
+		// Join the bytes already read with the remaining stream. Reader-only
+		// streams and *os.File inputs use FileManager's pooled buffer; other
+		// WriterTo readers retain their direct-write path.
 		reader := joinPrefix(firstChunk[:n], body)
 		filePath, checksum, bytesWritten, err := s.fileManager.Write(key, reader)
 		if err != nil {

@@ -5,8 +5,13 @@ package storage
 
 import (
 	"bytes"
+	"hash/crc32"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
+
+	"github.com/tigrisdata/ocache/common/bufferpool"
 )
 
 type prefixReaderReadRecorder struct {
@@ -29,6 +34,18 @@ func (f writerFunc) Write(p []byte) (int, error) {
 type writerToReadRecorder struct {
 	reader       *bytes.Reader
 	writeToCalls int
+}
+
+type writeCallCounter struct {
+	writer io.Writer
+	calls  int
+	sizes  []int
+}
+
+func (w *writeCallCounter) Write(p []byte) (int, error) {
+	w.calls++
+	w.sizes = append(w.sizes, len(p))
+	return w.writer.Write(p)
 }
 
 func (r *writerToReadRecorder) Read(p []byte) (int, error) {
@@ -95,6 +112,75 @@ func TestJoinPrefixUsesCopyBufferForReaderOnlyRemainder(t *testing.T) {
 	}
 	if len(writeSizes) != 2 || writeSizes[0] != len(prefix) || writeSizes[1] != len(remainder) {
 		t.Errorf("write sizes = %v, want [%d %d]", writeSizes, len(prefix), len(remainder))
+	}
+}
+
+func TestJoinPrefixRegularFileUsesPooledBuffer(t *testing.T) {
+	const total = 1 << 20
+	prefixSize := DefaultInlineThreshold + 1
+	want := bytes.Repeat([]byte("abcdefgh"), total/8)
+
+	dir := t.TempDir()
+	source, err := os.Create(filepath.Join(dir, "source"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := source.Write(want); err != nil {
+		source.Close()
+		t.Fatal(err)
+	}
+	info, err := source.Stat()
+	if err != nil {
+		source.Close()
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() {
+		source.Close()
+		t.Fatalf("source mode = %v, want regular file", info.Mode())
+	}
+	if _, err := source.Seek(int64(prefixSize), io.SeekStart); err != nil {
+		source.Close()
+		t.Fatal(err)
+	}
+	defer source.Close()
+
+	output, err := os.Create(filepath.Join(dir, "output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	counter := &writeCallCounter{writer: output}
+	reader := joinPrefix(want[:prefixSize], source)
+	_, hasWriterTo := reader.(io.WriterTo)
+	buffer, release := bufferpool.AcquireBuffer(1 << 20)
+	defer release()
+	hash := crc32.NewIEEE()
+
+	bytesWritten, err := io.CopyBuffer(io.MultiWriter(counter, hash), reader, buffer)
+	if err != nil {
+		output.Close()
+		t.Fatalf("copy regular-file remainder: %v", err)
+	}
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "output"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("regular-file copy changed payload order or identity")
+	}
+	if bytesWritten != int64(len(want)) {
+		t.Errorf("bytes written = %d, want %d", bytesWritten, len(want))
+	}
+	if gotChecksum, wantChecksum := hash.Sum32(), crc32.ChecksumIEEE(want); gotChecksum != wantChecksum {
+		t.Errorf("checksum = %08x, want %08x", gotChecksum, wantChecksum)
+	}
+	if hasWriterTo {
+		t.Error("regular-file remainder unexpectedly preserves io.WriterTo")
+	}
+	if counter.calls != 2 || len(counter.sizes) != 2 || counter.sizes[0] != prefixSize || counter.sizes[1] != total-prefixSize {
+		t.Errorf("file-boundary writes = %d calls with sizes %v, want 2 calls [%d %d]", counter.calls, counter.sizes, prefixSize, total-prefixSize)
 	}
 }
 
