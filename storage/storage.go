@@ -609,22 +609,11 @@ func (s *Storage) ListKeysWithPaginationCursor(userPrefix string, startKey *stri
 		it.Next()
 	}
 
+	hasMore := hasMoreLiveListKey(it, prefixBoundary, userPrefix)
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_paginated").Inc()
 		return nil, "", false, mapRocksDBError("ListKeysWithPagination", "", err)
-	}
-
-	// Check if there are more keys
-	hasMore := it.ValidForPrefix(prefixBoundary)
-	if hasMore {
-		// Peek at the next key to confirm it matches prefix
-		k := it.Key().Data()
-		nextUserKey := keys.ExtractUserKey(k)
-		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
-			hasMore = false
-		}
-		it.Key().Free()
 	}
 
 	// Clear lastKey if there are no more results
@@ -634,6 +623,30 @@ func (s *Storage) ListKeysWithPaginationCursor(userPrefix string, startKey *stri
 
 	metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "success").Inc()
 	return keyList, lastKey, hasMore, nil
+}
+
+// hasMoreLiveListKey advances over expired rows after the page limit so callers
+// report a continuation only when another live key is available.
+func hasMoreLiveListKey(it *grocksdb.Iterator, prefixBoundary []byte, userPrefix string) bool {
+	for it.ValidForPrefix(prefixBoundary) {
+		key := it.Key().Data()
+		value := it.Value().Data()
+		nextUserKey := keys.ExtractUserKey(key)
+		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
+			it.Key().Free()
+			it.Value().Free()
+			return false
+		}
+
+		expiry, ok := valueMessageExpiry(value)
+		it.Key().Free()
+		it.Value().Free()
+		if !ok || expiry <= 0 || time.Now().Unix() < expiry {
+			return true
+		}
+		it.Next()
+	}
+	return false
 }
 
 // MaxListValueSize caps the per-value bytes returned by List-with-values. A
@@ -792,21 +805,11 @@ func (s *Storage) ListKeyValuesWithPaginationCursor(userPrefix string, startKey 
 		it.Next()
 	}
 
+	hasMore := hasMoreLiveListKey(it, prefixBoundary, userPrefix)
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_kv_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_kv_paginated").Inc()
 		return nil, "", false, mapRocksDBError("ListKeyValuesWithPagination", "", err)
-	}
-
-	// Check if there are more keys
-	hasMore := it.ValidForPrefix(prefixBoundary)
-	if hasMore {
-		k := it.Key().Data()
-		nextUserKey := keys.ExtractUserKey(k)
-		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
-			hasMore = false
-		}
-		it.Key().Free()
 	}
 
 	if !hasMore {

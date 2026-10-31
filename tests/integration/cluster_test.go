@@ -1181,6 +1181,19 @@ func testClusterListDuplicateEmptyKeyTerminalPage(t *testing.T) {
 		return len(fixture.nodeA.Coordinator.GetRing().GetActiveNodes()) == 2
 	}, 5*time.Second, 10*time.Millisecond)
 
+	require.NoError(t, fixture.nodeA.Storage.Put("z", bytes.NewReader([]byte("expired-tail")), 1))
+	time.Sleep(2100 * time.Millisecond)
+	liveKeys, _, keysHaveMore, err := fixture.nodeA.Storage.ListKeysWithPagination("", "", 10)
+	require.NoError(t, err)
+	require.Equal(t, []string{""}, liveKeys)
+	require.False(t, keysHaveMore)
+	liveEntries, _, valuesHaveMore, err := fixture.nodeA.Storage.ListKeyValuesWithPagination("", "", 10)
+	require.NoError(t, err)
+	require.Len(t, liveEntries, 1)
+	require.Equal(t, "", liveEntries[0].Key)
+	require.Equal(t, valueA, liveEntries[0].Value)
+	require.False(t, valuesHaveMore)
+
 	t.Run("List", func(t *testing.T) {
 		response, err := fixture.client.List(ctx, &pb.ListRequest{Limit: 1})
 		require.NoError(t, err)
