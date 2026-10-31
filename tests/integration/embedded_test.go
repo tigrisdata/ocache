@@ -6,6 +6,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -242,6 +243,49 @@ func TestEmbeddedClient_ListPageWithValues(t *testing.T) {
 	assert.Len(t, entries, 1)
 	assert.Equal(t, "a-key", entries[0].Key)
 	assert.Equal(t, []byte("value-a-key"), entries[0].Value)
+
+	t.Run("cluster empty-key pagination option", testEmbeddedClusterListEmptyKeyPagination)
+}
+
+func testEmbeddedClusterListEmptyKeyPagination(t *testing.T) {
+	t.Helper()
+	ports, err := getFreePorts(2)
+	require.NoError(t, err)
+	clusterAddr := fmt.Sprintf("127.0.0.1:%d", ports[0])
+	grpcAddr := fmt.Sprintf("127.0.0.1:%d", ports[1])
+	client, err := embedded.New(&embedded.Config{
+		DiskPath:                     t.TempDir(),
+		TTL:                          time.Hour,
+		NodeID:                       "embedded-empty-key-pagination",
+		ClusterAddr:                  clusterAddr,
+		GRPCAddr:                     grpcAddr,
+		EnableEmptyKeyListPagination: true,
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.StartGRPCServer())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	require.NoError(t, client.WaitReady(ctx))
+	require.NoError(t, client.Put(ctx, "", []byte("empty"), 0))
+	require.NoError(t, client.Put(ctx, "\x00", []byte("nul"), 0))
+
+	entries, token, hasMore, err := client.ListPageWithValues(ctx, "", 1, "")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Empty(t, entries[0].Key)
+	require.Equal(t, []byte("empty"), entries[0].Value)
+	require.True(t, hasMore)
+	require.NotEmpty(t, token)
+
+	entries, token, hasMore, err = client.ListPageWithValues(ctx, "", 1, token)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "\x00", entries[0].Key)
+	require.Equal(t, []byte("nul"), entries[0].Value)
+	require.False(t, hasMore)
+	require.Empty(t, token)
 }
 
 func TestEmbeddedClient_ConfigValidation(t *testing.T) {
