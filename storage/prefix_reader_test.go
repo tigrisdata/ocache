@@ -36,18 +36,6 @@ type writerToReadRecorder struct {
 	writeToCalls int
 }
 
-type writeCallCounter struct {
-	writer io.Writer
-	calls  int
-	sizes  []int
-}
-
-func (w *writeCallCounter) Write(p []byte) (int, error) {
-	w.calls++
-	w.sizes = append(w.sizes, len(p))
-	return w.writer.Write(p)
-}
-
 func (r *writerToReadRecorder) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
@@ -148,7 +136,11 @@ func TestJoinPrefixRegularFileUsesPooledBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	counter := &writeCallCounter{writer: output}
+	var writeSizes []int
+	counter := writerFunc(func(p []byte) (int, error) {
+		writeSizes = append(writeSizes, len(p))
+		return output.Write(p)
+	})
 	reader := joinPrefix(want[:prefixSize], source)
 	_, hasWriterTo := reader.(io.WriterTo)
 	buffer, release := bufferpool.AcquireBuffer(1 << 20)
@@ -179,8 +171,8 @@ func TestJoinPrefixRegularFileUsesPooledBuffer(t *testing.T) {
 	if hasWriterTo {
 		t.Error("regular-file remainder unexpectedly preserves io.WriterTo")
 	}
-	if counter.calls != 2 || len(counter.sizes) != 2 || counter.sizes[0] != prefixSize || counter.sizes[1] != total-prefixSize {
-		t.Errorf("file-boundary writes = %d calls with sizes %v, want 2 calls [%d %d]", counter.calls, counter.sizes, prefixSize, total-prefixSize)
+	if len(writeSizes) != 2 || writeSizes[0] != prefixSize || writeSizes[1] != total-prefixSize {
+		t.Errorf("file-boundary writes = %d calls with sizes %v, want 2 calls [%d %d]", len(writeSizes), writeSizes, prefixSize, total-prefixSize)
 	}
 }
 
