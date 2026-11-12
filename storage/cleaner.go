@@ -59,6 +59,27 @@ const (
 	// the whole (reserve-bounded) deficit in one pass; only a small cache relative
 	// to the reserve is throttled across ticks.
 	reserveEvictSliceFraction int64 = 4 // 25%
+
+	// Cap enforcement (enforceDiskLimit) is continuous and incremental rather
+	// than one batch after the cap is crossed (#298). Eviction starts once the
+	// tracked total passes capEvictHighWater (a fraction of MaxDiskUsage) and
+	// each tick evicts a bounded slice toward capEvictLowWater, re-measuring the
+	// total between ticks. In steady state the total settles between the two
+	// marks and never reaches the cap, so ShedDiskRatio fires only on a genuine
+	// ingest burst, and the dead bytes eviction produces arrive in small, even
+	// slices for recompaction instead of one 10%-of-cap storm per pass.
+	capEvictHighWater = 0.97
+	capEvictLowWater  = 0.95
+
+	// capEvictMaxSliceFraction bounds what one tick evicts to 1/N of the cap. In
+	// steady state the slice is just the distance to the low-water mark (2-3% of
+	// the cap: on a 1.3 TB cap about 30 GB, a few minutes of eviction, which
+	// outruns any realistic ingest per tick and keeps the tick short enough for
+	// the TTL sweep and the ENOSPC backstop to run on time). After a burst the
+	// slice grows with the overshoot up to this bound, so convergence takes a
+	// tick or two per 10% of overshoot (the former single pass evicted 10% of
+	// the cap in one go).
+	capEvictMaxSliceFraction int64 = 10 // 10%
 )
 
 // Cleaner is responsible for background TTL cleanup and LRU eviction
@@ -770,16 +791,39 @@ func (c *Cleaner) stageBackfillEntry(batch *grocksdb.WriteBatch, userKey string,
 	batch.Put(keys.MakeBucketedAccessIndexKey(userKey), accessKey)
 }
 
-// enforceDiskLimit evicts keys if disk usage exceeds the limit
+// enforceDiskLimit keeps the tracked logical total under the cap by evicting a
+// bounded slice per tick once the total passes the high-water mark (#298). It
+// acts BELOW the cap, so in steady state the total oscillates between the
+// low- and high-water marks and never reaches MaxDiskUsage, let alone the shed
+// line. The slice is the distance to the low-water mark, bounded by
+// capEvictMaxSliceFraction, so a burst that pushes the total over the cap is
+// worked off over successive ticks, each re-measuring the total first.
+//
+// The former behaviour — act only once the cap was exceeded, then run one pass
+// down to 90% — left a busy node pinned at the shed line for most of each pass,
+// because the total was only corrected once the whole pass finished and
+// ingest never stopped.
 func (c *Cleaner) enforceDiskLimit() {
+	if c.maxDiskUsage <= 0 {
+		return
+	}
 	start := time.Now()
 	currentSize := c.totalSize.Load()
-	if currentSize <= c.maxDiskUsage {
+	highWater := int64(float64(c.maxDiskUsage) * capEvictHighWater)
+	if currentSize <= highWater {
 		return
 	}
 
-	targetSize := int64(float64(c.maxDiskUsage) * 0.9) // Target 90% of max
-	needToEvict := currentSize - targetSize
+	lowWater := int64(float64(c.maxDiskUsage) * capEvictLowWater)
+	needToEvict := currentSize - lowWater
+
+	slice := needToEvict
+	if maxSlice := c.maxDiskUsage / capEvictMaxSliceFraction; slice > maxSlice {
+		slice = maxSlice
+	}
+	if slice <= 0 {
+		return
+	}
 
 	fifo := c.storage != nil && c.storage.evictionPolicy == EvictionPolicyFIFO
 
@@ -795,11 +839,14 @@ func (c *Cleaner) enforceDiskLimit() {
 	zlog.Info().
 		Int64("current", currentSize).
 		Int64("max", c.maxDiskUsage).
+		Int64("high_water", highWater).
+		Int64("low_water", lowWater).
 		Int64("need_to_evict", needToEvict).
+		Int64("slice", slice).
 		Str("policy", policy).
 		Msg("cleaner: enforcing disk usage limit")
 
-	evicted := c.evictByIndex(idx, needToEvict)
+	evicted := c.evictByIndex(idx, slice)
 
 	// Record metrics
 	duration := time.Since(start)
