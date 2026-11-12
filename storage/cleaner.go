@@ -126,6 +126,9 @@ type Cleaner struct {
 	// deletion batch is re-checked and written, to inject a concurrent write
 	// into the window that re-check exists for (issue #256).
 	beforeExpiryFlush func()
+	// afterEvictCommit is set only by package tests: it runs after each eviction
+	// batch commits, to observe the live total mid-pass (issue #298).
+	afterEvictCommit func()
 	// fenceRetention is how long a CAS-delete tombstone outlives the delete as
 	// the key's fence (issue #267) before this sweep removes it. Defaults to
 	// DefaultFenceRetention; StorageConfig.FenceRetention overrides.

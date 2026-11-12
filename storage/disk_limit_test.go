@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tigrisdata/ocache/common/metrics"
 )
 
 // Cap enforcement is continuous and incremental (#298): it starts below the
@@ -119,6 +121,56 @@ func TestEnforceDiskLimit_OvershootWithinSlice(t *testing.T) {
 	total := s.cleaner.TotalSize()
 	assert.LessOrEqual(t, total, int64(float64(diskLimitTestCap)*capEvictLowWater), "one tick reaches the low-water mark")
 	assert.GreaterOrEqual(t, total, int64(94*1024), "and evicts no more than that")
+}
+
+// TestEnforceDiskLimit_TotalFallsMidPass: a pass that spans several write
+// batches decrements the live total (and the usage gauges) as each batch
+// commits, not once at the end. This is the regression test for the stale
+// total that kept a node at the shed line for the length of a pass (#298).
+func TestEnforceDiskLimit_TotalFallsMidPass(t *testing.T) {
+	// 100-byte objects with a cap sized so one tick's slice (10% of the cap)
+	// is 1,100 keys. Each evicted key stages three deletes and a batch flushes
+	// at 1,000 operations, so the pass commits several times before it ends.
+	const (
+		objSize = 100
+		cap     = 1_100_000
+		n       = 12_100 // 110% of the cap: the slice is the full 10%
+	)
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:        t.TempDir(),
+		InlineThreshold: 1 << 20,
+		MaxDiskUsage:    cap,
+		EvictionPolicy:  EvictionPolicyFIFO,
+		CleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+
+	for i := 0; i < n; i++ {
+		require.NoError(t, s.Put(fmt.Sprintf("key-%05d", i),
+			bytes.NewReader(bytes.Repeat([]byte("x"), objSize)), 0))
+	}
+	require.Equal(t, int64(n*objSize), s.cleaner.TotalSize())
+
+	// Capture the live total and the gauge as seen right after each commit.
+	var totals []int64
+	var gauges []float64
+	s.cleaner.afterEvictCommit = func() {
+		totals = append(totals, s.cleaner.TotalSize())
+		gauges = append(gauges, testutil.ToFloat64(metrics.DiskUsageBytes.WithLabelValues("total")))
+	}
+
+	s.cleaner.enforceDiskLimit()
+
+	require.GreaterOrEqual(t, len(totals), 2, "the pass should commit more than one batch")
+	before := int64(n * objSize)
+	for i, total := range totals {
+		assert.Less(t, total, before, "commit %d must lower the live total before the pass ends", i)
+		assert.Equal(t, float64(total), gauges[i], "commit %d must refresh the gauge with it", i)
+		before = total
+	}
+	assert.Equal(t, int64((n-1100)*objSize), totals[len(totals)-1], "the final commit completes the slice")
+	assert.Equal(t, totals[len(totals)-1], s.cleaner.TotalSize())
 }
 
 // TestEnforceDiskLimit_NoopWithoutCap: with no cap there is nothing to enforce.

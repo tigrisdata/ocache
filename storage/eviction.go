@@ -112,6 +112,9 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 			evictedCount += pendingCount
 			c.totalSize.Add(-pendingBytes)
 			c.refreshSizeMetrics()
+			if c.afterEvictCommit != nil {
+				c.afterEvictCommit()
+			}
 		}
 		pendingBytes = 0
 		pendingCount = 0
