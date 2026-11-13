@@ -116,9 +116,12 @@ func (s *ObjectsSuite) Test_Objects_LRUEviction() {
 		return
 	}
 
-	// Reconfigure with low disk limit
+	// Reconfigure with a low disk limit. Six 70 KiB objects (420 KiB) go in;
+	// eviction runs until the total is under the 97% high-water mark, one
+	// object per tick, so with a 260 KiB cap (high-water 252 KiB) exactly the
+	// three oldest must go: 420 -> 350 -> 280 -> 210 KiB.
 	s.Harness.Cleanup()
-	s.Config.MaxDiskUsage = 300 * 1024                // 300KB limit - lower to ensure eviction triggers
+	s.Config.MaxDiskUsage = 260 * 1024
 	s.Config.CleanupInterval = 500 * time.Millisecond // Faster cleanup for testing
 	s.Harness = NewIntegrationTestHarness(s.T(), s.Config)
 
@@ -135,7 +138,7 @@ func (s *ObjectsSuite) Test_Objects_LRUEviction() {
 		{Key: "lru-medium-new-3", Size: 70 * 1024, AccessTime: baseTime - 8, ShouldEvict: false},
 	}
 
-	RunLRUTests(s.T(), s.Harness, 300*1024, testCases)
+	RunLRUTests(s.T(), s.Harness, 260*1024, testCases)
 
 	// Verify eviction stats (only for single-node tests with direct storage access)
 	if storageAccess, ok := s.Harness.(TestStorageAccess); ok {

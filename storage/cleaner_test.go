@@ -134,10 +134,10 @@ func TestLRUEviction(t *testing.T) {
 	keys, err := s.ListKeys("")
 	require.NoError(t, err)
 
-	// With 1KB limit and 15 keys of 100 bytes each (1500 bytes total),
-	// we need to evict at least 500 bytes to get under the limit
-	// The cleaner targets 90% of max (900 bytes), so it needs to evict 600 bytes
-	// This means at least 6 keys should be evicted
+	// With 1KB limit and 15 keys of 100 bytes each (1500 bytes total), the
+	// cleaner evicts a bounded slice per tick (at most 10% of the cap, one key
+	// here) until the total is back under the 97% high-water mark, so over the
+	// ticks in this window at least 6 keys should be evicted.
 
 	// Verify that we have fewer keys than we started with
 	assert.Less(t, len(keys), 15, "Expected some keys to be evicted")

@@ -368,8 +368,10 @@ func TestFIFOEvictionReadDoesNotProtect(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	// Oldest-written keys first (natural write order == FIFO order).
-	for i := 0; i < 10; i++ {
+	// Oldest-written keys first (natural write order == FIFO order). Nine keys
+	// keep the total under the 97% high-water mark, so nothing is evicted before
+	// the newer keys below push it over.
+	for i := 0; i < 9; i++ {
 		key := fmt.Sprintf("old-key-%d", i)
 		require.NoError(t, s.Put(key, bytes.NewReader(bytes.Repeat([]byte("x"), 100)), 0))
 	}
@@ -393,9 +395,11 @@ func TestFIFOEvictionReadDoesNotProtect(t *testing.T) {
 		require.NoError(t, s.Put(key, bytes.NewReader(bytes.Repeat([]byte("y"), 100)), 0))
 	}
 
+	// Eviction is incremental (a bounded slice per tick), so wait for the three
+	// read keys' worth to go rather than for the first evicted key.
 	require.Eventually(t, func() bool {
 		_, evicted := s.CleanerStats()
-		return evicted > 0
+		return evicted >= 3
 	}, 3*time.Second, 100*time.Millisecond, "expected eviction to occur")
 	time.Sleep(300 * time.Millisecond)
 

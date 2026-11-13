@@ -93,6 +93,11 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 	// discards the pending state and they are retried on the next pass. Reclaiming
 	// files before the write would strand them (metadata still live) if the write
 	// failed — the dangling raw-file class reconciled by #150/#152.
+	//
+	// The live total is decremented here, per committed batch, not once at the
+	// end of the run: a long pass must let the total (and the shed decision and
+	// gauge derived from it) fall as keys actually go, instead of holding it at
+	// its pre-pass value until the pass completes (#298).
 	commit := func() {
 		if batch.Count() == 0 {
 			return
@@ -105,6 +110,11 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 			}
 			committedBytes += pendingBytes
 			evictedCount += pendingCount
+			c.totalSize.Add(-pendingBytes)
+			c.refreshSizeMetrics()
+			if c.afterEvictCommit != nil {
+				c.afterEvictCommit()
+			}
 		}
 		pendingBytes = 0
 		pendingCount = 0
@@ -112,17 +122,17 @@ func (c *Cleaner) evictByIndex(idx evictionIndex, targetBytes int64) (evictedCou
 		batch.Clear()
 	}
 
-	// finalize flushes the last batch and then reconciles the size/stat accounting
-	// for everything committed this run. It is deferred (registered after the
-	// resource defers, so it runs before they release) so the commit and its
-	// accounting stay together on EVERY return path — including the shutdown
-	// early-return. Splitting them let a shutdown mid-eviction flush the deletes
-	// while leaving totalSize inflated until the next startup recalculation.
+	// finalize flushes the last batch and then reconciles the stat accounting
+	// for everything committed this run (the size total is kept current by each
+	// commit). It is deferred (registered after the resource defers, so it runs
+	// before they release) so the commit and its accounting stay together on
+	// EVERY return path — including the shutdown early-return. Splitting them let
+	// a shutdown mid-eviction flush the deletes while leaving totalSize inflated
+	// until the next startup recalculation.
 	defer func() {
 		commit()
 
 		c.evictedKeys.Add(int64(evictedCount))
-		c.totalSize.Add(-committedBytes)
 
 		metrics.CleanerKeysDeleted.WithLabelValues(idx.policy, "disk_limit").Add(float64(evictedCount))
 		metrics.CleanerBytesFreed.WithLabelValues(idx.policy).Add(float64(committedBytes))

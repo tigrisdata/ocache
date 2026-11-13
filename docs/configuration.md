@@ -29,7 +29,10 @@ OCache can be configured through command-line flags when starting the server.
 | `-eviction-policy`   | string | `lru`        | Eviction order when `-max-disk-usage` is set: `lru` (reads refresh recency) or `fifo` (evict oldest-written first; reads do not protect data) |
 
 > **Eviction policies.** With `-max-disk-usage` set, the cache evicts to stay
-> under the cap. `lru` evicts the least-recently-*accessed* key first — a read
+> under the cap: eviction starts once the tracked total passes 97% of the cap
+> and each cleaner tick evicts a bounded slice toward 95%, so a steady-state
+> node settles just under the cap rather than crossing it and evicting in one
+> large batch. `lru` evicts the least-recently-*accessed* key first — a read
 > refreshes an entry's position, protecting recently-read data. `fifo` evicts the
 > oldest-*written* key first and reads never change an entry's position, so a rare
 > read of old data cannot displace hotter data. `fifo` suits write-once workloads

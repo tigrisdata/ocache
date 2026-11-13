@@ -85,7 +85,7 @@ The cleaner component manages both TTL expiration and LRU eviction through a sin
 - **Scan Interval**: Configurable, typically 1 minute for TTL checks
 - **Bucket Cleanup**: Every 24 hours for old access buckets (>30 days)
 - **Batch Size**: 1000 keys per write batch to balance memory and throughput
-- **Target Utilization**: 90% of max disk usage after eviction
+- **Target Utilization**: eviction starts at 97% of max disk usage and evicts a bounded slice per tick toward 95%, so the total settles just under the cap
 
 #### Time-Bucketed Access Index
 
@@ -218,8 +218,8 @@ After initialization, size is maintained incrementally:
 
 **Eviction Triggers:**
 
-- **Threshold**: Triggers when usage exceeds configured maximum
-- **Target Level**: Evicts to 90% of maximum to provide headroom
+- **Threshold**: Triggers when usage exceeds 97% of the configured maximum (the high-water mark), before the cap itself is reached
+- **Target Level**: Each tick evicts the distance to 95% of the maximum, bounded to 10% of the cap per tick, re-measuring between ticks; the tracked total is decremented per committed batch so it falls during a pass
 - **Check Frequency**: Evaluated every cleaner interval (1 minute)
 - **Bypass**: Disabled when `maxDiskUsage <= 0`
 
