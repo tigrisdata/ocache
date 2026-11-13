@@ -431,7 +431,8 @@ func (c *Compactor) CompactFiles(ctx context.Context, workerID int) (int, int64)
 					Msg("compactor: skipping corrupted file")
 				continue
 			}
-			// Log other errors and continue with next entry
+			// Other errors, including records that do not fit the configured
+			// segment capacity, retain their index rows for a later run.
 			continue
 		}
 
@@ -710,8 +711,15 @@ func (c *Compactor) commit(ctx context.Context, seg *segment.Segment, wb *grocks
 
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
-	if err := c.meta.Handle().Write(wo, wb); err != nil {
-		return err
+	// Serialize metadata publication with readers that observed a RAW_FILE row
+	// but have not opened its source yet. The segment is synced above, and source
+	// deletion is queued only after this write returns.
+	publicationGate := fd.GetFileLockManager().GetFileLock(c.meta.Handle().Name())
+	publicationGate.Lock()
+	writeErr := c.meta.Handle().Write(wo, wb)
+	publicationGate.Unlock()
+	if writeErr != nil {
+		return writeErr
 	}
 
 	return nil
@@ -734,10 +742,19 @@ func (c *Compactor) queueCompactedSources(pending *[]string) {
 	*pending = (*pending)[:0]
 }
 
-// ensureCapacity ensures that the segment has at least the needed bytes
-// available, finalising and acquiring a fresh segment when necessary.
+// ensureCapacity verifies the encoded record and footer fit a configured segment
+// and finalizes/acquires a fresh segment when the current one lacks room.
 func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, callerID string, needed int64, advice *cacheAdvice, wb *grocksdb.WriteBatch, pendingDeletes *[]string) error {
-	if (*seg).Remaining() >= needed {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	neededWithFooter := needed + int64(segment.SegmentFooterSize)
+	capacity := (*seg).GetSize() + (*seg).Remaining()
+	if neededWithFooter > capacity {
+		return fmt.Errorf("entry exceeds configured segment capacity: need %d bytes including footer, segment capacity %d", neededWithFooter, capacity)
+	}
+	if (*seg).Remaining() >= neededWithFooter {
 		return nil
 	}
 
@@ -779,7 +796,7 @@ func (c *Compactor) ensureCapacity(ctx context.Context, seg **segment.Segment, c
 		zlog.Error().Err(err).Str("callerID", callerID).Msg("failed to release segment after finalization")
 	}
 
-	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, 0)
+	newSeg, err := c.sm.AcquireOpenSegmentWithReservation(callerID, neededWithFooter)
 	if err != nil {
 		return err
 	}

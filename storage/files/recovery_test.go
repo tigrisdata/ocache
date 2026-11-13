@@ -197,12 +197,56 @@ func TestRecoveryHandlesOrphanedFiles(t *testing.T) {
 	err = recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
-	// Verify compaction entry was removed
+	// Verify compaction entry and orphaned file were removed.
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 	compactionSlice, _ := meta.Handle().Get(ro, compactionKey)
 	assert.False(t, compactionSlice.Exists(), "Orphaned compaction entry should be removed")
 	compactionSlice.Free()
+	_, err = os.Stat(orphanFile)
+	assert.True(t, os.IsNotExist(err), "Orphaned file should be deleted")
+}
+
+func TestRecoveryHandlesMissingFiles(t *testing.T) {
+	filesDir, meta, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	missingFile := filepath.Join(filesDir, "missing.dat")
+	metaKey := keys.MakeMetadataKey("missing-key")
+	compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), "missing-key")
+	vm := &pb.ValueMessage{
+		ValueLength: 100,
+		ValueType:   pb.ValueType_RAW_FILE,
+		RawFilePath: missingFile,
+	}
+	vmBytes, err := proto.Marshal(vm)
+	require.NoError(t, err)
+
+	wo := grocksdb.NewDefaultWriteOptions()
+	defer wo.Destroy()
+	batch := grocksdb.NewWriteBatch()
+	defer batch.Destroy()
+	batch.Put(metaKey, vmBytes)
+	batch.Put(compactionKey, []byte(missingFile))
+	require.NoError(t, meta.Handle().Write(wo, batch))
+
+	recovery := NewRecoveryManager(meta, filesDir, 0)
+	require.NoError(t, recovery.RecoverOnStartup())
+
+	ro := grocksdb.NewDefaultReadOptions()
+	defer ro.Destroy()
+	compactionSlice, err := meta.Handle().Get(ro, compactionKey)
+	require.NoError(t, err)
+	assert.False(t, compactionSlice.Exists(), "Missing-file compaction entry should be removed")
+	compactionSlice.Free()
+
+	metadataSlice, err := meta.Handle().Get(ro, metaKey)
+	require.NoError(t, err)
+	assert.False(t, metadataSlice.Exists(), "Metadata for a missing file should be removed")
+	metadataSlice.Free()
+
+	_, err = os.Stat(missingFile)
+	assert.True(t, os.IsNotExist(err), "Missing backing file should remain absent")
 }
 
 func TestRecoveryValidatesAllEntriesRegardlessOfAge(t *testing.T) {
@@ -265,6 +309,7 @@ func TestParallelRecovery(t *testing.T) {
 
 	// Create multiple files with different states
 	numFiles := 100
+	var validCompactionKeys, invalidCompactionKeys [][]byte
 	wo := grocksdb.NewDefaultWriteOptions()
 	defer wo.Destroy()
 
@@ -292,6 +337,7 @@ func TestParallelRecovery(t *testing.T) {
 
 			compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), fmt.Sprintf("key%d", i))
 			batch.Put(compactionKey, []byte(filePath))
+			validCompactionKeys = append(validCompactionKeys, compactionKey)
 		} else if i%3 == 1 {
 			// Corrupted files (size mismatch)
 			data := []byte("short")
@@ -309,6 +355,7 @@ func TestParallelRecovery(t *testing.T) {
 
 			compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), fmt.Sprintf("key%d", i))
 			batch.Put(compactionKey, []byte(filePath))
+			invalidCompactionKeys = append(invalidCompactionKeys, compactionKey)
 		} else {
 			// Stale entries (metadata points elsewhere)
 			// Create the file but metadata points to different file
@@ -327,6 +374,7 @@ func TestParallelRecovery(t *testing.T) {
 
 			compactionKey := keys.MakeCompactionKey(time.Now().UnixNano(), fmt.Sprintf("key%d", i))
 			batch.Put(compactionKey, []byte(filePath))
+			invalidCompactionKeys = append(invalidCompactionKeys, compactionKey)
 		}
 
 		err := meta.Handle().Write(wo, batch)
@@ -338,7 +386,8 @@ func TestParallelRecovery(t *testing.T) {
 	err := recovery.RecoverOnStartup()
 	require.NoError(t, err)
 
-	// Verify all compaction entries were removed after recovery
+	// Valid compaction rows remain for the normal compactor; all other parsed
+	// rows are removed by recovery.
 	ro := grocksdb.NewDefaultReadOptions()
 	defer ro.Destroy()
 	it := meta.Handle().NewIterator(ro)
@@ -349,7 +398,19 @@ func TestParallelRecovery(t *testing.T) {
 	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 		compactionCount++
 	}
-	assert.Equal(t, 0, compactionCount, "All compaction entries should be removed after recovery")
+	assert.Equal(t, len(validCompactionKeys), compactionCount, "Only validated compaction entries should remain")
+	for _, key := range validCompactionKeys {
+		slice, err := meta.Handle().Get(ro, key)
+		require.NoError(t, err)
+		require.True(t, slice.Exists(), "Valid compaction entry should remain")
+		slice.Free()
+	}
+	for _, key := range invalidCompactionKeys {
+		slice, err := meta.Handle().Get(ro, key)
+		require.NoError(t, err)
+		require.False(t, slice.Exists(), "Invalid compaction entry should be removed")
+		slice.Free()
+	}
 
 	// Verify corrupted files were deleted
 	for i := 1; i < numFiles; i += 3 {
