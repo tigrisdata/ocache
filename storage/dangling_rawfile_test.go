@@ -158,3 +158,150 @@ func TestStorage_PurgeDanglingRawFile_ConcurrentOverwriteNotPurged(t *testing.T)
 		rc.Close()
 	}
 }
+
+func readCASValueAndClose(t *testing.T, stor *Storage, key string) (uint64, []byte) {
+	t.Helper()
+
+	r, version, found, err := stor.GetWithVersion(key)
+	require.NoError(t, err)
+	require.True(t, found)
+	data, readErr := io.ReadAll(r)
+	var closeErr error
+	if rc, ok := r.(io.Closer); ok {
+		closeErr = rc.Close()
+	}
+	require.NoError(t, readErr)
+	require.NoError(t, closeErr)
+	return version, data
+}
+
+func TestCAS_GetWithVersion_DanglingLargeRawFile_Recovery(t *testing.T) {
+	t.Run("recovers_with_a_refill_token", func(t *testing.T) {
+		stor := danglingTestStorage(t, t.TempDir())
+		defer stor.Close()
+		// The medium-file control below needs a stable foreground state. Large
+		// raw files are not in the compaction index, so stopping the worker is
+		// otherwise immaterial to these fault fixtures.
+		stor.compactor.Close()
+
+		// A separate plain-read key proves that the existing recovery branch is
+		// reachable without mixing plain and CAS operations on one key.
+		plainKey := "dangling-plain-comparator"
+		plainValue := bytes.Repeat([]byte("p"), 8*1024)
+		require.NoError(t, stor.Put(plainKey, bytes.NewReader(plainValue), 0))
+		plainPath, _ := rawFilePathOf(t, stor, plainKey)
+		require.NoError(t, os.Remove(plainPath))
+		fd.GetFdCache().Remove(plainPath)
+		_, found, err := stor.Get(plainKey, 0, 0)
+		require.Error(t, err)
+		require.True(t, storageErrors.IsRetryable(err))
+		require.False(t, found)
+		_, found, err = stor.Get(plainKey, 0, 0)
+		require.NoError(t, err)
+		require.False(t, found)
+
+		key := "dangling-large-cas"
+		value := bytes.Repeat([]byte("x"), 8*1024) // >4 KiB: never compacted
+		_, err = stor.PutIfVersion(key, bytes.NewReader(value), 0, 0)
+		require.NoError(t, err)
+		rawPath, length := rawFilePathOf(t, stor, key)
+		require.Equal(t, int64(len(value)), length)
+		require.NoError(t, os.Remove(rawPath))
+		fd.GetFdCache().Remove(rawPath)
+
+		// A single failed open is retryable so the idempotent local wrapper can
+		// re-read. The next direct open must see the authoritative purge result.
+		_, _, found, err = stor.GetWithVersion(key)
+		require.Error(t, err)
+		require.True(t, storageErrors.IsRetryable(err))
+		require.False(t, found)
+		_, token, found, err := stor.GetWithVersion(key)
+		require.NoError(t, err, "the retry must re-read the purged metadata")
+		require.False(t, found)
+		require.NotZero(t, token, "absence must carry a refill observation token")
+
+		refill := []byte("refilled with the observed token")
+		refillVersion, err := stor.PutIfVersion(key, bytes.NewReader(refill), 0, token)
+		require.NoError(t, err)
+		gotVersion, got := readCASValueAndClose(t, stor, key)
+		assert.Equal(t, refillVersion, gotVersion)
+		assert.Equal(t, refill, got)
+
+		// A delete stamped after the observation must keep rejecting that older
+		// token, even after the key was refilled once.
+		require.NoError(t, stor.DeleteIfVersion(key, refillVersion))
+		_, fence, found, err := stor.GetWithVersion(key)
+		require.NoError(t, err)
+		require.False(t, found)
+		require.Greater(t, fence, token)
+		_, err = stor.PutIfVersion(key, bytes.NewReader(refill), 0, token)
+		mismatch, ok := storageErrors.IsVersionMismatch(err)
+		require.True(t, ok, "an intervening CAS delete must reject the earlier absence token")
+		assert.Equal(t, fence, mismatch.CurrentVersion)
+	})
+
+	t.Run("stale_purges_preserve_replacement_and_delete_fence", func(t *testing.T) {
+		stor := danglingTestStorage(t, t.TempDir())
+		defer stor.Close()
+		stor.compactor.Close()
+
+		key := "dangling-cas-replacement"
+		oldValue := bytes.Repeat([]byte("a"), 8*1024)
+		oldVersion, err := stor.PutIfVersion(key, bytes.NewReader(oldValue), 0, 0)
+		require.NoError(t, err)
+		oldPath, _ := rawFilePathOf(t, stor, key)
+		newValue := bytes.Repeat([]byte("b"), 8*1024)
+		newVersion, err := stor.PutIfVersion(key, bytes.NewReader(newValue), 0, oldVersion)
+		require.NoError(t, err)
+		newPath, _ := rawFilePathOf(t, stor, key)
+		require.NotEqual(t, oldPath, newPath, "CAS replacement must use a fresh raw-file path")
+
+		stor.purgeDanglingRawFile(key, oldPath)
+		gotVersion, got := readCASValueAndClose(t, stor, key)
+		assert.Equal(t, newVersion, gotVersion)
+		assert.Equal(t, newValue, got)
+
+		deleteKey := "dangling-cas-deleted"
+		deleteVersion, err := stor.PutIfVersion(deleteKey, bytes.NewReader(oldValue), 0, 0)
+		require.NoError(t, err)
+		deletePath, _ := rawFilePathOf(t, stor, deleteKey)
+		require.NoError(t, stor.DeleteIfVersion(deleteKey, deleteVersion))
+		_, fenceBefore, found, err := stor.GetWithVersion(deleteKey)
+		require.NoError(t, err)
+		require.False(t, found)
+		require.NotZero(t, fenceBefore)
+
+		stor.purgeDanglingRawFile(deleteKey, deletePath)
+		_, fenceAfter, found, err := stor.GetWithVersion(deleteKey)
+		require.NoError(t, err)
+		require.False(t, found)
+		assert.Equal(t, fenceBefore, fenceAfter, "a stale purge must preserve the CAS delete fence")
+		_, err = stor.PutIfVersion(deleteKey, bytes.NewReader(newValue), 0, deleteVersion)
+		mismatch, ok := storageErrors.IsVersionMismatch(err)
+		require.True(t, ok)
+		assert.Equal(t, fenceBefore, mismatch.CurrentVersion)
+	})
+
+	t.Run("missing_medium_raw_file_stays_retryable", func(t *testing.T) {
+		stor := danglingTestStorage(t, t.TempDir())
+		defer stor.Close()
+		stor.compactor.Close()
+
+		key := "dangling-medium-cas"
+		value := bytes.Repeat([]byte("m"), 2*1024) // 1 KiB < size <= 4 KiB
+		_, err := stor.PutIfVersion(key, bytes.NewReader(value), 0, 0)
+		require.NoError(t, err)
+		rawPath, length := rawFilePathOf(t, stor, key)
+		require.Equal(t, int64(len(value)), length)
+		require.NoError(t, os.Remove(rawPath))
+		fd.GetFdCache().Remove(rawPath)
+
+		_, _, found, err := stor.GetWithVersion(key)
+		require.Error(t, err)
+		assert.True(t, storageErrors.IsRetryable(err))
+		assert.False(t, found)
+		gotPath, gotLength := rawFilePathOf(t, stor, key)
+		assert.Equal(t, rawPath, gotPath, "a missing medium file must not be purged by the foreground CAS read")
+		assert.Equal(t, length, gotLength)
+	})
+}
