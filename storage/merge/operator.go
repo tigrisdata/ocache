@@ -290,10 +290,12 @@ func (m *MultiplexOperator) mergeMetadataCAS(key, existingValue []byte, operands
 				}
 				hadBase = true
 			case base.Expiry == tombstoneExpiry:
-				// Deleting a dead key again bumps the fence to a newer stamp, so
-				// a second invalidation orders AFTER anything that observed the
-				// first. Same admission rule as a put over a fence.
-				if fenceAdmits(&base, op.CasExpectedVersion) {
+				// Deleting a dead key again normally bumps the fence, so a second
+				// invalidation orders after anything that observed the first. But
+				// stamp issuance can precede the merge by an arbitrary delay: an
+				// otherwise-admitted older operand must not lower this newer fence.
+				// Keeping the base makes the delete's read-back report a mismatch.
+				if fenceAdmits(&base, op.CasExpectedVersion) && op.Version >= base.Version {
 					base = pb.ValueMessage{Expiry: tombstoneExpiry, Version: op.Version}
 				}
 			default:

@@ -22,10 +22,10 @@ import (
 	pb "github.com/tigrisdata/ocache/storage/proto"
 )
 
-func createCASTestStorage(t *testing.T) (*Storage, func()) {
+func createCASTestStorage(t *testing.T, options ...func(*StorageConfig)) (*Storage, func()) {
 	// Cap set so eviction indexing runs; thresholds small enough to exercise the
 	// raw-file path with modest payloads.
-	return createTestStorage(t, 3600, 1024, 4*1024, 16*1024*1024, 1000, 1<<30)
+	return createTestStorage(t, 3600, 1024, 4*1024, 16*1024*1024, 1000, 1<<30, options...)
 }
 
 func readAllString(t *testing.T, r io.Reader) string {
