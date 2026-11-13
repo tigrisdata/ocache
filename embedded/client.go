@@ -417,7 +417,11 @@ func (c *Client) ListPageWithValues(ctx context.Context, prefix string, limit in
 	return entries, token, more, nil
 }
 
-// PutStream stores data from a reader for the given key.
+// PutStream stores bytes from r's current position through EOF. On local writes,
+// the first attempt does not rewind r; retryable failures restart from the
+// call-entry position when it can be obtained through io.Seeker. Readers with
+// no obtainable position are attempted once. A failed retry seek returns an
+// error.
 func (c *Client) PutStream(ctx context.Context, key string, r io.Reader, ttlSeconds int64) error {
 	return c.ops.Put(ctx, key, r, int(ttlSeconds))
 }
