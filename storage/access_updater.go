@@ -20,8 +20,9 @@ import (
 // the second would sort BEFORE keys written later in the same second and lose
 // to them at eviction (issue #257).
 type accessUpdate struct {
-	key  string
-	time time.Time
+	key       string
+	time      time.Time
+	automatic bool // automatic reads must not replace a newer persisted recency
 }
 
 // accessUpdater handles asynchronous batched updates of access times for LRU tracking
@@ -76,21 +77,25 @@ func (a *accessUpdater) Stop() {
 	a.wg.Wait()
 }
 
-// Update queues an access time update (non-blocking)
+// Update queues an explicit access time (non-blocking).
 func (a *accessUpdater) Update(key string, accessTime time.Time) {
+	a.enqueue(accessUpdate{key: key, time: accessTime})
+}
+
+// UpdateNow queues an automatic access time update with current time (non-blocking).
+func (a *accessUpdater) UpdateNow(key string) {
+	a.enqueue(accessUpdate{key: key, time: time.Now(), automatic: true})
+}
+
+func (a *accessUpdater) enqueue(update accessUpdate) {
 	select {
-	case a.updates <- accessUpdate{key: key, time: accessTime}:
+	case a.updates <- update:
 		// Update queued successfully
 		metrics.LRUAccessUpdates.Inc()
 	default:
 		// Buffer full, drop the update (LRU tracking is best-effort)
 		metrics.Errors.WithLabelValues("access_updater", "buffer_full").Inc()
 	}
-}
-
-// UpdateNow queues an access time update with current time (non-blocking)
-func (a *accessUpdater) UpdateNow(key string) {
-	a.Update(key, time.Now())
 }
 
 // Flush forces all pending updates to be written to RocksDB immediately.
@@ -178,6 +183,31 @@ func (a *accessUpdater) timeGateUpdate(update accessUpdate) {
 	}
 }
 
+// parseWellFormedBucketedAccessKey validates the full stored key format.
+func parseWellFormedBucketedAccessKey(bucketedKey []byte) (string, time.Time, bool) {
+	prefixLen := len(keys.AccessBucketPrefix)
+	bucketEnd := prefixLen + len(keys.AccessBucketFormat)
+	timestampStart := bucketEnd + 1
+	timestampEnd := timestampStart + 19
+	if len(bucketedKey) < timestampEnd+1 || string(bucketedKey[:prefixLen]) != keys.AccessBucketPrefix ||
+		bucketedKey[bucketEnd] != '/' || bucketedKey[timestampEnd] != '/' {
+		return "", time.Time{}, false
+	}
+	for i, digit := range bucketedKey[timestampStart:timestampEnd] {
+		if i == 0 && digit == '-' {
+			continue
+		}
+		if digit < '0' || digit > '9' {
+			return "", time.Time{}, false
+		}
+	}
+	key, accessTime, err := keys.ParseBucketedAccessKey(bucketedKey)
+	if err != nil || string(bucketedKey[:timestampStart]) != keys.GetBucketedAccessKey(accessTime) {
+		return "", time.Time{}, false
+	}
+	return key, accessTime, true
+}
+
 // flushBatch writes a batch of access updates to RocksDB and returns its size.
 func (a *accessUpdater) flushBatch() int {
 	a.batchMutex.Lock()
@@ -204,8 +234,17 @@ func (a *accessUpdater) flushBatch() int {
 		bucketIndexKey := keys.MakeBucketedAccessIndexKey(key)
 		slice, err := a.storage.meta.Handle().Get(ro, bucketIndexKey)
 		if err == nil && slice.Exists() {
-			// Delete the old bucketed entry
 			oldBucketKey := slice.Data()
+			if update.automatic {
+				indexedKey, currentTime, wellFormed := parseWellFormedBucketedAccessKey(oldBucketKey)
+				if wellFormed && indexedKey == key && currentTime.After(update.time) {
+					// A completed write or newer read already published recency after this read.
+					slice.Free()
+					continue
+				}
+			}
+
+			// Delete the old bucketed entry
 			writeBatch.Delete(oldBucketKey)
 			slice.Free()
 		}

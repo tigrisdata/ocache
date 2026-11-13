@@ -385,6 +385,220 @@ func TestAccessUpdater_ReadBumpOutranksEarlierWrites(t *testing.T) {
 		"a read bump must sort after a key written before the read, so eviction reaches it later:\n  bumped:  %s\n  written: %s", bumped, written)
 }
 
+func TestAccessUpdater_DelayedReadDoesNotUndoNewerOverwrite(t *testing.T) {
+	const (
+		targetKey = "overwritten"
+		middleKey = "middle"
+		laterKey  = "later"
+	)
+	value := bytes.Repeat([]byte("x"), 128)
+	middleValue := bytes.Repeat([]byte("m"), len(value))
+
+	s, err := NewStorageWithConfig(&StorageConfig{
+		DiskPath:         t.TempDir(),
+		InlineThreshold:  1024,
+		CompactThreshold: 4096,
+		SegmentSize:      16 * 1024 * 1024,
+		FdCacheSize:      1000,
+		MaxDiskUsage:     1 << 20,
+		EvictionPolicy:   EvictionPolicyLRU,
+		CleanupInterval:  time.Hour,
+	})
+	require.NoError(t, err)
+	defer s.Close()
+	require.NotNil(t, s.accessUpdater, "LRU with a disk cap must run the access updater")
+
+	// Hold the automatic notification admitted by Get until after the overwrite.
+	// The replacement worker's long interval prevents a timer flush while the
+	// notification is held; Flush below still exercises the worker path.
+	s.accessUpdater.Stop()
+	updater := newAccessUpdater(s, 16, time.Hour, DefaultAccessUpdateDelay)
+	s.accessUpdater = updater
+
+	require.NoError(t, s.Put(targetKey, bytes.NewReader(value), 0))
+	require.NoError(t, s.Put(middleKey, bytes.NewReader(middleValue), 0))
+	require.NoError(t, s.Put(laterKey, bytes.NewReader([]byte("l")), 0))
+
+	reader, found, err := s.Get(targetKey, 0, 0)
+	require.NoError(t, err)
+	require.True(t, found, "the initial read must find the inline value")
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, value, got)
+
+	var readUpdate accessUpdate
+	select {
+	case readUpdate = <-updater.updates:
+	case <-time.After(time.Second):
+		t.Fatal("Get did not admit an automatic access update")
+	}
+	require.Equal(t, targetKey, readUpdate.key)
+
+	// Put a live, equal-sized key between the read time and the overwrite time.
+	middleTime := time.Unix(readUpdate.time.Unix()+1, 0)
+	require.True(t, readUpdate.time.Before(middleTime))
+	s.SetAccessTime(middleKey, middleTime.Unix())
+	updater.Start()
+	require.Equal(t, 1, updater.Flush(), "the explicit middle timestamp should be persisted")
+
+	indexTime := func(key string) time.Time {
+		entry, ok := readAccessIndex(t, s, key)
+		require.True(t, ok, "%s should have a current LRU entry", key)
+		indexedKey, accessTime, err := keys.ParseBucketedAccessKey([]byte(entry))
+		require.NoError(t, err)
+		require.Equal(t, key, indexedKey)
+		return accessTime
+	}
+	keyExists := func(key string) bool {
+		ro := grocksdb.NewDefaultReadOptions()
+		defer ro.Destroy()
+		slice, err := s.meta.Handle().Get(ro, keys.MakeMetadataKey(key))
+		require.NoError(t, err)
+		defer slice.Free()
+		return slice.Exists()
+	}
+	indexEntryExists := func(entry string) bool {
+		ro := grocksdb.NewDefaultReadOptions()
+		defer ro.Destroy()
+		slice, err := s.meta.Handle().Get(ro, []byte(entry))
+		require.NoError(t, err)
+		defer slice.Free()
+		return slice.Exists()
+	}
+
+	require.True(t, indexTime(middleKey).Equal(middleTime))
+	require.Eventually(t, func() bool {
+		return time.Now().Unix() > middleTime.Unix()
+	}, 5*time.Second, time.Millisecond, "the overwrite must use a timestamp in a later second")
+	require.NoError(t, s.Put(targetKey, bytes.NewReader(value), 0))
+	writeEntry, writeEntryExists := readAccessIndex(t, s, targetKey)
+	require.True(t, writeEntryExists)
+	writeTime := indexTime(targetKey)
+	require.True(t, middleTime.Before(writeTime))
+	require.Greater(t, writeTime.Unix(), readUpdate.time.Unix(), "read and overwrite timestamps must differ by seconds")
+
+	// A later explicit index update shares the flush batch. Its persisted time
+	// proves the batch write succeeded and puts it after both eviction candidates.
+	laterTime := time.Unix(writeTime.Unix()+1, 0)
+	require.True(t, writeTime.Before(laterTime))
+	updater.updates <- readUpdate
+	s.SetAccessTime(laterKey, laterTime.Unix())
+	updater.Flush()
+	require.True(t, indexTime(laterKey).Equal(laterTime),
+		"the later index update must prove the flush batch committed")
+	currentEntry, currentIndexExists := readAccessIndex(t, s, targetKey)
+	assert.True(t, currentIndexExists && currentEntry == writeEntry && indexEntryExists(currentEntry),
+		"automatic LRU update must not undo recency established by a completed overwrite")
+
+	// Walk the ordinary LRU index for one value's bytes. The old read time sorts
+	// before middleTime on the broken implementation, so it evicts targetKey.
+	evicted := s.cleaner.evictByIndex(lruEvictionIndex(), int64(len(value)))
+	evictionHolds := evicted == 1 && keyExists(targetKey) && !keyExists(middleKey)
+	require.True(t, evictionHolds,
+		"ordinary LRU eviction should remove the intermediate key and retain the overwritten key")
+
+	// A later admitted automatic read still advances the persisted timestamp.
+	updater.accessTimeLRU.Remove(targetKey)
+	reader, found, err = s.Get(targetKey, 0, 0)
+	require.NoError(t, err)
+	require.True(t, found, "the overwritten value must survive the LRU eviction")
+	got, err = io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, value, got)
+	require.Equal(t, 1, updater.Flush())
+	require.True(t, indexTime(targetKey).After(writeTime), "a newer automatic read should advance recency")
+
+	// An explicit SetAccessTime is not an automatic read and may deliberately
+	// move the index to an older timestamp. Remove only the throttle cache entry
+	// so this control tests flush semantics rather than the read-delay gate.
+	updater.accessTimeLRU.Remove(targetKey)
+	explicitTime := time.Unix(readUpdate.time.Unix()-60, 0)
+	s.SetAccessTime(targetKey, explicitTime.Unix())
+	require.Equal(t, 1, updater.Flush())
+	require.True(t, indexTime(targetKey).Equal(explicitTime), "explicit SetAccessTime may set an older timestamp")
+}
+
+func TestAccessUpdater_RewritesMalformedCurrentIndex(t *testing.T) {
+	prefixLen := len(keys.AccessBucketPrefix)
+	bucketEnd := prefixLen + len(keys.AccessBucketFormat)
+	timestampStart := bucketEnd + 1
+	cases := []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{name: "prefix", mutate: func(entry []byte) { entry[0] = '?' }},
+		{name: "bucket byte", mutate: func(entry []byte) { entry[prefixLen] = 'X' }},
+		{name: "invalid bucket date", mutate: func(entry []byte) { copy(entry[prefixLen:bucketEnd], "2023023000") }},
+		{name: "bucket timestamp mismatch", mutate: func(entry []byte) {
+			lastBucketDigit := bucketEnd - 1
+			if entry[lastBucketDigit] == '0' {
+				entry[lastBucketDigit] = '1'
+			} else {
+				entry[lastBucketDigit] = '0'
+			}
+		}},
+		{name: "timestamp separator", mutate: func(entry []byte) { entry[timestampStart+19] = '?' }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			storage, cleanup := createTestStorage(t, 3600, 1024, 4096, 16*1024*1024, 1000, 1<<20)
+			defer cleanup()
+			require.NotNil(t, storage.accessUpdater)
+
+			storage.accessUpdater.Stop()
+			updater := newAccessUpdater(storage, 16, time.Hour, DefaultAccessUpdateDelay)
+			storage.accessUpdater = updater
+
+			const key = "malformed"
+			value := []byte("value")
+			require.NoError(t, storage.Put(key, bytes.NewReader(value), 0))
+
+			futureTime := time.Now().Add(time.Hour)
+			malformedEntry := keys.MakeBucketedAccessKey(key, futureTime)
+			tc.mutate(malformedEntry)
+			wo := grocksdb.NewDefaultWriteOptions()
+			defer wo.Destroy()
+			require.NoError(t, storage.meta.Handle().Put(wo, malformedEntry, []byte{}))
+			require.NoError(t, storage.meta.Handle().Put(wo, keys.MakeBucketedAccessIndexKey(key), malformedEntry))
+
+			reader, found, err := storage.Get(key, 0, 0)
+			require.NoError(t, err)
+			require.True(t, found)
+			got, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			require.Equal(t, value, got)
+
+			var update accessUpdate
+			select {
+			case update = <-updater.updates:
+			case <-time.After(time.Second):
+				t.Fatal("Get did not admit an automatic access update")
+			}
+			require.Equal(t, key, update.key)
+			require.True(t, futureTime.After(update.time))
+			updater.updates <- update
+			updater.Start()
+			require.Equal(t, 1, updater.Flush())
+			currentEntry, ok := readAccessIndex(t, storage, key)
+			require.True(t, ok)
+			require.NotEqual(t, string(malformedEntry), currentEntry,
+				"malformed current entries must follow the existing refresh path")
+			indexedKey, accessTime, err := keys.ParseBucketedAccessKey([]byte(currentEntry))
+			require.NoError(t, err)
+			require.Equal(t, key, indexedKey)
+			require.True(t, accessTime.Equal(update.time))
+
+			ro := grocksdb.NewDefaultReadOptions()
+			defer ro.Destroy()
+			oldEntry, err := storage.meta.Handle().Get(ro, malformedEntry)
+			require.NoError(t, err)
+			defer oldEntry.Free()
+			require.False(t, oldEntry.Exists(), "the malformed ordered row should be replaced")
+		})
+	}
+}
+
 func benchmarkStorageGet(b *testing.B, storage *Storage, key string) {
 	b.Helper()
 
