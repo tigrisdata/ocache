@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"net"
 	"strings"
@@ -22,6 +23,43 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestHashKeyMatchesFormatter(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	tests := []struct {
+		name   string
+		keyNum int
+	}{
+		{name: "zero", keyNum: 0},
+		{name: "positive", keyNum: 42},
+		{name: "negative", keyNum: -42},
+		{name: "max int", keyNum: maxInt},
+		{name: "min int", keyNum: -maxInt - 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, want := hashKey(tt.keyNum), formatterHashKey(tt.keyNum); got != want {
+				t.Errorf("hashKey(%d) = %q, want %q", tt.keyNum, got, want)
+			}
+		})
+	}
+}
+
+func formatterHashKey(keyNum int) string {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	n := uint64(keyNum)
+	for range 8 {
+		h ^= n & 0xff
+		h *= prime64
+		n >>= 8
+	}
+	return fmt.Sprintf("user%x", h)
+}
 
 const (
 	ycsbReadWorkers    = 4
