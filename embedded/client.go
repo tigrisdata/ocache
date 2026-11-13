@@ -51,6 +51,11 @@ type Config struct {
 	// NodeID is the unique identifier for this node in cluster mode
 	NodeID string
 
+	// EnableEmptyKeyListPagination allows issuing cluster list tokens that resume
+	// after an empty key. Enable only after every endpoint that may receive those
+	// tokens supports explicit empty-key cursors; the default is disabled.
+	EnableEmptyKeyListPagination bool
+
 	// ClusterAddr is the address for cluster membership (gossip) protocol
 	// Example: ":7000"
 	ClusterAddr string
@@ -192,16 +197,17 @@ func New(cfg *Config) (*Client, error) {
 	var coord *coordinator.Coordinator
 	if cfg.IsClusterMode() {
 		coordCfg := &coordinator.Config{
-			Enabled:         true,
-			MyNodeID:        cfg.NodeID,
-			ClusterAddr:     cfg.ClusterAddr,
-			ListenAddr:      cfg.GRPCAddr,
-			AdvertiseAddr:   cfg.AdvertiseAddr,
-			Seeds:           cfg.SeedNodes,
-			DiskPath:        cfg.DiskPath,
-			GRPCDialOptions: cfg.GRPCDialOptions,
-			RouterConfig:    cfg.Router,
-			Registerer:      cfg.Registerer,
+			Enabled:                      true,
+			EnableEmptyKeyListPagination: cfg.EnableEmptyKeyListPagination,
+			MyNodeID:                     cfg.NodeID,
+			ClusterAddr:                  cfg.ClusterAddr,
+			ListenAddr:                   cfg.GRPCAddr,
+			AdvertiseAddr:                cfg.AdvertiseAddr,
+			Seeds:                        cfg.SeedNodes,
+			DiskPath:                     cfg.DiskPath,
+			GRPCDialOptions:              cfg.GRPCDialOptions,
+			RouterConfig:                 cfg.Router,
+			Registerer:                   cfg.Registerer,
 		}
 		if cfg.Lifecycler != nil {
 			coordCfg.LifecyclerConfig = *cfg.Lifecycler

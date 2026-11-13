@@ -46,6 +46,11 @@ type Config struct {
     // NodeID is the unique identifier for this node in cluster mode
     NodeID string
 
+    // Enable empty-key cluster list continuation. Default false; enable only
+    // after every endpoint that may receive continuation tokens supports
+    // explicit empty cursors.
+    EnableEmptyKeyListPagination bool
+
     // ClusterAddr is the address for cluster membership (gossip) protocol
     // Example: ":7000"
     ClusterAddr string
@@ -101,6 +106,12 @@ To enable cluster mode, provide:
 - `GRPCAddr`: Address for gRPC server (other nodes route requests here)
 - `AdvertiseAddr`: Address other nodes should use to connect
 - `SeedNodes`: Initial nodes for cluster discovery
+- `EnableEmptyKeyListPagination`: Defaults to false. Set it on every coordinator
+  that may issue empty-key tokens only after every token-receiving endpoint
+  supports explicit empty cursors. A page that needs an empty-key continuation
+  returns `FailedPrecondition` while disabled. Keep the option enabled while
+  those tokens may still be submitted; the ring capability check does not
+  inventory external endpoints.
 
 ## Usage Examples
 

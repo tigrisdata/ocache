@@ -55,11 +55,16 @@ var (
 	showVersion = flag.Bool("version", false, "Print version information and exit")
 
 	// Cluster configuration flags
-	clusterEnabled = flag.Bool("cluster-enabled", false, "Enable cluster mode")
-	nodeID         = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
-	clusterAddr    = flag.String("cluster-addr", ":7000", "Address for cluster communication")
-	seedsStr       = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000 or ocache.svc.cluster.local:7000)")
-	advertiseAddr  = flag.String("advertise-addr", "", "Address advertised to other nodes for routing (defaults to -listen-addr)")
+	clusterEnabled               = flag.Bool("cluster-enabled", false, "Enable cluster mode")
+	enableEmptyKeyListPagination = flag.Bool(
+		"enable-cluster-list-empty-key-pagination",
+		false,
+		"Allow list continuation after an empty key; enable only after every endpoint that may receive continuation tokens supports it",
+	)
+	nodeID        = flag.String("node-id", "", "Unique node identifier (required in cluster mode)")
+	clusterAddr   = flag.String("cluster-addr", ":7000", "Address for cluster communication")
+	seedsStr      = flag.String("seeds", "", "Comma-separated list of seed nodes (e.g., node1:7000,node2:7000 or ocache.svc.cluster.local:7000)")
+	advertiseAddr = flag.String("advertise-addr", "", "Address advertised to other nodes for routing (defaults to -listen-addr)")
 
 	seeds []string
 )
@@ -84,13 +89,14 @@ func initializeCluster(ctx context.Context) *coordinator.Coordinator {
 	}
 
 	coordConfig := &coordinator.Config{
-		Enabled:       true,
-		MyNodeID:      AppConfig.NodeID,
-		ClusterAddr:   AppConfig.ClusterAddr,
-		ListenAddr:    AppConfig.ListenAddr,
-		AdvertiseAddr: AppConfig.AdvertiseAddr,
-		Seeds:         AppConfig.Seeds,
-		DiskPath:      AppConfig.DiskPath,
+		Enabled:                      true,
+		EnableEmptyKeyListPagination: AppConfig.EnableEmptyKeyListPagination,
+		MyNodeID:                     AppConfig.NodeID,
+		ClusterAddr:                  AppConfig.ClusterAddr,
+		ListenAddr:                   AppConfig.ListenAddr,
+		AdvertiseAddr:                AppConfig.AdvertiseAddr,
+		Seeds:                        AppConfig.Seeds,
+		DiskPath:                     AppConfig.DiskPath,
 	}
 
 	var err error
