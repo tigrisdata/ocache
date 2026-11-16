@@ -609,7 +609,12 @@ func (s *Storage) ListKeysWithPaginationCursor(userPrefix string, startKey *stri
 		it.Next()
 	}
 
-	hasMore := hasMoreLiveListKey(it, prefixBoundary, userPrefix)
+	// An empty frontier needs exact lookahead: an expired suffix must not
+	// force issuance of an empty-key continuation token.
+	hasMore := it.ValidForPrefix(prefixBoundary)
+	if lastKey == "" {
+		hasMore = hasMoreLiveListKey(it, prefixBoundary)
+	}
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_paginated").Inc()
@@ -625,22 +630,13 @@ func (s *Storage) ListKeysWithPaginationCursor(userPrefix string, startKey *stri
 	return keyList, lastKey, hasMore, nil
 }
 
-// hasMoreLiveListKey advances over expired rows after the page limit so callers
-// report a continuation only when another live key is available.
-func hasMoreLiveListKey(it *grocksdb.Iterator, prefixBoundary []byte, userPrefix string) bool {
+// hasMoreLiveListKey advances over expired rows after an empty-key page so
+// callers need an empty-key continuation only when another live key is available.
+func hasMoreLiveListKey(it *grocksdb.Iterator, prefixBoundary []byte) bool {
 	for it.ValidForPrefix(prefixBoundary) {
-		key := it.Key().Data()
-		value := it.Value().Data()
-		nextUserKey := keys.ExtractUserKey(key)
-		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
-			it.Key().Free()
-			it.Value().Free()
-			return false
-		}
-
-		expiry, ok := valueMessageExpiry(value)
-		it.Key().Free()
-		it.Value().Free()
+		value := it.Value()
+		expiry, ok := valueMessageExpiry(value.Data())
+		value.Free()
 		if !ok || expiry <= 0 || time.Now().Unix() < expiry {
 			return true
 		}
@@ -805,7 +801,12 @@ func (s *Storage) ListKeyValuesWithPaginationCursor(userPrefix string, startKey 
 		it.Next()
 	}
 
-	hasMore := hasMoreLiveListKey(it, prefixBoundary, userPrefix)
+	// An empty frontier needs exact lookahead: an expired suffix must not
+	// force issuance of an empty-key continuation token.
+	hasMore := it.ValidForPrefix(prefixBoundary)
+	if lastKey == "" {
+		hasMore = hasMoreLiveListKey(it, prefixBoundary)
+	}
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_kv_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_kv_paginated").Inc()

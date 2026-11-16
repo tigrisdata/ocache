@@ -36,7 +36,9 @@ func StartKey(ctx context.Context) (string, bool) {
 // cannot leak from an earlier shard call on the same parent context.
 func WithEmptyStartKeyCursor(ctx context.Context, present bool) context.Context {
 	md, _ := metadata.FromOutgoingContext(ctx)
-	md = md.Copy()
+	if !present && len(md.Get(emptyStartKeyCursorMetadata)) == 0 {
+		return ctx
+	}
 	if md == nil {
 		md = metadata.MD{}
 	}
