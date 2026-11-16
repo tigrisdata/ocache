@@ -8,6 +8,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/internal/listinput"
 	stor "github.com/tigrisdata/ocache/storage"
 	"github.com/tigrisdata/ocache/storage/retry"
 )
@@ -54,15 +55,27 @@ func (o *Operations) ListLocalWithValues(ctx context.Context, prefix string, lim
 		limit = MaxListLimit
 	}
 
-	startKey := continuationToken
+	startKey, hasStartKey := listinput.StartKey(ctx)
+	if !hasStartKey {
+		startKey = continuationToken
+		hasStartKey = startKey != ""
+	}
+	var cursor *string
+	if hasStartKey {
+		cursor = &startKey
+	}
 
+	return o.listLocalWithValuesCursor(ctx, prefix, limit, cursor)
+}
+
+func (o *Operations) listLocalWithValuesCursor(ctx context.Context, prefix string, limit int, cursor *string) ([]*pb.KeyValue, string, bool, error) {
 	var storageEntries []stor.KeyValue
 	var lastKey string
 	var hasMore bool
 
 	err := retry.Do(ctx, retry.DefaultConfig(), "ListKeyValuesWithPagination", func() error {
 		var listErr error
-		storageEntries, lastKey, hasMore, listErr = o.storage.ListKeyValuesWithPagination(prefix, startKey, limit)
+		storageEntries, lastKey, hasMore, listErr = o.storage.ListKeyValuesWithPaginationCursor(prefix, cursor, limit)
 		return listErr
 	})
 	if err != nil {

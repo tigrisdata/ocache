@@ -121,18 +121,19 @@ curl -X DELETE "http://localhost:9001/v1/cache/mykey"
 
 Key configuration flags:
 
-| Flag                   | Default    | Description                                               |
-| ---------------------- | ---------- | --------------------------------------------------------- |
-| `-listen-addr`         | :9000      | gRPC server listen address                                |
-| `-listen-http`         | :9001      | HTTP server listen address                                |
-| `-disk`                | /var/cache | Storage directory                                         |
-| `-ttl`                 | 0          | Default global TTL (seconds)                              |
-| `-max-disk-usage`      | 0          | Max disk usage (0=unlimited)                              |
-| `-metadata-cache-size` | 1073741824 | Maximum size of the metadata cache in bytes (1GB)         |
-| `-cluster-enabled`     | false      | Enable cluster mode                                       |
-| `-cluster-addr`        | :7000      | Cluster address                                           |
-| `-seeds`               | ""         | Comma-separated list of seed nodes (required for cluster) |
-| `-node-id`             | ""         | Unique node identifier (required for cluster)             |
+| Flag                                         | Default    | Description                                               |
+| -------------------------------------------- | ---------- | --------------------------------------------------------- |
+| `-listen-addr`                               | :9000      | gRPC server listen address                                |
+| `-listen-http`                               | :9001      | HTTP server listen address                                |
+| `-disk`                                      | /var/cache | Storage directory                                         |
+| `-ttl`                                       | 0          | Default global TTL (seconds)                              |
+| `-max-disk-usage`                            | 0          | Max disk usage (0=unlimited)                              |
+| `-metadata-cache-size`                       | 1073741824 | Maximum size of the metadata cache in bytes (1GB)         |
+| `-cluster-enabled`                           | false      | Enable cluster mode                                       |
+| `-enable-cluster-list-empty-key-pagination`  | false      | Enable empty-key continuations after every public endpoint supports them |
+| `-cluster-addr`                              | :7000      | Cluster address                                           |
+| `-seeds`                                     | ""         | Comma-separated list of seed nodes (required for cluster) |
+| `-node-id`                                   | ""         | Unique node identifier (required for cluster)             |
 
 See [Configuration Guide](docs/configuration.md) for complete options.
 

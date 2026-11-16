@@ -12,6 +12,7 @@ import (
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/metrics"
 	pb "github.com/tigrisdata/ocache/proto"
+	"github.com/tigrisdata/ocache/server/internal/listinput"
 )
 
 // List implements the public List RPC
@@ -34,10 +35,9 @@ func (s *CacheService) List(ctx context.Context, req *pb.ListRequest) (*pb.ListR
 	// Operations handles both single-node and cluster mode automatically
 	continuationToken := req.ContinuationToken
 	if continuationToken == "" && req.StartKey != "" {
-		// For single-node compatibility, treat StartKey as continuation token
-		continuationToken = req.StartKey
+		// Preserve the raw StartKey; it may have the shape of an opaque token.
+		ctx = listinput.WithStartKey(ctx, req.StartKey)
 	}
-
 	keys, token, hasMore, err := s.ops.ListPage(ctx, req.Prefix, int(req.Limit), continuationToken)
 	if err != nil {
 		metrics.RPCRequests.WithLabelValues("List", "error").Inc()
@@ -73,6 +73,9 @@ func (s *CacheService) ListLocal(ctx context.Context, req *pb.ListRequest) (*pb.
 	if continuationToken == "" && req.StartKey != "" {
 		continuationToken = req.StartKey
 	}
+	if continuationToken == "" && req.StartKey == "" && listinput.HasEmptyStartKeyCursor(ctx) {
+		ctx = listinput.WithStartKey(ctx, "")
+	}
 
 	keys, token, hasMore, err := s.ops.ListLocal(ctx, req.Prefix, int(req.Limit), continuationToken)
 	if err != nil {
@@ -82,6 +85,7 @@ func (s *CacheService) ListLocal(ctx context.Context, req *pb.ListRequest) (*pb.
 	}
 
 	metrics.RPCRequests.WithLabelValues("ListLocal", "success").Inc()
+	listinput.AdvertiseEmptyStartKeyCursorCapability(ctx)
 	return &pb.ListResponse{
 		Keys:              keys,
 		ContinuationToken: token,
