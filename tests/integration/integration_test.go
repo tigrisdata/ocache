@@ -76,6 +76,7 @@ func TestIntegration_Cluster(t *testing.T) {
 	}
 	t.Run("ListWithValuesPagination", testClusterListWithValuesPagination)
 	t.Run("ListLegacyReaderCompatibility", testClusterListLegacyReaderCompatibility)
+	t.Run("ListLegacyServerRPC", testClusterListLegacyServerRPC)
 	t.Run("ListEmptyCursorCompatibilityGate", testClusterListEmptyCursorCompatibilityGate)
 	t.Run("ListEmptyCursorRolloutGate", testClusterListEmptyCursorRolloutGate)
 	t.Run("ListDuplicateEmptyKeyTerminalPage", testClusterListDuplicateEmptyKeyTerminalPage)
@@ -85,6 +86,7 @@ func TestIntegration_Cluster(t *testing.T) {
 	t.Run("ListRawStartKeyCompatibility", testClusterListRawStartKey)
 	t.Run("ListContinuationTokenSize", testClusterListContinuationTokenSize)
 	t.Run("ListPartialCursorAtResponseLimit", testClusterListPartialCursorAtResponseLimit)
+	t.Run("ListLargeCursorResponse", testClusterListLargeCursorResponse)
 }
 
 // TestIntegration_All runs all Integration test suites

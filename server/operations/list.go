@@ -14,6 +14,7 @@ import (
 
 	zlog "github.com/rs/zerolog/log"
 	"github.com/tigrisdata/ocache/common/logsample"
+	"github.com/tigrisdata/ocache/coordinator"
 	"github.com/tigrisdata/ocache/coordinator/ring"
 	pb "github.com/tigrisdata/ocache/proto"
 	"github.com/tigrisdata/ocache/server/internal/listinput"
@@ -22,6 +23,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -40,10 +43,14 @@ type ContinuationToken struct {
 }
 
 type continuationTokenFields struct {
-	NodeCursors  json.RawMessage `json:"node_cursors"`
-	Prefix       string          `json:"prefix"`
-	CursorMode   string          `json:"cursor_mode"`
-	CursorPrefix *string         `json:"cursor_prefix"`
+	// Compact partial tokens capitalize the legacy prefix field to mark peer
+	// mode without growing a response that already fills the message limit.
+	// Legacy encoding/json readers accept either spelling.
+	CompactPeerPrefix *string         `json:"Prefix"`
+	NodeCursors       json.RawMessage `json:"node_cursors"`
+	Prefix            string          `json:"prefix"`
+	CursorMode        string          `json:"cursor_mode"`
+	CursorPrefix      *string         `json:"cursor_prefix"`
 }
 
 // The empty node ID is reserved for partial-page tokens. Coordinator node IDs
@@ -128,8 +135,9 @@ func (nr *NodeResponse) keyAt(i int) string {
 
 // mergeResult holds the output of the unified K-way merge.
 type mergeResult struct {
-	Keys    []string       // always populated
-	Entries []*pb.KeyValue // non-nil only in withValues mode
+	Keys       []string       // always populated
+	Entries    []*pb.KeyValue // non-nil only in withValues mode
+	lastNodeID string         // owner of the last distinct key, before duplicate draining
 }
 
 // List returns all keys matching prefix across the entire cluster.
@@ -368,10 +376,44 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 				return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
 			}
 		}
-		if peerPage {
-			newToken, err = o.encodePeerContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
-		} else {
-			newToken, err = o.encodeContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
+		tokenBudget := coordinator.MaxMessageSize - listPageSize(merged, "", withValues)
+		// String escaping and JSON fields can only increase this lower bound.
+		// Avoid allocating an already-too-large cumulative token just to discard it.
+		cursorBytes := 0
+		for nodeID, key := range pageCursors {
+			cursorBytes += len(nodeID) + len(key)
+		}
+		compact := !hasEmptyNodeCursor(pageCursors) && base64.StdEncoding.EncodedLen(cursorBytes) > tokenBudget
+		if !compact {
+			if peerPage {
+				newToken, err = o.encodePeerContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
+			} else {
+				newToken, err = o.encodeContinuationToken(pageCursors, prefix, allNodesSupportEmptyCursor)
+			}
+			// Both public response messages use field 2 for the continuation.
+			compact = protowire.SizeTag(2)+protowire.SizeBytes(len(newToken)) > tokenBudget
+		}
+		if err == nil && compact {
+			// Cumulative progress is useful to older readers, but must not make
+			// a previously fitting response fail. Fall back to the base merge's
+			// sparse current-page cursors. New complete readers still recover
+			// the global frontier from their maximum; partial readers retain
+			// peer mode so an absent shard can recover earlier keys.
+			compactCursors := compactPageCursors(nodeResponses, merged)
+			emptyCursor := hasEmptyNodeCursor(compactCursors)
+			if peerPage && !emptyCursor {
+				var data []byte
+				data, err = json.Marshal(struct {
+					NodeCursors map[string]string `json:"node_cursors"`
+					Prefix      string            `json:"Prefix"`
+				}{compactCursors, prefix})
+				newToken = base64.StdEncoding.EncodeToString(data)
+			} else if peerPage {
+				// Preserve the gated, legacy-rejecting empty-key format.
+				newToken, err = o.encodePeerContinuationToken(compactCursors, prefix, allNodesSupportEmptyCursor)
+			} else {
+				newToken, err = o.encodeContinuationToken(compactCursors, prefix, emptyCursor && allNodesSupportEmptyCursor)
+			}
 		}
 		if err == nil && newToken == "" {
 			err = fmt.Errorf("list has more results but no continuation token")
@@ -383,6 +425,35 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 	}
 
 	return merged, newToken, hasMore, nil
+}
+
+// listPageSize counts the complete public response, not just its cursor.
+func listPageSize(page *mergeResult, token string, withValues bool) int {
+	if withValues {
+		return proto.Size(&pb.ListWithValuesResponse{Entries: page.Entries, ContinuationToken: token, HasMore: true})
+	}
+	return proto.Size(&pb.ListResponse{Keys: page.Keys, ContinuationToken: token, HasMore: true})
+}
+
+// compactPageCursors reconstructs the base merge's stop point. It excludes both
+// historical cursors and peers consumed only by the final duplicate drain.
+func compactPageCursors(responses map[string]*NodeResponse, page *mergeResult) map[string]string {
+	cursors := make(map[string]string)
+	if len(page.Keys) == 0 {
+		return cursors
+	}
+	cutoff := page.Keys[len(page.Keys)-1]
+	for nodeID, response := range responses {
+		for i := 0; i < response.itemCount(); i++ {
+			key := response.keyAt(i)
+			if key >= cutoff {
+				break
+			}
+			cursors[nodeID] = key
+		}
+	}
+	cursors[page.lastNodeID] = cutoff
+	return cursors
 }
 
 // maxListNodeFanout bounds the number of concurrent per-node list RPCs issued
@@ -704,6 +775,7 @@ func (o *Operations) kWayMerge(ctx context.Context, nodeResponses map[string]*No
 		// Deduplicate (shouldn't happen with proper partitioning, but handle it)
 		if !seenKeys[minNode.key] {
 			result.Keys = append(result.Keys, minNode.key)
+			result.lastNodeID = minNode.nodeID
 			if withValues {
 				nodeResp := nodeResponses[minNode.nodeID]
 				idx := nodeIndices[minNode.nodeID]
@@ -791,6 +863,16 @@ func (o *Operations) parseContinuationToken(token string, prefix string) (listCu
 	if err := json.Unmarshal(fields.NodeCursors, &nodeCursors); err != nil || len(nodeCursors) == 0 {
 		zlog.Debug().Str("token", token).Msg("Token has no recognized cluster cursor, treating as plain start key")
 		return plainStartKey()
+	}
+
+	if fields.CompactPeerPrefix != nil && fields.CursorMode == "" {
+		if *fields.CompactPeerPrefix != prefix || (fields.Prefix != "" && fields.Prefix != prefix) {
+			return listCursorState{}, fmt.Errorf("compact peer token prefix mismatch")
+		}
+		if _, reserved := nodeCursors[clusterGlobalCursorNodeID]; reserved {
+			return listCursorState{}, fmt.Errorf("compact peer token contains reserved node cursor")
+		}
+		return listCursorState{nodeCursors: nodeCursors, peerCursors: true, knownProgress: true}, nil
 	}
 
 	if fields.CursorMode != "" {

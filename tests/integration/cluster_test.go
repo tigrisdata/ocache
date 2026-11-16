@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1454,58 +1456,163 @@ func testClusterListPartialFailureRecovery(t *testing.T) {
 }
 
 func testClusterListPartialCursorAtResponseLimit(t *testing.T) {
+	for _, prefix := range []string{"", "p/"} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			oldLogLevel := zerolog.GlobalLevel()
+			zerolog.SetGlobalLevel(zerolog.WarnLevel)
+			defer zerolog.SetGlobalLevel(oldLogLevel)
+
+			var failList atomic.Bool
+			var failListWithValues atomic.Bool
+			var failureCount atomic.Int32
+			fixture := newClusterListPaginationFixtureWithInterceptor(
+				t,
+				listFailureInterceptorFactory("cluster-node-2", &failList, &failListWithValues, &failureCount),
+			)
+			client := newLargeListPaginationClient(t, fixture.nodeA)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+
+			const valueSize = 1 << 20
+			largeValue := bytes.Repeat([]byte{'v'}, valueSize)
+			// Size the last value against the legacy envelope so a marker
+			// cannot consume even one additional byte at this boundary.
+			data, err := json.Marshal(struct {
+				NodeCursors map[string]string `json:"node_cursors"`
+				Prefix      string            `json:"prefix"`
+			}{map[string]string{fixture.nodeA.NodeID: prefix + "m127"}, prefix})
+			require.NoError(t, err)
+			legacy := &pb.ListWithValuesResponse{ContinuationToken: base64.StdEncoding.EncodeToString(data), HasMore: true}
+			for i := 0; i < 128; i++ {
+				legacy.Entries = append(legacy.Entries, &pb.KeyValue{Key: fmt.Sprintf("%sm%03d", prefix, i), Value: largeValue, ValueLength: valueSize})
+			}
+			const maxGRPCMessageSize = 128 << 20
+			lastValue := largeValue[:valueSize-(proto.Size(legacy)-maxGRPCMessageSize)]
+			for i := 0; i < 127; i++ {
+				key := fmt.Sprintf("%sm%03d", prefix, i)
+				require.NoError(t, fixture.nodeA.Storage.Put(key, bytes.NewReader(largeValue), 0))
+			}
+			require.NoError(t, fixture.nodeA.Storage.Put(prefix+"m127", bytes.NewReader(lastValue), 0))
+			require.NoError(t, fixture.nodeA.Storage.Put(prefix+"z", bytes.NewReader([]byte(prefix+"z")), 0))
+			for _, key := range []string{prefix + "a", prefix + "b"} {
+				require.NoError(t, fixture.nodeB.Storage.Put(key, bytes.NewReader([]byte(key)), 0))
+			}
+
+			failListWithValues.Store(true)
+			first, err := client.ListWithValues(ctx, &pb.ListRequest{Prefix: prefix, Limit: 128})
+			require.NoError(t, err)
+			require.Len(t, first.Entries, 128)
+			require.Equal(t, prefix+"m000", first.Entries[0].Key)
+			require.Equal(t, prefix+"m127", first.Entries[len(first.Entries)-1].Key)
+			require.True(t, first.HasMore)
+			require.NotEmpty(t, first.ContinuationToken)
+			require.Equal(t, int32(1), failureCount.Load())
+
+			responseSize := proto.Size(first)
+			require.LessOrEqual(t, responseSize, maxGRPCMessageSize)
+			require.GreaterOrEqual(t, responseSize, maxGRPCMessageSize-4096, "fixture should exercise a near-limit page")
+
+			second, err := client.ListWithValues(ctx, &pb.ListRequest{Prefix: prefix, Limit: 128, ContinuationToken: first.ContinuationToken})
+			require.NoError(t, err)
+			got := make([]string, len(second.Entries))
+			for i, entry := range second.Entries {
+				require.NotNil(t, entry)
+				got[i] = entry.Key
+			}
+			require.Equal(t, []string{prefix + "a", prefix + "b", prefix + "z"}, got)
+			require.False(t, second.HasMore)
+		})
+	}
+}
+
+// Cumulative cursors and duplicate draining must not enlarge a page past the
+// transport limit when the legacy sparse page fits.
+func testClusterListLargeCursorResponse(t *testing.T) {
 	oldLogLevel := zerolog.GlobalLevel()
 	zerolog.SetGlobalLevel(zerolog.WarnLevel)
 	defer zerolog.SetGlobalLevel(oldLogLevel)
-
-	var failList atomic.Bool
-	var failListWithValues atomic.Bool
-	var failureCount atomic.Int32
-	fixture := newClusterListPaginationFixtureWithInterceptor(
-		t,
-		listFailureInterceptorFactory("cluster-node-2", &failList, &failListWithValues, &failureCount),
-	)
-	client := newLargeListPaginationClient(t, fixture.nodeA)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	const valueSize = 1 << 20
-	largeValue := bytes.Repeat([]byte{'v'}, valueSize)
-	lastValue := bytes.Repeat([]byte{'v'}, 1_046_196)
-	for i := 0; i < 127; i++ {
-		key := fmt.Sprintf("m%03d", i)
-		require.NoError(t, fixture.nodeA.Storage.Put(key, bytes.NewReader(largeValue), 0))
+	for _, duplicate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("duplicate=%v", duplicate), func(t *testing.T) {
+			var failList, failValues atomic.Bool
+			var failures atomic.Int32
+			f := newClusterListPaginationFixtureWithNodeCount(t, 3,
+				listFailureInterceptorFactory("cluster-node-3", &failList, &failValues, &failures))
+			client := newLargeListPaginationClient(t, f.nodeA)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			defer cancel()
+			const keySize = (48 << 20) + 1
+			first := "a" + strings.Repeat("x", keySize-1)
+			second := "b" + strings.Repeat("x", keySize-1)
+			if duplicate {
+				first = second
+			}
+			for _, row := range []struct {
+				node *ClusterServerNode
+				key  string
+			}{
+				{f.nodeA, first}, {f.nodeB, second}, {f.nodeB, "z"},
+			} {
+				require.NoError(t, row.node.Storage.Put(row.key, bytes.NewReader([]byte("v")), 0))
+			}
+			var start string
+			if !duplicate {
+				data, err := json.Marshal(struct {
+					NodeCursors map[string]string `json:"node_cursors"`
+					Prefix      string            `json:"prefix"`
+				}{map[string]string{f.nodeA.NodeID: first}, ""})
+				require.NoError(t, err)
+				start = base64.StdEncoding.EncodeToString(data)
+			}
+			for _, partial := range []bool{false, true} {
+				for _, values := range []bool{false, true} {
+					failList.Store(partial && !values)
+					failValues.Store(partial && values)
+					req := &pb.ListRequest{Limit: 1, ContinuationToken: start}
+					var token string
+					if values {
+						page, err := client.ListWithValues(ctx, req)
+						require.NoError(t, err)
+						require.Len(t, page.Entries, 1)
+						require.True(t, page.Entries[0].Key == second)
+						require.Equal(t, []byte("v"), page.Entries[0].Value)
+						require.True(t, page.HasMore)
+						token = page.ContinuationToken
+					} else {
+						page, err := client.List(ctx, req)
+						require.NoError(t, err)
+						require.Len(t, page.Keys, 1)
+						require.True(t, page.Keys[0] == second)
+						require.True(t, page.HasMore)
+						token = page.ContinuationToken
+					}
+					require.NotEmpty(t, token)
+					req = &pb.ListRequest{Limit: 10, ContinuationToken: token}
+					var keys []string
+					if values {
+						page, err := client.ListWithValues(ctx, req)
+						require.NoError(t, err)
+						require.False(t, page.HasMore)
+						for _, entry := range page.Entries {
+							keys = append(keys, entry.Key)
+							require.Equal(t, []byte("v"), entry.Value)
+						}
+					} else {
+						page, err := client.List(ctx, req)
+						require.NoError(t, err)
+						require.False(t, page.HasMore)
+						keys = page.Keys
+					}
+					expected := []string{"z"}
+					if partial {
+						// Sparse partial tokens retain the base's best-effort
+						// replay, rather than skipping a recovered peer.
+						expected = []string{first, "z"}
+					}
+					require.True(t, slices.Equal(expected, keys), "partial=%v values=%v", partial, values)
+				}
+			}
+		})
 	}
-	require.NoError(t, fixture.nodeA.Storage.Put("m127", bytes.NewReader(lastValue), 0))
-	require.NoError(t, fixture.nodeA.Storage.Put("z", bytes.NewReader([]byte("z")), 0))
-	for _, key := range []string{"a", "b"} {
-		require.NoError(t, fixture.nodeB.Storage.Put(key, bytes.NewReader([]byte(key)), 0))
-	}
-
-	failListWithValues.Store(true)
-	first, err := client.ListWithValues(ctx, &pb.ListRequest{Limit: 128})
-	require.NoError(t, err)
-	require.Len(t, first.Entries, 128)
-	require.Equal(t, "m000", first.Entries[0].Key)
-	require.Equal(t, "m127", first.Entries[len(first.Entries)-1].Key)
-	require.True(t, first.HasMore)
-	require.NotEmpty(t, first.ContinuationToken)
-	require.Equal(t, int32(1), failureCount.Load())
-
-	const maxGRPCMessageSize = 128 << 20
-	responseSize := proto.Size(first)
-	require.LessOrEqual(t, responseSize, maxGRPCMessageSize)
-	require.GreaterOrEqual(t, responseSize, maxGRPCMessageSize-4096, "fixture should exercise a near-limit page")
-
-	second, err := client.ListWithValues(ctx, &pb.ListRequest{Limit: 128, ContinuationToken: first.ContinuationToken})
-	require.NoError(t, err)
-	got := make([]string, len(second.Entries))
-	for i, entry := range second.Entries {
-		require.NotNil(t, entry)
-		got[i] = entry.Key
-	}
-	require.Equal(t, []string{"a", "b", "z"}, got)
-	require.False(t, second.HasMore)
 }
 
 func testClusterListContinuationTokenSize(t *testing.T) {
