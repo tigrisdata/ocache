@@ -699,6 +699,12 @@ func (s *Storage) DeleteIfVersion(key string, expected uint64) (retErr error) {
 		return storageErrors.NewInternalError("DeleteIfVersion", err)
 	}
 
+	if s.beforeMetaCommit != nil {
+		if err := s.beforeMetaCommit(); err != nil {
+			return mapRocksDBError("DeleteIfVersion", key, err)
+		}
+	}
+
 	// Every eviction-index entry of the value being deleted — the captured
 	// one, and any the asynchronous LRU refresh flushes for a read that
 	// preceded the delete — carries a write time before this instant; a
