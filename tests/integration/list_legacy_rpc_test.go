@@ -163,6 +163,16 @@ func buildLegacyListServer(t *testing.T) string {
 	binary := filepath.Join(t.TempDir(), "legacy-list.test")
 	build := exec.Command("make", "bench-integration", "INTEGRATION_BENCH_BINARY="+binary)
 	build.Dir = source
+	if os.Getenv("STATIC_BUILD") == "true" {
+		rocksdbDir := os.Getenv("ROCKSDB_STATIC_DIR")
+		if rocksdbDir == "" {
+			rocksdbDir = filepath.Join("rocksdb-static", "artifact")
+		}
+		if !filepath.IsAbs(rocksdbDir) {
+			rocksdbDir = filepath.Join(strings.TrimSpace(string(root)), rocksdbDir)
+		}
+		build.Args = append(build.Args, "ROCKSDB_STATIC_DIR="+rocksdbDir)
+	}
 	// The workflow exports an absolute GOWORK; do not accidentally build the
 	// historical worker against this checkout's current modules.
 	build.Env = append(os.Environ(), "GOWORK="+filepath.Join(source, "go.work"))

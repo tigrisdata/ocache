@@ -361,19 +361,25 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 				advanceEmptyNodeCursors(pageCursors, frontier)
 			}
 		}
-		if hasEmptyNodeCursor(pageCursors) {
+		checkEmptyCursor := func() error {
 			if !o.coordinator.AllowsEmptyKeyListPagination() {
-				return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key is disabled; enable the cluster empty-key pagination option only after every endpoint that may receive continuation tokens supports explicit empty cursors")
+				return status.Error(codes.FailedPrecondition, "cluster pagination after an empty key is disabled; enable the cluster empty-key pagination option only after every endpoint that may receive continuation tokens supports explicit empty cursors")
 			}
 			if !emptyCursorCapabilityChecked {
 				allNodesSupportEmptyCursor, err = o.allHealthyRingNodesSupportEmptyCursor(ctx, ringMgr.GetAllNodes(), nodes, nodeResponses, prefix)
 				if err != nil {
-					return nil, "", false, err
+					return err
 				}
 				emptyCursorCapabilityChecked = true
 			}
 			if !allNodesSupportEmptyCursor {
-				return nil, "", false, status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
+				return status.Error(codes.FailedPrecondition, "cluster pagination after an empty key requires every currently healthy ring member to support explicit empty cursors")
+			}
+			return nil
+		}
+		if hasEmptyNodeCursor(pageCursors) {
+			if err := checkEmptyCursor(); err != nil {
+				return nil, "", false, err
 			}
 		}
 		tokenBudget := coordinator.MaxMessageSize - listPageSize(merged, "", withValues)
@@ -401,6 +407,11 @@ func (o *Operations) listClusterWide(ctx context.Context, prefix string, limit i
 			// peer mode so an absent shard can recover earlier keys.
 			compactCursors := compactPageCursors(nodeResponses, merged)
 			emptyCursor := hasEmptyNodeCursor(compactCursors)
+			if emptyCursor {
+				if err := checkEmptyCursor(); err != nil {
+					return nil, "", false, err
+				}
+			}
 			if peerPage && !emptyCursor {
 				var data []byte
 				data, err = json.Marshal(struct {

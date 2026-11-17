@@ -79,6 +79,7 @@ func TestIntegration_Cluster(t *testing.T) {
 	t.Run("ListLegacyServerRPC", testClusterListLegacyServerRPC)
 	t.Run("ListEmptyCursorCompatibilityGate", testClusterListEmptyCursorCompatibilityGate)
 	t.Run("ListEmptyCursorRolloutGate", testClusterListEmptyCursorRolloutGate)
+	t.Run("ListCompactEmptyCursorRolloutGate", testClusterListCompactEmptyCursorRolloutGate)
 	t.Run("ListDuplicateEmptyKeyTerminalPage", testClusterListDuplicateEmptyKeyTerminalPage)
 	t.Run("ListEmptyCursorCapabilityProbeTimeout", testClusterListEmptyCursorCapabilityProbeTimeout)
 	t.Run("ListLeavingNodeCompatibilityGate", testClusterListLeavingNodeCompatibilityGate)

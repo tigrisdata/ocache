@@ -1171,6 +1171,91 @@ func testClusterListEmptyCursorRolloutGate(t *testing.T) {
 	}
 }
 
+// Compacting cumulative cursors can restore an empty shard cursor even when
+// the complete page has a nonempty frontier. Gate the actual emitted format.
+func testClusterListCompactEmptyCursorRolloutGate(t *testing.T) {
+	oldLogLevel := zerolog.GlobalLevel()
+	zerolog.SetGlobalLevel(zerolog.WarnLevel)
+	defer zerolog.SetGlobalLevel(oldLogLevel)
+	for _, scenario := range []string{"disabled", "enabled", "unsupported-leaving"} {
+		t.Run(scenario, func(t *testing.T) {
+			enabled := scenario != "disabled"
+			nodes := 2
+			var interceptor func(string, grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor
+			if scenario == "unsupported-leaving" {
+				nodes = 3
+				interceptor = emptyCursorCapabilityMissingOnNode("cluster-node-3")
+			}
+			f := newClusterListPaginationFixtureWithOptions(t, nodes, 2, interceptor, enabled)
+			client := newLargeListPaginationClient(t, f.nodeA)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if scenario == "unsupported-leaving" {
+				require.NoError(t, f.nodeC.Coordinator.GetRing().AnnounceLeaving(ctx))
+				require.Eventually(t, func() bool {
+					for _, node := range f.nodeA.Coordinator.GetRing().GetAllNodes() {
+						if node.ID == f.nodeC.NodeID {
+							return node.Status == ring.NodeStatusLeaving
+						}
+					}
+					return false
+				}, 5*time.Second, 10*time.Millisecond)
+				require.Len(t, f.nodeA.Coordinator.GetRing().GetActiveNodes(), 2)
+			}
+			largeKey := "a" + strings.Repeat("x", 48<<20)
+			for _, row := range []struct {
+				node *ClusterServerNode
+				key  string
+			}{{f.nodeA, ""}, {f.nodeB, largeKey}, {f.nodeB, "z"}} {
+				require.NoError(t, row.node.Storage.Put(row.key, bytes.NewReader([]byte("v")), 0))
+			}
+			for _, values := range []bool{false, true} {
+				req := &pb.ListRequest{Limit: 2}
+				var token string
+				if values {
+					page, err := client.ListWithValues(ctx, req)
+					if scenario != "enabled" {
+						require.Equal(t, codes.FailedPrecondition, status.Code(err))
+						require.Nil(t, page)
+						continue
+					}
+					require.NoError(t, err)
+					require.Len(t, page.Entries, 2)
+					require.Empty(t, page.Entries[0].Key)
+					require.True(t, page.Entries[1].Key == largeKey)
+					for _, entry := range page.Entries {
+						require.Equal(t, []byte("v"), entry.Value)
+					}
+					require.True(t, page.HasMore)
+					token = page.ContinuationToken
+					last, err := client.ListWithValues(ctx, &pb.ListRequest{Limit: 2, ContinuationToken: token})
+					require.NoError(t, err)
+					require.Len(t, last.Entries, 1)
+					require.Equal(t, "z", last.Entries[0].Key)
+					require.Equal(t, []byte("v"), last.Entries[0].Value)
+					require.False(t, last.HasMore)
+				} else {
+					page, err := client.List(ctx, req)
+					if scenario != "enabled" {
+						require.Equal(t, codes.FailedPrecondition, status.Code(err))
+						require.Nil(t, page)
+						continue
+					}
+					require.NoError(t, err)
+					require.True(t, slices.Equal([]string{"", largeKey}, page.Keys))
+					require.True(t, page.HasMore)
+					token = page.ContinuationToken
+					last, err := client.List(ctx, &pb.ListRequest{Limit: 2, ContinuationToken: token})
+					require.NoError(t, err)
+					require.Equal(t, []string{"z"}, last.Keys)
+					require.False(t, last.HasMore)
+				}
+				require.NotEmpty(t, token)
+			}
+		})
+	}
+}
+
 func testClusterListDuplicateEmptyKeyTerminalPage(t *testing.T) {
 	fixture := newClusterListPaginationFixtureWithOptions(t, 2, 0, nil, false)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
