@@ -40,11 +40,12 @@ type Config struct {
 	MetadataBackgroundJobs int   // Max concurrent RocksDB background jobs (compactions + flushes)
 
 	// Cluster configuration
-	ClusterEnabled bool     // Enable cluster mode
-	NodeID         string   // Unique node identifier in cluster
-	ClusterAddr    string   // Address for cluster communication
-	Seeds          []string // Seed nodes for joining cluster
-	AdvertiseAddr  string   // Address advertised to other nodes for routing (defaults to ListenAddr)
+	ClusterEnabled               bool     // Enable cluster mode
+	EnableEmptyKeyListPagination bool     // Allow explicit empty-key list continuation tokens after rollout
+	NodeID                       string   // Unique node identifier in cluster
+	ClusterAddr                  string   // Address for cluster communication
+	Seeds                        []string // Seed nodes for joining cluster
+	AdvertiseAddr                string   // Address advertised to other nodes for routing (defaults to ListenAddr)
 }
 
 // AppConfig is the singleton that stores the parsed configuration.
@@ -55,34 +56,35 @@ var AppConfig Config
 // flag variables into the global AppConfig variable.
 func LoadConfig() {
 	AppConfig = Config{
-		DiskPath:               *diskPath,
-		InlineThreshold:        *inlineThreshold,
-		CompactThreshold:       *compactThreshold,
-		SegmentSize:            *segmentSize,
-		TTL:                    *ttl,
-		ListenAddr:             *listenAddr,
-		ListenHTTP:             *listenHTTP,
-		Verbose:                *verbose,
-		FdCacheSize:            *fdCacheSize,
-		MaxDiskUsage:           *maxDiskUsage,
-		EvictionPolicy:         *evictionPolicy,
-		CompactionThreads:      *compactionThreads,
-		FragThreshold:          *fragThreshold,
-		RecompactMinSegmentAge: *recompactMinSegmentAge,
-		RecompactMinSegments:   *recompactMinSegments,
-		RecompactDisable:       *recompactDisable,
-		TTLCleanupInterval:     *ttlCleanupInterval,
-		FenceRetention:         *fenceRetention,
-		RecoveryWorkers:        *recoveryWorkers,
-		DeleteBatchSize:        *deleteBatchSize,
-		RequestLogging:         *requestLogging,
-		MetadataCacheSize:      *metadataCacheSize,
-		MetadataBackgroundJobs: *metadataBackgroundJobs,
-		ClusterEnabled:         *clusterEnabled,
-		NodeID:                 *nodeID,
-		ClusterAddr:            *clusterAddr,
-		Seeds:                  seeds,
-		AdvertiseAddr:          resolveAdvertiseAddr(*listenAddr, *advertiseAddr),
+		DiskPath:                     *diskPath,
+		InlineThreshold:              *inlineThreshold,
+		CompactThreshold:             *compactThreshold,
+		SegmentSize:                  *segmentSize,
+		TTL:                          *ttl,
+		ListenAddr:                   *listenAddr,
+		ListenHTTP:                   *listenHTTP,
+		Verbose:                      *verbose,
+		FdCacheSize:                  *fdCacheSize,
+		MaxDiskUsage:                 *maxDiskUsage,
+		EvictionPolicy:               *evictionPolicy,
+		CompactionThreads:            *compactionThreads,
+		FragThreshold:                *fragThreshold,
+		RecompactMinSegmentAge:       *recompactMinSegmentAge,
+		RecompactMinSegments:         *recompactMinSegments,
+		RecompactDisable:             *recompactDisable,
+		TTLCleanupInterval:           *ttlCleanupInterval,
+		FenceRetention:               *fenceRetention,
+		RecoveryWorkers:              *recoveryWorkers,
+		DeleteBatchSize:              *deleteBatchSize,
+		RequestLogging:               *requestLogging,
+		MetadataCacheSize:            *metadataCacheSize,
+		MetadataBackgroundJobs:       *metadataBackgroundJobs,
+		ClusterEnabled:               *clusterEnabled,
+		EnableEmptyKeyListPagination: *enableEmptyKeyListPagination,
+		NodeID:                       *nodeID,
+		ClusterAddr:                  *clusterAddr,
+		Seeds:                        seeds,
+		AdvertiseAddr:                resolveAdvertiseAddr(*listenAddr, *advertiseAddr),
 
 		CompactionBytesPerSecond: *compactionBytesPerSecond,
 	}

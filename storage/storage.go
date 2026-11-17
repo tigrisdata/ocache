@@ -514,6 +514,17 @@ func (s *Storage) ListKeys(userPrefix string) ([]string, error) {
 // - lastKey: The last key in this page (for continuation)
 // - hasMore: True if more keys exist beyond this page
 func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, limit int) ([]string, string, bool, error) {
+	var cursor *string
+	if startKey != "" {
+		cursor = &startKey
+	}
+	return s.ListKeysWithPaginationCursor(userPrefix, cursor, limit)
+}
+
+// ListKeysWithPaginationCursor is the explicit-cursor form of
+// ListKeysWithPagination. A nil cursor starts at the beginning; a non-nil cursor
+// is exclusive even when its value is the empty key.
+func (s *Storage) ListKeysWithPaginationCursor(userPrefix string, startKey *string, limit int) ([]string, string, bool, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -530,9 +541,9 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 
 	// Determine where to start iteration
 	var seekKey []byte
-	if startKey != "" {
+	if startKey != nil && *startKey != "" {
 		// Start after the given key
-		seekKey = keys.MakeMetadataKey(startKey)
+		seekKey = keys.MakeMetadataKey(*startKey)
 	} else if userPrefix != "" {
 		// Start at the prefix
 		seekKey = keys.MakeMetadataKey(userPrefix)
@@ -553,10 +564,10 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 	it.Seek(seekKey)
 
 	// If we have a startKey, skip it (pagination is exclusive)
-	if startKey != "" && it.Valid() {
+	if startKey != nil && it.Valid() {
 		k := it.Key().Data()
 		currentUserKey := keys.ExtractUserKey(k)
-		if currentUserKey == startKey {
+		if currentUserKey == *startKey {
 			it.Key().Free()
 			it.Value().Free()
 			it.Next()
@@ -598,22 +609,16 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 		it.Next()
 	}
 
+	// An empty frontier needs exact lookahead: an expired suffix must not
+	// force issuance of an empty-key continuation token.
+	hasMore := it.ValidForPrefix(prefixBoundary)
+	if lastKey == "" {
+		hasMore = hasMoreLiveListKey(it, prefixBoundary)
+	}
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_paginated").Inc()
 		return nil, "", false, mapRocksDBError("ListKeysWithPagination", "", err)
-	}
-
-	// Check if there are more keys
-	hasMore := it.ValidForPrefix(prefixBoundary)
-	if hasMore {
-		// Peek at the next key to confirm it matches prefix
-		k := it.Key().Data()
-		nextUserKey := keys.ExtractUserKey(k)
-		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
-			hasMore = false
-		}
-		it.Key().Free()
 	}
 
 	// Clear lastKey if there are no more results
@@ -623,6 +628,21 @@ func (s *Storage) ListKeysWithPagination(userPrefix string, startKey string, lim
 
 	metrics.StorageOperations.WithLabelValues("list_paginated", storageType, "success").Inc()
 	return keyList, lastKey, hasMore, nil
+}
+
+// hasMoreLiveListKey advances over expired rows after an empty-key page so
+// callers need an empty-key continuation only when another live key is available.
+func hasMoreLiveListKey(it *grocksdb.Iterator, prefixBoundary []byte) bool {
+	for it.ValidForPrefix(prefixBoundary) {
+		value := it.Value()
+		expiry, ok := valueMessageExpiry(value.Data())
+		value.Free()
+		if !ok || expiry <= 0 || time.Now().Unix() < expiry {
+			return true
+		}
+		it.Next()
+	}
+	return false
 }
 
 // MaxListValueSize caps the per-value bytes returned by List-with-values. A
@@ -647,6 +667,17 @@ type KeyValue struct {
 // For inline values the data is returned directly; for file/segment values the data is
 // read from disk. Returns: (entries, lastKey, hasMore, error).
 func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string, limit int) ([]KeyValue, string, bool, error) {
+	var cursor *string
+	if startKey != "" {
+		cursor = &startKey
+	}
+	return s.ListKeyValuesWithPaginationCursor(userPrefix, cursor, limit)
+}
+
+// ListKeyValuesWithPaginationCursor is the explicit-cursor form of
+// ListKeyValuesWithPagination. A nil cursor starts at the beginning; a non-nil
+// cursor is exclusive even when its value is the empty key.
+func (s *Storage) ListKeyValuesWithPaginationCursor(userPrefix string, startKey *string, limit int) ([]KeyValue, string, bool, error) {
 	storageType := "unknown"
 	start := time.Now()
 	defer func() {
@@ -663,8 +694,8 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 
 	// Determine where to start iteration
 	var seekKey []byte
-	if startKey != "" {
-		seekKey = keys.MakeMetadataKey(startKey)
+	if startKey != nil && *startKey != "" {
+		seekKey = keys.MakeMetadataKey(*startKey)
 	} else if userPrefix != "" {
 		seekKey = keys.MakeMetadataKey(userPrefix)
 	} else {
@@ -683,10 +714,10 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 	it.Seek(seekKey)
 
 	// If we have a startKey, skip it (pagination is exclusive)
-	if startKey != "" && it.Valid() {
+	if startKey != nil && it.Valid() {
 		k := it.Key().Data()
 		currentUserKey := keys.ExtractUserKey(k)
-		if currentUserKey == startKey {
+		if currentUserKey == *startKey {
 			it.Key().Free()
 			it.Value().Free()
 			it.Next()
@@ -770,21 +801,16 @@ func (s *Storage) ListKeyValuesWithPagination(userPrefix string, startKey string
 		it.Next()
 	}
 
+	// An empty frontier needs exact lookahead: an expired suffix must not
+	// force issuance of an empty-key continuation token.
+	hasMore := it.ValidForPrefix(prefixBoundary)
+	if lastKey == "" {
+		hasMore = hasMoreLiveListKey(it, prefixBoundary)
+	}
 	if err := it.Err(); err != nil {
 		metrics.StorageOperations.WithLabelValues("list_kv_paginated", storageType, "error").Inc()
 		metrics.Errors.WithLabelValues("rocksdb", "list_kv_paginated").Inc()
 		return nil, "", false, mapRocksDBError("ListKeyValuesWithPagination", "", err)
-	}
-
-	// Check if there are more keys
-	hasMore := it.ValidForPrefix(prefixBoundary)
-	if hasMore {
-		k := it.Key().Data()
-		nextUserKey := keys.ExtractUserKey(k)
-		if userPrefix != "" && !bytes.HasPrefix([]byte(nextUserKey), []byte(userPrefix)) {
-			hasMore = false
-		}
-		it.Key().Free()
 	}
 
 	if !hasMore {

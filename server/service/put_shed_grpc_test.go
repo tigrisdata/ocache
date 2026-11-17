@@ -24,9 +24,9 @@ import (
 )
 
 // startBufconnService serves svc over an in-memory gRPC connection.
-func startBufconnService(t *testing.T, svc *CacheService) pb.CacheServiceClient {
+func startBufconnService(t *testing.T, svc *CacheService, opts ...grpc.ServerOption) pb.CacheServiceClient {
 	lis := bufconn.Listen(1 << 20)
-	srv := grpc.NewServer()
+	srv := grpc.NewServer(opts...)
 	pb.RegisterCacheServiceServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)

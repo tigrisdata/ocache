@@ -32,6 +32,11 @@ type Config struct {
 	Seeds         []string // Seed nodes for joining cluster (memberlist addresses of other nodes)
 	DiskPath      string   // The path to the disk for persisting ring tokens
 
+	// EnableEmptyKeyListPagination allows issuing cluster list tokens that resume
+	// after an empty key. Enable only after every public endpoint that may receive
+	// those tokens supports explicit empty-key cursors.
+	EnableEmptyKeyListPagination bool
+
 	// LifecyclerConfig allows advanced ring configuration (optional).
 	// Mainly used for testing.
 	LifecyclerConfig ring.LifecyclerConfig
@@ -353,6 +358,12 @@ func (c *Coordinator) GetNodeForKey(key string) (*ring.NodeInfo, error) {
 // GetLocalNodeID returns the ID of the local node
 func (c *Coordinator) GetLocalNodeID() string {
 	return c.config.MyNodeID
+}
+
+// AllowsEmptyKeyListPagination reports whether this coordinator may issue
+// continuation tokens that require explicit empty-key cursor support.
+func (c *Coordinator) AllowsEmptyKeyListPagination() bool {
+	return c != nil && c.config != nil && c.config.EnableEmptyKeyListPagination
 }
 
 // GetEpoch returns the current ring epoch
